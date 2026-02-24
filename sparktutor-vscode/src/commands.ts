@@ -255,7 +255,7 @@ async function openLesson(
       effectiveDepth
     );
 
-    // Open exercise file for code steps
+    // Open exercise file for code steps, or re-open existing file on resume
     if (result.step.cls === "script" || result.step.cls === "cmd_question") {
       await workspace.openExercise(
         courseId,
@@ -264,6 +264,10 @@ async function openLesson(
         result.starterCode || "",
         result.restoredCode || undefined
       );
+    } else if (result.restoredCode || result.currentIndex > 0) {
+      // Non-code step but resuming — open the exercise file if it exists
+      // so the user's accumulated code stays visible
+      await workspace.openExerciseIfExists(courseId, result.lessonId);
     }
 
     diagnostics.clear();
@@ -410,7 +414,9 @@ async function nextStep(
   statusBar: StatusBarManager
 ): Promise<void> {
   try {
-    const result = await bridge.call<AdvanceResult>("advance");
+    // Send current code so the server persists it for resume
+    const code = workspace.getCurrentCode();
+    const result = await bridge.call<AdvanceResult>("advance", { code });
 
     if (result.finished) {
       lessonPanel.showFinished();
@@ -447,7 +453,9 @@ async function prevStep(
   statusBar: StatusBarManager
 ): Promise<void> {
   try {
-    const result = await bridge.call<GoBackResult>("goBack");
+    // Send current code so the server persists it for resume
+    const code = workspace.getCurrentCode();
+    const result = await bridge.call<GoBackResult>("goBack", { code });
 
     if (result.atStart) {
       vscode.window.showInformationMessage(

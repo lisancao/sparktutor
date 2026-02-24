@@ -265,6 +265,60 @@ h3 {
   background: rgba(115, 201, 145, 0.1);
 }
 
+/* Pass/Fail verdict banner */
+.feedback-verdict {
+  font-size: 1.1em;
+  font-weight: 700;
+  padding: 8px 12px;
+  border-radius: 4px;
+  margin-bottom: 10px;
+}
+
+.feedback-verdict-pass {
+  color: var(--vscode-testing-iconPassed, #73c991);
+  background: rgba(115, 201, 145, 0.12);
+}
+
+.feedback-verdict-fail {
+  color: var(--vscode-testing-iconFailed, #f14c4c);
+  background: rgba(241, 76, 76, 0.12);
+}
+
+/* Feedback category groups */
+.feedback-group {
+  margin: 8px 0;
+}
+
+.feedback-group-label {
+  font-size: 0.8em;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 2px 8px;
+  border-radius: 3px;
+  display: inline-block;
+  margin-bottom: 4px;
+}
+
+.label-bug {
+  color: var(--vscode-testing-iconFailed, #f14c4c);
+  background: rgba(241, 76, 76, 0.12);
+}
+
+.label-convention {
+  color: var(--vscode-editorWarning-foreground, #cca700);
+  background: rgba(204, 167, 0, 0.12);
+}
+
+.label-best-practice {
+  color: var(--vscode-editorInfo-foreground, #3794ff);
+  background: rgba(55, 148, 255, 0.12);
+}
+
+.label-other {
+  display: none;
+}
+
 .encouragement {
   margin-top: 8px;
   font-style: italic;
@@ -290,7 +344,7 @@ h3 {
 }
 
 .chat-messages {
-  max-height: 200px;
+  max-height: 400px;
   overflow-y: auto;
   margin-bottom: 8px;
 }
@@ -343,6 +397,64 @@ h3 {
 .finished-banner h2 {
   font-size: 1.5em;
   color: var(--vscode-testing-iconPassed, #73c991);
+}
+
+/* Inline code and code blocks inside dynamic sections (feedback, hints, chat) */
+.feedback-section code,
+.hint-section code,
+.chat-msg code {
+  background: var(--vscode-textCodeBlock-background, #1e1e1e);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 0.92em;
+}
+
+.feedback-section pre,
+.hint-section pre,
+.chat-msg pre {
+  background: var(--vscode-textCodeBlock-background, #1e1e1e);
+  padding: 10px 12px;
+  border-radius: 6px;
+  overflow-x: auto;
+  margin: 8px 0;
+  line-height: 1.4;
+}
+
+.feedback-section pre code,
+.hint-section pre code,
+.chat-msg pre code {
+  background: none;
+  padding: 0;
+  font-size: 0.9em;
+}
+
+/* Lists inside rendered markdown */
+.feedback-section ul,
+.hint-section ul,
+.chat-msg ul {
+  margin: 6px 0;
+  padding-left: 20px;
+}
+
+.feedback-section li,
+.hint-section li,
+.chat-msg li {
+  margin: 2px 0;
+}
+
+/* Links inside rendered markdown */
+.hint-section a,
+.chat-msg a,
+.feedback-section a {
+  color: var(--vscode-textLink-foreground, #3794ff);
+  text-decoration: none;
+}
+
+.hint-section a:hover,
+.chat-msg a:hover,
+.feedback-section a:hover {
+  text-decoration: underline;
 }
 
 hr {

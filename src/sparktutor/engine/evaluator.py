@@ -18,6 +18,7 @@ class FeedbackItem:
     severity: str  # "error", "warning", "info", "success"
     message: str
     suggestion: Optional[str] = None
+    category: Optional[str] = None  # "bug", "convention", "best_practice"
 
 
 @dataclass
@@ -193,20 +194,34 @@ Student code:
 {f'Execution stdout:\\n{stdout}' if stdout else 'No execution output.'}
 {f'Execution stderr:\\n{stderr}' if stderr else ''}
 
-Respond in JSON:
+Respond in JSON. Be concise — 1-2 sentences per feedback item max.
 {{
   "passed": true/false,
   "feedback": [
-    {{"line": <int or null>, "severity": "error|warning|info", "message": "<text>", "suggestion": "<fix or null>"}}
+    {{
+      "line": <int or null>,
+      "severity": "error|warning|info",
+      "category": "bug|convention|best_practice",
+      "message": "<text — use `backticks` for inline code>",
+      "suggestion": "<fix hint or null — use `backticks` for inline code>"
+    }}
   ],
   "encouragement": "<one sentence calibrated to their depth level>",
   "skill_signals": ["<observed competency or gap>"]
 }}
 
-Calibrate feedback to the student's level:
-- beginner: be encouraging, explain concepts, give concrete examples
-- intermediate: be specific about patterns, mention alternatives
-- advanced: challenge on performance, edge cases, production readiness"""
+Category meanings:
+- "bug": code is incorrect, will not work, or does not satisfy the objective
+- "convention": code works but doesn't follow PySpark/Python conventions
+- "best_practice": code works and is correct, but could be improved (OPTIONAL — only at intermediate/advanced depth)
+
+Rules:
+- If the code satisfies the objective, set "passed": true even if there are convention/best_practice suggestions
+- Only "bug" category items should block passing
+- Keep feedback short and actionable — prefer showing a small code snippet over long explanations
+- For beginners: focus on bugs only, skip convention/best_practice unless critical
+- For intermediate: include convention items, optional best_practice
+- For advanced: include all categories, challenge on edge cases and production readiness"""
 
         try:
             response = client.messages.create(
@@ -227,6 +242,7 @@ Calibrate feedback to the student's level:
                             severity=f.get("severity", "info"),
                             message=f.get("message", ""),
                             suggestion=f.get("suggestion"),
+                            category=f.get("category"),
                         )
                         for f in data.get("feedback", [])
                     ],
@@ -293,6 +309,11 @@ Calibrate feedback to the student's level:
                 stdout=exec_result.stdout if exec_result else "",
                 stderr=exec_result.stderr if exec_result else "",
             )
+
+        # For cmd_question steps: if AST checks passed and execution succeeded,
+        # skip the slower Claude review and pass locally
+        if step.cls == "cmd_question" and ast_checks and exec_result and exec_result.exit_code == 0:
+            return EvalResult(passed=True, encouragement="Well done!")
 
         # If we got past exact match without passing, do Claude review as fallback
         if step.correct_answer:

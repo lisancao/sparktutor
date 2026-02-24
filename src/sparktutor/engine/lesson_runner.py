@@ -149,7 +149,7 @@ class LessonRunner:
 
         return result
 
-    def advance(self) -> Optional[Step]:
+    def advance(self, current_code: str = "") -> Optional[Step]:
         """Move to the next step (only if current step passed)."""
         if self.state is None:
             return None
@@ -160,11 +160,11 @@ class LessonRunner:
         self.state.last_result = None
         self.state.last_exec = None
 
-        self._save_progress("")
+        self._save_progress(current_code)
 
         return self.state.current_step
 
-    def go_back(self) -> Optional[Step]:
+    def go_back(self, current_code: str = "") -> Optional[Step]:
         """Move to the previous step."""
         if self.state is None:
             return None
@@ -177,7 +177,7 @@ class LessonRunner:
         self.state.last_result = None
         self.state.last_exec = None
 
-        self._save_progress("")
+        self._save_progress(current_code)
 
         return self.state.current_step
 
@@ -203,15 +203,32 @@ class LessonRunner:
         return None
 
     def get_starter_code(self) -> str:
-        """Return starter code for the current step."""
+        """Return starter code for the current step.
+
+        If a step has an explicit starter file, use that. Otherwise, generate
+        depth-appropriate scaffolding so the student knows where to start.
+        """
         step = self.current_step()
         if step is None:
             return ""
 
+        # Use explicit starter file if available
         if step.starter_code and self.state:
             starter_path = self.state.lesson.base_path / step.starter_code
             if starter_path.exists():
                 return starter_path.read_text()
 
-        # For cmd_question with no starter, return empty
+        # Generate scaffolding for code steps without an explicit starter
+        if step.cls in ("cmd_question", "script"):
+            from sparktutor.engine.scaffolding import generate_scaffold
+
+            return generate_scaffold(
+                step_output=step.output,
+                step_cls=step.cls,
+                depth=self.profile.depth.value,
+                correct_answer=step.correct_answer or "",
+                hint=step.hint or "",
+                lesson_title=self.state.lesson.title if self.state else "",
+            )
+
         return ""

@@ -68,8 +68,8 @@ export class WorkspaceManager {
   ): Promise<vscode.Uri> {
     const filePath = this.getLessonFilePath(courseId, lessonId);
 
-    if (restoredCode) {
-      // Resuming from a previous session — write the restored code
+    if (restoredCode && !(fs.existsSync(filePath) && fs.readFileSync(filePath, "utf-8").trim())) {
+      // Resuming from a previous session AND no file on disk — write the restored code
       fs.writeFileSync(filePath, restoredCode, "utf-8");
     } else if (fs.existsSync(filePath)) {
       const existing = fs.readFileSync(filePath, "utf-8");
@@ -116,6 +116,34 @@ export class WorkspaceManager {
    * - For cmd_question/script: reads from the editor tab (unsaved changes included).
    * - For text: returns empty (nothing to submit).
    */
+  /**
+   * Open the exercise file if it already exists on disk (for non-code steps
+   * during resume, so the user's accumulated code stays visible).
+   */
+  async openExerciseIfExists(
+    courseId: string,
+    lessonId: string
+  ): Promise<void> {
+    const filePath = this.getLessonFilePath(courseId, lessonId);
+    if (!fs.existsSync(filePath)) {
+      return;
+    }
+    const content = fs.readFileSync(filePath, "utf-8");
+    if (!content.trim()) {
+      return;
+    }
+
+    const uri = vscode.Uri.file(filePath);
+    const existingEditor = vscode.window.visibleTextEditors.find(
+      (e) => e.document.uri.fsPath === filePath
+    );
+    if (!existingEditor) {
+      const doc = await vscode.workspace.openTextDocument(uri);
+      await vscode.window.showTextDocument(doc, vscode.ViewColumn.One);
+    }
+    this.currentFile = uri;
+  }
+
   getCurrentCode(): string {
     if (this.currentStepCls === "mult_question") {
       return this.selectedChoice || "";

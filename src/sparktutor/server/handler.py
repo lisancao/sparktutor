@@ -46,6 +46,7 @@ def _feedback_to_dict(item) -> dict:
         "severity": item.severity,
         "message": item.message,
         "suggestion": item.suggestion,
+        "category": getattr(item, "category", None),
     }
 
 
@@ -207,7 +208,7 @@ class ServerHandler:
         if self._runner is None:
             raise ValueError("No lesson loaded")
 
-        step = self._runner.advance()
+        step = self._runner.advance(current_code=params.get("code", ""))
         if self._runner.state and self._runner.state.is_finished:
             return {"finished": True}
 
@@ -224,7 +225,7 @@ class ServerHandler:
         if self._runner is None:
             raise ValueError("No lesson loaded")
 
-        step = self._runner.go_back()
+        step = self._runner.go_back(current_code=params.get("code", ""))
         if step is None:
             return {"atStart": True}
 

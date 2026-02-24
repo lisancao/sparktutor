@@ -241,27 +241,45 @@ function escapeHtml(text: string): string {
     .replace(/"/g, "&quot;");
 }
 
-/** Simple markdown-to-HTML (handles code blocks, inline code, bold, newlines). */
+/** Markdown-to-HTML: code blocks, inline code, bold, italic, lists, links, line breaks. */
 function markdownToHtml(md: string): string {
   let html = escapeHtml(md);
 
-  // Code blocks: ```...```
+  // Fenced code blocks: ```lang\n...\n```
   html = html.replace(
     /```(\w*)\n([\s\S]*?)```/g,
-    '<pre><code class="language-$1">$2</code></pre>'
+    (_m, lang, code) => `<pre><code${lang ? ` class="language-${lang}"` : ""}>${code}</code></pre>`
   );
 
   // Inline code: `...`
-  html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+  html = html.replace(/`([^`\n]+)`/g, "<code>$1</code>");
 
   // Bold: **...**
   html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
 
-  // Italic: *...*
-  html = html.replace(/\*(.+?)\*/g, "<em>$1</em>");
+  // Italic: *...* (but not inside <strong>)
+  html = html.replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, "<em>$1</em>");
 
-  // Line breaks (but not inside <pre> blocks)
+  // Links: [text](url)
+  html = html.replace(
+    /\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g,
+    '<a href="$2">$1</a>'
+  );
+
+  // Bullet lists: lines starting with - or *
+  html = html.replace(/^([*-]) (.+)$/gm, "<li>$2</li>");
+  html = html.replace(/((?:<li>.*<\/li>\n?)+)/g, "<ul>$1</ul>");
+
+  // Line breaks — protect <pre> blocks first
+  const preBlocks: string[] = [];
+  html = html.replace(/<pre>[\s\S]*?<\/pre>/g, (match) => {
+    preBlocks.push(match);
+    return `%%PRE_BLOCK_${preBlocks.length - 1}%%`;
+  });
   html = html.replace(/\n/g, "<br>");
+  preBlocks.forEach((block, i) => {
+    html = html.replace(`%%PRE_BLOCK_${i}%%`, block);
+  });
 
   return html;
 }

@@ -44,6 +44,7 @@ export interface FeedbackItem {
   severity: "error" | "warning" | "info" | "success";
   message: string;
   suggestion: string | null;
+  category: "bug" | "convention" | "best_practice" | null;
 }
 
 export interface EvalResult {

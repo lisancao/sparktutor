@@ -7,11 +7,19 @@ build/
 .pytest_cache/
 *.db
 
+# Virtualenv
+.venv/
+
 # VS Code extension
 sparktutor-vscode/node_modules/
 sparktutor-vscode/out/
+sparktutor-vscode/*.vsix
 
 # Editor (but keep extension's .vscode for F5 launch config)
 .vscode/
 !sparktutor-vscode/.vscode/
 *.swp
+
+# Secrets
+.env
+.env.*
