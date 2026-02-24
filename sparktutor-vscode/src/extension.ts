@@ -20,7 +20,7 @@ export async function activate(
   const outputChannel = new SparkOutputChannel();
 
   // Start the Python JSON-lines server
-  bridge = new Bridge();
+  bridge = new Bridge(context.extensionPath);
   bridge.on("log", (text: string) => outputChannel.appendLine(`[server] ${text}`));
 
   try {
@@ -80,7 +80,9 @@ export async function activate(
     },
   });
 
-  outputChannel.appendLine("SparkTutor extension activated");
+  // Show the output channel so the user knows it exists
+  outputChannel.show();
+  outputChannel.appendLine("SparkTutor extension activated — select a lesson from the sidebar to begin");
 }
 
 export function deactivate(): void {

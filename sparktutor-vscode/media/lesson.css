@@ -158,6 +158,31 @@ h3 {
   margin-bottom: 16px;
 }
 
+/* Instruction banner — tells the user what to do for this step type */
+.instruction-banner {
+  margin: 12px 0;
+  padding: 10px 14px;
+  border-radius: 6px;
+  font-size: 0.95em;
+  line-height: 1.5;
+}
+
+.instruction-banner.info {
+  background: rgba(55, 148, 255, 0.08);
+  border-left: 4px solid var(--vscode-editorInfo-foreground, #3794ff);
+  color: var(--vscode-foreground);
+}
+
+.instruction-banner.prompt {
+  background: rgba(226, 90, 28, 0.08);
+  border-left: 4px solid var(--spark-orange);
+  color: var(--vscode-foreground);
+}
+
+.instruction-banner strong {
+  color: var(--spark-orange-light);
+}
+
 /* Feedback */
 .feedback-section {
   margin: 12px 0;

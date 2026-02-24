@@ -16,15 +16,17 @@ import {
   ExecResult,
   GoBackResult,
   LoadLessonResult,
-  StepResult,
+  StepData,
 } from "./types";
 
 // Current lesson state
 let currentCourseId: string | undefined;
 let currentLessonId: string | undefined;
 let currentLessonTitle: string | undefined;
+let currentLessonIdx: number | undefined;
 let currentIndex = 0;
 let totalSteps = 0;
+let currentStep: StepData | undefined;
 
 export function registerCommands(
   context: vscode.ExtensionContext,
@@ -50,6 +52,9 @@ export function registerCommands(
   lessonPanel.onChat = (question: string) => {
     handleChat(bridge, lessonPanel, workspace, question);
   };
+  lessonPanel.onChoiceSelect = (choice: string) => {
+    workspace.setSelectedChoice(choice);
+  };
 
   context.subscriptions.push(
     vscode.commands.registerCommand(
@@ -60,6 +65,7 @@ export function registerCommands(
           lessonPanel,
           workspace,
           diagnostics,
+          outputChannel,
           statusBar,
           courseId,
           lessonIdx
@@ -76,7 +82,8 @@ export function registerCommands(
         bridge,
         lessonPanel,
         workspace,
-        diagnostics
+        diagnostics,
+        outputChannel
       );
     }),
 
@@ -86,6 +93,7 @@ export function registerCommands(
         lessonPanel,
         workspace,
         diagnostics,
+        outputChannel,
         statusBar
       );
     }),
@@ -96,6 +104,7 @@ export function registerCommands(
         lessonPanel,
         workspace,
         diagnostics,
+        outputChannel,
         statusBar
       );
     }),
@@ -105,7 +114,6 @@ export function registerCommands(
     }),
 
     vscode.commands.registerCommand("sparktutor.showSolution", async () => {
-      // TODO: implement solution diff
       vscode.window.showInformationMessage(
         "Solution diff not yet available for this step."
       );
@@ -116,17 +124,16 @@ export function registerCommands(
         ["beginner", "intermediate", "advanced"],
         { placeHolder: "Select difficulty level" }
       );
-      if (pick && currentCourseId !== undefined) {
-        // Reload current lesson with new depth
-        const lessonIdx = 0; // TODO: track current lesson idx
+      if (pick && currentCourseId !== undefined && currentLessonIdx !== undefined) {
         await openLesson(
           bridge,
           lessonPanel,
           workspace,
           diagnostics,
+          outputChannel,
           statusBar,
           currentCourseId,
-          lessonIdx,
+          currentLessonIdx,
           pick
         );
       }
@@ -139,6 +146,7 @@ async function openLesson(
   lessonPanel: LessonPanel,
   workspace: WorkspaceManager,
   diagnostics: DiagnosticsManager,
+  outputChannel: SparkOutputChannel,
   statusBar: StatusBarManager,
   courseId: string,
   lessonIdx: number,
@@ -155,11 +163,16 @@ async function openLesson(
     currentCourseId = courseId;
     currentLessonId = result.lessonId;
     currentLessonTitle = result.lessonTitle;
+    currentLessonIdx = lessonIdx;
     currentIndex = result.currentIndex;
     totalSteps = result.totalSteps;
+    currentStep = result.step;
 
     // Set context for keybinding "when" clauses
     vscode.commands.executeCommand("setContext", "sparktutor.active", true);
+
+    // Track step type so workspace knows where to read input from
+    workspace.setStepType(result.step.cls);
 
     // Update UI
     statusBar.setStep(currentIndex, totalSteps);
@@ -170,11 +183,8 @@ async function openLesson(
       result.lessonTitle
     );
 
-    // Open exercise file if this step has code
-    if (
-      result.step.cls === "script" ||
-      result.step.cls === "cmd_question"
-    ) {
+    // Open exercise file for code steps
+    if (result.step.cls === "script" || result.step.cls === "cmd_question") {
       await workspace.openExercise(
         courseId,
         result.lessonId,
@@ -185,6 +195,7 @@ async function openLesson(
     }
 
     diagnostics.clear();
+    outputChannel.clear();
   } catch (err) {
     vscode.window.showErrorMessage(
       `Failed to load lesson: ${err instanceof Error ? err.message : err}`
@@ -199,20 +210,22 @@ async function runCode(
 ): Promise<void> {
   const code = workspace.getCurrentCode();
   if (!code.trim()) {
-    vscode.window.showWarningMessage("No code to run.");
+    vscode.window.showWarningMessage(
+      "No code to run. Write your code in the editor tab on the left."
+    );
     return;
   }
 
   outputChannel.clear();
   outputChannel.show();
-  outputChannel.appendLine("--- Running code ---");
+  outputChannel.appendLine("--- Running code ---\n");
 
   try {
     const result = await bridge.call<ExecResult>("run", { code });
-    outputChannel.appendLine(`--- Exit code: ${result.exitCode} ---`);
+    outputChannel.appendLine(`\n--- Exit code: ${result.exitCode} (${result.mode}) ---`);
   } catch (err) {
     outputChannel.appendLine(
-      `--- Error: ${err instanceof Error ? err.message : err} ---`
+      `\n--- Error: ${err instanceof Error ? err.message : err} ---`
     );
   }
 }
@@ -221,32 +234,94 @@ async function submitCode(
   bridge: Bridge,
   lessonPanel: LessonPanel,
   workspace: WorkspaceManager,
-  diagnostics: DiagnosticsManager
+  diagnostics: DiagnosticsManager,
+  outputChannel: SparkOutputChannel
 ): Promise<void> {
   const code = workspace.getCurrentCode();
   if (!code.trim()) {
-    vscode.window.showWarningMessage("No code to submit.");
+    if (currentStep?.cls === "mult_question") {
+      vscode.window.showWarningMessage(
+        "Select an answer choice first, then click Submit."
+      );
+    } else {
+      vscode.window.showWarningMessage(
+        "No code to submit. Write your code in the editor tab on the left, then click Submit."
+      );
+    }
     return;
   }
+
+  // Show progress
+  outputChannel.clear();
+  outputChannel.show();
+  outputChannel.appendLine("--- Submitting... ---\n");
 
   try {
     const result = await bridge.call<EvalResult>("submit", { code });
     lessonPanel.showFeedback(result);
 
-    // Set diagnostics on the exercise file
+    // Set diagnostics on the exercise file (code steps only)
     const uri = workspace.getCurrentUri();
-    if (uri) {
+    if (uri && currentStep?.cls !== "mult_question") {
       diagnostics.setFeedback(uri, result.feedback);
     }
 
     if (result.passed) {
+      outputChannel.appendLine("--- PASSED ---");
       vscode.window.showInformationMessage(
-        result.encouragement || "Correct!"
+        result.encouragement || "Correct! Click Next to continue."
       );
+    } else {
+      outputChannel.appendLine("--- NOT PASSED --- check feedback in the lesson panel");
+      // Log feedback to output too
+      for (const fb of result.feedback) {
+        const lineInfo = fb.line ? `Line ${fb.line}: ` : "";
+        outputChannel.appendLine(`[${fb.severity}] ${lineInfo}${fb.message}`);
+        if (fb.suggestion) {
+          outputChannel.appendLine(`  suggestion: ${fb.suggestion}`);
+        }
+      }
     }
   } catch (err) {
-    vscode.window.showErrorMessage(
-      `Submit failed: ${err instanceof Error ? err.message : err}`
+    const msg = err instanceof Error ? err.message : String(err);
+    outputChannel.appendLine(`\n--- Error: ${msg} ---`);
+    vscode.window.showErrorMessage(`Submit failed: ${msg}`);
+  }
+}
+
+async function loadStepUI(
+  step: StepData,
+  stepIndex: number,
+  stepTotal: number,
+  starterCode: string,
+  lessonPanel: LessonPanel,
+  workspace: WorkspaceManager,
+  diagnostics: DiagnosticsManager,
+  outputChannel: SparkOutputChannel,
+  statusBar: StatusBarManager
+): Promise<void> {
+  currentIndex = stepIndex;
+  totalSteps = stepTotal;
+  currentStep = step;
+
+  diagnostics.clear();
+  outputChannel.clear();
+  workspace.setStepType(step.cls);
+  statusBar.setStep(stepIndex, stepTotal);
+
+  lessonPanel.updateStep(step, stepIndex, stepTotal, currentLessonTitle || "");
+
+  // Open exercise file for code steps
+  if (
+    (step.cls === "script" || step.cls === "cmd_question") &&
+    currentCourseId &&
+    currentLessonId
+  ) {
+    await workspace.openExercise(
+      currentCourseId,
+      currentLessonId,
+      stepIndex,
+      starterCode
     );
   }
 }
@@ -256,6 +331,7 @@ async function nextStep(
   lessonPanel: LessonPanel,
   workspace: WorkspaceManager,
   diagnostics: DiagnosticsManager,
+  outputChannel: SparkOutputChannel,
   statusBar: StatusBarManager
 ): Promise<void> {
   try {
@@ -269,32 +345,17 @@ async function nextStep(
       return;
     }
 
-    diagnostics.clear();
-    currentIndex = result.currentIndex!;
-    totalSteps = result.totalSteps!;
-    statusBar.setStep(currentIndex, totalSteps);
-
-    lessonPanel.updateStep(
+    await loadStepUI(
       result.step!,
       result.currentIndex!,
       result.totalSteps!,
-      currentLessonTitle || ""
+      result.starterCode || "",
+      lessonPanel,
+      workspace,
+      diagnostics,
+      outputChannel,
+      statusBar
     );
-
-    // Open exercise file for code steps
-    if (
-      result.step &&
-      (result.step.cls === "script" || result.step.cls === "cmd_question") &&
-      currentCourseId &&
-      currentLessonId
-    ) {
-      await workspace.openExercise(
-        currentCourseId,
-        currentLessonId,
-        result.currentIndex!,
-        result.starterCode || ""
-      );
-    }
   } catch (err) {
     vscode.window.showErrorMessage(
       `Navigation failed: ${err instanceof Error ? err.message : err}`
@@ -307,6 +368,7 @@ async function prevStep(
   lessonPanel: LessonPanel,
   workspace: WorkspaceManager,
   diagnostics: DiagnosticsManager,
+  outputChannel: SparkOutputChannel,
   statusBar: StatusBarManager
 ): Promise<void> {
   try {
@@ -319,31 +381,17 @@ async function prevStep(
       return;
     }
 
-    diagnostics.clear();
-    currentIndex = result.currentIndex!;
-    totalSteps = result.totalSteps!;
-    statusBar.setStep(currentIndex, totalSteps);
-
-    lessonPanel.updateStep(
+    await loadStepUI(
       result.step!,
       result.currentIndex!,
       result.totalSteps!,
-      currentLessonTitle || ""
+      result.starterCode || "",
+      lessonPanel,
+      workspace,
+      diagnostics,
+      outputChannel,
+      statusBar
     );
-
-    if (
-      result.step &&
-      (result.step.cls === "script" || result.step.cls === "cmd_question") &&
-      currentCourseId &&
-      currentLessonId
-    ) {
-      await workspace.openExercise(
-        currentCourseId,
-        currentLessonId,
-        result.currentIndex!,
-        result.starterCode || ""
-      );
-    }
   } catch (err) {
     vscode.window.showErrorMessage(
       `Navigation failed: ${err instanceof Error ? err.message : err}`

@@ -12,6 +12,12 @@ export class WorkspaceManager {
   private readonly baseDir: string;
   private currentFile: vscode.Uri | null = null;
 
+  /** For mult_question steps: stores the selected choice from the webview. */
+  private selectedChoice: string | null = null;
+
+  /** The current step type, so we know how to read user input. */
+  private currentStepCls: string = "";
+
   constructor() {
     this.baseDir = path.join(os.homedir(), ".sparktutor", "workspace");
   }
@@ -24,6 +30,21 @@ export class WorkspaceManager {
     const dir = path.join(this.baseDir, courseId, lessonId);
     fs.mkdirSync(dir, { recursive: true });
     return path.join(dir, `step_${stepIdx}.py`);
+  }
+
+  /**
+   * Track what kind of step we're on so getCurrentCode() knows where to look.
+   */
+  setStepType(cls: string): void {
+    this.currentStepCls = cls;
+    this.selectedChoice = null;
+  }
+
+  /**
+   * Store a multiple-choice selection from the webview.
+   */
+  setSelectedChoice(choice: string): void {
+    this.selectedChoice = choice;
   }
 
   /**
@@ -67,9 +88,16 @@ export class WorkspaceManager {
   }
 
   /**
-   * Read the current exercise file content.
+   * Read the user's current input for the step.
+   * - For mult_question: returns the selected choice from the webview.
+   * - For cmd_question/script: reads from the editor tab (unsaved changes included).
+   * - For text: returns empty (nothing to submit).
    */
   getCurrentCode(): string {
+    if (this.currentStepCls === "mult_question") {
+      return this.selectedChoice || "";
+    }
+
     if (!this.currentFile) {
       return "";
     }

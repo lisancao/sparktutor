@@ -3,13 +3,13 @@
  */
 
 import * as vscode from "vscode";
-import { EvalResult, FeedbackItem, StepData } from "./types";
+import { EvalResult, StepData } from "./types";
 
 export class LessonPanel {
   private panel: vscode.WebviewPanel | null = null;
   private readonly extensionUri: vscode.Uri;
 
-  // Callbacks for webview → extension messages
+  // Callbacks for webview -> extension messages
   public onSubmit?: () => void;
   public onRun?: () => void;
   public onNext?: () => void;
@@ -79,13 +79,6 @@ export class LessonPanel {
     lessonTitle: string
   ): void {
     this.show();
-    this.panel?.webview.postMessage({
-      type: "updateStep",
-      step,
-      currentIndex,
-      totalSteps,
-      lessonTitle,
-    });
     this.setHtml(step, currentIndex, totalSteps, lessonTitle);
   }
 
@@ -139,33 +132,44 @@ export class LessonPanel {
       ((currentIndex + 1) / totalSteps) * 100
     );
 
-    const choices = step.answerChoices
-      ? step.answerChoices.split(";").map((c) => c.trim())
-      : [];
+    // Build step-type-specific content
+    let instructionHtml = "";
+    let choicesHtml = "";
+    let actionButtonsHtml = "";
 
-    const choicesHtml =
-      choices.length > 0
-        ? `<div class="choices">${choices
-            .map(
-              (c) =>
-                `<button class="choice-btn" onclick="selectChoice('${escapeHtml(c)}')">${escapeHtml(c)}</button>`
-            )
-            .join("")}</div>`
-        : "";
-
-    const needsInput =
-      step.cls === "cmd_question" ||
-      step.cls === "script" ||
-      step.cls === "mult_question";
-
-    const actionButtons = needsInput
-      ? `<div class="actions">
-           <button class="btn btn-primary" onclick="send('run')">▶ Run</button>
-           <button class="btn btn-success" onclick="send('submit')">✓ Submit</button>
-         </div>`
-      : `<div class="actions">
-           <button class="btn btn-primary" onclick="send('next')">Next →</button>
-         </div>`;
+    if (step.cls === "text") {
+      // Read-only content step — just Next
+      instructionHtml = `<div class="instruction-banner info">Read the content above, then click <strong>Next</strong> to continue.</div>`;
+      actionButtonsHtml = `<div class="actions">
+        <button class="btn btn-primary" onclick="send('next')">Next &rarr;</button>
+      </div>`;
+    } else if (step.cls === "mult_question") {
+      // Multiple choice — pick an answer, then Submit
+      const choices = step.answerChoices
+        ? step.answerChoices.split(";").map((c) => c.trim())
+        : [];
+      instructionHtml = `<div class="instruction-banner prompt">Select an answer below, then click <strong>Submit</strong>.</div>`;
+      choicesHtml = `<div class="choices">${choices
+        .map(
+          (c) =>
+            `<button class="choice-btn" onclick="selectChoice('${escapeHtml(c)}')">${escapeHtml(c)}</button>`
+        )
+        .join("")}</div>`;
+      actionButtonsHtml = `<div class="actions">
+        <button class="btn btn-success" onclick="send('submit')">&check; Submit</button>
+      </div>`;
+    } else if (step.cls === "cmd_question" || step.cls === "script") {
+      // Code step — write code in editor, Run/Submit
+      const label =
+        step.cls === "script"
+          ? "Write your solution in the <strong>editor tab on the left</strong>, then Run or Submit."
+          : "Write your code in the <strong>editor tab on the left</strong>, then click Submit.";
+      instructionHtml = `<div class="instruction-banner prompt">${label}</div>`;
+      actionButtonsHtml = `<div class="actions">
+        <button class="btn btn-primary" onclick="send('run')">&#9654; Run</button>
+        <button class="btn btn-success" onclick="send('submit')">&check; Submit</button>
+      </div>`;
+    }
 
     this.panel.webview.html = `<!DOCTYPE html>
 <html lang="en">
@@ -189,14 +193,16 @@ export class LessonPanel {
     ${choicesHtml}
   </div>
 
+  ${instructionHtml}
+
   <div id="feedback-section" class="feedback-section hidden"></div>
 
-  ${actionButtons}
+  ${actionButtonsHtml}
 
   <div class="nav-buttons">
-    <button class="btn btn-secondary" onclick="send('back')">← Back</button>
-    <button class="btn btn-secondary" onclick="send('hint')">💡 Hint</button>
-    <button class="btn btn-secondary" onclick="send('next')">Next →</button>
+    <button class="btn btn-secondary" onclick="send('back')">&larr; Back</button>
+    <button class="btn btn-secondary" onclick="send('hint')">Hint</button>
+    <button class="btn btn-secondary" onclick="send('next')">Next &rarr;</button>
   </div>
 
   <div id="hint-section" class="hint-section hidden"></div>
@@ -206,7 +212,7 @@ export class LessonPanel {
     <h3>Ask the Tutor</h3>
     <div id="chat-messages" class="chat-messages"></div>
     <div class="chat-input-row">
-      <input type="text" id="chat-input" placeholder="Ask a question..." onkeydown="if(event.key==='Enter')sendChat()">
+      <input type="text" id="chat-input" placeholder="Ask a question about this step..." onkeydown="if(event.key==='Enter')sendChat()">
       <button class="btn btn-primary" onclick="sendChat()">Send</button>
     </div>
   </div>
@@ -249,7 +255,7 @@ function markdownToHtml(md: string): string {
   // Italic: *...*
   html = html.replace(/\*(.+?)\*/g, "<em>$1</em>");
 
-  // Line breaks
+  // Line breaks (but not inside <pre> blocks)
   html = html.replace(/\n/g, "<br>");
 
   return html;

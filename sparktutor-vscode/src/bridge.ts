@@ -5,6 +5,7 @@
 
 import { ChildProcess, spawn } from "child_process";
 import { EventEmitter } from "events";
+import * as path from "path";
 import * as readline from "readline";
 import * as vscode from "vscode";
 
@@ -22,9 +23,11 @@ export class Bridge extends EventEmitter {
   >();
   private restartAttempted = false;
   private pythonPath: string;
+  private extensionDir: string;
 
-  constructor() {
+  constructor(extensionDir: string) {
     super();
+    this.extensionDir = extensionDir;
     this.pythonPath =
       vscode.workspace
         .getConfiguration("sparktutor")
@@ -37,8 +40,21 @@ export class Bridge extends EventEmitter {
 
   private spawn(): Promise<void> {
     return new Promise((resolve, reject) => {
+      let settled = false;
+
+      // Resolve the Python src/ directory relative to the extension
+      // Extension is at sparktutor-vscode/, src/ is at ../src/
+      const srcDir = path.resolve(this.extensionDir, "..", "src");
+
+      // Merge PYTHONPATH so sparktutor is importable
+      const env = { ...process.env };
+      env.PYTHONPATH = env.PYTHONPATH
+        ? `${srcDir}:${env.PYTHONPATH}`
+        : srcDir;
+
       this.proc = spawn(this.pythonPath, ["-m", "sparktutor.server"], {
         stdio: ["pipe", "pipe", "pipe"],
+        env,
       });
 
       if (!this.proc.stdout || !this.proc.stdin) {
@@ -54,7 +70,8 @@ export class Bridge extends EventEmitter {
 
       this.proc.stderr?.on("data", (data: Buffer) => {
         const text = data.toString().trim();
-        if (text.includes("sparktutor-server: ready")) {
+        if (!settled && text.includes("sparktutor-server: ready")) {
+          settled = true;
           resolve();
         }
         // Forward server logs to output channel
@@ -64,6 +81,12 @@ export class Bridge extends EventEmitter {
       this.proc.on("close", (code: number | null) => {
         this.rejectAll(new Error(`Server exited with code ${code}`));
         this.emit("close", code);
+
+        if (!settled) {
+          settled = true;
+          reject(new Error(`Server exited during startup (code ${code})`));
+          return;
+        }
 
         if (!this.restartAttempted) {
           this.restartAttempted = true;
@@ -76,12 +99,18 @@ export class Bridge extends EventEmitter {
       });
 
       this.proc.on("error", (err: Error) => {
-        reject(err);
+        if (!settled) {
+          settled = true;
+          reject(err);
+        }
       });
 
       // Timeout for initial startup
       setTimeout(() => {
-        reject(new Error("Server startup timed out"));
+        if (!settled) {
+          settled = true;
+          reject(new Error("Server startup timed out after 10s"));
+        }
       }, 10000);
     });
   }
@@ -156,7 +185,7 @@ export class Bridge extends EventEmitter {
   }
 
   private rejectAll(err: Error): void {
-    for (const [id, entry] of this.pending) {
+    for (const [, entry] of this.pending) {
       clearTimeout(entry.timer);
       entry.reject(err);
     }

@@ -10,7 +10,9 @@
   "categories": [
     "Education"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onView:sparktutorCourses"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
@@ -84,7 +86,7 @@
         {
           "id": "sparktutor",
           "title": "SparkTutor",
-          "icon": "$(book)"
+          "icon": "media/sparktutor-icon.svg"
         }
       ]
     },
