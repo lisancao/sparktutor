@@ -251,6 +251,7 @@ class ServerHandler:
         step_context = ""
         code_context = params.get("code", "")
         lesson_title = ""
+        extra_context = ""
 
         if self._runner and self._runner.state:
             lesson_title = self._runner.state.lesson.title
@@ -258,12 +259,33 @@ class ServerHandler:
             if step:
                 step_context = step.output
 
+            # Include last execution output so the tutor can reference it
+            last_exec = self._runner.state.last_exec
+            if last_exec:
+                parts = []
+                if last_exec.stdout:
+                    parts.append(f"Last execution stdout:\n{last_exec.stdout[:2000]}")
+                if last_exec.stderr:
+                    parts.append(f"Last execution stderr:\n{last_exec.stderr[:2000]}")
+                if parts:
+                    extra_context += "\n".join(parts)
+
+            # Include last feedback so the tutor knows what was already said
+            last_result = self._runner.state.last_result
+            if last_result and last_result.feedback:
+                fb_lines = []
+                for fb in last_result.feedback[:10]:
+                    cat = f"[{fb.category}] " if getattr(fb, "category", None) else ""
+                    fb_lines.append(f"  {cat}{fb.message}")
+                extra_context += "\nPrior feedback:\n" + "\n".join(fb_lines)
+
         answer = await self.evaluator.chat(
             question=question,
             lesson_title=lesson_title,
             step_context=step_context,
             code_context=code_context,
             depth=self._profile.depth.value,
+            extra_context=extra_context,
         )
         return {"answer": answer}
 

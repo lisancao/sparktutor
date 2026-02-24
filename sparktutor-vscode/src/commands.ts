@@ -108,7 +108,7 @@ export function registerCommands(
     ),
 
     vscode.commands.registerCommand("sparktutor.run", async () => {
-      await runCode(bridge, workspace, outputChannel);
+      await runCode(bridge, lessonPanel, workspace, outputChannel);
     }),
 
     vscode.commands.registerCommand("sparktutor.submit", async () => {
@@ -124,6 +124,7 @@ export function registerCommands(
     vscode.commands.registerCommand("sparktutor.next", async () => {
       await nextStep(
         bridge,
+        treeProvider,
         lessonPanel,
         workspace,
         diagnostics,
@@ -282,6 +283,7 @@ async function openLesson(
 
 async function runCode(
   bridge: Bridge,
+  lessonPanel: LessonPanel,
   workspace: WorkspaceManager,
   outputChannel: SparkOutputChannel
 ): Promise<void> {
@@ -290,6 +292,7 @@ async function runCode(
     vscode.window.showWarningMessage(
       "No code to run. Write your code in the editor tab on the left."
     );
+    lessonPanel.notifyExecDone();
     return;
   }
 
@@ -304,6 +307,8 @@ async function runCode(
     outputChannel.appendLine(
       `\n--- Error: ${err instanceof Error ? err.message : err} ---`
     );
+  } finally {
+    lessonPanel.notifyExecDone();
   }
 }
 
@@ -407,6 +412,7 @@ async function loadStepUI(
 
 async function nextStep(
   bridge: Bridge,
+  treeProvider: CourseTreeProvider,
   lessonPanel: LessonPanel,
   workspace: WorkspaceManager,
   diagnostics: DiagnosticsManager,
@@ -420,6 +426,7 @@ async function nextStep(
 
     if (result.finished) {
       lessonPanel.showFinished();
+      treeProvider.refresh();
       vscode.window.showInformationMessage(
         "Congratulations! You completed the lesson!"
       );

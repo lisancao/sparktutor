@@ -66,12 +66,34 @@ function markdownToHtml(md) {
   return html;
 }
 
+// --- Loading spinner ---
+
+/**
+ * Show/hide the loading spinner overlay.
+ */
+function setLoading(show, label) {
+  var overlay = document.getElementById('loading-overlay');
+  if (!overlay) return;
+  if (show) {
+    var text = overlay.querySelector('.loading-text');
+    if (text) text.textContent = label || 'Processing...';
+    overlay.classList.remove('hidden');
+  } else {
+    overlay.classList.add('hidden');
+  }
+}
+
 // --- Message sending ---
 
 /**
  * Send a message to the extension (for button clicks).
  */
 function send(type) {
+  if (type === 'submit') {
+    setLoading(true, 'Evaluating...');
+  } else if (type === 'run') {
+    setLoading(true, 'Running...');
+  }
   vscode.postMessage({ type });
 }
 
@@ -125,7 +147,11 @@ window.addEventListener('message', function (event) {
 
   switch (msg.type) {
     case 'feedback':
+      setLoading(false);
       showFeedback(msg);
+      break;
+    case 'execDone':
+      setLoading(false);
       break;
     case 'hint':
       showHint(msg.hint);
@@ -134,6 +160,7 @@ window.addEventListener('message', function (event) {
       addChatMessage(msg.answer, 'tutor');
       break;
     case 'finished':
+      setLoading(false);
       showFinished();
       break;
   }

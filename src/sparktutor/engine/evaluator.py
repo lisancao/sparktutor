@@ -312,7 +312,25 @@ Rules:
 
         # For cmd_question steps: if AST checks passed and execution succeeded,
         # skip the slower Claude review and pass locally
-        if step.cls == "cmd_question" and ast_checks and exec_result and exec_result.exit_code == 0:
+        if step.cls == "cmd_question" and ast_checks:
+            if exec_result is None or exec_result.exit_code != 0:
+                # Execution failed or wasn't run — don't pass
+                fb = []
+                if exec_result and exec_result.stderr:
+                    fb.append(FeedbackItem(
+                        line=None, severity="error",
+                        message=f"Code execution failed (exit code {exec_result.exit_code}).",
+                        suggestion="Check the Output panel for error details.",
+                        category="bug",
+                    ))
+                elif exec_result is None:
+                    fb.append(FeedbackItem(
+                        line=None, severity="error",
+                        message="Code requires execution but was not run.",
+                        suggestion="Make sure your code can be executed successfully.",
+                        category="bug",
+                    ))
+                return EvalResult(passed=False, feedback=fb)
             return EvalResult(passed=True, encouragement="Well done!")
 
         # If we got past exact match without passing, do Claude review as fallback
@@ -339,6 +357,7 @@ Rules:
         step_context: str = "",
         code_context: str = "",
         depth: str = "beginner",
+        extra_context: str = "",
     ) -> str:
         """Answer a freeform question about the current lesson/code using Claude."""
         from sparktutor.engine.spark_knowledge import get_system_prompt
@@ -352,6 +371,7 @@ Current exercise: {step_context}
 Student depth level: {depth}
 
 {f'Their current code:\n```python\n{code_context}\n```' if code_context else '(no code yet)'}
+{extra_context}
 
 Student question: {question}"""
 

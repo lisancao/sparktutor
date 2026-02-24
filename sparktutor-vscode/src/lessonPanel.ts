@@ -106,6 +106,12 @@ export class LessonPanel {
     });
   }
 
+  notifyExecDone(): void {
+    this.panel?.webview.postMessage({
+      type: "execDone",
+    });
+  }
+
   showFinished(): void {
     this.panel?.webview.postMessage({
       type: "finished",
@@ -199,6 +205,11 @@ export class LessonPanel {
   </div>
 
   ${instructionHtml}
+
+  <div id="loading-overlay" class="loading-overlay hidden">
+    <div class="loading-spinner"></div>
+    <span class="loading-text">Processing...</span>
+  </div>
 
   <div id="feedback-section" class="feedback-section hidden"></div>
 
