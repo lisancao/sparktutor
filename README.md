@@ -4,6 +4,8 @@ Interactive Apache Spark 4.1 learning environment — a VS Code extension with C
 
 [![Demo](https://img.youtube.com/vi/LMDfyscN9FY/maxresdefault.jpg)](https://www.youtube.com/watch?v=LMDfyscN9FY)
 
+**[Watch the full demo on YouTube](https://www.youtube.com/watch?v=LMDfyscN9FY)**
+
 ## What is SparkTutor?
 
 SparkTutor is a learn-by-doing environment for Apache Spark 4.1. Instead of watching videos or reading docs, you write real PySpark code in VS Code with an AI tutor guiding you through structured lessons — from creating your first SparkSession to building a complete bronze-silver-gold data pipeline.
