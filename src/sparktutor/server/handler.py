@@ -89,6 +89,8 @@ class ServerHandler:
             "getHint": self._get_hint,
             "chat": self._chat,
             "detectMode": self._detect_mode,
+            "resetLesson": self._reset_lesson,
+            "getSolution": self._get_solution,
         }
 
         handler = handler_map.get(method)
@@ -288,6 +290,27 @@ class ServerHandler:
             extra_context=extra_context,
         )
         return {"answer": answer}
+
+    async def _get_solution(self, params: dict) -> dict:
+        if self._runner is None or self._runner.state is None:
+            raise ValueError("No lesson loaded")
+
+        step = self._runner.state.current_step
+        if step is None or not step.solution_code:
+            return {"solution": ""}
+
+        solution_path = self._runner.state.lesson.base_path / step.solution_code
+        if solution_path.exists():
+            return {"solution": solution_path.read_text()}
+        return {"solution": ""}
+
+    async def _reset_lesson(self, params: dict) -> dict:
+        course_id = params["courseId"]
+        lesson_id = params["lessonId"]
+        self.progress.reset_lesson(course_id, lesson_id)
+        # Clear the runner so the lesson reloads fresh
+        self._runner = None
+        return {"ok": True}
 
     async def _detect_mode(self, params: dict) -> dict:
         mode = await self.executor.detect_mode()

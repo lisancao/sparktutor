@@ -149,9 +149,59 @@ export function registerCommands(
     }),
 
     vscode.commands.registerCommand("sparktutor.showSolution", async () => {
-      vscode.window.showInformationMessage(
-        "Solution diff not yet available for this step."
-      );
+      if (
+        !currentStep ||
+        !currentCourseId ||
+        !currentLessonId
+      ) {
+        vscode.window.showWarningMessage("No lesson is currently open.");
+        return;
+      }
+
+      // Get solution code from the step
+      const solutionCode = currentStep.solutionCode;
+      if (!solutionCode) {
+        vscode.window.showInformationMessage(
+          "No solution available for this step."
+        );
+        return;
+      }
+
+      // Load solution from the lesson directory via bridge
+      try {
+        const result = await bridge.call<{ solution: string }>("getSolution");
+        if (!result.solution) {
+          vscode.window.showInformationMessage(
+            "No solution available for this step."
+          );
+          return;
+        }
+
+        const solutionUri = workspace.writeSolutionFile(
+          currentCourseId,
+          currentLessonId,
+          currentIndex,
+          result.solution
+        );
+
+        const exerciseUri = workspace.getCurrentUri();
+        if (exerciseUri) {
+          await vscode.commands.executeCommand(
+            "vscode.diff",
+            exerciseUri,
+            solutionUri,
+            `Your Code ↔ Solution (Step ${currentIndex + 1})`
+          );
+        } else {
+          // No exercise file open, just show the solution
+          const doc = await vscode.workspace.openTextDocument(solutionUri);
+          await vscode.window.showTextDocument(doc, vscode.ViewColumn.One);
+        }
+      } catch (err) {
+        vscode.window.showErrorMessage(
+          `Failed to load solution: ${err instanceof Error ? err.message : err}`
+        );
+      }
     }),
 
     vscode.commands.registerCommand("sparktutor.changeDepth", async () => {
@@ -168,6 +218,52 @@ export function registerCommands(
           currentCourseId,
           currentLessonIdx,
           pick
+        );
+      }
+    }),
+
+    vscode.commands.registerCommand("sparktutor.resetLesson", async () => {
+      if (!currentCourseId || !currentLessonId || currentLessonIdx === undefined) {
+        vscode.window.showWarningMessage("No lesson is currently open.");
+        return;
+      }
+
+      const confirm = await vscode.window.showWarningMessage(
+        `Reset "${currentLessonTitle || currentLessonId}"? This will clear all progress and saved code for this lesson.`,
+        { modal: true },
+        "Reset"
+      );
+      if (confirm !== "Reset") {
+        return;
+      }
+
+      try {
+        await bridge.call("resetLesson", {
+          courseId: currentCourseId,
+          lessonId: currentLessonId,
+        });
+
+        // Delete the exercise file on disk
+        workspace.deleteExerciseFile(currentCourseId, currentLessonId);
+
+        // Refresh tree and re-open the lesson from step 0
+        treeProvider.refresh();
+        await openLesson(
+          bridge,
+          lessonPanel,
+          workspace,
+          diagnostics,
+          outputChannel,
+          statusBar,
+          currentCourseId,
+          currentLessonIdx,
+          currentDepth
+        );
+
+        vscode.window.showInformationMessage("Lesson reset successfully.");
+      } catch (err) {
+        vscode.window.showErrorMessage(
+          `Reset failed: ${err instanceof Error ? err.message : err}`
         );
       }
     })

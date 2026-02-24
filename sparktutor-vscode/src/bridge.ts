@@ -173,13 +173,20 @@ export class Bridge extends EventEmitter {
     }
   }
 
+  /** Check if the server process is alive and responsive. */
+  isAlive(): boolean {
+    return !!(this.proc && !this.proc.killed && this.proc.stdin?.writable);
+  }
+
   async call<T = unknown>(
     method: string,
     params: Record<string, unknown> = {},
     timeoutMs = 120000
   ): Promise<T> {
-    if (!this.proc?.stdin?.writable) {
-      throw new Error("Server not running");
+    if (!this.isAlive()) {
+      throw new Error(
+        "SparkTutor server is not running. Try reloading the window (Ctrl+Shift+P → Reload Window)."
+      );
     }
 
     const id = this.nextId++;
@@ -187,7 +194,12 @@ export class Bridge extends EventEmitter {
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`Request ${method} timed out after ${timeoutMs}ms`));
+        reject(
+          new Error(
+            `Request "${method}" timed out after ${Math.round(timeoutMs / 1000)}s. ` +
+              "The server may be overloaded — try again or reload the window."
+          )
+        );
       }, timeoutMs);
 
       this.pending.set(id, {

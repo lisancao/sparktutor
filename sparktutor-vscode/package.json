@@ -52,6 +52,11 @@
       {
         "command": "sparktutor.changeDepth",
         "title": "SparkTutor: Change Depth Level"
+      },
+      {
+        "command": "sparktutor.resetLesson",
+        "title": "SparkTutor: Reset Current Lesson",
+        "icon": "$(trash)"
       }
     ],
     "keybindings": [

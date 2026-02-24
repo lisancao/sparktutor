@@ -111,12 +111,12 @@ class Executor:
     ) -> ExecResult:
         """Execute via docker exec on spark-master-41."""
         container = self.settings.docker.container_name
-        remote_path = "/tmp/sparktutor_exercise.py"
 
-        # Write code to temp file and copy into container
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as tmp:
+        # Write code to a unique temp file to avoid collisions
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", prefix="sparktutor_", delete=False) as tmp:
             tmp.write(code)
             tmp_path = tmp.name
+        remote_path = f"/tmp/{Path(tmp_path).name}"
 
         # docker cp
         cp_proc = await asyncio.create_subprocess_exec(

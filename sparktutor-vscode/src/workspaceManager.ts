@@ -174,6 +174,16 @@ export class WorkspaceManager {
   }
 
   /**
+   * Delete the exercise file for a lesson (used by reset).
+   */
+  deleteExerciseFile(courseId: string, lessonId: string): void {
+    const filePath = this.getLessonFilePath(courseId, lessonId);
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+  }
+
+  /**
    * Write a solution file for diff comparison.
    */
   writeSolutionFile(
