@@ -13,6 +13,7 @@ build/
 # VS Code extension
 sparktutor-vscode/node_modules/
 sparktutor-vscode/out/
+sparktutor-vscode/python_src/
 sparktutor-vscode/*.vsix
 
 # Editor (but keep extension's .vscode for F5 launch config)

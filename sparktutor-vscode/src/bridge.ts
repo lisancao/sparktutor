@@ -5,6 +5,7 @@
 
 import { ChildProcess, spawn } from "child_process";
 import { EventEmitter } from "events";
+import * as fs from "fs";
 import * as path from "path";
 import * as readline from "readline";
 import * as vscode from "vscode";
@@ -42,9 +43,22 @@ export class Bridge extends EventEmitter {
     return new Promise((resolve, reject) => {
       let settled = false;
 
-      // Resolve the Python src/ directory relative to the extension
-      // Extension is at sparktutor-vscode/, src/ is at ../src/
-      const srcDir = path.resolve(this.extensionDir, "..", "src");
+      // Resolve the Python src/ directory.
+      // Priority: 1) sparktutor.projectPath setting, 2) relative to extension dir, 3) extensionDir itself
+      const config = vscode.workspace.getConfiguration("sparktutor");
+      const projectPath = config.get<string>("projectPath") || "";
+      let srcDir: string;
+      if (projectPath && fs.existsSync(path.join(projectPath, "src", "sparktutor"))) {
+        srcDir = path.join(projectPath, "src");
+      } else if (fs.existsSync(path.resolve(this.extensionDir, "..", "src", "sparktutor"))) {
+        // Dev mode: extension is at sparktutor-vscode/, src/ is at ../src/
+        srcDir = path.resolve(this.extensionDir, "..", "src");
+      } else if (fs.existsSync(path.join(this.extensionDir, "python_src", "sparktutor"))) {
+        // Installed VSIX: Python source bundled inside the extension
+        srcDir = path.join(this.extensionDir, "python_src");
+      } else {
+        srcDir = path.join(this.extensionDir, "src");
+      }
 
       // Merge PYTHONPATH so sparktutor is importable
       const env = { ...process.env };
@@ -53,7 +67,6 @@ export class Bridge extends EventEmitter {
         : srcDir;
 
       // Forward VS Code settings as environment variables for the Python server
-      const config = vscode.workspace.getConfiguration("sparktutor");
       const apiKey = config.get<string>("anthropicApiKey");
       if (apiKey) {
         env.ANTHROPIC_API_KEY = apiKey;
