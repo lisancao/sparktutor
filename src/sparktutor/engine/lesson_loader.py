@@ -123,8 +123,8 @@ def load_lesson(lesson_dir: Path) -> Lesson:
             answer_choices=raw.get("AnswerChoices"),
             correct_answer=raw.get("CorrectAnswer"),
             hint=raw.get("Hint"),
-            starter_code=raw.get("StarterCode"),
-            solution_code=raw.get("SolutionCode"),
+            starter_code=raw.get("StarterCode") or raw.get("StarterFile"),
+            solution_code=raw.get("SolutionCode") or raw.get("SolutionFile"),
             validation=_parse_validation(raw.get("Validation")),
             requires_execution=raw.get("RequiresExecution", False),
         )
