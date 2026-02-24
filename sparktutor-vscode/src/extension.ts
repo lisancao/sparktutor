@@ -4,7 +4,7 @@
 
 import * as vscode from "vscode";
 import { Bridge } from "./bridge";
-import { registerCommands } from "./commands";
+import { getSavedSession, registerCommands } from "./commands";
 import { CourseTreeProvider } from "./courseTree";
 import { DiagnosticsManager } from "./diagnostics";
 import { LessonPanel } from "./lessonPanel";
@@ -82,7 +82,25 @@ export async function activate(
 
   // Show the output channel so the user knows it exists
   outputChannel.show();
-  outputChannel.appendLine("SparkTutor extension activated — select a lesson from the sidebar to begin");
+  outputChannel.appendLine("SparkTutor extension activated");
+
+  // Check for a saved session and offer to resume
+  const saved = getSavedSession();
+  if (saved) {
+    const resume = await vscode.window.showInformationMessage(
+      `Resume "${saved.lessonTitle}" (${saved.depth})?`,
+      "Resume",
+      "Start Fresh"
+    );
+    if (resume === "Resume") {
+      vscode.commands.executeCommand(
+        "sparktutor.openLesson",
+        saved.courseId,
+        saved.lessonIdx,
+        saved.depth,
+      );
+    }
+  }
 }
 
 export function deactivate(): void {

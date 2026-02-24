@@ -29,6 +29,34 @@ let totalSteps = 0;
 let currentStep: StepData | undefined;
 let currentDepth: string | undefined;
 
+/** Session state saved to globalState for resume-on-reload. */
+interface SavedSession {
+  courseId: string;
+  lessonIdx: number;
+  lessonId: string;
+  lessonTitle: string;
+  depth: string;
+}
+
+let extensionContext: vscode.ExtensionContext;
+
+function saveSession(): void {
+  if (currentCourseId && currentLessonIdx !== undefined && currentLessonId && currentDepth) {
+    const session: SavedSession = {
+      courseId: currentCourseId,
+      lessonIdx: currentLessonIdx,
+      lessonId: currentLessonId,
+      lessonTitle: currentLessonTitle || "",
+      depth: currentDepth,
+    };
+    extensionContext.globalState.update("sparktutorSession", session);
+  }
+}
+
+export function getSavedSession(): SavedSession | undefined {
+  return extensionContext?.globalState.get<SavedSession>("sparktutorSession");
+}
+
 export function registerCommands(
   context: vscode.ExtensionContext,
   bridge: Bridge,
@@ -39,6 +67,7 @@ export function registerCommands(
   outputChannel: SparkOutputChannel,
   statusBar: StatusBarManager
 ): void {
+  extensionContext = context;
   // Wire up webview button callbacks
   lessonPanel.onSubmit = () =>
     vscode.commands.executeCommand("sparktutor.submit");
@@ -60,7 +89,10 @@ export function registerCommands(
   context.subscriptions.push(
     vscode.commands.registerCommand(
       "sparktutor.openLesson",
-      async (courseId: string, lessonIdx: number) => {
+      async (courseId: string, lessonIdx: number, depth?: string) => {
+        if (depth) {
+          currentDepth = depth; // pre-set so pickDepth isn't triggered
+        }
         await openLesson(
           bridge,
           lessonPanel,
@@ -69,7 +101,8 @@ export function registerCommands(
           outputChannel,
           statusBar,
           courseId,
-          lessonIdx
+          lessonIdx,
+          depth
         );
       }
     ),
@@ -235,6 +268,7 @@ async function openLesson(
 
     diagnostics.clear();
     outputChannel.clear();
+    saveSession();
   } catch (err) {
     vscode.window.showErrorMessage(
       `Failed to load lesson: ${err instanceof Error ? err.message : err}`
