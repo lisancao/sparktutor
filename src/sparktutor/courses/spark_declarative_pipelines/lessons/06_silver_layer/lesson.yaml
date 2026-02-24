@@ -1,0 +1,187 @@
+- Class: meta
+  Lesson: "Silver Layer"
+  EstimatedMinutes: 15
+
+- Class: text
+  Depth: all
+  Output: |
+    The **silver layer** transforms raw bronze data into a clean, typed,
+    and enriched dataset. This is where the heavy lifting happens:
+
+    - **Type casting**: convert strings to proper types (int, double, timestamp)
+    - **Data cleaning**: handle nulls, trim whitespace, standardize formats
+    - **Joins**: enrich records by joining with reference tables
+    - **Feature extraction**: parse nested fields, extract time components
+
+- Class: text
+  Depth: beginner
+  Output: |
+    The most common silver operation is casting bronze string columns to
+    their proper types:
+
+    ```python
+    from pyspark.sql import functions as f
+
+    def silver_orders(spark):
+        bronze = spark.table("bronze_orders")
+        return (bronze
+            .withColumn("price", f.col("price").cast("double"))
+            .withColumn("quantity", f.col("quantity").cast("int"))
+            .withColumn("order_date", f.to_date(f.col("order_date_str"), "yyyy-MM-dd"))
+            .drop("order_date_str")
+        )
+    ```
+
+    If a value cannot be cast (e.g., "N/A" to double), Spark produces
+    `null` -- which is exactly what we want. Those rows can be sent to
+    a quarantine table for investigation.
+
+- Class: mult_question
+  Depth: all
+  Output: "What happens when you cast the string 'N/A' to DoubleType in Spark?"
+  AnswerChoices: "It becomes null;It throws an exception;It becomes 0.0;It stays as 'N/A'"
+  CorrectAnswer: "It becomes null"
+  Hint: "Spark's cast is lenient -- unparseable values become null, not errors."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Given a bronze DataFrame `bronze_df` with string columns `price` and
+    `quantity`, cast `price` to double and `quantity` to integer.
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+    silver_df = (bronze_df
+        .withColumn("price", f.col("price").cast("double"))
+        .withColumn("quantity", f.col("quantity").cast("int"))
+    )
+  Hint: "Use .withColumn with f.col(...).cast('double') and .cast('int')."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    **Joins** are essential in the silver layer for enriching transactional
+    data with reference data. Spark supports:
+
+    - `inner` -- only matching rows from both sides
+    - `left` -- all rows from the left, matching from the right (or null)
+    - `broadcast` -- hint for small tables to avoid a shuffle
+
+    ```python
+    products = spark.table("dim_products")  # small reference table
+
+    enriched = (orders
+        .join(f.broadcast(products), on="product_id", how="left")
+    )
+    ```
+
+    `f.broadcast()` tells Spark to send the small table to every executor,
+    avoiding an expensive shuffle join.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "When should you use a broadcast join?"
+  AnswerChoices: "When one side of the join is small enough to fit in executor memory;When both tables are large;When you want to remove duplicates;When joining on multiple columns"
+  CorrectAnswer: "When one side of the join is small enough to fit in executor memory"
+  Hint: "Broadcast sends the entire small table to each executor, eliminating the shuffle."
+
+- Class: cmd_question
+  Depth: intermediate
+  Output: |
+    Join `orders_df` with a small reference DataFrame `products_df` on
+    `product_id` using a left broadcast join.
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+    enriched = orders_df.join(f.broadcast(products_df), on="product_id", how="left")
+  Hint: "Wrap the small DataFrame in f.broadcast() inside the join call."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    **Parsing JSON columns** is common when bronze data contains a raw
+    JSON string (e.g., from an API response or Kafka message):
+
+    ```python
+    from pyspark.sql.types import StructType, StructField, StringType, IntegerType
+
+    payload_schema = StructType([
+        StructField("action", StringType()),
+        StructField("item_count", IntegerType()),
+    ])
+
+    df = df.withColumn("parsed", f.from_json(f.col("payload"), payload_schema))
+    df = df.select("*", "parsed.action", "parsed.item_count").drop("parsed", "payload")
+    ```
+
+- Class: cmd_question
+  Depth: intermediate
+  Output: |
+    Given a DataFrame `events_df` with a string column `metadata` containing
+    JSON like `{"browser": "Chrome", "os": "Linux"}`, parse it into separate
+    `browser` and `os` columns. Drop the original `metadata` column.
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+    from pyspark.sql.types import StructType, StructField, StringType
+
+    meta_schema = StructType([
+        StructField("browser", StringType()),
+        StructField("os", StringType()),
+    ])
+
+    result = (events_df
+        .withColumn("parsed", f.from_json(f.col("metadata"), meta_schema))
+        .select("*", "parsed.browser", "parsed.os")
+        .drop("parsed", "metadata")
+    )
+  Hint: "Define a StructType for the JSON, use f.from_json, then select the nested fields."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    **Slowly Changing Dimensions (SCD Type 2)** track historical changes
+    to reference data. Each row has `valid_from` and `valid_to` timestamps.
+
+    To join a fact table against an SCD-2 dimension:
+    ```python
+    enriched = (facts
+        .join(dim,
+              (facts.product_id == dim.product_id) &
+              (facts.order_date >= dim.valid_from) &
+              (facts.order_date < dim.valid_to),
+              how="left")
+    )
+    ```
+
+    **Data quality checks** can be embedded in the silver layer to flag
+    suspicious records:
+    ```python
+    df = df.withColumn("_dq_price_valid",
+        f.when(f.col("price") > 0, True).otherwise(False))
+    ```
+
+- Class: mult_question
+  Depth: advanced
+  Output: "In an SCD Type 2 join, what additional condition beyond the key match is required?"
+  AnswerChoices: "The fact date must fall within the dimension's valid_from and valid_to range;The dimension must be broadcast;The fact table must be sorted;Both tables must be partitioned by date"
+  CorrectAnswer: "The fact date must fall within the dimension's valid_from and valid_to range"
+  Hint: "SCD-2 rows have validity windows. You match based on time overlap."
+
+- Class: script
+  Depth: all
+  Output: |
+    Build a silver transformation function. Open `starter.py` and implement
+    `silver_orders` that:
+    1. Reads from the `bronze_orders` temp view
+    2. Casts `price` to double and `quantity` to int
+    3. Adds a `total` column (price * quantity)
+    4. Filters out rows where price is null (failed casts)
+    5. Adds an `order_hour` column extracted from `order_ts`
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Cast columns, compute total, filter nulls, extract hour from timestamp."
+
+- Class: text
+  Depth: all
+  Output: |
+    Your silver layer now produces clean, typed, enriched data. In the
+    next lesson you will build **gold layer** aggregations that power
+    dashboards and reports.

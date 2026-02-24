@@ -1,0 +1,170 @@
+- Class: meta
+  Lesson: "Functions & Transforms"
+  EstimatedMinutes: 15
+
+- Class: text
+  Depth: all
+  Output: |
+    Now that you have a SparkSession, it is time to work with DataFrames.
+    Spark DataFrames are distributed collections of rows with named columns,
+    similar to a table in a database or a pandas DataFrame -- but designed
+    to scale across a cluster.
+
+    The three transformations you will use most often:
+    - `select()` -- choose which columns to keep
+    - `filter()` (or `where()`) -- keep only rows that match a condition
+    - `withColumn()` -- add or replace a column
+
+- Class: text
+  Depth: all
+  Output: |
+    Spark ships hundreds of built-in functions in the `pyspark.sql.functions`
+    module. The convention is to import it as `f`:
+
+    ```python
+    from pyspark.sql import functions as f
+    ```
+
+    The most common helpers:
+    - `f.col("name")` -- reference a column by name
+    - `f.lit(42)` -- create a literal (constant) column
+    - `f.when(condition, value).otherwise(default)` -- conditional logic
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Here is a quick example. Suppose you have a DataFrame `df` with columns
+    `name`, `age`, and `city`:
+
+    ```python
+    # Keep only name and age
+    df.select("name", "age")
+
+    # Keep rows where age > 30
+    df.filter(f.col("age") > 30)
+
+    # Add a column
+    df.withColumn("birth_year", f.lit(2026) - f.col("age"))
+    ```
+
+    Remember: transformations are **lazy**. Nothing actually runs until you
+    call an **action** like `.show()`, `.count()`, or `.write`.
+
+- Class: mult_question
+  Depth: all
+  Output: "Which function creates a reference to a DataFrame column by name?"
+  AnswerChoices: "f.col();f.ref();f.column();f.field()"
+  CorrectAnswer: "f.col()"
+  Hint: "It is a three-letter function in pyspark.sql.functions."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Given a DataFrame `df` with columns `product`, `price`, and `quantity`,
+    write a select that returns only `product` and `price`.
+  CorrectAnswer: |
+    df.select("product", "price")
+  Hint: "Pass column names as strings to df.select()"
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Filter the DataFrame `df` to keep only rows where `price` is greater
+    than 10.0.
+  CorrectAnswer: |
+    df.filter(f.col("price") > 10.0)
+  Hint: "Use f.col('price') to reference the column, then compare with >"
+
+- Class: mult_question
+  Depth: all
+  Output: "What does `f.lit(value)` do?"
+  AnswerChoices: "Creates a column with a constant value;Lights up the Spark UI;Converts a column to lowercase;Limits the number of rows"
+  CorrectAnswer: "Creates a column with a constant value"
+  Hint: "lit is short for 'literal' -- it wraps a Python value as a Spark column expression."
+
+- Class: cmd_question
+  Depth: intermediate
+  Output: |
+    Add a new column called `total` to DataFrame `df` that equals
+    `price * quantity`.
+  CorrectAnswer: |
+    df.withColumn("total", f.col("price") * f.col("quantity"))
+  Hint: "Use withColumn with an arithmetic expression on f.col columns."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    You can chain multiple transformations together. Spark builds up a logical
+    plan and only executes when an action is triggered:
+
+    ```python
+    result = (df
+        .filter(f.col("quantity") > 0)
+        .withColumn("total", f.col("price") * f.col("quantity"))
+        .select("product", "total")
+    )
+    result.show()  # <-- action triggers execution
+    ```
+
+- Class: cmd_question
+  Depth: intermediate
+  Output: |
+    Using `f.when`, add a column called `tier` to `df` that is 'premium'
+    when `price >= 100`, and 'standard' otherwise.
+  CorrectAnswer: |
+    df.withColumn("tier", f.when(f.col("price") >= 100, "premium").otherwise("standard"))
+  Hint: "f.when(condition, value).otherwise(default_value) returns a Column expression."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    **User-Defined Functions (UDFs)** let you run arbitrary Python code on
+    each row. However, classic UDFs serialize data to Python and back, which
+    is slow.
+
+    Spark 4.x encourages **Arrow-optimized UDFs** (also called pandas UDFs or
+    vectorized UDFs) that operate on batches of rows using Apache Arrow:
+
+    ```python
+    import pandas as pd
+    from pyspark.sql.functions import pandas_udf
+
+    @pandas_udf("double")
+    def discount(price: pd.Series) -> pd.Series:
+        return price * 0.9
+
+    df.withColumn("sale_price", discount(f.col("price")))
+    ```
+
+    Arrow UDFs are typically 3-100x faster than row-at-a-time UDFs because
+    they avoid per-row serialization overhead.
+
+- Class: mult_question
+  Depth: advanced
+  Output: "Why are Arrow (pandas) UDFs faster than classic Python UDFs?"
+  AnswerChoices: "They process batches of rows via Arrow, avoiding per-row serialization;They run on the GPU;They skip the Catalyst optimizer;They use less memory"
+  CorrectAnswer: "They process batches of rows via Arrow, avoiding per-row serialization"
+  Hint: "The key advantage is batch processing and the zero-copy Arrow format."
+
+- Class: cmd_question
+  Depth: advanced
+  Output: |
+    Write a pandas UDF called `normalize` that takes a pandas Series of
+    doubles and returns each value divided by the max of the series. Declare
+    the return type as 'double'.
+  CorrectAnswer: |
+    import pandas as pd
+    from pyspark.sql.functions import pandas_udf
+
+    @pandas_udf("double")
+    def normalize(s: pd.Series) -> pd.Series:
+        return s / s.max()
+  Hint: "Use @pandas_udf('double') decorator. Inside, divide the series by s.max()."
+
+- Class: text
+  Depth: all
+  Output: |
+    You now have a solid grasp of Spark's core transformation functions.
+    In the next lesson you will learn how to **read** data from files and
+    **write** results back -- the I/O layer that connects your transforms
+    to the outside world.

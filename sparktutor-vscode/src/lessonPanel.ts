@@ -1,0 +1,256 @@
+/**
+ * Lesson webview panel: renders step content, feedback, navigation, and chat.
+ */
+
+import * as vscode from "vscode";
+import { EvalResult, FeedbackItem, StepData } from "./types";
+
+export class LessonPanel {
+  private panel: vscode.WebviewPanel | null = null;
+  private readonly extensionUri: vscode.Uri;
+
+  // Callbacks for webview → extension messages
+  public onSubmit?: () => void;
+  public onRun?: () => void;
+  public onNext?: () => void;
+  public onBack?: () => void;
+  public onHint?: () => void;
+  public onChat?: (question: string) => void;
+  public onChoiceSelect?: (choice: string) => void;
+
+  constructor(extensionUri: vscode.Uri) {
+    this.extensionUri = extensionUri;
+  }
+
+  show(): void {
+    if (this.panel) {
+      this.panel.reveal(vscode.ViewColumn.Two);
+      return;
+    }
+
+    this.panel = vscode.window.createWebviewPanel(
+      "sparktutorLesson",
+      "SparkTutor Lesson",
+      vscode.ViewColumn.Two,
+      {
+        enableScripts: true,
+        retainContextWhenHidden: true,
+        localResourceRoots: [
+          vscode.Uri.joinPath(this.extensionUri, "media"),
+        ],
+      }
+    );
+
+    this.panel.onDidDispose(() => {
+      this.panel = null;
+    });
+
+    this.panel.webview.onDidReceiveMessage((msg) => {
+      switch (msg.type) {
+        case "submit":
+          this.onSubmit?.();
+          break;
+        case "run":
+          this.onRun?.();
+          break;
+        case "next":
+          this.onNext?.();
+          break;
+        case "back":
+          this.onBack?.();
+          break;
+        case "hint":
+          this.onHint?.();
+          break;
+        case "chat":
+          this.onChat?.(msg.question);
+          break;
+        case "choiceSelect":
+          this.onChoiceSelect?.(msg.choice);
+          break;
+      }
+    });
+  }
+
+  updateStep(
+    step: StepData,
+    currentIndex: number,
+    totalSteps: number,
+    lessonTitle: string
+  ): void {
+    this.show();
+    this.panel?.webview.postMessage({
+      type: "updateStep",
+      step,
+      currentIndex,
+      totalSteps,
+      lessonTitle,
+    });
+    this.setHtml(step, currentIndex, totalSteps, lessonTitle);
+  }
+
+  showFeedback(result: EvalResult): void {
+    this.panel?.webview.postMessage({
+      type: "feedback",
+      passed: result.passed,
+      feedback: result.feedback,
+      encouragement: result.encouragement,
+    });
+  }
+
+  showHint(hint: string): void {
+    this.panel?.webview.postMessage({
+      type: "hint",
+      hint,
+    });
+  }
+
+  showChatResponse(answer: string): void {
+    this.panel?.webview.postMessage({
+      type: "chatResponse",
+      answer,
+    });
+  }
+
+  showFinished(): void {
+    this.panel?.webview.postMessage({
+      type: "finished",
+    });
+  }
+
+  private setHtml(
+    step: StepData,
+    currentIndex: number,
+    totalSteps: number,
+    lessonTitle: string
+  ): void {
+    if (!this.panel) {
+      return;
+    }
+
+    const cssUri = this.panel.webview.asWebviewUri(
+      vscode.Uri.joinPath(this.extensionUri, "media", "lesson.css")
+    );
+    const jsUri = this.panel.webview.asWebviewUri(
+      vscode.Uri.joinPath(this.extensionUri, "media", "lesson.js")
+    );
+
+    const progressPercent = Math.round(
+      ((currentIndex + 1) / totalSteps) * 100
+    );
+
+    const choices = step.answerChoices
+      ? step.answerChoices.split(";").map((c) => c.trim())
+      : [];
+
+    const choicesHtml =
+      choices.length > 0
+        ? `<div class="choices">${choices
+            .map(
+              (c) =>
+                `<button class="choice-btn" onclick="selectChoice('${escapeHtml(c)}')">${escapeHtml(c)}</button>`
+            )
+            .join("")}</div>`
+        : "";
+
+    const needsInput =
+      step.cls === "cmd_question" ||
+      step.cls === "script" ||
+      step.cls === "mult_question";
+
+    const actionButtons = needsInput
+      ? `<div class="actions">
+           <button class="btn btn-primary" onclick="send('run')">▶ Run</button>
+           <button class="btn btn-success" onclick="send('submit')">✓ Submit</button>
+         </div>`
+      : `<div class="actions">
+           <button class="btn btn-primary" onclick="send('next')">Next →</button>
+         </div>`;
+
+    this.panel.webview.html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="${cssUri}">
+  <title>SparkTutor</title>
+</head>
+<body>
+  <div class="lesson-header">
+    <h2>${escapeHtml(lessonTitle)}</h2>
+    <div class="progress-bar">
+      <div class="progress-fill" style="width: ${progressPercent}%"></div>
+    </div>
+    <span class="step-label">Step ${currentIndex + 1} of ${totalSteps}</span>
+  </div>
+
+  <div class="step-content">
+    <div class="step-output">${markdownToHtml(step.output)}</div>
+    ${choicesHtml}
+  </div>
+
+  <div id="feedback-section" class="feedback-section hidden"></div>
+
+  ${actionButtons}
+
+  <div class="nav-buttons">
+    <button class="btn btn-secondary" onclick="send('back')">← Back</button>
+    <button class="btn btn-secondary" onclick="send('hint')">💡 Hint</button>
+    <button class="btn btn-secondary" onclick="send('next')">Next →</button>
+  </div>
+
+  <div id="hint-section" class="hint-section hidden"></div>
+
+  <hr>
+  <div class="chat-section">
+    <h3>Ask the Tutor</h3>
+    <div id="chat-messages" class="chat-messages"></div>
+    <div class="chat-input-row">
+      <input type="text" id="chat-input" placeholder="Ask a question..." onkeydown="if(event.key==='Enter')sendChat()">
+      <button class="btn btn-primary" onclick="sendChat()">Send</button>
+    </div>
+  </div>
+
+  <script src="${jsUri}"></script>
+</body>
+</html>`;
+  }
+
+  dispose(): void {
+    this.panel?.dispose();
+    this.panel = null;
+  }
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+/** Simple markdown-to-HTML (handles code blocks, inline code, bold, newlines). */
+function markdownToHtml(md: string): string {
+  let html = escapeHtml(md);
+
+  // Code blocks: ```...```
+  html = html.replace(
+    /```(\w*)\n([\s\S]*?)```/g,
+    '<pre><code class="language-$1">$2</code></pre>'
+  );
+
+  // Inline code: `...`
+  html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+
+  // Bold: **...**
+  html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+
+  // Italic: *...*
+  html = html.replace(/\*(.+?)\*/g, "<em>$1</em>");
+
+  // Line breaks
+  html = html.replace(/\n/g, "<br>");
+
+  return html;
+}

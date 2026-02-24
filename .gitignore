@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+*.db
+
+# VS Code extension
+sparktutor-vscode/node_modules/
+sparktutor-vscode/out/
+
+# Editor
+.vscode/
+*.swp

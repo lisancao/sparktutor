@@ -1,0 +1,214 @@
+- Class: meta
+  Lesson: "Pipeline Framework"
+  EstimatedMinutes: 20
+
+- Class: text
+  Depth: all
+  Output: |
+    So far you have learned to create a SparkSession, transform data, and
+    read/write files. But real-world pipelines have **multiple steps** that
+    depend on each other: you cannot build the silver layer until bronze is
+    ready, and gold depends on silver.
+
+    In this lesson you will build a lightweight **Pipeline class** that:
+    1. Registers transformation functions with a decorator
+    2. Auto-detects dependencies between them
+    3. Runs them in the correct order using topological sort
+
+- Class: text
+  Depth: beginner
+  Output: |
+    A Python **decorator** is a function that wraps another function to add
+    behavior. You have probably seen `@property` or `@staticmethod`. We will
+    create a `@pipeline.materialized_view()` decorator that registers a
+    function as a pipeline step:
+
+    ```python
+    @pipeline.materialized_view()
+    def bronze_orders(spark):
+        return spark.read.csv("/data/orders.csv", header=True)
+    ```
+
+    When the pipeline runs, it calls `bronze_orders(spark)` and saves the
+    result as a table called `bronze_orders`.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    The decorator stores each function in a registry dictionary:
+
+    ```python
+    class Pipeline:
+        def __init__(self, spark):
+            self.spark = spark
+            self._flows = {}  # name -> function
+
+        def materialized_view(self):
+            def decorator(func):
+                self._flows[func.__name__] = func
+                return func
+            return decorator
+    ```
+
+    When you decorate a function, it gets added to `_flows` keyed by its
+    name. The function itself is unchanged -- it still takes `spark` and
+    returns a DataFrame.
+
+- Class: mult_question
+  Depth: all
+  Output: "What does the `@pipeline.materialized_view()` decorator do?"
+  AnswerChoices: "Registers the function as a pipeline step;Materializes the DataFrame to memory;Creates a SQL view;Caches the result in Spark"
+  CorrectAnswer: "Registers the function as a pipeline step"
+  Hint: "The decorator adds the function to the pipeline's registry so it can be executed later."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write a Pipeline class with an `__init__` that takes `spark` and
+    initializes an empty dictionary called `_flows`. Add a
+    `materialized_view` method that returns a decorator which registers
+    functions by name.
+  CorrectAnswer: |
+    class Pipeline:
+        def __init__(self, spark):
+            self.spark = spark
+            self._flows = {}
+
+        def materialized_view(self):
+            def decorator(func):
+                self._flows[func.__name__] = func
+                return func
+            return decorator
+  Hint: "The decorator stores func in self._flows[func.__name__] and returns func."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    **Dependency detection**: how does the pipeline know that `silver_orders`
+    depends on `bronze_orders`? We inspect the function's source code for
+    calls to `spark.table("...")`.
+
+    ```python
+    import inspect, re
+
+    def _detect_deps(self, func):
+        source = inspect.getsource(func)
+        return re.findall(r'spark\.table\(["\'](\w+)["\']\)', source)
+    ```
+
+    If `silver_orders` calls `spark.table("bronze_orders")`, then it depends
+    on `bronze_orders`.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "How does the pipeline auto-detect that silver_orders depends on bronze_orders?"
+  AnswerChoices: "By scanning the function source for spark.table() calls;By checking the Spark catalog;By running the function and catching errors;By analyzing the DataFrame lineage"
+  CorrectAnswer: "By scanning the function source for spark.table() calls"
+  Hint: "The pipeline uses inspect.getsource and a regex to find table references."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    **Topological sort** determines execution order. Given a dependency
+    graph, it produces an ordering where every function runs after its
+    dependencies.
+
+    The algorithm (Kahn's algorithm):
+    1. Compute in-degree (number of dependencies) for each node
+    2. Start with nodes that have in-degree 0 (no dependencies)
+    3. Process each node, decrementing in-degree of its dependents
+    4. Repeat until all nodes are processed
+
+    If the queue empties before all nodes are processed, you have a cycle.
+
+    ```python
+    from collections import deque
+
+    def _topo_sort(self, graph):
+        in_degree = {n: 0 for n in graph}
+        for node, deps in graph.items():
+            for dep in deps:
+                in_degree[node] += 1
+
+        queue = deque(n for n, d in in_degree.items() if d == 0)
+        order = []
+
+        while queue:
+            node = queue.popleft()
+            order.append(node)
+            for candidate, deps in graph.items():
+                if node in deps:
+                    in_degree[candidate] -= 1
+                    if in_degree[candidate] == 0:
+                        queue.append(candidate)
+
+        if len(order) != len(graph):
+            raise ValueError("Cycle detected in pipeline dependencies")
+        return order
+    ```
+
+- Class: cmd_question
+  Depth: advanced
+  Output: |
+    Write a `_detect_deps` method for the Pipeline class that takes a
+    function, reads its source with `inspect.getsource`, and returns a
+    list of table names found in `spark.table("...")` calls.
+  CorrectAnswer: |
+    import inspect
+    import re
+
+    def _detect_deps(self, func):
+        source = inspect.getsource(func)
+        return re.findall(r'spark\.table\(["\'](\w+)["\']\)', source)
+  Hint: "Use inspect.getsource to get the source, then re.findall with a pattern matching spark.table(...)."
+
+- Class: text
+  Depth: all
+  Output: |
+    Finally, the `run()` method ties it all together:
+
+    ```python
+    def run(self):
+        # Build dependency graph
+        graph = {}
+        for name, func in self._flows.items():
+            graph[name] = self._detect_deps(func)
+
+        # Sort
+        order = self._topo_sort(graph)
+
+        # Execute
+        for name in order:
+            df = self._flows[name](self.spark)
+            df.createOrReplaceTempView(name)
+            print(f"Materialized: {name} ({df.count()} rows)")
+    ```
+
+    Each step's result is registered as a temp view so downstream steps
+    can reference it with `spark.table("step_name")`.
+
+- Class: script
+  Depth: all
+  Output: |
+    Put it all together: complete the Pipeline class below so that it can
+    register flows, detect dependencies, sort them, and execute in order.
+
+    Open `starter.py`, fill in the missing methods, and verify it matches
+    the expected behavior described in the comments.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Implement materialized_view, _detect_deps, _topo_sort, and run. See the lesson text for reference."
+
+- Class: mult_question
+  Depth: all
+  Output: "If step A depends on step B and step B depends on step A, what happens during topological sort?"
+  AnswerChoices: "A cycle is detected and an error is raised;Step A runs first;Step B runs first;Both run in parallel"
+  CorrectAnswer: "A cycle is detected and an error is raised"
+  Hint: "Circular dependencies cannot be resolved -- the algorithm detects this when not all nodes get processed."
+
+- Class: text
+  Depth: all
+  Output: |
+    Excellent! You now have a reusable Pipeline framework. In the next three
+    lessons you will use it to build real **bronze**, **silver**, and **gold**
+    layers for a data pipeline.

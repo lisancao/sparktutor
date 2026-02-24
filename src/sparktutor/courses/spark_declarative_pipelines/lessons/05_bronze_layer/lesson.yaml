@@ -1,0 +1,170 @@
+- Class: meta
+  Lesson: "Bronze Layer"
+  EstimatedMinutes: 15
+
+- Class: text
+  Depth: all
+  Output: |
+    The **bronze layer** is the first stage of a medallion architecture
+    pipeline. Its job is simple but critical:
+
+    1. **Ingest** raw data from external sources (CSV, JSON, APIs)
+    2. **Preserve** the original data as-is (schema-on-read)
+    3. **Add metadata** columns for lineage tracking
+    4. **Deduplicate** obvious duplicates
+
+    Bronze tables are your safety net. If anything goes wrong downstream,
+    you can always re-process from bronze.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    A minimal bronze ingestion reads a raw file and adds two metadata
+    columns:
+
+    ```python
+    from pyspark.sql import functions as f
+
+    def bronze_orders(spark):
+        return (spark.read.csv("/data/raw/orders.csv", header=True, inferSchema=True)
+            .withColumn("_ingested_at", f.current_timestamp())
+            .withColumn("_source_file", f.input_file_name())
+        )
+    ```
+
+    `_ingested_at` records **when** the row was loaded.
+    `_source_file` records **where** it came from.
+
+- Class: mult_question
+  Depth: all
+  Output: "What is the primary purpose of the bronze layer?"
+  AnswerChoices: "Ingest and preserve raw data with metadata;Aggregate data for dashboards;Clean and normalize data;Train machine learning models"
+  CorrectAnswer: "Ingest and preserve raw data with metadata"
+  Hint: "Bronze is about raw ingestion and preservation, not transformation."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write a function `bronze_events` that reads JSON from '/data/raw/events.json'
+    and adds an `_ingested_at` column with the current timestamp.
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+
+    def bronze_events(spark):
+        return (spark.read.json("/data/raw/events.json")
+            .withColumn("_ingested_at", f.current_timestamp())
+        )
+  Hint: "Use spark.read.json() and .withColumn with f.current_timestamp()."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    **Schema-on-read** means you do not enforce strict types at the bronze
+    layer. Instead, read everything as strings and let the silver layer
+    handle type casting. This ensures you never lose data due to parsing
+    errors:
+
+    ```python
+    from pyspark.sql.types import StructType, StructField, StringType
+
+    raw_schema = StructType([
+        StructField("order_id", StringType()),
+        StructField("product", StringType()),
+        StructField("price", StringType()),   # string, not double!
+        StructField("quantity", StringType()), # string, not int!
+    ])
+    ```
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    **Deduplication** at the bronze layer removes exact duplicates that can
+    appear when files are re-delivered or events are replayed:
+
+    ```python
+    df = df.dropDuplicates(["order_id"])
+    ```
+
+    `dropDuplicates` keeps the first occurrence. If you need to keep the
+    *latest*, add a sort first:
+
+    ```python
+    from pyspark.sql import Window
+
+    w = Window.partitionBy("order_id").orderBy(f.col("_ingested_at").desc())
+    df = (df.withColumn("_rn", f.row_number().over(w))
+            .filter(f.col("_rn") == 1)
+            .drop("_rn"))
+    ```
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "Why should the bronze layer read columns as strings instead of their true types?"
+  AnswerChoices: "To avoid losing data from parse errors -- type casting happens in silver;To save memory;Because Spark cannot read typed CSV;To make queries faster"
+  CorrectAnswer: "To avoid losing data from parse errors -- type casting happens in silver"
+  Hint: "If a price column contains 'N/A', casting to double would lose the row. Keeping it as a string preserves it."
+
+- Class: cmd_question
+  Depth: intermediate
+  Output: |
+    Given a DataFrame `raw_df` with columns `event_id`, `user_id`, `action`,
+    and `_ingested_at`, deduplicate by `event_id` keeping only the latest
+    ingestion (highest `_ingested_at`). Use dropDuplicates is not sufficient
+    here -- use a window function with row_number.
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+    from pyspark.sql import Window
+
+    w = Window.partitionBy("event_id").orderBy(f.col("_ingested_at").desc())
+    deduped = (raw_df
+        .withColumn("_rn", f.row_number().over(w))
+        .filter(f.col("_rn") == 1)
+        .drop("_rn"))
+  Hint: "Partition by event_id, order by _ingested_at desc, take row_number == 1."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    **Incremental ingestion** avoids reprocessing the entire source each
+    run. Common patterns:
+
+    1. **File-based watermark**: track which files have been processed using
+       `_source_file` metadata. On the next run, only read new files:
+       ```python
+       processed = spark.table("bronze_orders").select("_source_file").distinct()
+       new_files = all_files.subtract(processed)
+       ```
+
+    2. **Timestamp-based watermark**: store the max `updated_at` from the
+       previous run and filter the source to only newer rows.
+
+    3. **Spark Structured Streaming**: use `spark.readStream` with a file
+       source to automatically pick up new files as they arrive.
+
+- Class: mult_question
+  Depth: advanced
+  Output: "Which approach lets Spark automatically detect new files in a directory without manual watermark tracking?"
+  AnswerChoices: "spark.readStream with a file source;spark.read with glob patterns;A cron job that lists files;Manual timestamp comparison"
+  CorrectAnswer: "spark.readStream with a file source"
+  Hint: "Structured Streaming's file source maintains internal state of which files have been processed."
+
+- Class: script
+  Depth: all
+  Output: |
+    Build a complete bronze ingestion function. Open `starter.py` and
+    implement `bronze_orders` that:
+    1. Reads CSV from the given path with all-string schema
+    2. Adds `_ingested_at` (current_timestamp) and `_source_file` (input_file_name)
+    3. Deduplicates by `order_id`
+
+    The test harness will verify your output.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Read CSV with a StringType schema, add metadata columns, then dropDuplicates."
+
+- Class: text
+  Depth: all
+  Output: |
+    Your bronze layer is ready. It ingests raw data, adds lineage metadata,
+    and removes duplicates. Next you will build the **silver layer** to
+    clean, type-cast, and enrich this data.

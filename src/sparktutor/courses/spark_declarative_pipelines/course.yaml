@@ -1,0 +1,15 @@
+course:
+  id: spark_declarative_pipelines
+  title: "Spark 4.1 Declarative Pipelines"
+  description: "Build production-grade bronze-silver-gold data pipelines"
+  version: "1.0.0"
+  requires_lakehouse: true
+  lessons:
+    - 01_spark_session
+    - 02_functions_and_transforms
+    - 03_reading_writing_data
+    - 04_pipeline_framework
+    - 05_bronze_layer
+    - 06_silver_layer
+    - 07_gold_layer
+    - 08_full_pipeline

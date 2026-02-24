@@ -1,0 +1,121 @@
+{
+  "name": "sparktutor",
+  "displayName": "SparkTutor",
+  "description": "Interactive Apache Spark 4.1 learning environment with Claude-powered tutoring",
+  "version": "0.1.0",
+  "publisher": "sparktutor",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Education"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "sparktutor.run",
+        "title": "SparkTutor: Run Code",
+        "icon": "$(play)"
+      },
+      {
+        "command": "sparktutor.submit",
+        "title": "SparkTutor: Submit Code",
+        "icon": "$(check)"
+      },
+      {
+        "command": "sparktutor.next",
+        "title": "SparkTutor: Next Step",
+        "icon": "$(arrow-right)"
+      },
+      {
+        "command": "sparktutor.back",
+        "title": "SparkTutor: Previous Step",
+        "icon": "$(arrow-left)"
+      },
+      {
+        "command": "sparktutor.hint",
+        "title": "SparkTutor: Show Hint",
+        "icon": "$(lightbulb)"
+      },
+      {
+        "command": "sparktutor.openLesson",
+        "title": "SparkTutor: Open Lesson"
+      },
+      {
+        "command": "sparktutor.showSolution",
+        "title": "SparkTutor: Show Solution Diff"
+      },
+      {
+        "command": "sparktutor.changeDepth",
+        "title": "SparkTutor: Change Depth Level"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "sparktutor.run",
+        "key": "ctrl+shift+r",
+        "when": "sparktutor.active"
+      },
+      {
+        "command": "sparktutor.submit",
+        "key": "ctrl+shift+s",
+        "when": "sparktutor.active"
+      },
+      {
+        "command": "sparktutor.next",
+        "key": "ctrl+shift+n",
+        "when": "sparktutor.active"
+      },
+      {
+        "command": "sparktutor.back",
+        "key": "ctrl+shift+b",
+        "when": "sparktutor.active"
+      },
+      {
+        "command": "sparktutor.hint",
+        "key": "ctrl+shift+h",
+        "when": "sparktutor.active"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "sparktutor",
+          "title": "SparkTutor",
+          "icon": "$(book)"
+        }
+      ]
+    },
+    "views": {
+      "sparktutor": [
+        {
+          "id": "sparktutorCourses",
+          "name": "Courses"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "SparkTutor",
+      "properties": {
+        "sparktutor.pythonPath": {
+          "type": "string",
+          "default": "python3",
+          "description": "Path to the Python interpreter with sparktutor installed"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "lint": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.0",
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.3.0"
+  }
+}
