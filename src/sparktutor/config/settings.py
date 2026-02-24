@@ -30,6 +30,9 @@ class ClaudeConfig(BaseModel):
     def get_api_key(self) -> Optional[str]:
         return self.api_key or os.environ.get("ANTHROPIC_API_KEY")
 
+    def get_model(self) -> str:
+        return os.environ.get("SPARKTUTOR_CLAUDE_MODEL") or self.model
+
 
 class Settings(BaseModel):
     execution_mode: ExecutionMode = ExecutionMode.AUTO

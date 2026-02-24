@@ -52,6 +52,17 @@ export class Bridge extends EventEmitter {
         ? `${srcDir}:${env.PYTHONPATH}`
         : srcDir;
 
+      // Forward VS Code settings as environment variables for the Python server
+      const config = vscode.workspace.getConfiguration("sparktutor");
+      const apiKey = config.get<string>("anthropicApiKey");
+      if (apiKey) {
+        env.ANTHROPIC_API_KEY = apiKey;
+      }
+      const model = config.get<string>("claudeModel");
+      if (model) {
+        env.SPARKTUTOR_CLAUDE_MODEL = model;
+      }
+
       this.proc = spawn(this.pythonPath, ["-m", "sparktutor.server"], {
         stdio: ["pipe", "pipe", "pipe"],
         env,

@@ -105,6 +105,22 @@
           "type": "string",
           "default": "python3",
           "description": "Path to the Python interpreter with sparktutor installed"
+        },
+        "sparktutor.anthropicApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Anthropic API key for Claude-powered code review and chat. Leave empty to use ANTHROPIC_API_KEY environment variable.",
+          "order": 0
+        },
+        "sparktutor.claudeModel": {
+          "type": "string",
+          "default": "claude-sonnet-4-6",
+          "enum": [
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5-20251001",
+            "claude-opus-4-6"
+          ],
+          "description": "Claude model to use for code review and chat"
         }
       }
     }

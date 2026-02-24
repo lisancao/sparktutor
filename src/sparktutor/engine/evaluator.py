@@ -210,7 +210,7 @@ Calibrate feedback to the student's level:
 
         try:
             response = client.messages.create(
-                model=self.settings.claude.model,
+                model=self.settings.claude.get_model(),
                 max_tokens=1024,
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -338,7 +338,7 @@ Answer concisely (2-4 sentences). Be direct and helpful. If the question is abou
 
         try:
             response = client.messages.create(
-                model=self.settings.claude.model,
+                model=self.settings.claude.get_model(),
                 max_tokens=512,
                 messages=[{"role": "user", "content": prompt}],
             )
