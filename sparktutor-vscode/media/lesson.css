@@ -47,9 +47,42 @@ h3 {
   transition: width 0.3s ease;
 }
 
+.step-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
 .step-label {
   font-size: 0.9em;
   color: var(--vscode-descriptionForeground);
+}
+
+.depth-badge {
+  font-size: 0.8em;
+  padding: 2px 10px;
+  border-radius: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.depth-beginner {
+  background: rgba(115, 201, 145, 0.15);
+  color: var(--vscode-testing-iconPassed, #73c991);
+  border: 1px solid rgba(115, 201, 145, 0.3);
+}
+
+.depth-intermediate {
+  background: rgba(226, 90, 28, 0.15);
+  color: var(--spark-orange-light);
+  border: 1px solid rgba(226, 90, 28, 0.3);
+}
+
+.depth-advanced {
+  background: rgba(241, 76, 76, 0.15);
+  color: var(--vscode-testing-iconFailed, #f14c4c);
+  border: 1px solid rgba(241, 76, 76, 0.3);
 }
 
 /* Step content */

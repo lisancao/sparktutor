@@ -76,10 +76,11 @@ export class LessonPanel {
     step: StepData,
     currentIndex: number,
     totalSteps: number,
-    lessonTitle: string
+    lessonTitle: string,
+    depth: string = "beginner"
   ): void {
     this.show();
-    this.setHtml(step, currentIndex, totalSteps, lessonTitle);
+    this.setHtml(step, currentIndex, totalSteps, lessonTitle, depth);
   }
 
   showFeedback(result: EvalResult): void {
@@ -115,7 +116,8 @@ export class LessonPanel {
     step: StepData,
     currentIndex: number,
     totalSteps: number,
-    lessonTitle: string
+    lessonTitle: string,
+    depth: string = "beginner"
   ): void {
     if (!this.panel) {
       return;
@@ -185,7 +187,10 @@ export class LessonPanel {
     <div class="progress-bar">
       <div class="progress-fill" style="width: ${progressPercent}%"></div>
     </div>
-    <span class="step-label">Step ${currentIndex + 1} of ${totalSteps}</span>
+    <div class="step-meta">
+      <span class="step-label">Step ${currentIndex + 1} of ${totalSteps}</span>
+      <span class="depth-badge depth-${depth}">${depth.charAt(0).toUpperCase() + depth.slice(1)}</span>
+    </div>
   </div>
 
   <div class="step-content">

@@ -320,27 +320,26 @@ Calibrate feedback to the student's level:
         depth: str = "beginner",
     ) -> str:
         """Answer a freeform question about the current lesson/code using Claude."""
+        from sparktutor.engine.spark_knowledge import get_system_prompt
+
         client = self._get_client()
         if client is None:
             return "Claude API not configured. Set ANTHROPIC_API_KEY to enable chat."
 
-        prompt = f"""You are SparkTutor, an interactive Apache Spark 4.1 tutor embedded in a terminal learning app.
-
-The student is working on: "{lesson_title}"
+        user_msg = f"""The student is working on: "{lesson_title}"
 Current exercise: {step_context}
 Student depth level: {depth}
 
-{f'Their current code:\\n```python\\n{code_context}\\n```' if code_context else ''}
+{f'Their current code:\n```python\n{code_context}\n```' if code_context else '(no code yet)'}
 
-Student question: {question}
-
-Answer concisely (2-4 sentences). Be direct and helpful. If the question is about their code, reference specific lines. Calibrate your explanation to their depth level. Use markdown for code snippets."""
+Student question: {question}"""
 
         try:
             response = client.messages.create(
                 model=self.settings.claude.get_model(),
-                max_tokens=512,
-                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1024,
+                system=get_system_prompt(),
+                messages=[{"role": "user", "content": user_msg}],
             )
             return response.content[0].text
         except Exception as e:

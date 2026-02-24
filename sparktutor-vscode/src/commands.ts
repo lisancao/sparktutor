@@ -27,6 +27,7 @@ let currentLessonIdx: number | undefined;
 let currentIndex = 0;
 let totalSteps = 0;
 let currentStep: StepData | undefined;
+let currentDepth: string | undefined;
 
 export function registerCommands(
   context: vscode.ExtensionContext,
@@ -120,11 +121,9 @@ export function registerCommands(
     }),
 
     vscode.commands.registerCommand("sparktutor.changeDepth", async () => {
-      const pick = await vscode.window.showQuickPick(
-        ["beginner", "intermediate", "advanced"],
-        { placeHolder: "Select difficulty level" }
-      );
+      const pick = await pickDepth();
       if (pick && currentCourseId !== undefined && currentLessonIdx !== undefined) {
+        currentDepth = pick;
         await openLesson(
           bridge,
           lessonPanel,
@@ -141,6 +140,31 @@ export function registerCommands(
   );
 }
 
+async function pickDepth(): Promise<string | undefined> {
+  const items: vscode.QuickPickItem[] = [
+    {
+      label: "Beginner",
+      description: "Core concepts, guided examples, encouraging feedback",
+      detail: "Best if you're new to Spark or PySpark",
+    },
+    {
+      label: "Intermediate",
+      description: "Patterns, trade-offs, configuration tuning",
+      detail: "You know DataFrames but want to go deeper",
+    },
+    {
+      label: "Advanced",
+      description: "Internals, performance, production readiness",
+      detail: "You've run Spark in production and want mastery",
+    },
+  ];
+  const pick = await vscode.window.showQuickPick(items, {
+    placeHolder: "Choose your experience level",
+    title: "SparkTutor — Set Your Level",
+  });
+  return pick?.label.toLowerCase();
+}
+
 async function openLesson(
   bridge: Bridge,
   lessonPanel: LessonPanel,
@@ -153,10 +177,22 @@ async function openLesson(
   depth?: string
 ): Promise<void> {
   try {
-    const params: Record<string, unknown> = { courseId, lessonIdx };
-    if (depth) {
-      params.depth = depth;
+    // Prompt for depth on first lesson open
+    if (!depth && !currentDepth) {
+      const picked = await pickDepth();
+      if (!picked) {
+        return; // user cancelled
+      }
+      currentDepth = picked;
+      depth = picked;
     }
+    const effectiveDepth = depth || currentDepth || "beginner";
+
+    const params: Record<string, unknown> = {
+      courseId,
+      lessonIdx,
+      depth: effectiveDepth,
+    };
 
     const result = await bridge.call<LoadLessonResult>("loadLesson", params);
 
@@ -167,6 +203,7 @@ async function openLesson(
     currentIndex = result.currentIndex;
     totalSteps = result.totalSteps;
     currentStep = result.step;
+    currentDepth = effectiveDepth;
 
     // Set context for keybinding "when" clauses
     vscode.commands.executeCommand("setContext", "sparktutor.active", true);
@@ -176,11 +213,13 @@ async function openLesson(
 
     // Update UI
     statusBar.setStep(currentIndex, totalSteps);
+    statusBar.setDepth(effectiveDepth);
     lessonPanel.updateStep(
       result.step,
       result.currentIndex,
       result.totalSteps,
-      result.lessonTitle
+      result.lessonTitle,
+      effectiveDepth
     );
 
     // Open exercise file for code steps
@@ -309,7 +348,9 @@ async function loadStepUI(
   workspace.setStepType(step.cls);
   statusBar.setStep(stepIndex, stepTotal);
 
-  lessonPanel.updateStep(step, stepIndex, stepTotal, currentLessonTitle || "");
+  lessonPanel.updateStep(
+    step, stepIndex, stepTotal, currentLessonTitle || "", currentDepth || "beginner"
+  );
 
   // Open exercise file for code steps
   if (
