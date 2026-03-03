@@ -376,8 +376,9 @@ async function openLesson(
     statusBar.setStep(currentIndex, totalSteps);
     statusBar.setDepth(effectiveDepth);
 
-    // Open exercise file FIRST (in Column One) for code steps
+    // Open exercise file FIRST (in Column One)
     if (result.step.cls === "script" || result.step.cls === "cmd_question") {
+      // Code steps: create/append starter code
       await workspace.openExercise(
         courseId,
         result.lessonId,
@@ -385,7 +386,8 @@ async function openLesson(
         result.starterCode || "",
         result.restoredCode || undefined
       );
-    } else if (result.restoredCode || result.currentIndex > 0) {
+    } else {
+      // Non-code steps: open existing exercise file if one exists for this course
       await workspace.openExerciseIfExists(courseId, result.lessonId);
     }
 
