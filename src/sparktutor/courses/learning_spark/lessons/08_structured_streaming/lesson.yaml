@@ -1,0 +1,345 @@
+- Class: meta
+  Lesson: Structured Streaming
+  EstimatedMinutes: 30
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    Everything so far has been **batch** processing — read a complete
+    dataset, transform it, write the output. But real data often arrives
+    continuously: user clicks, sensor readings, transaction events.
+
+    Structured Streaming lets you process this data as it arrives, using
+    the same DataFrame API you already know.
+
+    By the end of this lesson you will be able to:
+
+    - Explain the streaming execution model (unbounded table)
+    - Set up sources (files, Kafka, sockets) and sinks (files, console)
+    - Choose the right output mode (append, update, complete)
+    - Configure triggers for processing frequency
+    - Apply watermarks to handle late-arriving data
+    - Understand fault tolerance via checkpointing
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Imagine a conveyor belt of packages arriving at a warehouse. Instead
+    of waiting for all packages to arrive before sorting them, you process
+    each batch as it comes. You keep a running tally (state) that updates
+    with each new batch.
+
+    Structured Streaming works the same way — it processes data in
+    micro-batches, applying your familiar DataFrame operations to each
+    batch. Your code looks almost identical to batch code.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Streaming Model
+
+    Structured Streaming treats a live data stream as a **continuously
+    appended table**. New data arriving is like new rows being appended
+    to an unbounded input table. Your query runs incrementally on this
+    table, producing results in an output table.
+
+    The core components:
+
+    - **Source** — where data comes from: files, Kafka, socket, rate
+      (synthetic)
+    - **Query** — your DataFrame transformations (same API as batch)
+    - **Sink** — where results go: files, Kafka, console, memory, foreach
+    - **Trigger** — how often to check for new data
+    - **Output mode** — what to write to the sink each trigger
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Reading a Stream
+
+    Replace `spark.read` with `spark.readStream`:
+
+    ```python
+    # File source — picks up new files as they appear
+    stream_df = (spark.readStream
+        .format("csv")
+        .option("header", "true")
+        .schema(my_schema)       # required for streaming!
+        .load("/data/incoming/"))
+
+    # Socket source — for development/testing
+    lines = (spark.readStream
+        .format("socket")
+        .option("host", "localhost")
+        .option("port", 9999)
+        .load())
+    ```
+
+    **Important**: streaming sources **require** an explicit schema.
+    `inferSchema` is not available because there is no complete dataset
+    to sample from.
+
+    **Docs:** [Structured Streaming Programming Guide](https://spark.apache.org/docs/3.5.0/structured-streaming-programming-guide.html)
+    — sources, sinks, output modes, triggers, watermarks, fault tolerance,
+    and stream-stream joins with full code examples.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Writing a Stream
+
+    Replace `df.write` with `df.writeStream`:
+
+    ```python
+    query = (result_df.writeStream
+        .outputMode("complete")
+        .format("console")
+        .trigger(processingTime="10 seconds")
+        .start())
+
+    query.awaitTermination()  # blocks until the stream is stopped
+    ```
+
+    `start()` returns a `StreamingQuery` object you can use to monitor
+    and stop the stream.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Output Modes
+
+    The output mode determines **what** is written to the sink each trigger:
+
+    **`append`** — only new rows since the last trigger. Use for stateless
+    transforms (select, filter, map) or after watermark-based aggregations.
+
+    **`update`** — only rows that changed since the last trigger. Good for
+    aggregations where you only care about the latest value.
+
+    **`complete`** — the entire result table every trigger. Required for
+    aggregations without watermarks. Can be expensive for large results.
+
+    Not all modes work with all operations. Aggregations require `complete`
+    or `update`. Stateless transforms support all three modes.
+
+- Class: mult_question
+  Depth: all
+  Output: "Which output mode writes the entire result table to the sink after every trigger?"
+  AnswerChoices: "complete;append;update;overwrite"
+  CorrectAnswer: "complete"
+  Hint: "This mode outputs everything — not just new or changed rows."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Stateless vs. Stateful Transforms
+
+    **Stateless** — operate on individual rows without history: `select`,
+    `filter`, `withColumn`, `flatMap`. These work with all output modes
+    and require no special configuration.
+
+    **Stateful** — maintain state across micro-batches: `groupBy`
+    aggregations, windowed aggregations, stream-stream joins,
+    `dropDuplicates`. These need state management and may restrict output
+    modes.
+
+    The distinction matters because stateful operations accumulate memory.
+    Without bounds (like watermarks), state can grow indefinitely.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Triggers
+
+    Triggers control how often Spark checks for new data:
+
+    ```python
+    # Process every 10 seconds
+    .trigger(processingTime="10 seconds")
+
+    # Process all available data in one batch, then stop
+    .trigger(availableNow=True)
+
+    # Process one micro-batch, then stop (for testing)
+    .trigger(once=True)
+
+    # Default: process as fast as possible
+    # (no trigger specified)
+    ```
+
+    `availableNow` is particularly useful for bridging batch and streaming
+    — run it on a schedule (e.g., hourly via cron) to process whatever
+    data has accumulated.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Windowed Aggregations
+
+    Group events into time-based windows:
+
+    ```python
+    from pyspark.sql.functions import window
+
+    # Tumbling windows (non-overlapping, 10-minute buckets)
+    windowed = (events
+        .groupBy(window("event_time", "10 minutes"))
+        .count())
+
+    # Sliding windows (10-minute windows, sliding every 5 minutes)
+    windowed = (events
+        .groupBy(window("event_time", "10 minutes", "5 minutes"))
+        .count())
+    ```
+
+    Tumbling windows partition time into non-overlapping buckets. Sliding
+    windows overlap, so each event appears in multiple windows.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "What is the purpose of watermarks in Structured Streaming?"
+  AnswerChoices: "Define how late data can arrive before being dropped, allowing Spark to clean up old state;Limit the output rate of the stream;Control the number of output partitions;Encrypt data in transit"
+  CorrectAnswer: "Define how late data can arrive before being dropped, allowing Spark to clean up old state"
+  Hint: "Watermarks set a threshold for late-arriving data. What happens to state that's older than the threshold?"
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Watermarks: Handling Late Data
+
+    In the real world, events can arrive late — a sensor reading from
+    5 minutes ago arrives now. Watermarks tell Spark how long to wait:
+
+    ```python
+    result = (events
+        .withWatermark("event_time", "10 minutes")
+        .groupBy(window("event_time", "5 minutes"))
+        .count())
+    ```
+
+    Spark tracks the maximum event time seen so far. Any event arriving
+    more than 10 minutes behind the max is dropped. This lets Spark
+    discard old state and bound memory usage.
+
+    Without a watermark, stateful operations keep all state forever,
+    eventually running out of memory.
+
+    **Docs:** [f.window](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.window.html)
+    — `windowDuration`, `slideDuration`, and `startTime` parameters for
+    tumbling and sliding windows.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Create a streaming word count from a socket source on localhost:9999.
+    Split lines into words, group by word, count, and write to console in
+    complete mode.
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+
+    lines = (spark.readStream
+        .format("socket")
+        .option("host", "localhost")
+        .option("port", 9999)
+        .load())
+
+    words = lines.select(f.explode(f.split("value", " ")).alias("word"))
+
+    counts = words.groupBy("word").count()
+
+    query = (counts.writeStream
+        .outputMode("complete")
+        .format("console")
+        .start())
+  Hint: "readStream with socket format, split and explode for words, groupBy + count, writeStream in complete mode."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Stream-Stream and Stream-Static Joins
+
+    **Stream-static join** — join a streaming DataFrame with a batch
+    DataFrame. The static side is re-read each micro-batch. Useful for
+    enrichment (e.g., joining click events with a product catalog):
+
+    ```python
+    enriched = click_stream.join(product_catalog, "product_id")
+    ```
+
+    **Stream-stream join** — both sides are streams. Requires watermarks
+    to bound state. Spark buffers rows from both sides and matches them
+    as they arrive:
+
+    ```python
+    clicks = clicks.withWatermark("click_time", "10 minutes")
+    impressions = impressions.withWatermark("imp_time", "10 minutes")
+
+    matched = clicks.join(impressions,
+        expr("click_id = imp_id AND click_time BETWEEN imp_time AND imp_time + interval 5 minutes"))
+    ```
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Fault Tolerance: Checkpointing
+
+    Structured Streaming uses **checkpointing** for exactly-once
+    processing. Set a checkpoint location in your writeStream:
+
+    ```python
+    query = (result.writeStream
+        .outputMode("update")
+        .option("checkpointLocation", "/checkpoints/my_query")
+        .format("parquet")
+        .start("/output/data"))
+    ```
+
+    On restart, Spark replays from the checkpoint to recover state. Two
+    rules to remember:
+    1. Never change the query logic between restarts without clearing
+       the checkpoint
+    2. Never share checkpoint locations between different queries
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Streaming Word Count
+
+    Implement a batch-mode simulation of streaming word count (dry-run
+    compatible — no actual streaming source needed).
+
+    Complete both functions:
+    1. `streaming_word_count(spark, lines_df)` — split lines into words,
+       group by word, count, order by count descending
+    2. `streaming_windowed_count(spark, events_df)` — count events in
+       5-minute tumbling windows, ordered by window start time
+
+    These exercises practice the core streaming patterns (split/explode,
+    groupBy, window) using batch DataFrames.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Use f.split() + f.explode() for words, groupBy().count() for aggregation, and f.window() for time-based grouping."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    In this lesson you learned:
+
+    - **Streaming model** — unbounded input table processed incrementally
+    - **Sources and sinks** — readStream/writeStream with familiar formats
+    - **Output modes** — append (new rows), update (changed rows), complete
+      (everything)
+    - **Triggers** — control processing frequency; `availableNow` bridges
+      batch and streaming
+    - **Windowed aggregations** — tumbling and sliding time windows
+    - **Watermarks** — bound state by defining a late-data threshold
+    - **Checkpointing** — enables exactly-once fault tolerance
+
+    You can now process both batch and streaming data with Spark. In the
+    next lesson, you will learn about **data lakes and lakehouses** — the
+    storage layer that makes large-scale data reliable with ACID
+    transactions and time travel.

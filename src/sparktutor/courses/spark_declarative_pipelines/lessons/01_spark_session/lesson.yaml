@@ -1,131 +1,178 @@
 - Class: meta
-  Lesson: "SparkSession Basics"
-  EstimatedMinutes: 10
+  Lesson: "SparkSession & Pipeline Setup"
+  EstimatedMinutes: 15
 
 - Class: text
   Depth: all
   Output: |
-    Welcome to **Spark Declarative Pipelines**! In this course you will build
-    a complete bronze-silver-gold data pipeline using Apache Spark 4.1.
+    ## Welcome to Spark Declarative Pipelines
 
-    Every Spark program begins with a **SparkSession**. It is the single entry
-    point to all DataFrame, SQL, and Catalog operations. Before you can read
-    data, transform it, or write results, you need a SparkSession.
+    In this course you will build a complete **bronze-silver-gold data
+    pipeline** using Apache Spark 4.1. By the end, you will have a
+    production-ready framework that ingests raw data, cleans it, and
+    produces business-ready aggregations.
+
+    **What you'll build across the 8 lessons:**
+
+    ```
+    Raw CSV → [Bronze] → [Silver] → [Gold] → Business Reports
+               ingest     clean      aggregate
+               metadata   type cast  rank
+               dedup      enrich     summarize
+    ```
+
+    This first lesson covers the **SparkSession** — the ignition key for
+    everything that follows. Every transformation, every query, every
+    table read starts with a SparkSession.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    - Create a SparkSession with the builder pattern
+    - Configure key settings for pipeline workloads
+    - Understand what the SparkSession provides (DataFrames, SQL, Catalog)
+    - Set up an Iceberg catalog for lakehouse tables (advanced)
+
+    **Prerequisites**: Basic Python. If you have taken the Learning Spark
+    course, this will be quick review with a pipeline-specific focus.
 
 - Class: text
   Depth: beginner
   Output: |
-    Think of SparkSession as the ignition key for a car. Without it, nothing
-    moves. You create one with a simple builder pattern:
+    Think of SparkSession as the ignition key for a car. Without it,
+    nothing moves. You create one with a simple builder pattern:
 
     ```python
     from pyspark.sql import SparkSession
-    spark = SparkSession.builder.appName("MyApp").getOrCreate()
+
+    spark = SparkSession.builder.appName("MyPipeline").getOrCreate()
     ```
 
     `getOrCreate()` either creates a brand-new session or returns one that
-    already exists in the same process.
+    already exists. This means you can safely call it multiple times without
+    creating duplicate sessions.
+
+    **Docs:** [SparkSession](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.SparkSession.html)
+    — `builder.appName()`, `builder.config()`, `builder.master()`, `getOrCreate()`.
 
 - Class: text
   Depth: intermediate
   Output: |
-    SparkSession replaced the older `SQLContext` and `HiveContext` APIs that
-    existed in Spark 1.x. It provides a unified interface for:
+    SparkSession replaced the older SQLContext and HiveContext from Spark
+    1.x. It is the single entry point for:
 
-    - Creating DataFrames (`spark.createDataFrame()`)
-    - Running SQL queries (`spark.sql()`)
-    - Accessing the catalog (`spark.catalog.listTables()`)
-    - Reading data (`spark.read`)
+    - Creating DataFrames: `spark.createDataFrame(data, schema)`
+    - Running SQL queries: `spark.sql("SELECT ...")`
+    - Accessing the catalog: `spark.catalog.listTables()`
+    - Reading data: `spark.read.csv(...)`, `spark.read.parquet(...)`
 
-    Two important configuration knobs:
-    - `spark.sql.shuffle.partitions` -- controls the number of partitions
-      after a shuffle (default 200; lower it for small data).
-    - `spark.driver.memory` -- how much RAM the driver JVM gets.
+    For pipeline workloads, two configurations matter most:
 
-- Class: text
-  Depth: advanced
-  Output: |
-    Under the hood, `SparkSession` wraps a `SparkContext` (the connection to
-    the cluster) and a `SessionState` that holds the Catalyst optimizer,
-    the analyzer, and the physical planner.
-
-    When you call `spark.sql("SELECT ...")`, the query text travels through:
-    1. **Parser** -- SQL string to unresolved logical plan
-    2. **Analyzer** -- resolves column names, tables via the Catalog
-    3. **Optimizer** -- applies Catalyst rules (predicate pushdown, etc.)
-    4. **Planner** -- converts to a physical plan with concrete operators
-
-    In Spark 4.1 you can attach an Iceberg catalog at session creation time:
-    ```python
-    spark = (SparkSession.builder
-        .config("spark.sql.catalog.lakehouse", "org.apache.iceberg.spark.SparkCatalog")
-        .config("spark.sql.catalog.lakehouse.type", "hadoop")
-        .config("spark.sql.catalog.lakehouse.warehouse", "/warehouse")
-        .getOrCreate())
-    ```
+    - `spark.sql.shuffle.partitions` — controls partitions after shuffles
+      like `groupBy`. Default is 200, but for development and small
+      datasets, set it to 8-16.
+    - `spark.driver.memory` — how much RAM the driver gets. Increase for
+      pipelines that collect large results.
 
 - Class: mult_question
   Depth: all
-  Output: "Which method creates or retrieves an existing SparkSession?"
+  Output: "Which method on SparkSession.builder creates a new session or returns the existing one?"
   AnswerChoices: "getOrCreate();create();start();initialize()"
   CorrectAnswer: "getOrCreate()"
-  Hint: "It is a method on SparkSession.builder that either creates a new session or returns the existing one."
+  Hint: "The name describes exactly what it does — get an existing one, or create a new one."
 
 - Class: cmd_question
   Depth: all
-  Output: "Create a SparkSession with the app name 'MyPipeline'."
+  Output: |
+    Create a SparkSession with the app name `'OrdersPipeline'`.
   CorrectAnswer: |
     from pyspark.sql import SparkSession
-    spark = SparkSession.builder.appName('MyPipeline').getOrCreate()
-  Hint: "Use SparkSession.builder, then chain .appName() and .getOrCreate()"
+    spark = SparkSession.builder.appName("OrdersPipeline").getOrCreate()
+  Hint: "Use SparkSession.builder, chain .appName(), then .getOrCreate()."
 
 - Class: mult_question
   Depth: intermediate
   Output: "Which config controls the number of partitions produced by shuffle operations like groupBy?"
   AnswerChoices: "spark.sql.shuffle.partitions;spark.default.parallelism;spark.executor.cores;spark.shuffle.count"
   CorrectAnswer: "spark.sql.shuffle.partitions"
-  Hint: "It is an SQL-level config, not a core Spark config. Its default value is 200."
+  Hint: "It is an SQL-level config with a default of 200."
 
 - Class: cmd_question
   Depth: intermediate
   Output: |
-    Create a SparkSession named 'PipelineApp' with shuffle partitions set to 8
-    and driver memory set to '2g'.
+    Create a SparkSession named `'PipelineApp'` with shuffle partitions
+    set to 8 and driver memory set to `'2g'`.
   CorrectAnswer: |
     from pyspark.sql import SparkSession
     spark = (SparkSession.builder
-        .appName('PipelineApp')
-        .config('spark.sql.shuffle.partitions', '8')
-        .config('spark.driver.memory', '2g')
+        .appName("PipelineApp")
+        .config("spark.sql.shuffle.partitions", "8")
+        .config("spark.driver.memory", "2g")
         .getOrCreate())
-  Hint: "Chain multiple .config(key, value) calls before .getOrCreate()"
+  Hint: "Chain multiple .config(key, value) calls before .getOrCreate()."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    Under the hood, SparkSession wraps a `SparkContext` (the cluster
+    connection) and a `SessionState` that holds the Catalyst optimizer,
+    analyzer, and physical planner.
+
+    When you call `spark.sql("SELECT ...")`, the query travels through:
+    1. **Parser** — SQL string to unresolved logical plan
+    2. **Analyzer** — resolves column/table names via the Catalog
+    3. **Optimizer** — applies Catalyst rules (predicate pushdown, etc.)
+    4. **Planner** — converts to a physical plan with concrete operators
+
+    For pipeline workloads, you can attach an **Iceberg catalog** at
+    session creation. This gives your pipeline ACID transactions, schema
+    evolution, and time travel:
+
+    ```python
+    spark = (SparkSession.builder
+        .config("spark.sql.catalog.lakehouse",
+                "org.apache.iceberg.spark.SparkCatalog")
+        .config("spark.sql.catalog.lakehouse.type", "hadoop")
+        .config("spark.sql.catalog.lakehouse.warehouse", "/warehouse")
+        .getOrCreate())
+    ```
 
 - Class: mult_question
   Depth: advanced
   Output: "In the Catalyst optimizer pipeline, what happens immediately after parsing?"
-  AnswerChoices: "Analysis (resolve names via Catalog);Physical planning;Code generation;Partition pruning"
-  CorrectAnswer: "Analysis (resolve names via Catalog)"
-  Hint: "The parser produces an *unresolved* logical plan. The next stage resolves column and table names."
+  AnswerChoices: "Analysis — resolve names via the Catalog;Physical planning;Code generation;Partition pruning"
+  CorrectAnswer: "Analysis — resolve names via the Catalog"
+  Hint: "The parser produces an *unresolved* plan. The next stage resolves column and table names."
 
 - Class: cmd_question
   Depth: advanced
   Output: |
-    Create a SparkSession with an Iceberg catalog named 'lakehouse' using the
-    hadoop catalog type and warehouse path '/warehouse/iceberg'.
+    Create a SparkSession with an Iceberg catalog named `'lakehouse'`
+    using the hadoop catalog type and warehouse path `'/warehouse/iceberg'`.
   CorrectAnswer: |
     from pyspark.sql import SparkSession
     spark = (SparkSession.builder
-        .appName('IcebergPipeline')
-        .config('spark.sql.catalog.lakehouse', 'org.apache.iceberg.spark.SparkCatalog')
-        .config('spark.sql.catalog.lakehouse.type', 'hadoop')
-        .config('spark.sql.catalog.lakehouse.warehouse', '/warehouse/iceberg')
+        .appName("IcebergPipeline")
+        .config("spark.sql.catalog.lakehouse", "org.apache.iceberg.spark.SparkCatalog")
+        .config("spark.sql.catalog.lakehouse.type", "hadoop")
+        .config("spark.sql.catalog.lakehouse.warehouse", "/warehouse/iceberg")
         .getOrCreate())
-  Hint: "Iceberg catalog configs follow the pattern spark.sql.catalog.<name>.<property>"
+  Hint: "Iceberg catalog configs follow the pattern spark.sql.catalog.<name>.<property>."
 
 - Class: text
   Depth: all
   Output: |
-    Great work! You now know how to create a SparkSession with custom
-    configurations. In the next lesson you will learn the core DataFrame
-    transformations -- select, filter, and withColumn -- that power every
-    data pipeline.
+    ## Summary
+
+    You now know how to create and configure a SparkSession — the
+    foundation that every pipeline layer will use. Key takeaways:
+
+    - `SparkSession.builder.appName(...).getOrCreate()` is the entry point
+    - Configure `shuffle.partitions` for your data size
+    - Advanced: attach an Iceberg catalog for ACID-compliant table storage
+
+    In the next lesson, you will learn the **DataFrame transformations**
+    that power every pipeline stage: select, filter, withColumn, and
+    conditional logic.

@@ -1,0 +1,286 @@
+- Class: meta
+  Lesson: Spark SQL & the Catalyst Optimizer
+  EstimatedMinutes: 30
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    You have been using the DataFrame API for several lessons. Behind the
+    scenes, every `select()`, `filter()`, and `groupBy()` passes through
+    the same engine: **Spark SQL**. In this lesson you will look under the
+    hood.
+
+    By the end of this lesson you will be able to:
+
+    - Explain the four phases of the Catalyst optimizer pipeline
+    - Read execution plans with `explain()`
+    - Write SQL queries against DataFrames using temporary views
+    - Create and use User-Defined Functions (UDFs)
+    - Understand why DataFrames outperform RDDs
+    - Explain what Adaptive Query Execution (AQE) does at runtime
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Catalyst Optimizer
+
+    Spark SQL is not just a query language — it is an **optimization
+    engine**. Whether you write DataFrame API code or raw SQL, your query
+    passes through the same four-phase pipeline:
+
+    1. **Parsing** — your code is converted into an unresolved logical plan
+       (a tree of operations with placeholder column names)
+    2. **Analysis** — column names, table references, and types are resolved
+       using the catalog
+    3. **Optimization** — the plan is rewritten with rules like predicate
+       pushdown, constant folding, and column pruning
+    4. **Physical Planning** — Spark chooses execution strategies (join
+       algorithms, scan methods) and generates JVM bytecode
+
+    This is why `df.filter(...).select(...)` and
+    `spark.sql("SELECT ... WHERE ...")` produce identical results — they
+    both go through Catalyst.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Think of Catalyst like a GPS navigation system. You tell it where you
+    want to go (your query), and it figures out the best route (execution
+    plan). It considers shortcuts (optimizations like skipping unneeded
+    columns) and traffic conditions (data statistics) to find the fastest
+    path. You do not need to know the route — just the destination.
+
+- Class: mult_question
+  Depth: all
+  Output: "In which Catalyst phase does Spark apply optimizations like predicate pushdown and constant folding?"
+  AnswerChoices: "Optimization;Parsing;Analysis;Physical Planning"
+  CorrectAnswer: "Optimization"
+  Hint: "After the plan is parsed and column references are resolved, which phase rewrites it into a more efficient form?"
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Key Catalyst Optimizations
+
+    **Predicate pushdown** — filters are pushed as close to the data source
+    as possible. If you filter after a join, Catalyst moves the filter
+    *before* the join (when applicable), reducing the amount of data
+    shuffled.
+
+    **Column pruning** — only columns actually used in the query are read.
+    With Parquet, this means entire columns are skipped at the file level.
+
+    **Constant folding** — expressions like `1 + 2` or `lit("a") == lit("a")`
+    are evaluated at plan time, not at runtime for every row.
+
+    **Join reordering** — when joining multiple tables, Catalyst can
+    rearrange the join order to minimize intermediate result sizes.
+
+    These optimizations happen automatically. You get them for free by using
+    the DataFrame API or SQL.
+
+    **Docs:** [Spark SQL Programming Guide](https://spark.apache.org/docs/3.5.0/sql-programming-guide.html)
+    — covers Catalyst phases, predicate pushdown, column pruning, and plan optimization.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Reading Execution Plans
+
+    Use `explain()` to see what Spark will actually do:
+
+    ```python
+    df.filter(col("age") > 30).select("name").explain()
+    ```
+
+    The `explain()` method has several modes:
+
+    - `explain()` or `explain("simple")` — physical plan only
+    - `explain("extended")` — all plans (parsed, analyzed, optimized,
+      physical)
+    - `explain("formatted")` — human-readable with section headers
+    - `explain("cost")` — includes statistics estimates
+    - `explain("codegen")` — shows generated Java bytecode
+
+    Start with `explain("formatted")` — it is the most readable. Look for:
+    - `FileScan` — how data is read (which columns, pushed filters)
+    - `Filter` — where filtering happens in the plan
+    - `HashAggregate` / `SortAggregate` — aggregation strategy
+    - `BroadcastHashJoin` / `SortMergeJoin` — join strategy
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Show the extended execution plan for a DataFrame `df` filtered to
+    rows where `age > 30`, selecting only the `name` column.
+  CorrectAnswer: |
+    df.filter(df.age > 30).select("name").explain("extended")
+  Hint: "Chain filter(), select(), then .explain('extended')."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## SQL Queries with spark.sql()
+
+    You have already used `createOrReplaceTempView` to register a
+    DataFrame as a SQL table. Here is the full workflow:
+
+    ```python
+    # Register the DataFrame as a SQL view
+    employees_df.createOrReplaceTempView("employees")
+
+    # Query with standard SQL
+    result = spark.sql("""
+        SELECT department, AVG(salary) AS avg_salary
+        FROM employees
+        WHERE hire_date > '2020-01-01'
+        GROUP BY department
+        HAVING AVG(salary) > 80000
+        ORDER BY avg_salary DESC
+    """)
+    ```
+
+    SQL and DataFrames are interchangeable. Use SQL when the query is
+    naturally expressed as a SELECT statement. Use DataFrames when you
+    need programmatic composition (building queries dynamically).
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## User-Defined Functions (UDFs)
+
+    When built-in functions are not enough, you can write custom logic
+    with UDFs:
+
+    ```python
+    from pyspark.sql.functions import udf
+    from pyspark.sql.types import StringType
+
+    @udf(returnType=StringType())
+    def normalize_name(name):
+        return name.strip().title() if name else None
+
+    df.withColumn("clean_name", normalize_name(col("name")))
+    ```
+
+    **Important tradeoffs:**
+    - UDFs are **opaque** to Catalyst — the optimizer cannot look inside
+      them to push filters or prune logic
+    - Python UDFs add **serialization overhead** — data is sent from JVM
+      to Python and back for every row
+    - Prefer built-in functions when possible — they run natively in the
+      JVM and are optimized by Catalyst
+
+    **Docs:**
+    [udf](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.udf.html) |
+    [pandas_udf](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.pandas_udf.html) |
+    [Arrow in PySpark](https://spark.apache.org/docs/3.5.0/api/python/user_guide/sql/arrow_pandas.html)
+    — `returnType` parameter, batch UDF signatures, and performance guidance.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "Why are Python UDFs generally slower than built-in Spark SQL functions?"
+  AnswerChoices: "Data must be serialized between JVM and Python for every row;UDFs use more memory;UDFs cannot run in parallel;Built-in functions skip the Catalyst optimizer"
+  CorrectAnswer: "Data must be serialized between JVM and Python for every row"
+  Hint: "PySpark runs on top of the JVM. What happens when Python code needs to process JVM data?"
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## DataFrames vs. RDDs
+
+    Spark has two main APIs: DataFrames and RDDs (Resilient Distributed
+    Datasets). DataFrames are almost always better because:
+
+    - **Catalyst optimization** — DataFrames go through the full optimizer
+      pipeline. RDDs are opaque — Spark cannot optimize your lambdas.
+    - **Tungsten memory** — DataFrames use Spark's compact binary format.
+      RDDs use Java object serialization (slower, more memory).
+    - **Code generation** — Spark generates JVM bytecode for DataFrame
+      operations. RDD operations are interpreted.
+
+    Use DataFrames unless you need fine-grained control over partitioning
+    or work with types that do not map to Spark's type system.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Adaptive Query Execution (AQE)
+
+    Enabled by default since Spark 3.2, AQE re-optimizes the plan at
+    **runtime** based on actual shuffle statistics. It fixes problems that
+    the static optimizer cannot predict:
+
+    **1. Coalescing post-shuffle partitions** — after a shuffle, many
+    partitions may be tiny. AQE merges them to reduce task overhead and
+    small file problems.
+
+    **2. Switching join strategies** — if the optimizer planned a Sort
+    Merge Join but one side turns out to be small after filtering, AQE
+    converts it to a Broadcast Hash Join at runtime.
+
+    **3. Skew join optimization** — if one partition is much larger than
+    others (data skew), AQE splits it into smaller sub-partitions to
+    prevent stragglers.
+
+    ```python
+    # AQE is on by default; explicit configuration:
+    spark.conf.set("spark.sql.adaptive.enabled", "true")
+    spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
+    spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
+    ```
+
+- Class: cmd_question
+  Depth: advanced
+  Output: |
+    Enable AQE and set the advisory partition size to 128MB using
+    `spark.conf.set`.
+  CorrectAnswer: |
+    spark.conf.set("spark.sql.adaptive.enabled", "true")
+    spark.conf.set("spark.sql.adaptive.advisoryPartitionSizeInBytes", "128m")
+  Hint: "Use spark.conf.set for spark.sql.adaptive.enabled and advisoryPartitionSizeInBytes."
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: DataFrame API vs. SQL
+
+    Implement `compare_plans(spark)` that writes the same query in both
+    the DataFrame API and Spark SQL, then captures the execution plans.
+
+    This demonstrates that both APIs produce the same optimized plan — a
+    key insight for choosing between them in practice.
+
+    1. Create a sample employee DataFrame
+    2. Write a filter → groupBy → agg → orderBy using the DataFrame API
+    3. Register as a temp view and write the same query in SQL
+    4. Capture both explain plans as strings
+    5. Return a dict with both results and plans
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Register the DataFrame as a temp view, write the same filter-groupBy-agg-orderBy in both APIs, and use explain() to capture plans."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    In this lesson you learned:
+
+    - **Catalyst optimizer** — the four-phase pipeline (parse, analyze,
+      optimize, physical plan) that powers all Spark queries
+    - **Key optimizations** — predicate pushdown, column pruning, constant
+      folding, and join reordering happen automatically
+    - **explain()** — read execution plans to understand and debug what
+      Spark actually does
+    - **SQL queries** — `spark.sql()` with temp views gives you full SQL
+      alongside the DataFrame API
+    - **UDFs** — custom logic with a performance tradeoff; prefer built-in
+      functions when possible
+    - **AQE** — runtime re-optimization that adapts to actual data
+
+    Understanding the optimizer is what separates Spark users from Spark
+    experts. In the next lesson, you will use this knowledge to tune
+    performance — caching, partitioning, and configuration.

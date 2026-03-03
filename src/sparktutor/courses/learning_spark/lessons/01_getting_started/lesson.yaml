@@ -1,0 +1,314 @@
+- Class: meta
+  Lesson: Introduction & Getting Started
+  EstimatedMinutes: 25
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    By the end of this lesson you will be able to:
+
+    - Explain what Apache Spark is and why it exists
+    - Describe the Driver-Executor architecture
+    - Create a SparkSession — the entry point to all Spark functionality
+    - Read a CSV file into a DataFrame
+    - Perform basic aggregations with `groupBy`, `agg`, and `orderBy`
+    - Filter results to answer specific questions about your data
+
+    This lesson establishes the foundation everything else builds on. Every
+    Spark program starts with a SparkSession and works with DataFrames.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What Is Apache Spark?
+
+    Apache Spark is a **unified analytics engine** for large-scale data
+    processing. It handles SQL queries, streaming data, machine learning, and
+    graph processing — all through a single framework.
+
+    Spark's key innovation is **in-memory processing**. The earlier MapReduce
+    model writes intermediate results to disk after every step. Spark keeps
+    data in memory across operations, which can make iterative workloads
+    (like ML training) 10-100x faster.
+
+    Spark provides APIs in Python, Scala, Java, and R. Throughout this course
+    we use PySpark — the Python API. Under the hood, PySpark communicates
+    with the same JVM-based engine, so you get full Spark performance while
+    writing Python.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    ## Analogy: Spark as a Restaurant Kitchen
+
+    Think of Spark like a busy restaurant kitchen:
+
+    - The **Driver** is the **head chef** — it reads the order (your code),
+      plans the steps, and coordinates who does what. It does not cook
+      the food itself.
+    - **Executors** are the **line cooks** — they do the actual work on their
+      assigned portion of the data: slicing, grilling, plating.
+    - The **Cluster Manager** is the **restaurant manager** — it decides how
+      many cooks are available and assigns resources.
+
+    When you submit a Spark job, the head chef (Driver) breaks it into tasks
+    and hands them to line cooks (Executors), who work in parallel to get
+    the result out fast. More cooks = more parallelism = faster results.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Spark Architecture
+
+    A Spark application has four core components:
+
+    - **Driver Program** — runs your `main()` function, creates the
+      SparkSession, and coordinates execution across the cluster.
+    - **Cluster Manager** — allocates resources. Options include Standalone,
+      YARN, Mesos, and Kubernetes.
+    - **Worker Nodes** — machines in the cluster that host Executors.
+    - **Executors** — JVM processes on workers that run tasks and cache data.
+
+    The execution hierarchy:
+
+    ```
+    Application  →  Jobs  →  Stages  →  Tasks
+    ```
+
+    A **job** is triggered by an action (e.g., `show()`, `count()`). Jobs are
+    divided into **stages** at shuffle boundaries. Stages contain **tasks** —
+    one per data partition — that run in parallel across executors.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## SparkSession: The Unified Entry Point
+
+    Starting in Spark 2.0, `SparkSession` replaced the older SparkContext,
+    SQLContext, and HiveContext. You create one with the **builder pattern**:
+
+    ```python
+    from pyspark.sql import SparkSession
+
+    spark = (SparkSession.builder
+        .appName("MyApp")
+        .master("local[*]")
+        .config("spark.some.option", "value")
+        .getOrCreate())
+    ```
+
+    The `master` setting controls where Spark runs:
+    - `local[*]` — use all local CPU cores (great for development)
+    - `local[4]` — use exactly 4 cores
+    - `spark://host:7077` — connect to a Standalone cluster
+    - `k8s://...` — connect to a Kubernetes cluster
+
+    `getOrCreate()` either creates a new session or returns the existing one,
+    so calling it multiple times is safe.
+
+    **Docs:** [SparkSession](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.SparkSession.html)
+    — builder pattern, `appName()`, `master()`, `config()`, `getOrCreate()`.
+
+- Class: mult_question
+  Depth: all
+  Output: "What is the role of the Driver in a Spark application?"
+  AnswerChoices: "Coordinates execution and plans queries;Stores data on disk;Executes individual tasks on data partitions;Manages cluster resources"
+  CorrectAnswer: "Coordinates execution and plans queries"
+  Hint: "Think about the head chef analogy — who plans the work but doesn't do the cooking?"
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## The Execution Model in Detail
+
+    When you call an action, Spark's execution engine kicks in:
+
+    1. **DAG Scheduler** — analyzes the chain of transformations and builds a
+       Directed Acyclic Graph (DAG). It breaks the DAG into stages at
+       **shuffle boundaries** — points where data must be redistributed
+       across partitions.
+
+    2. **Task Scheduler** — takes each stage and creates tasks (one per
+       partition), then assigns them to available executors.
+
+    **Narrow vs. Wide Transformations:**
+    - **Narrow** (e.g., `map`, `filter`, `select`) — each input partition
+      contributes to exactly one output partition. No data movement.
+    - **Wide** (e.g., `groupBy`, `join`, `repartition`) — input partitions
+      contribute to multiple output partitions. Requires a **shuffle** —
+      expensive network I/O.
+
+    **Lazy Evaluation:**
+    Transformations build up a logical plan. Only actions trigger execution.
+    This lets Spark's Catalyst optimizer analyze the entire pipeline and
+    rewrite it before generating code — predicate pushdown, column pruning,
+    join reordering — all happen transparently.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Create a SparkSession with the app name `'MnMCount'` and master set to
+    `'local[*]'`. Store it in a variable called `spark`.
+  CorrectAnswer: |
+    from pyspark.sql import SparkSession
+
+    spark = SparkSession.builder.appName("MnMCount").master("local[*]").getOrCreate()
+  Hint: "Use SparkSession.builder, chain .appName() and .master(), then call .getOrCreate()."
+
+- Class: mult_question
+  Depth: all
+  Output: "Which of these triggers actual computation in Spark (is an action, not a transformation)?"
+  AnswerChoices: "show();select();filter();withColumn()"
+  CorrectAnswer: "show()"
+  Hint: "Transformations are lazy — they build the plan. Actions trigger the plan to execute and produce results."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Reading Data
+
+    Spark reads data through the **DataFrameReader** API. The most common
+    pattern:
+
+    ```python
+    df = (spark.read
+        .format("csv")
+        .option("header", "true")
+        .option("inferSchema", "true")
+        .load("/path/to/file.csv"))
+    ```
+
+    Or using the shorthand:
+
+    ```python
+    df = spark.read.csv("/path/to/file.csv", header=True, inferSchema=True)
+    ```
+
+    This gives you a **DataFrame** — a distributed table with named, typed
+    columns. Think of it as a spreadsheet that can span thousands of machines.
+
+    **Docs:** [DataFrameReader.csv](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrameReader.csv.html)
+    — all parameters for `header`, `inferSchema`, `schema`, `sep`, `nullValue`, etc.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Aggregations and Filtering
+
+    Once you have a DataFrame, you can analyze it with transformations:
+
+    ```python
+    from pyspark.sql import functions as f
+
+    result = (df
+        .groupBy("State", "Color")
+        .agg(f.sum("Count").alias("Total"))
+        .orderBy(f.col("Total").desc()))
+    ```
+
+    Breaking this down:
+    - `groupBy("State", "Color")` — groups rows by unique combinations
+    - `agg(f.sum("Count").alias("Total"))` — sums the Count column, names
+      it "Total"
+    - `orderBy(f.col("Total").desc())` — sorts descending by Total
+
+    `filter()` and `where()` select rows matching a condition:
+
+    ```python
+    ca_only = result.filter(f.col("State") == "CA")
+    ```
+
+    **Docs:**
+    [f.col](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.col.html) |
+    [f.sum](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.sum.html) |
+    [DataFrame.groupBy](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.groupBy.html) |
+    [Column.alias](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.Column.alias.html)
+
+- Class: cmd_question
+  Depth: intermediate
+  Output: |
+    Given a DataFrame `df` with columns `State`, `Color`, and `Count`,
+    write code to group by State and Color, sum the Count column (aliased
+    as "Total"), and order by the sum descending.
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+
+    result = (df.groupBy("State", "Color")
+        .agg(f.sum("Count").alias("Total"))
+        .orderBy(f.col("Total").desc()))
+  Hint: "Use groupBy with two columns, agg with f.sum() and alias(), then orderBy with desc()."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Reading Data: Options and Formats
+
+    The `option()` method configures how Spark reads files. For CSV:
+
+    - `header` — first row contains column names (true/false)
+    - `inferSchema` — scan the file to detect types (true/false)
+    - `sep` — field delimiter (default: comma)
+    - `nullValue` — string to treat as null
+
+    Common formats beyond CSV: **JSON** (semi-structured), **Parquet**
+    (columnar, compressed — Spark's preferred format), and **ORC** (similar
+    to Parquet, popular in Hive ecosystems).
+
+    We will explore all of these in depth in the next lesson on Data Sources.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Why inferSchema Costs You
+
+    When you set `inferSchema=true` on CSV or JSON, Spark makes **two passes**
+    over the data: one to sample rows and infer types, another to actually
+    load. For large files this doubles read time.
+
+    In production, always define schemas explicitly with `StructType`. You
+    will learn how in the next lesson. For now, `inferSchema` is fine for
+    exploration and small datasets.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: M&M Candy Count Analysis
+
+    Time to put it all together. Implement the `mnm_analysis` function,
+    adapted from the M&M count example in the book *Learning Spark*.
+
+    Your function should:
+    1. Read a CSV file (with header and inferSchema) containing columns:
+       `State`, `Color`, `Count`
+    2. Group by State and Color, sum the Count column (alias as "Total")
+    3. Order by Total descending
+    4. Filter for California (`'CA'`) only
+    5. Return the California-only DataFrame
+
+    This exercises every skill from the lesson: SparkSession, reading data,
+    groupBy, agg, orderBy, and filter.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Read with spark.read.csv() and options. groupBy two columns, agg with f.sum(), orderBy desc, then filter where State == 'CA'."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    In this lesson you learned:
+
+    - **What Spark is** — a unified analytics engine with in-memory processing
+    - **Spark architecture** — Driver coordinates, Executors do the work,
+      Cluster Manager assigns resources
+    - **SparkSession** — the entry point, created with the builder pattern
+    - **Reading data** — `spark.read.csv()` with options like header and
+      inferSchema
+    - **Aggregations** — `groupBy`, `agg`, `orderBy` for data analysis
+    - **Filtering** — `filter()` to narrow results
+
+    You wrote your first complete Spark program. In the next lesson, you
+    will learn how DataFrames work under the hood — schemas, column
+    expressions, and the type system that makes Spark reliable at scale.

@@ -1,27 +1,32 @@
 - Class: meta
   Lesson: "Pipeline Framework"
-  EstimatedMinutes: 20
+  EstimatedMinutes: 25
 
 - Class: text
   Depth: all
   Output: |
-    So far you have learned to create a SparkSession, transform data, and
-    read/write files. But real-world pipelines have **multiple steps** that
-    depend on each other: you cannot build the silver layer until bronze is
-    ready, and gold depends on silver.
+    ## What You'll Learn
+
+    Over the last three lessons you learned to create a SparkSession,
+    transform data, and read/write files. But real-world pipelines have
+    **multiple steps that depend on each other**: you cannot build the
+    silver layer until bronze is ready, and gold depends on silver.
 
     In this lesson you will build a lightweight **Pipeline class** that:
     1. Registers transformation functions with a decorator
     2. Auto-detects dependencies between them
     3. Runs them in the correct order using topological sort
 
+    By the end you will have a reusable framework for the bronze, silver,
+    and gold layers you build in the next three lessons.
+
 - Class: text
   Depth: beginner
   Output: |
-    A Python **decorator** is a function that wraps another function to add
-    behavior. You have probably seen `@property` or `@staticmethod`. We will
-    create a `@pipeline.materialized_view()` decorator that registers a
-    function as a pipeline step:
+    A Python **decorator** is a function that wraps another function to
+    add behavior. You have probably seen `@property` or `@staticmethod`.
+    We will create a `@pipeline.materialized_view()` decorator that
+    registers a function as a pipeline step:
 
     ```python
     @pipeline.materialized_view()
@@ -30,11 +35,14 @@
     ```
 
     When the pipeline runs, it calls `bronze_orders(spark)` and saves the
-    result as a table called `bronze_orders`.
+    result as a temp view named `bronze_orders`. The function name becomes
+    the table name — this is the "declarative" part.
 
 - Class: text
   Depth: intermediate
   Output: |
+    ## The Decorator Pattern
+
     The decorator stores each function in a registry dictionary:
 
     ```python
@@ -51,23 +59,26 @@
     ```
 
     When you decorate a function, it gets added to `_flows` keyed by its
-    name. The function itself is unchanged -- it still takes `spark` and
+    name. The function itself is unchanged — it still takes `spark` and
     returns a DataFrame.
+
+    This pattern separates **declaration** (what each step does) from
+    **orchestration** (what order to run them in). You declare the steps;
+    the framework handles the ordering.
 
 - Class: mult_question
   Depth: all
-  Output: "What does the `@pipeline.materialized_view()` decorator do?"
+  Output: "What does the @pipeline.materialized_view() decorator do?"
   AnswerChoices: "Registers the function as a pipeline step;Materializes the DataFrame to memory;Creates a SQL view;Caches the result in Spark"
   CorrectAnswer: "Registers the function as a pipeline step"
-  Hint: "The decorator adds the function to the pipeline's registry so it can be executed later."
+  Hint: "The decorator adds the function to the pipeline's internal registry."
 
 - Class: cmd_question
   Depth: all
   Output: |
     Write a Pipeline class with an `__init__` that takes `spark` and
-    initializes an empty dictionary called `_flows`. Add a
-    `materialized_view` method that returns a decorator which registers
-    functions by name.
+    initializes an empty dictionary `_flows`. Add a `materialized_view`
+    method that returns a decorator which registers functions by name.
   CorrectAnswer: |
     class Pipeline:
         def __init__(self, spark):
@@ -84,9 +95,11 @@
 - Class: text
   Depth: intermediate
   Output: |
-    **Dependency detection**: how does the pipeline know that `silver_orders`
-    depends on `bronze_orders`? We inspect the function's source code for
-    calls to `spark.table("...")`.
+    ## Dependency Detection
+
+    How does the pipeline know that `silver_orders` depends on
+    `bronze_orders`? We inspect the function's source code for calls to
+    `spark.table("...")`:
 
     ```python
     import inspect, re
@@ -96,8 +109,10 @@
         return re.findall(r'spark\.table\(["\'](\w+)["\']\)', source)
     ```
 
-    If `silver_orders` calls `spark.table("bronze_orders")`, then it depends
-    on `bronze_orders`.
+    If `silver_orders` calls `spark.table("bronze_orders")`, the regex
+    finds `"bronze_orders"` as a dependency. This is a simple but
+    effective heuristic — it works because our convention is to use
+    `spark.table()` to read from pipeline steps.
 
 - Class: mult_question
   Depth: intermediate
@@ -109,17 +124,17 @@
 - Class: text
   Depth: advanced
   Output: |
-    **Topological sort** determines execution order. Given a dependency
-    graph, it produces an ordering where every function runs after its
-    dependencies.
+    ## Topological Sort
 
-    The algorithm (Kahn's algorithm):
-    1. Compute in-degree (number of dependencies) for each node
+    Given a dependency graph, **topological sort** produces an ordering
+    where every function runs after its dependencies. We use Kahn's
+    algorithm:
+
+    1. Compute **in-degree** (number of dependencies) for each node
     2. Start with nodes that have in-degree 0 (no dependencies)
     3. Process each node, decrementing in-degree of its dependents
     4. Repeat until all nodes are processed
-
-    If the queue empties before all nodes are processed, you have a cycle.
+    5. If the queue empties before all nodes are processed → cycle detected
 
     ```python
     from collections import deque
@@ -160,12 +175,14 @@
     def _detect_deps(self, func):
         source = inspect.getsource(func)
         return re.findall(r'spark\.table\(["\'](\w+)["\']\)', source)
-  Hint: "Use inspect.getsource to get the source, then re.findall with a pattern matching spark.table(...)."
+  Hint: "Use inspect.getsource for the source, then re.findall with a pattern matching spark.table(...)."
 
 - Class: text
   Depth: all
   Output: |
-    Finally, the `run()` method ties it all together:
+    ## The run() Method
+
+    Finally, `run()` ties it all together:
 
     ```python
     def run(self):
@@ -184,31 +201,51 @@
             print(f"Materialized: {name} ({df.count()} rows)")
     ```
 
-    Each step's result is registered as a temp view so downstream steps
-    can reference it with `spark.table("step_name")`.
+    Each step's result is registered as a **temp view** so downstream
+    steps can reference it with `spark.table("step_name")`. This is the
+    contract that makes dependency detection work.
 
 - Class: script
   Depth: all
   Output: |
-    Put it all together: complete the Pipeline class below so that it can
+    ## Exercise: Build the Pipeline Framework
+
+    Put it all together: complete the Pipeline class so that it can
     register flows, detect dependencies, sort them, and execute in order.
 
-    Open `starter.py`, fill in the missing methods, and verify it matches
-    the expected behavior described in the comments.
+    Open the starter file and implement:
+    - `materialized_view()` — the decorator
+    - `_detect_deps(func)` — source inspection for dependencies
+    - `_topo_sort(graph)` — Kahn's algorithm
+    - `run()` — build graph, sort, execute
+
+    The test harness registers three functions (bronze → silver → gold)
+    and verifies they execute in the correct order.
   StarterFile: starter.py
   SolutionFile: solution.py
-  Hint: "Implement materialized_view, _detect_deps, _topo_sort, and run. See the lesson text for reference."
+  Hint: "Implement all four methods. See the lesson text for reference code."
 
 - Class: mult_question
   Depth: all
   Output: "If step A depends on step B and step B depends on step A, what happens during topological sort?"
   AnswerChoices: "A cycle is detected and an error is raised;Step A runs first;Step B runs first;Both run in parallel"
   CorrectAnswer: "A cycle is detected and an error is raised"
-  Hint: "Circular dependencies cannot be resolved -- the algorithm detects this when not all nodes get processed."
+  Hint: "Circular dependencies cannot be resolved — the algorithm detects this when not all nodes get processed."
 
 - Class: text
   Depth: all
   Output: |
-    Excellent! You now have a reusable Pipeline framework. In the next three
-    lessons you will use it to build real **bronze**, **silver**, and **gold**
-    layers for a data pipeline.
+    ## Summary
+
+    You now have a reusable Pipeline framework with:
+
+    - **Declarative registration** — `@pipe.materialized_view()` registers
+      steps by function name
+    - **Automatic dependency detection** — regex inspection of
+      `spark.table()` calls
+    - **Topological execution** — Kahn's algorithm ensures correct ordering
+    - **Cycle detection** — circular dependencies raise clear errors
+
+    This is the backbone of everything that follows. In the next three
+    lessons you will use this framework to build real **bronze**, **silver**,
+    and **gold** layers for a data pipeline.

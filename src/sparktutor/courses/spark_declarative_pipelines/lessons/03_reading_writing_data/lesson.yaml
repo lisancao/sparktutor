@@ -5,19 +5,22 @@
 - Class: text
   Depth: all
   Output: |
+    ## What You'll Learn
+
     A pipeline is only useful if it can **ingest** data from the outside
-    world and **persist** results. Spark's DataFrameReader (`spark.read`)
-    and DataFrameWriter (`df.write`) support dozens of formats out of the
-    box: CSV, JSON, Parquet, ORC, Avro, and more.
+    world and **persist** results. In this lesson you will learn Spark's
+    I/O layer — the DataFrameReader and DataFrameWriter APIs.
 
-    The general pattern:
-    ```python
-    # Read
-    df = spark.read.format("csv").option("header", "true").load("/data/input")
+    By the end of this lesson you will be able to:
 
-    # Write
-    df.write.format("parquet").mode("overwrite").save("/data/output")
-    ```
+    - Read CSV and JSON files with explicit schemas
+    - Write data in Parquet format (Spark's preferred format)
+    - Choose the right write mode (overwrite, append, error, ignore)
+    - Explain why explicit schemas are required for production pipelines
+    - Write to Iceberg tables for ACID-compliant storage (advanced)
+
+    These skills directly power the **bronze layer** — reading raw files
+    is the first step of every pipeline.
 
 - Class: text
   Depth: beginner
@@ -25,26 +28,57 @@
     The simplest way to read a CSV file:
 
     ```python
-    df = spark.read.csv("/data/sales.csv", header=True, inferSchema=True)
+    df = spark.read.csv("/data/orders.csv", header=True, inferSchema=True)
     ```
 
-    `header=True` tells Spark the first row contains column names.
-    `inferSchema=True` makes Spark scan the file to guess column types
-    (string, integer, double, etc.). This is convenient for exploration
-    but slow on large files.
+    `header=True` means the first row contains column names.
+    `inferSchema=True` makes Spark scan the file to guess column types.
+    This is convenient for exploration but slow on large files — Spark
+    reads the data twice (once to infer, once to load).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The DataFrameReader Pattern
+
+    Every data read follows the same structure:
+
+    ```python
+    df = (spark.read
+        .format("csv")             # what format
+        .option("header", "true")  # format-specific settings
+        .schema(my_schema)         # explicit schema (recommended)
+        .load("/data/input"))      # where to read from
+    ```
+
+    The chain is always: **format → options → schema → load**.
+
+    Shorthand methods are also available:
+    ```python
+    spark.read.csv(path, header=True, schema=schema)
+    spark.read.json(path, schema=schema)
+    spark.read.parquet(path)  # schema embedded, no options needed
+    ```
+
+    **Docs:**
+    [DataFrameReader.csv](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrameReader.csv.html) |
+    [.json](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrameReader.json.html) |
+    [.parquet](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrameReader.parquet.html) |
+    [DataFrameWriter.mode](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrameWriter.mode.html) |
+    [.parquet](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrameWriter.parquet.html)
 
 - Class: mult_question
   Depth: all
-  Output: "What does `inferSchema=True` do when reading a CSV?"
+  Output: "What does inferSchema=True do when reading a CSV?"
   AnswerChoices: "Scans the data to guess column types automatically;Enforces a user-provided schema;Skips rows with bad data;Infers the file encoding"
   CorrectAnswer: "Scans the data to guess column types automatically"
-  Hint: "Spark needs an extra pass over the data to figure out the types."
+  Hint: "Spark needs an extra pass over the data to figure out types."
 
 - Class: cmd_question
   Depth: all
   Output: |
-    Read a CSV file at '/data/orders.csv' with headers and inferred schema
-    into a DataFrame called `orders`.
+    Read a CSV file at `'/data/orders.csv'` with headers and inferred
+    schema into a DataFrame called `orders`.
   CorrectAnswer: |
     orders = spark.read.csv("/data/orders.csv", header=True, inferSchema=True)
   Hint: "spark.read.csv(path, header=True, inferSchema=True)"
@@ -52,11 +86,15 @@
 - Class: text
   Depth: intermediate
   Output: |
-    For production pipelines you should **never** rely on `inferSchema`.
-    Instead, define the schema explicitly using `StructType`:
+    ## Explicit Schemas: The Production Standard
+
+    For production pipelines, **never** rely on `inferSchema`. Define the
+    schema explicitly with `StructType`:
 
     ```python
-    from pyspark.sql.types import StructType, StructField, StringType, DoubleType, IntegerType
+    from pyspark.sql.types import (
+        StructType, StructField, StringType, DoubleType, IntegerType
+    )
 
     schema = StructType([
         StructField("order_id", StringType(), nullable=False),
@@ -68,15 +106,25 @@
     df = spark.read.csv("/data/orders.csv", header=True, schema=schema)
     ```
 
-    This is faster (no extra scan) and safer (bad data becomes `null`
-    instead of silently mistyped).
+    Benefits:
+    - **Faster** — no extra scan to detect types
+    - **Safer** — bad data becomes `null` instead of being silently mistyped
+    - **Self-documenting** — the schema is your contract
+
+    In our pipeline, the **bronze layer** will read with all-string schemas
+    (schema-on-read), and the **silver layer** will cast to proper types.
+
+    **Docs:**
+    [StructType](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.types.StructType.html) |
+    [StructField](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.types.StructField.html)
+    — `StructField(name, dataType, nullable)` and all type classes.
 
 - Class: cmd_question
   Depth: intermediate
   Output: |
     Define a schema for a `users` CSV with columns: `user_id` (StringType),
-    `name` (StringType), and `age` (IntegerType). Then read '/data/users.csv'
-    using that schema.
+    `name` (StringType), and `age` (IntegerType). Then read
+    `'/data/users.csv'` using that schema.
   CorrectAnswer: |
     from pyspark.sql.types import StructType, StructField, StringType, IntegerType
 
@@ -92,26 +140,35 @@
 - Class: text
   Depth: all
   Output: |
-    **Write modes** control what happens when the output path already exists:
+    ## Write Modes
 
-    | Mode        | Behavior                              |
-    |-------------|---------------------------------------|
-    | `overwrite` | Delete existing data, write new       |
-    | `append`    | Add new data alongside existing       |
-    | `error`     | Fail if data already exists (default) |
-    | `ignore`    | Silently skip if data exists          |
+    The DataFrameWriter controls how data is persisted:
+
+    ```python
+    df.write.format("parquet").mode("overwrite").save("/output/data")
+    ```
+
+    | Mode | Behavior |
+    |------|----------|
+    | `error` (default) | Fail if data already exists |
+    | `overwrite` | Delete existing data, write new |
+    | `append` | Add new data alongside existing |
+    | `ignore` | Silently skip if data exists |
+
+    For our pipeline: use `overwrite` for batch runs (ensures
+    idempotency), `append` only for incremental/streaming pipelines.
 
 - Class: mult_question
   Depth: all
   Output: "What is the default write mode if you do not specify one?"
   AnswerChoices: "error;overwrite;append;ignore"
   CorrectAnswer: "error"
-  Hint: "Spark is cautious by default -- it will not overwrite existing data unless you tell it to."
+  Hint: "Spark is cautious by default — it will not overwrite existing data unless you tell it to."
 
 - Class: cmd_question
   Depth: all
   Output: |
-    Write the DataFrame `orders` to Parquet format at '/output/orders_parquet'
+    Write DataFrame `orders` to Parquet format at `'/output/orders_parquet'`
     using overwrite mode.
   CorrectAnswer: |
     orders.write.mode("overwrite").parquet("/output/orders_parquet")
@@ -120,70 +177,94 @@
 - Class: text
   Depth: intermediate
   Output: |
-    **Parquet** is the preferred format for analytics pipelines because:
-    - It is columnar (reads only the columns you need)
-    - It compresses well (snappy by default)
-    - It preserves the schema inside the file (no inference needed)
+    ## Parquet: The Preferred Pipeline Format
 
-    Reading Parquet is as simple as:
+    **Parquet** is the recommended format for pipeline intermediate and
+    output data because:
+
+    - **Columnar** — reads only the columns your query needs
+    - **Compressed** — Snappy compression by default, excellent ratios
+    - **Schema embedded** — no inference needed when reading back
+    - **Predicate pushdown** — Spark can skip row groups that do not match
+      your filters
+
+    Reading Parquet is the simplest read in Spark:
     ```python
     df = spark.read.parquet("/data/orders.parquet")
     ```
 
+    In our pipeline, bronze writes intermediate data as temp views (in
+    memory). For persistent storage between pipeline runs, Parquet or
+    Iceberg tables are the standard choice.
+
 - Class: cmd_question
   Depth: intermediate
   Output: |
-    Read a Parquet file at '/data/events.parquet', filter to rows where
-    `event_type` equals 'purchase', and write the result as Parquet to
-    '/output/purchases' in overwrite mode.
+    Read a Parquet file at `'/data/events.parquet'`, filter to rows where
+    `event_type` equals `'purchase'`, and write the result to
+    `'/output/purchases'` in overwrite mode.
   CorrectAnswer: |
     from pyspark.sql import functions as f
     events = spark.read.parquet("/data/events.parquet")
     purchases = events.filter(f.col("event_type") == "purchase")
     purchases.write.mode("overwrite").parquet("/output/purchases")
-  Hint: "Chain read -> filter -> write. Use f.col for the filter condition."
+  Hint: "Chain read → filter → write. Use f.col() for the filter condition."
 
 - Class: text
   Depth: advanced
   Output: |
-    **Iceberg** is a table format that adds ACID transactions, time travel,
-    and partition evolution on top of Parquet files. In Spark 4.1 you write
-    to Iceberg tables like this:
+    ## Iceberg Tables: ACID for Pipelines
+
+    For production pipelines, **Iceberg** adds ACID transactions, time
+    travel, and schema evolution on top of Parquet:
 
     ```python
+    # Write to an Iceberg table
     df.writeTo("lakehouse.db.orders").using("iceberg").createOrReplace()
-    ```
 
-    Key benefits:
-    - **Partition pruning** -- Iceberg maintains partition statistics so
-      Spark skips entire files that cannot match your filter.
-    - **Schema evolution** -- add, rename, or drop columns without rewriting
-      data.
-    - **Time travel** -- query the table as it was at a previous snapshot.
+    # Read from an Iceberg table
+    df = spark.table("lakehouse.db.orders")
 
-    ```python
+    # Time travel — read a previous snapshot
     spark.read.option("snapshot-id", 12345).table("lakehouse.db.orders")
     ```
+
+    Key benefits for pipelines:
+    - **Atomicity** — partial writes never corrupt the table
+    - **Schema evolution** — add columns without rewriting data
+    - **Partition evolution** — change partitioning without rewriting data
+    - **Time travel** — query any previous version for debugging
 
 - Class: mult_question
   Depth: advanced
   Output: "Which Iceberg feature lets you query a table as it looked at a previous point in time?"
   AnswerChoices: "Time travel via snapshot IDs;Schema evolution;Partition pruning;Compaction"
   CorrectAnswer: "Time travel via snapshot IDs"
-  Hint: "Iceberg stores immutable snapshots; you can read any historical snapshot."
+  Hint: "Iceberg stores immutable snapshots. You can read any historical snapshot."
 
 - Class: cmd_question
   Depth: advanced
   Output: |
     Write DataFrame `orders` to an Iceberg table called
-    'lakehouse.bronze.orders' using createOrReplace.
+    `'lakehouse.bronze.orders'` using `createOrReplace`.
   CorrectAnswer: |
     orders.writeTo("lakehouse.bronze.orders").using("iceberg").createOrReplace()
-  Hint: "Use df.writeTo(table_name).using('iceberg').createOrReplace()"
+  Hint: "Use df.writeTo(table_name).using('iceberg').createOrReplace()."
 
 - Class: text
   Depth: all
   Output: |
-    You can now read and write data in multiple formats with explicit
-    schemas. Next up: building a **Pipeline Framework** that ties your
-    transforms together into a declarative, dependency-aware workflow.
+    ## Summary
+
+    You now know how to read and write data in Spark:
+
+    - **DataFrameReader** — format, options, schema, load
+    - **Explicit schemas** — always use them in production (no inferSchema)
+    - **Parquet** — the default format for analytics and pipelines
+    - **Write modes** — overwrite for idempotent batch pipelines
+    - **Iceberg** — ACID transactions for production table storage
+
+    You have all the building blocks: a SparkSession, transformations, and
+    I/O. In the next lesson, you will build the **Pipeline Framework** —
+    a reusable class that ties transformations together with automatic
+    dependency resolution.

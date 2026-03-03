@@ -1,0 +1,17 @@
+course:
+  id: learning_spark
+  title: "Learning Spark: From Fundamentals to Production"
+  description: "Master Apache Spark from the ground up — DataFrames, SQL, streaming, optimization, and ML"
+  version: "1.0.0"
+  requires_lakehouse: false
+  lessons:
+    - 01_getting_started
+    - 02_dataframes_schemas
+    - 03_data_sources
+    - 04_external_sources_hof
+    - 05_spark_sql_deep_dive
+    - 06_optimization_tuning
+    - 07_join_strategies
+    - 08_structured_streaming
+    - 09_data_lakes
+    - 10_mllib

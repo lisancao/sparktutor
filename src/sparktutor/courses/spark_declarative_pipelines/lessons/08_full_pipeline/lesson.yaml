@@ -1,58 +1,81 @@
 - Class: meta
   Lesson: "Full Pipeline"
-  EstimatedMinutes: 20
+  EstimatedMinutes: 25
 
 - Class: text
   Depth: all
   Output: |
-    Congratulations -- you have built every layer of a medallion architecture
-    pipeline! In this final lesson you will **connect the pieces** into a
-    single, runnable pipeline that flows from bronze through silver to gold.
+    ## What You'll Learn
 
-    You will also add **error handling**, **logging**, and learn about
-    deployment patterns.
+    This is the capstone lesson. You have built every piece individually:
+    a SparkSession, transformations, I/O, a Pipeline framework, and
+    three medallion layers. Now you will **connect them into a single
+    end-to-end pipeline** and learn how to make it production-ready.
+
+    By the end of this lesson you will be able to:
+
+    - Wire bronze, silver, and gold functions into one Pipeline
+    - Trace data flow through all three layers
+    - Add error handling and logging to the Pipeline runner
+    - Understand idempotency and why it matters for batch pipelines
+    - Choose a deployment pattern for production (advanced)
 
 - Class: text
   Depth: all
   Output: |
-    Here is the big picture of what you have built:
+    ## The Complete Picture
+
+    Here is the architecture you have built across this course:
 
     ```
-    Raw CSV  -->  [Bronze]  -->  [Silver]  -->  [Gold]
-                  - ingest       - cast types    - groupBy/agg
-                  - metadata     - joins          - window funcs
-                  - dedup        - filter nulls   - rankings
+    Raw CSV  ──>  [Bronze]  ──>  [Silver]  ──>  [Gold]
+                   │ ingest        │ cast types     │ groupBy/agg
+                   │ metadata      │ compute total  │ rankings
+                   │ dedup         │ filter nulls   │ window funcs
+                   │               │ extract hour   │
+                   ▼               ▼                ▼
+                 temp view      temp view        temp view
+                 "bronze_       "silver_         "gold_product_
+                  orders"        orders"          summary"
     ```
 
-    Each layer reads from the previous layer's temp view (or table) and
-    writes its result as a new temp view. The Pipeline framework handles
-    dependency ordering automatically.
+    Each layer reads from the previous layer's temp view using
+    `spark.table()`. The Pipeline framework detects these dependencies
+    and runs everything in the correct order.
 
 - Class: text
   Depth: beginner
   Output: |
-    Connecting the layers is straightforward. Register each layer function
-    with the pipeline, and the dependency detector figures out the order:
+    Connecting the layers is straightforward. Register each function
+    with the pipeline decorator, and dependency detection handles the
+    rest:
 
     ```python
     pipe = Pipeline(spark)
 
     @pipe.materialized_view()
     def bronze_orders(spark):
+        # Read raw CSV, add metadata, deduplicate
         ...
 
     @pipe.materialized_view()
     def silver_orders(spark):
-        df = spark.table("bronze_orders")  # <-- dependency detected
+        df = spark.table("bronze_orders")  # dependency detected!
+        # Cast types, compute total, filter nulls
         ...
 
     @pipe.materialized_view()
     def gold_summary(spark):
-        df = spark.table("silver_orders")  # <-- dependency detected
+        df = spark.table("silver_orders")  # dependency detected!
+        # Aggregate and rank
         ...
 
-    pipe.run()  # Executes: bronze -> silver -> gold
+    pipe.run()  # Executes: bronze → silver → gold
     ```
+
+    The `pipe.run()` call builds the dependency graph, topologically
+    sorts it, and executes each function in order. You declare **what**
+    each step does; the framework handles **when** to run it.
 
 - Class: mult_question
   Depth: all
@@ -62,10 +85,40 @@
   Hint: "Each layer depends on the output of the previous one."
 
 - Class: text
+  Depth: all
+  Output: |
+    ## Why This Design Works
+
+    The medallion architecture gives you several important properties:
+
+    **Reprocessability.** If the silver logic changes (e.g., a new type
+    cast), you re-run silver and gold from the unchanged bronze data.
+    You never need to re-ingest from the original source.
+
+    **Debuggability.** When gold numbers look wrong, you can inspect
+    the silver temp view to see if cleaning was correct, or the bronze
+    view to see the raw input. Each layer is independently queryable.
+
+    **Separation of concerns.** Bronze engineers worry about ingestion
+    reliability. Silver engineers worry about data quality. Gold
+    engineers worry about business logic. Each layer has a clear owner
+    and contract.
+
+- Class: mult_question
+  Depth: all
+  Output: "If the gold layer produces unexpected results, what should you check first?"
+  AnswerChoices: "The silver temp view to verify the cleaned data is correct;The raw CSV file on disk;The Spark driver logs;The gold layer's write mode"
+  CorrectAnswer: "The silver temp view to verify the cleaned data is correct"
+  Hint: "Gold reads from silver. If silver data is wrong, gold will be wrong too. Debug layer by layer."
+
+- Class: text
   Depth: intermediate
   Output: |
-    **Error handling** is critical for production pipelines. Wrap each step
-    in a try/except and log the error:
+    ## Error Handling and Logging
+
+    Production pipelines need to report what happened — which steps
+    succeeded, how many rows were processed, and what went wrong.
+    Enhance the `run()` method with logging and error tracking:
 
     ```python
     import logging
@@ -73,7 +126,8 @@
     logger = logging.getLogger("pipeline")
 
     def run(self):
-        graph = {name: self._detect_deps(func) for name, func in self._flows.items()}
+        graph = {name: self._detect_deps(func)
+                 for name, func in self._flows.items()}
         order = self._topo_sort(graph)
 
         results = {}
@@ -87,16 +141,19 @@
             except Exception as e:
                 results[name] = {"status": "error", "error": str(e)}
                 logger.error(f"Failed to materialize {name}: {e}")
-                raise  # or continue, depending on your strategy
+                raise
 
         return results
     ```
 
+    The `results` dictionary becomes a pipeline run report. In
+    production, you would persist this to a monitoring system.
+
 - Class: mult_question
   Depth: intermediate
   Output: "If the silver layer fails, should the gold layer still run?"
-  AnswerChoices: "No -- gold depends on silver, so it should be skipped or the pipeline should stop;Yes -- each layer is independent;Yes -- gold can use stale data;It depends on the file format"
-  CorrectAnswer: "No -- gold depends on silver, so it should be skipped or the pipeline should stop"
+  AnswerChoices: "No — gold depends on silver, so it should be skipped or the pipeline should stop;Yes — each layer is independent;Yes — gold can use stale data;It depends on the file format"
+  CorrectAnswer: "No — gold depends on silver, so it should be skipped or the pipeline should stop"
   Hint: "Gold reads from silver. If silver failed, there is no valid data for gold to consume."
 
 - Class: cmd_question
@@ -104,8 +161,9 @@
   Output: |
     Write a `run_with_logging` method for a Pipeline class that iterates
     through sorted flows, executes each one inside a try/except, and
-    collects results in a dictionary with keys 'status' and 'rows' (or 'error').
-    Use Python's `logging` module.
+    collects results in a dictionary with keys 'status' and 'rows' (or
+    'error'). Use Python's `logging` module. Re-raise the exception so
+    downstream steps do not run.
   CorrectAnswer: |
     import logging
 
@@ -133,23 +191,56 @@
 - Class: text
   Depth: advanced
   Output: |
-    **Deployment patterns** for Spark pipelines:
+    ## Idempotency: Run It Twice, Get the Same Result
 
-    1. **spark-submit**: the classic approach. Package your code as a .py
-       file or .zip and submit to the cluster:
-       ```bash
-       spark-submit --master spark://master:7077 pipeline.py
-       ```
+    A pipeline is **idempotent** if running it twice with the same input
+    produces the same output without side effects. This is critical for
+    production because pipelines will be retried after failures.
 
-    2. **Orchestration with Airflow/Dagster**: schedule pipeline runs,
-       handle retries, and manage dependencies between pipelines.
+    Your pipeline is already idempotent because:
 
-    3. **Containerized**: package Spark + your code in a Docker image,
-       submit via Kubernetes (`spark-submit --master k8s://...`).
+    1. **Bronze deduplicates** by `order_id` — re-ingesting the same
+       CSV produces the same set of rows
+    2. **Silver uses deterministic transforms** — casts, filters, and
+       arithmetic produce the same output for the same input
+    3. **Temp views are replaced** — `createOrReplaceTempView` overwrites
+       the previous result, not appends to it
 
-    4. **Monitoring**: expose pipeline metrics (rows processed, duration,
-       errors) to Prometheus/Grafana. Use Spark's metrics system or
-       custom counters.
+    If you persist results to storage, use `mode("overwrite")` or
+    Iceberg's `createOrReplace` — never `mode("append")` for batch
+    pipelines, as re-running would create duplicate rows.
+
+- Class: mult_question
+  Depth: advanced
+  Output: "Why should batch pipelines avoid using mode('append') for writes?"
+  AnswerChoices: "Because re-running the pipeline creates duplicate rows;Because append is slower than overwrite;Because append does not support Parquet;Because append locks the table"
+  CorrectAnswer: "Because re-running the pipeline creates duplicate rows"
+  Hint: "If you run the pipeline twice, append writes the same data twice."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Deployment Patterns
+
+    Your Pipeline class runs locally in this course, but the same code
+    runs in production with different submission methods:
+
+    **1. spark-submit** — the standard way to run Spark jobs:
+    ```bash
+    spark-submit --master spark://master:7077 pipeline.py
+    ```
+
+    **2. Orchestration (Airflow/Dagster)** — schedule pipeline runs,
+    handle retries, and manage dependencies between multiple pipelines.
+    Each pipeline becomes a task in a DAG.
+
+    **3. Containerized (Kubernetes)** — package Spark + your code in a
+    Docker image and submit via `spark-submit --master k8s://...`.
+    Executor pods are created and destroyed per job.
+
+    **4. Monitoring** — expose pipeline metrics (rows processed,
+    duration, errors) to Prometheus/Grafana. The `results` dictionary
+    from `run_with_logging` is a natural starting point.
 
 - Class: mult_question
   Depth: advanced
@@ -158,40 +249,29 @@
   CorrectAnswer: "Containerized with Kubernetes"
   Hint: "Kubernetes orchestrates containers. Spark on K8s launches executor pods from a Docker image."
 
-- Class: text
-  Depth: advanced
-  Output: |
-    **Idempotency** is a key property for production pipelines. A pipeline
-    is idempotent if running it twice with the same input produces the same
-    output without side effects.
-
-    To achieve idempotency:
-    - Use `mode("overwrite")` or Iceberg's `createOrReplace` for writes
-    - Never use `mode("append")` for batch pipelines (it creates duplicates)
-    - Include deduplication logic in bronze
-    - Use deterministic transformations (avoid `f.rand()` in silver/gold)
-
-- Class: mult_question
-  Depth: advanced
-  Output: "Why should batch pipelines avoid using `mode('append')` for writes?"
-  AnswerChoices: "Because re-running the pipeline creates duplicate rows;Because append is slower than overwrite;Because append does not support Parquet;Because append locks the table"
-  CorrectAnswer: "Because re-running the pipeline creates duplicate rows"
-  Hint: "If you run the pipeline twice, append writes the same data twice."
-
 - Class: script
   Depth: all
   Output: |
-    This is the capstone exercise. Open `starter.py` and build a complete
-    end-to-end pipeline that:
+    ## Capstone Exercise: End-to-End Pipeline
 
-    1. **Bronze**: reads raw CSV, adds metadata, deduplicates
-    2. **Silver**: casts types, computes total, filters nulls, extracts hour
-    3. **Gold**: groups by product, computes order_count + revenue + avg,
-       ranks by revenue
-    4. Uses the Pipeline framework with `@pipe.materialized_view()`
-    5. Calls `pipe.run()` to execute everything in order
+    This is the final exercise. Open the starter file and build a
+    complete pipeline that connects all three layers:
 
-    The test harness will verify all three layers produce correct output.
+    1. **Bronze** (`bronze_orders`): read raw CSV with an all-string
+       schema, add `_ingested_at` and `_source_file` metadata,
+       deduplicate by `order_id`
+    2. **Silver** (`silver_orders`): read from `bronze_orders` temp
+       view, cast `price` to double and `quantity` to int, compute
+       `total` (price * quantity), filter out null prices, extract
+       `order_hour` from the timestamp
+    3. **Gold** (`gold_product_summary`): read from `silver_orders`
+       temp view, group by `product`, compute `order_count`,
+       `total_revenue`, `avg_order_value`, and add `revenue_rank`
+    4. Register all three with `@pipe.materialized_view()` and
+       call `pipe.run()`
+
+    The test harness feeds in a CSV with clean and dirty rows, then
+    verifies all three layers produce correct output.
   StarterFile: starter.py
   SolutionFile: solution.py
   Hint: "Combine everything from lessons 04-07. Register three functions with the pipeline decorator."
@@ -199,17 +279,32 @@
 - Class: text
   Depth: all
   Output: |
-    You have completed the **Spark Declarative Pipelines** course!
+    ## Course Complete!
 
-    Here is what you learned:
-    - **Lesson 1**: Creating and configuring a SparkSession
-    - **Lesson 2**: Core transforms -- select, filter, withColumn, UDFs
-    - **Lesson 3**: Reading and writing data in CSV, Parquet, and Iceberg
-    - **Lesson 4**: A reusable Pipeline framework with decorators and topo sort
-    - **Lesson 5**: Bronze layer -- raw ingestion with metadata and dedup
-    - **Lesson 6**: Silver layer -- type casting, joins, JSON parsing
-    - **Lesson 7**: Gold layer -- aggregations, window functions, rankings
-    - **Lesson 8**: Full pipeline -- connecting layers with error handling
+    You have built a production-style data pipeline from scratch.
+    Here is what you learned across all eight lessons:
+
+    | Lesson | What You Built |
+    |--------|---------------|
+    | 1. SparkSession | The entry point — configured for local development |
+    | 2. Functions & Transforms | select, filter, withColumn, f.col, f.when |
+    | 3. Reading & Writing Data | DataFrameReader/Writer, schemas, Parquet, write modes |
+    | 4. Pipeline Framework | Decorator registration, dependency detection, topo sort |
+    | 5. Bronze Layer | Raw ingestion, metadata columns, deduplication |
+    | 6. Silver Layer | Type casting, null handling, enrichment joins, JSON parsing |
+    | 7. Gold Layer | Aggregations, window functions, rankings |
+    | 8. Full Pipeline | End-to-end wiring, error handling, idempotency |
+
+    The first three lessons gave you the Spark vocabulary. Lesson 4
+    gave you the orchestration framework. Lessons 5-7 used both to
+    build the three medallion layers. And this lesson connected
+    everything into a working pipeline.
+
+    **Where to go from here:**
+    - Add persistent storage with Parquet or Iceberg tables
+    - Replace the CSV source with a Kafka stream
+    - Deploy with spark-submit or an orchestrator like Airflow
+    - Add data quality checks between layers
 
     You are now equipped to build production-grade data pipelines with
-    Apache Spark 4.1. Happy engineering!
+    Apache Spark. Happy engineering!

@@ -1,0 +1,283 @@
+- Class: meta
+  Lesson: Data Lakes & Lakehouses
+  EstimatedMinutes: 25
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    You have learned to read Parquet files, run SQL queries, and even
+    process streaming data. But what happens when two jobs write to the
+    same table at once? What if a write fails halfway? How do you query
+    last week's version of your data?
+
+    Plain files (Parquet, CSV) cannot answer these questions. **Lakehouse
+    table formats** add the reliability of a database to the scale of a
+    data lake.
+
+    By the end of this lesson you will be able to:
+
+    - Explain the evolution from data lakes to lakehouses
+    - Compare Delta Lake, Apache Iceberg, and Apache Hudi
+    - Describe ACID guarantees and why they matter
+    - Use schema enforcement and schema evolution
+    - Query historical data with time travel
+    - Understand when to choose which format
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Evolution of Data Architectures
+
+    **Databases** (1970s-2000s) — structured, ACID-compliant, limited
+    scale. Great for transactions, expensive for large analytics.
+
+    **Data warehouses** — optimized for analytics, structured data,
+    expensive to scale. Good for BI but rigid schemas.
+
+    **Data lakes** (2010s) — store everything cheaply on distributed
+    storage (HDFS, S3, ADLS). Schema-on-read means any format goes.
+    Problem: no transactions, no quality enforcement, data becomes a
+    "data swamp."
+
+    **Lakehouses** (2020s) — combine lake storage with warehouse
+    reliability. You get cheap, scalable storage with ACID transactions,
+    schema enforcement, and time travel.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    A data lake is like a massive warehouse where you dump everything —
+    boxes of documents, photos, recordings — in whatever format. It is
+    cheap and flexible, but things get messy fast. You cannot undo a
+    mistake, and two people dropping boxes at the same time can corrupt
+    each other's work.
+
+    A lakehouse adds organization: labeled shelves (schema enforcement),
+    an inventory system (transaction log), and the ability to undo
+    mistakes (time travel). You keep the flexibility of a lake with the
+    reliability of a database.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Three Major Lakehouse Formats
+
+    **Delta Lake** — developed by Databricks. Uses a JSON-based
+    transaction log (`_delta_log/`). Deep Spark integration. Strong
+    community and tooling.
+
+    **Apache Iceberg** — developed at Netflix. Uses metadata files with
+    manifest lists. Designed for multi-engine access (Spark, Trino, Flink,
+    Dremio). Supports hidden partitioning and partition evolution.
+
+    **Apache Hudi** — developed at Uber. Optimized for upserts and
+    incremental processing. Good for streaming + change data capture (CDC).
+
+    All three provide ACID transactions, schema enforcement, time travel,
+    and merge (upsert) operations. The choice depends on your ecosystem.
+
+    **Docs:**
+    [Delta Lake Quickstart](https://docs.delta.io/latest/quick-start.html) |
+    [Iceberg Spark Guide](https://iceberg.apache.org/docs/latest/spark-getting-started/) |
+    [Hudi Spark Guide](https://hudi.apache.org/docs/quick-start-guide)
+    — setup, read/write, time travel, and schema evolution for each format.
+
+- Class: mult_question
+  Depth: all
+  Output: "What key problem do lakehouse formats solve that plain data lake files (Parquet/CSV) cannot?"
+  AnswerChoices: "ACID transactions, schema enforcement, and reliable concurrent writes;Cheaper storage costs;Faster file I/O speeds;Better compression ratios"
+  CorrectAnswer: "ACID transactions, schema enforcement, and reliable concurrent writes"
+  Hint: "What guarantees are missing when two Spark jobs write to the same Parquet directory at once?"
+
+- Class: text
+  Depth: all
+  Output: |
+    ## ACID Guarantees
+
+    Lakehouses provide the same ACID properties as databases:
+
+    - **Atomicity** — a write either succeeds completely or not at all.
+      No partial writes that leave corrupt data.
+    - **Consistency** — schema enforcement ensures every row matches the
+      table schema. Bad data is rejected at write time.
+    - **Isolation** — concurrent readers see consistent snapshots. A reader
+      never sees a half-written batch.
+    - **Durability** — once a write is committed, it is permanent — stored
+      in the transaction log.
+
+    These guarantees mean you can run pipelines confidently without
+    worrying about data corruption from failures or concurrency.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Schema Enforcement and Evolution
+
+    **Schema enforcement** rejects writes that do not match the table
+    schema. If your pipeline accidentally produces a column with the wrong
+    type, the write fails immediately instead of silently corrupting data.
+
+    **Schema evolution** lets you safely add columns or widen types without
+    rewriting existing data:
+
+    ```python
+    # Delta Lake — merge schema on append
+    (new_df.write
+        .format("delta")
+        .mode("append")
+        .option("mergeSchema", "true")
+        .save(path))
+
+    # Iceberg — ALTER TABLE
+    spark.sql("ALTER TABLE catalog.db.events ADD COLUMN browser STRING")
+    ```
+
+    Existing data is unchanged — new columns appear as `null` in old rows.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Time Travel: Querying Historical Data
+
+    Every write creates a new **version** (or **snapshot**). You can query
+    any previous version:
+
+    ```python
+    # Delta Lake — by version number
+    spark.read.format("delta").option("versionAsOf", 5).load(path)
+
+    # Delta Lake — by timestamp
+    spark.read.format("delta").option("timestampAsOf", "2025-01-15").load(path)
+
+    # Iceberg — by snapshot ID
+    spark.read.format("iceberg").option("snapshot-id", 12345).load("db.table")
+    ```
+
+    Use cases for time travel:
+    - **Auditing** — prove what data looked like at a specific date
+    - **Debugging** — compare current vs. previous versions to find when
+      data went wrong
+    - **Reproducibility** — re-run an analysis on the exact data it
+      originally used
+
+- Class: mult_question
+  Depth: all
+  Output: "What is time travel in the context of lakehouse tables?"
+  AnswerChoices: "Querying historical versions of data as they existed at a past point in time;Moving data between time zones;Scheduling writes for future execution;Compressing old data files"
+  CorrectAnswer: "Querying historical versions of data as they existed at a past point in time"
+  Hint: "Each write creates a new version. Time travel lets you look at any previous version."
+
+- Class: cmd_question
+  Depth: intermediate
+  Output: |
+    Write a DataFrame `df` to a Delta table at `'/data/events'`, then
+    read back version 0 (the original) into a variable called `df_v0`.
+  CorrectAnswer: |
+    df.write.format("delta").mode("overwrite").save("/data/events")
+
+    df_v0 = spark.read.format("delta").option("versionAsOf", 0).load("/data/events")
+  Hint: "Write with format('delta'), then read with option('versionAsOf', 0)."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Delta Lake vs. Iceberg: Choosing a Format
+
+    | Feature | Delta Lake | Apache Iceberg |
+    |---------|-----------|----------------|
+    | Transaction log | JSON + checkpoint Parquet | Metadata files + manifests |
+    | Multi-engine | Spark-centric (expanding) | Spark, Trino, Flink, Dremio |
+    | Partitioning | Explicit `PARTITIONED BY` | Hidden partitioning, partition evolution |
+    | Schema evolution | mergeSchema option | ALTER TABLE, full type promotion |
+    | Community | Databricks-led | Apache Foundation, multi-vendor |
+
+    **Choose Delta** when working primarily with Spark and Databricks.
+    **Choose Iceberg** when you need multi-engine access or advanced
+    partition management.
+
+    Both support ACID, time travel, schema evolution, and merge operations.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Maintenance Operations
+
+    Lakehouse tables accumulate old data files over time. Regular
+    maintenance keeps them performant:
+
+    **Compaction** — merge small files into larger ones for better read
+    performance.
+
+    **Vacuum / Expire snapshots** — remove old data files no longer
+    needed by any active version:
+    ```python
+    # Delta Lake
+    spark.sql("VACUUM delta.`/data/events` RETAIN 168 HOURS")
+
+    # Iceberg
+    spark.sql("CALL catalog.system.expire_snapshots('db.events', TIMESTAMP '2025-01-01')")
+    ```
+
+    **History** — view all operations:
+    ```python
+    spark.sql("DESCRIBE HISTORY delta.`/data/events`")
+    ```
+
+    Never vacuum below the default retention (7 days for Delta) unless
+    you are certain no long-running queries need older versions.
+
+- Class: mult_question
+  Depth: advanced
+  Output: "Which lakehouse format is generally considered most portable across different query engines?"
+  AnswerChoices: "Apache Iceberg;Delta Lake;Apache Hudi;Apache Parquet"
+  CorrectAnswer: "Apache Iceberg"
+  Hint: "This format was designed with multi-engine support as a core goal."
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Lakehouse Simulation
+
+    Since this exercise runs in dry-run mode (no Delta/Iceberg JARs
+    required), you will simulate lakehouse concepts using versioned
+    Parquet directories.
+
+    Implement `lakehouse_simulation(spark, base_path)`:
+
+    1. Create initial employee data and write as "version 0"
+    2. Add new employees and write combined data as "version 1"
+    3. Read both versions to demonstrate time travel
+    4. Verify schema consistency between versions
+    5. Return a dict with both versions and schema comparison
+
+    This simulates the core lakehouse workflow: write, evolve, query
+    historical versions.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Use spark.createDataFrame with SCHEMA, write each version to a versioned subdirectory, read both back, and compare schemas."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    In this lesson you learned:
+
+    - **Data architecture evolution** — databases → warehouses → lakes →
+      lakehouses
+    - **Three formats** — Delta Lake, Apache Iceberg, Apache Hudi provide
+      ACID transactions on data lake storage
+    - **ACID guarantees** — atomicity, consistency, isolation, durability
+      prevent corruption from failures and concurrency
+    - **Schema enforcement/evolution** — reject bad writes, safely add
+      columns
+    - **Time travel** — query any historical version for auditing,
+      debugging, or reproducibility
+    - **Maintenance** — vacuum/expire old snapshots, compact small files
+
+    You now understand the storage layer that production data platforms
+    are built on. In the final lesson, you will use everything you have
+    learned as we explore **machine learning with MLlib** — Spark's
+    built-in library for training and deploying models at scale.

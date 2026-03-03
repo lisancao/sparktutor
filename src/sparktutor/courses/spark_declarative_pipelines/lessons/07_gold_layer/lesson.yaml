@@ -1,20 +1,42 @@
 - Class: meta
   Lesson: "Gold Layer"
-  EstimatedMinutes: 15
+  EstimatedMinutes: 20
 
 - Class: text
   Depth: all
   Output: |
-    The **gold layer** produces business-ready aggregations. While bronze
-    preserves raw data and silver cleans it, gold answers specific business
-    questions:
+    ## What You'll Learn
+
+    Bronze preserved raw data. Silver cleaned and enriched it. Now the
+    **gold layer** transforms that trusted data into business-ready
+    aggregations that answer specific questions.
+
+    By the end of this lesson you will be able to:
+
+    - Use `groupBy().agg()` to compute summaries (count, sum, avg, min, max)
+    - Name aggregated columns clearly with `alias()`
+    - Build hourly/daily summaries from time-extracted columns
+    - Use window functions for running totals and rankings (intermediate)
+    - Handle data skew with two-phase salted aggregation (advanced)
+
+    Gold tables are the ones your stakeholders actually see — in
+    dashboards, reports, and ML feature stores.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## From Silver to Gold
+
+    The silver layer you built in the previous lesson produces a DataFrame
+    with clean types, a computed `total` column, and an `order_hour`
+    extracted from the timestamp. Gold reads that silver output and
+    answers business questions like:
 
     - "What is the total revenue per product?"
     - "How many orders per hour?"
-    - "What is the running total of sales this month?"
+    - "Which product generates the most revenue?"
 
-    Gold tables are typically consumed by dashboards, reports, and ML
-    feature stores.
+    The pattern is always: **group → aggregate → (optionally) rank or sort**.
 
 - Class: text
   Depth: beginner
@@ -34,7 +56,37 @@
     )
     ```
 
-    `alias()` gives each aggregated column a meaningful name.
+    `groupBy("product")` creates one group per unique product value.
+    `agg()` then computes one or more aggregate expressions within each
+    group. `alias()` gives each result column a meaningful name — without
+    it, Spark generates names like `sum(total)` which are hard to work
+    with downstream.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Common Aggregate Functions
+
+    These are the functions you will use most often inside `agg()`:
+
+    | Function              | Description                    |
+    |-----------------------|--------------------------------|
+    | `f.count("*")`        | Number of rows                 |
+    | `f.sum("col")`        | Sum of values                  |
+    | `f.avg("col")`        | Average (mean)                 |
+    | `f.min("col")`        | Minimum value                  |
+    | `f.max("col")`        | Maximum value                  |
+    | `f.countDistinct("c")`| Number of unique values        |
+
+    You can pass multiple expressions to `agg()` — Spark computes them
+    all in a single pass over the data.
+
+    **Docs:**
+    [f.sum](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.functions.sum.html) |
+    [f.avg](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.functions.avg.html) |
+    [f.count](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.functions.count.html) |
+    [f.countDistinct](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.functions.countDistinct.html) |
+    [Column.alias](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.Column.alias.html)
 
 - Class: mult_question
   Depth: all
@@ -59,20 +111,6 @@
         )
     )
   Hint: "Use groupBy('product').agg(f.sum(...).alias(...), f.sum(...).alias(...))"
-
-- Class: text
-  Depth: all
-  Output: |
-    Common aggregate functions:
-
-    | Function              | Description                    |
-    |-----------------------|--------------------------------|
-    | `f.count("*")`        | Number of rows                 |
-    | `f.sum("col")`        | Sum of values                  |
-    | `f.avg("col")`        | Average (mean)                 |
-    | `f.min("col")`        | Minimum value                  |
-    | `f.max("col")`        | Maximum value                  |
-    | `f.countDistinct("c")`| Number of unique values        |
 
 - Class: mult_question
   Depth: all
@@ -103,10 +141,15 @@
 - Class: text
   Depth: intermediate
   Output: |
-    **Window functions** compute values across a set of rows related to the
-    current row, without collapsing them into a single row like groupBy does.
+    ## Window Functions: Aggregation Without Collapse
 
-    Common use case: running totals, rankings, moving averages.
+    `groupBy` collapses rows — one output row per group. **Window
+    functions** compute values across related rows while keeping every
+    row in the output. This makes them perfect for:
+
+    - **Running totals** — cumulative sum up to the current row
+    - **Rankings** — rank products by revenue
+    - **Moving averages** — average over a sliding window of rows
 
     ```python
     from pyspark.sql import Window
@@ -118,8 +161,16 @@
     df = df.withColumn("running_revenue", f.sum("total").over(w))
     ```
 
-    This computes a cumulative sum of `total` for each product, ordered
-    by date.
+    `partitionBy` defines the groups (like groupBy, but rows are not
+    collapsed). `orderBy` defines the row ordering within each group.
+    `rowsBetween` defines which rows to include in the computation
+    relative to the current row.
+
+    **Docs:**
+    [Window](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.Window.html) — `partitionBy()`, `orderBy()`, `rowsBetween()`, `rangeBetween()` |
+    [f.rank](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.functions.rank.html) |
+    [f.dense_rank](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.functions.dense_rank.html) |
+    [f.row_number](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.functions.row_number.html)
 
 - Class: cmd_question
   Depth: intermediate
@@ -137,28 +188,57 @@
   Hint: "Define a Window with partitionBy, orderBy, and rowsBetween. Use f.sum().over(window)."
 
 - Class: text
+  Depth: intermediate
+  Output: |
+    ## Rankings with Window Functions
+
+    A common gold-layer pattern is ranking — "which product has the
+    highest revenue?" Use `f.rank()` or `f.dense_rank()` over a window
+    ordered by the metric:
+
+    ```python
+    rank_window = Window.orderBy(f.col("revenue").desc())
+    gold = gold.withColumn("revenue_rank", f.rank().over(rank_window))
+    ```
+
+    - `f.rank()` — ties get the same rank, next rank is skipped (1, 2, 2, 4)
+    - `f.dense_rank()` — ties get the same rank, no gap (1, 2, 2, 3)
+    - `f.row_number()` — no ties, arbitrary tiebreaking (1, 2, 3, 4)
+
+    Rankings are especially useful for "top N" queries — filter to
+    `revenue_rank <= 10` to get the top 10 products.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "What is the difference between f.rank() and f.dense_rank()?"
+  AnswerChoices: "rank() skips numbers after ties while dense_rank() does not;They are identical;rank() is faster;dense_rank() only works with partitions"
+  CorrectAnswer: "rank() skips numbers after ties while dense_rank() does not"
+  Hint: "With values 100, 90, 90, 80: rank gives 1,2,2,4 while dense_rank gives 1,2,2,3."
+
+- Class: text
   Depth: advanced
   Output: |
-    **Performance tuning** for gold aggregations:
+    ## Performance Tuning for Gold Aggregations
 
-    1. **Reduce shuffle partitions**: for small to medium datasets, set
-       `spark.sql.shuffle.partitions` to 8-32 instead of the default 200.
+    Gold-layer aggregations involve shuffles — Spark must redistribute
+    data so all rows with the same key end up on the same partition.
+    Three techniques to make this faster:
 
-    2. **Cache intermediate results**: if a silver DataFrame is used by
-       multiple gold aggregations, cache it first:
-       ```python
-       silver_df.cache()
-       silver_df.count()  # materialize the cache
-       ```
+    **1. Tune shuffle partitions.** The default `spark.sql.shuffle.partitions`
+    is 200, which is too many for small to medium datasets. For datasets
+    under a few GB, try 8-32 partitions.
 
-    3. **Repartition before groupBy**: if data is heavily skewed, repartition
-       on the groupBy key first:
-       ```python
-       silver_df.repartition("product").groupBy("product").agg(...)
-       ```
+    **2. Cache the silver input.** If multiple gold tables read from the
+    same silver DataFrame, cache it to avoid recomputation:
+    ```python
+    silver_df.cache()
+    silver_df.count()  # materialize the cache
+    ```
 
-    4. **Two-phase aggregation**: for extremely skewed keys, add a random
-       salt, aggregate partially, then aggregate again without the salt.
+    **3. Two-phase (salted) aggregation.** When a single key dominates
+    the data (e.g., 80% of orders are for one product), that key's
+    partition becomes a bottleneck. The solution: add a random salt,
+    aggregate partially, then aggregate again without the salt.
 
 - Class: mult_question
   Depth: advanced
@@ -193,12 +273,20 @@
 - Class: script
   Depth: all
   Output: |
-    Build a complete gold aggregation. Open `starter.py` and implement
-    `gold_product_summary` that:
-    1. Reads from the `silver_orders` temp view
-    2. Groups by `product`
-    3. Computes `order_count`, `total_revenue`, `avg_order_value`
-    4. Adds a `revenue_rank` column using a window function (rank by total_revenue desc)
+    ## Exercise: Build a Gold Aggregation
+
+    Open the starter file and implement `gold_product_summary(spark)`:
+
+    1. Read from the `silver_orders` temp view
+    2. Group by `product`
+    3. Compute `order_count` (count), `total_revenue` (sum of total),
+       and `avg_order_value` (avg of total)
+    4. Add a `revenue_rank` column using a window function
+       (rank by total_revenue descending)
+    5. Return the gold DataFrame
+
+    The test harness creates silver data with multiple products and
+    verifies your aggregation and ranking are correct.
   StarterFile: starter.py
   SolutionFile: solution.py
   Hint: "groupBy product, agg for counts and sums, then use Window with f.rank().over(w)."
@@ -206,6 +294,16 @@
 - Class: text
   Depth: all
   Output: |
-    Your gold layer now produces clean, aggregated, business-ready data.
-    In the final lesson you will connect all three layers into a single
-    end-to-end pipeline.
+    ## Summary
+
+    Your gold layer produces clean, aggregated, business-ready data:
+
+    - **groupBy + agg** — the core pattern for summaries
+    - **Aggregate functions** — count, sum, avg, min, max, countDistinct
+    - **alias()** — give computed columns meaningful names
+    - **Window functions** — running totals, rankings, moving averages
+    - **Two-phase aggregation** — handle data skew for hot keys
+
+    You now have all three layers of the medallion architecture. In the
+    final lesson, you will connect them into a **single end-to-end
+    pipeline** with error handling and deployment patterns.

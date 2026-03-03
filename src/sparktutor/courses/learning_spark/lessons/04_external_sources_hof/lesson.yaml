@@ -1,0 +1,317 @@
+- Class: meta
+  Lesson: Complex Types & Higher-Order Functions
+  EstimatedMinutes: 25
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    Real-world data is rarely flat. JSON from APIs contains nested objects
+    and arrays. Event logs carry lists of tags. User profiles have maps of
+    preferences. Spark handles all of this natively.
+
+    In the previous lesson you read flat CSV and Parquet files. Now you
+    will learn to work with the **complex types** that appear in real data:
+
+    - Arrays, maps, and nested structs
+    - `explode` to flatten arrays into rows
+    - Higher-order functions (`transform`, `filter`, `exists`, `aggregate`)
+      that operate on arrays *without* exploding them
+    - `collect_list` and `collect_set` to reassemble arrays from rows
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Complex Type Schemas
+
+    Spark supports three complex types within `StructType` schemas:
+
+    **ArrayType** — an ordered list of elements (all same type):
+    ```python
+    StructField("tags", ArrayType(StringType()))
+    ```
+
+    **MapType** — key-value pairs:
+    ```python
+    StructField("preferences", MapType(StringType(), StringType()))
+    ```
+
+    **Nested StructType** — a struct within a struct:
+    ```python
+    StructField("address", StructType([
+        StructField("city", StringType()),
+        StructField("state", StringType()),
+        StructField("zip", StringType()),
+    ]))
+    ```
+
+    You access nested fields with dot notation: `col("address.city")`.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Think of complex types in terms of everyday data:
+
+    - An **array** is like a shopping list — ordered items:
+      `["milk", "eggs", "bread"]`
+    - A **map** is like a settings page — keys and values:
+      `{"theme": "dark", "language": "en"}`
+    - A **nested struct** is like a mailing label — a group of related
+      fields bundled together: `{city: "SF", state: "CA", zip: "94102"}`
+
+    Spark can read, filter, and transform all of these without you having
+    to flatten them first.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Explode: Arrays to Rows
+
+    `explode()` turns each element of an array into its own row. This is a
+    one-to-many operation:
+
+    ```python
+    from pyspark.sql import functions as f
+
+    # Before: id=1, tags=["spark", "python", "data"]
+    # After:  three rows — (1, "spark"), (1, "python"), (1, "data")
+
+    df.select("id", f.explode("tags").alias("tag"))
+    ```
+
+    `posexplode()` also returns the position index:
+    ```python
+    df.select("id", f.posexplode("tags").alias("pos", "tag"))
+    # (1, 0, "spark"), (1, 1, "python"), (1, 2, "data")
+    ```
+
+    Use explode when you need to analyze individual array elements as rows.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Given a DataFrame `df` with columns `id` and `tags` (an array of
+    strings), use `explode` to create one row per tag. Keep the `id`
+    column and alias the exploded column as `"tag"`.
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+
+    result = df.select("id", f.explode("tags").alias("tag"))
+  Hint: "Use f.explode('tags') inside select(), with .alias('tag') to name the output column."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Collect: Rows Back to Arrays
+
+    The reverse of explode — `collect_list()` and `collect_set()` gather
+    rows back into arrays during aggregation:
+
+    ```python
+    # Collect all tags per user into an array
+    df.groupBy("user_id").agg(
+        f.collect_list("tag").alias("all_tags"),
+        f.collect_set("tag").alias("unique_tags")
+    )
+    ```
+
+    `collect_list` preserves duplicates and order. `collect_set` removes
+    duplicates (order is not guaranteed).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Higher-Order Functions
+
+    Exploding an array creates many rows, which is expensive. For
+    transformations that should stay within the array, Spark provides
+    **higher-order functions** that operate element-by-element:
+
+    **`transform()`** — apply a function to every element (like Python's
+    `map()`):
+    ```python
+    df.select(f.transform("prices", lambda x: x * 1.1).alias("with_tax"))
+    ```
+
+    **`filter()`** — keep elements matching a condition:
+    ```python
+    df.select(f.filter("scores", lambda x: x > 80).alias("passing"))
+    ```
+
+    **`exists()`** — true if any element matches:
+    ```python
+    df.select(f.exists("tags", lambda x: x == "urgent").alias("is_urgent"))
+    ```
+
+    These keep your DataFrame structure intact — no explosion of rows.
+
+    **Docs:**
+    [transform](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.transform.html) |
+    [filter (HOF)](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.filter.html) |
+    [exists](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.exists.html) |
+    [aggregate](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.aggregate.html) |
+    [explode](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.explode.html) |
+    [collect_list](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.collect_list.html)
+
+- Class: mult_question
+  Depth: all
+  Output: "Which higher-order function applies a transformation to every element of an array without creating new rows?"
+  AnswerChoices: "transform();explode();map();foreach()"
+  CorrectAnswer: "transform()"
+  Hint: "This function works like Python's map() but operates directly on array columns."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Given a DataFrame `df` with an array column `items` (strings), use
+    `transform` to create a new column `items_upper` that contains
+    the uppercased version of every item.
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+
+    result = df.withColumn("items_upper", f.transform("items", lambda x: f.upper(x)))
+  Hint: "Use f.transform('items', lambda x: f.upper(x)) inside withColumn."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Aggregate: Folding an Array
+
+    `aggregate()` folds an array into a single value, like Python's
+    `functools.reduce()`. It takes four arguments:
+
+    ```python
+    f.aggregate(
+        "column",          # the array column
+        f.lit(0),          # initial accumulator value (zero)
+        lambda acc, x: acc + x,   # merge function
+        lambda acc: acc           # finish function (optional)
+    )
+    ```
+
+    **Example — sum all elements in an array:**
+    ```python
+    df.select(f.aggregate("scores", f.lit(0), lambda acc, x: acc + x).alias("total"))
+    ```
+
+    **Example — concatenate strings with a separator:**
+    ```python
+    df.select(f.aggregate(
+        "words",
+        f.lit(""),
+        lambda acc, x: f.concat(acc, f.lit(" "), x),
+        lambda acc: f.trim(acc)
+    ).alias("sentence"))
+    ```
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "What does aggregate() do with an array column?"
+  AnswerChoices: "Folds the array into a single value using an accumulator function;Splits the array into multiple rows;Sorts the array elements;Counts the number of elements"
+  CorrectAnswer: "Folds the array into a single value using an accumulator function"
+  Hint: "Think of Python's functools.reduce() — it takes an initial value and combines elements one by one."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Working with Maps
+
+    Map columns store key-value pairs. Access values with bracket notation
+    or `element_at()`:
+
+    ```python
+    # Access a specific key
+    df.select(df["preferences"]["theme"])      # bracket notation
+    df.select(f.element_at("preferences", "theme"))  # function
+
+    # Get all keys or values
+    df.select(f.map_keys("preferences"))
+    df.select(f.map_values("preferences"))
+
+    # Explode a map into key-value rows
+    df.select(f.explode("preferences").alias("key", "value"))
+    ```
+
+    You can also create maps:
+    ```python
+    df.withColumn("meta", f.create_map(
+        f.lit("source"), f.col("source_name"),
+        f.lit("version"), f.col("version")
+    ))
+    ```
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Performance: Explode vs. Higher-Order Functions
+
+    `explode()` is convenient but has a cost: it multiplies the number of
+    rows, which increases shuffle sizes and memory usage. If an array
+    column averages 10 elements, exploding it makes your DataFrame 10x
+    larger.
+
+    Higher-order functions (`transform`, `filter`, `aggregate`) avoid this
+    by operating within each row. They are:
+    - More memory-efficient (no row multiplication)
+    - Faster for large arrays (no shuffle expansion)
+    - Easier to reason about (output has same row count as input)
+
+    **When to explode**: you need to join or group by individual array
+    elements. **When to use HOFs**: you need to transform, filter, or
+    reduce array contents while keeping the row structure intact.
+
+- Class: cmd_question
+  Depth: intermediate
+  Output: |
+    Given a DataFrame `df` with an array column `items` (strings), use
+    `filter` to create a new column `p_items` containing only items that
+    start with the letter "p".
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+
+    result = df.withColumn("p_items", f.filter("items", lambda x: x.startswith("p")))
+  Hint: "Use f.filter('items', lambda x: x.startswith('p')) to keep only elements starting with 'p'."
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Order Analysis with HOFs
+
+    Implement `analyze_orders(spark)` that creates order data with array
+    columns and demonstrates higher-order functions:
+
+    1. Create a DataFrame with columns: order_id, region, total, items (array)
+    2. Use `transform()` to uppercase all items → new column `items_upper`
+    3. Use `filter()` to keep only items starting with "p" → new column `p_items`
+    4. Add a window-based rank by total (descending) within each region
+    5. Return the result
+
+    This exercise combines complex type operations with window functions —
+    a common pattern in real analytics.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Use f.transform with f.upper(), f.filter with startswith(), and Window.partitionBy().orderBy() with f.rank()."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    In this lesson you learned:
+
+    - **Complex types** — `ArrayType`, `MapType`, and nested `StructType`
+      model real-world nested data
+    - **explode / posexplode** — flatten arrays into rows for per-element
+      analysis
+    - **collect_list / collect_set** — reassemble rows into arrays during
+      aggregation
+    - **Higher-order functions** — `transform`, `filter`, `exists`, and
+      `aggregate` operate on arrays without creating extra rows
+    - **Map operations** — `element_at`, `map_keys`, `map_values`, and
+      `create_map`
+
+    You can now handle any data shape Spark throws at you. In the next
+    lesson, you will dive into Spark SQL — the query engine that powers
+    both the DataFrame API and SQL queries — and learn to read execution
+    plans and write user-defined functions.
