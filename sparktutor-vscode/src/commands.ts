@@ -57,6 +57,10 @@ export function getSavedSession(): SavedSession | undefined {
   return extensionContext?.globalState.get<SavedSession>("sparktutorSession");
 }
 
+export function clearSavedSession(): void {
+  extensionContext?.globalState.update("sparktutorSession", undefined);
+}
+
 export function registerCommands(
   context: vscode.ExtensionContext,
   bridge: Bridge,
@@ -89,7 +93,7 @@ export function registerCommands(
   context.subscriptions.push(
     vscode.commands.registerCommand(
       "sparktutor.openLesson",
-      async (courseId: string, lessonIdx: number, depth?: string) => {
+      async (courseId: string, lessonIdx: number, depth?: string, skipResumePrompt?: boolean) => {
         if (depth) {
           currentDepth = depth; // pre-set so pickDepth isn't triggered
         }
@@ -102,7 +106,8 @@ export function registerCommands(
           statusBar,
           courseId,
           lessonIdx,
-          depth
+          depth,
+          skipResumePrompt
         );
       }
     ),
@@ -257,7 +262,8 @@ export function registerCommands(
           statusBar,
           currentCourseId,
           currentLessonIdx,
-          currentDepth
+          currentDepth,
+          true // skipResumePrompt — we just reset
         );
 
         vscode.window.showInformationMessage("Lesson reset successfully.");
@@ -304,7 +310,8 @@ async function openLesson(
   statusBar: StatusBarManager,
   courseId: string,
   lessonIdx: number,
-  depth?: string
+  depth?: string,
+  skipResumePrompt?: boolean
 ): Promise<void> {
   try {
     // Prompt for depth on first lesson open
@@ -318,13 +325,37 @@ async function openLesson(
     }
     const effectiveDepth = depth || currentDepth || "beginner";
 
+    // Detect course switch and handle tab/workspace transition
+    if (currentCourseId && courseId !== currentCourseId) {
+      await workspace.switchCourse(courseId);
+    }
+
     const params: Record<string, unknown> = {
       courseId,
       lessonIdx,
       depth: effectiveDepth,
     };
 
-    const result = await bridge.call<LoadLessonResult>("loadLesson", params);
+    let result = await bridge.call<LoadLessonResult>("loadLesson", params);
+
+    // If there's saved progress, ask whether to resume or start fresh
+    if (result.currentIndex > 0 && !skipResumePrompt) {
+      const choice = await vscode.window.showInformationMessage(
+        `"${result.lessonTitle}" — resume at step ${result.currentIndex + 1}/${result.totalSteps}?`,
+        "Resume",
+        "Start from Beginning"
+      );
+      if (choice === "Start from Beginning") {
+        await bridge.call("resetLesson", {
+          courseId,
+          lessonId: result.lessonId,
+        });
+        workspace.deleteExerciseFile(courseId, result.lessonId);
+        result = await bridge.call<LoadLessonResult>("loadLesson", params);
+      } else if (!choice) {
+        return; // dismissed — do nothing
+      }
+    }
 
     currentCourseId = courseId;
     currentLessonId = result.lessonId;
@@ -341,18 +372,11 @@ async function openLesson(
     // Track step type so workspace knows where to read input from
     workspace.setStepType(result.step.cls);
 
-    // Update UI
+    // Update status bar
     statusBar.setStep(currentIndex, totalSteps);
     statusBar.setDepth(effectiveDepth);
-    lessonPanel.updateStep(
-      result.step,
-      result.currentIndex,
-      result.totalSteps,
-      result.lessonTitle,
-      effectiveDepth
-    );
 
-    // Open exercise file for code steps, or re-open existing file on resume
+    // Open exercise file FIRST (in Column One) for code steps
     if (result.step.cls === "script" || result.step.cls === "cmd_question") {
       await workspace.openExercise(
         courseId,
@@ -362,10 +386,17 @@ async function openLesson(
         result.restoredCode || undefined
       );
     } else if (result.restoredCode || result.currentIndex > 0) {
-      // Non-code step but resuming — open the exercise file if it exists
-      // so the user's accumulated code stays visible
       await workspace.openExerciseIfExists(courseId, result.lessonId);
     }
+
+    // THEN show the lesson panel (in Column Two) so it doesn't get displaced
+    lessonPanel.updateStep(
+      result.step,
+      result.currentIndex,
+      result.totalSteps,
+      result.lessonTitle,
+      effectiveDepth
+    );
 
     diagnostics.clear();
     outputChannel.clear();
@@ -487,11 +518,7 @@ async function loadStepUI(
   workspace.setStepType(step.cls);
   statusBar.setStep(stepIndex, stepTotal);
 
-  lessonPanel.updateStep(
-    step, stepIndex, stepTotal, currentLessonTitle || "", currentDepth || "beginner"
-  );
-
-  // Open exercise file for code steps
+  // Open exercise file FIRST (Column One) for code steps
   if (
     (step.cls === "script" || step.cls === "cmd_question") &&
     currentCourseId &&
@@ -504,6 +531,11 @@ async function loadStepUI(
       starterCode
     );
   }
+
+  // THEN show lesson panel (Column Two) so it stays visible
+  lessonPanel.updateStep(
+    step, stepIndex, stepTotal, currentLessonTitle || "", currentDepth || "beginner"
+  );
 }
 
 async function nextStep(

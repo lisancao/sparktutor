@@ -4,7 +4,7 @@
 
 import * as vscode from "vscode";
 import { Bridge } from "./bridge";
-import { getSavedSession, registerCommands } from "./commands";
+import { clearSavedSession, getSavedSession, registerCommands } from "./commands";
 import { CourseTreeProvider } from "./courseTree";
 import { DiagnosticsManager } from "./diagnostics";
 import { LessonPanel } from "./lessonPanel";
@@ -98,7 +98,10 @@ export async function activate(
         saved.courseId,
         saved.lessonIdx,
         saved.depth,
+        true, // skipResumePrompt — user already confirmed
       );
+    } else if (resume === "Start Fresh") {
+      clearSavedSession();
     }
   }
 }

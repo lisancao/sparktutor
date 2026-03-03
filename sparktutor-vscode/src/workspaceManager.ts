@@ -1,10 +1,13 @@
 /**
  * Exercise file management.
  *
- * Each lesson gets ONE file (exercise.py) that accumulates code across steps.
- * When the user advances to a code step, any new starter code is appended
- * (with a comment separator) rather than overwriting. This makes the lesson
- * iterative — a SparkSession built in step 3 is still there in step 5.
+ * Each course gets ONE main file (exercise.py) that accumulates code across
+ * lessons and steps. When the user advances to a code step, any new starter
+ * code is appended (with a comment separator) rather than overwriting.
+ * Supplementary files (data, configs) live in per-lesson subdirectories.
+ *
+ * Switching courses closes old tabs (configurable) and opens the new course's
+ * exercise file.
  */
 
 import * as fs from "fs";
@@ -15,6 +18,7 @@ import * as vscode from "vscode";
 export class WorkspaceManager {
   private readonly baseDir: string;
   private currentFile: vscode.Uri | null = null;
+  private currentCourseId: string | null = null;
 
   /** For mult_question steps: stores the selected choice from the webview. */
   private selectedChoice: string | null = null;
@@ -27,12 +31,106 @@ export class WorkspaceManager {
   }
 
   /**
-   * Get the single exercise file path for a lesson.
+   * Get the single exercise file path for a course (one main file per course).
    */
-  private getLessonFilePath(courseId: string, lessonId: string): string {
-    const dir = path.join(this.baseDir, courseId, lessonId);
+  private getLessonFilePath(courseId: string, _lessonId: string): string {
+    const dir = path.join(this.baseDir, courseId);
     fs.mkdirSync(dir, { recursive: true });
     return path.join(dir, "exercise.py");
+  }
+
+  /**
+   * Get directory for supplementary files (data files, configs) created by a
+   * specific lesson.
+   */
+  getSupplementaryDir(courseId: string, lessonId: string): string {
+    const dir = path.join(this.baseDir, courseId, lessonId);
+    fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+
+  /**
+   * Switch to a different course workspace.
+   * Saves current file, optionally closes old course tabs, opens new course file.
+   */
+  async switchCourse(newCourseId: string): Promise<void> {
+    const oldCourseId = this.currentCourseId;
+    if (oldCourseId === newCourseId) {
+      return;
+    }
+
+    // Save any dirty editors belonging to the old course
+    if (oldCourseId) {
+      await this.saveCourseDirtyEditors(oldCourseId);
+    }
+
+    // Close old course tabs if setting is enabled
+    const autoClose = vscode.workspace
+      .getConfiguration("sparktutor")
+      .get<boolean>("autoCloseTabs", true);
+    if (autoClose && oldCourseId) {
+      await this.closeCourseTabs(oldCourseId);
+    }
+
+    this.currentCourseId = newCourseId;
+
+    // Open the new course's exercise.py if it exists on disk
+    const newFilePath = path.join(this.baseDir, newCourseId, "exercise.py");
+    if (fs.existsSync(newFilePath)) {
+      const content = fs.readFileSync(newFilePath, "utf-8");
+      if (content.trim()) {
+        const uri = vscode.Uri.file(newFilePath);
+        const doc = await vscode.workspace.openTextDocument(uri);
+        await vscode.window.showTextDocument(doc, {
+          viewColumn: vscode.ViewColumn.One,
+          preserveFocus: false,
+          preview: false,
+        });
+        this.currentFile = uri;
+      }
+    }
+  }
+
+  /**
+   * Close all editor tabs whose file belongs to a course's workspace directory.
+   */
+  private async closeCourseTabs(courseId: string): Promise<void> {
+    const courseDir = path.join(this.baseDir, courseId);
+    const tabsToClose: vscode.Tab[] = [];
+
+    for (const group of vscode.window.tabGroups.all) {
+      for (const tab of group.tabs) {
+        const input = tab.input;
+        if (input instanceof vscode.TabInputText) {
+          if (input.uri.fsPath.startsWith(courseDir)) {
+            tabsToClose.push(tab);
+          }
+        } else if (input instanceof vscode.TabInputTextDiff) {
+          if (
+            input.original.fsPath.startsWith(courseDir) ||
+            input.modified.fsPath.startsWith(courseDir)
+          ) {
+            tabsToClose.push(tab);
+          }
+        }
+      }
+    }
+
+    if (tabsToClose.length > 0) {
+      await vscode.window.tabGroups.close(tabsToClose);
+    }
+  }
+
+  /**
+   * Save any unsaved editors belonging to a course before switching away.
+   */
+  private async saveCourseDirtyEditors(courseId: string): Promise<void> {
+    const courseDir = path.join(this.baseDir, courseId);
+    for (const doc of vscode.workspace.textDocuments) {
+      if (doc.isDirty && doc.uri.fsPath.startsWith(courseDir)) {
+        await doc.save();
+      }
+    }
   }
 
   /**
@@ -103,10 +201,15 @@ export class WorkspaceManager {
     );
     if (!existingEditor) {
       const doc = await vscode.workspace.openTextDocument(uri);
-      await vscode.window.showTextDocument(doc, vscode.ViewColumn.One);
+      await vscode.window.showTextDocument(doc, {
+        viewColumn: vscode.ViewColumn.One,
+        preserveFocus: false,
+        preview: false,
+      });
     }
 
     this.currentFile = uri;
+    this.currentCourseId = courseId;
     return uri;
   }
 
@@ -139,9 +242,14 @@ export class WorkspaceManager {
     );
     if (!existingEditor) {
       const doc = await vscode.workspace.openTextDocument(uri);
-      await vscode.window.showTextDocument(doc, vscode.ViewColumn.One);
+      await vscode.window.showTextDocument(doc, {
+        viewColumn: vscode.ViewColumn.One,
+        preserveFocus: false,
+        preview: false,
+      });
     }
     this.currentFile = uri;
+    this.currentCourseId = courseId;
   }
 
   getCurrentCode(): string {
@@ -174,10 +282,11 @@ export class WorkspaceManager {
   }
 
   /**
-   * Delete the exercise file for a lesson (used by reset).
+   * Delete the exercise file for a course (used by reset).
+   * Clears the course-level exercise.py file.
    */
-  deleteExerciseFile(courseId: string, lessonId: string): void {
-    const filePath = this.getLessonFilePath(courseId, lessonId);
+  deleteExerciseFile(courseId: string, _lessonId: string): void {
+    const filePath = path.join(this.baseDir, courseId, "exercise.py");
     if (fs.existsSync(filePath)) {
       fs.unlinkSync(filePath);
     }
@@ -192,8 +301,7 @@ export class WorkspaceManager {
     stepIdx: number,
     solutionCode: string
   ): vscode.Uri {
-    const dir = path.join(this.baseDir, courseId, lessonId);
-    fs.mkdirSync(dir, { recursive: true });
+    const dir = this.getSupplementaryDir(courseId, lessonId);
     const filePath = path.join(dir, `step_${stepIdx}_solution.py`);
     fs.writeFileSync(filePath, solutionCode, "utf-8");
     return vscode.Uri.file(filePath);

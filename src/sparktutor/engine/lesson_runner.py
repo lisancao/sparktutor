@@ -80,9 +80,9 @@ class LessonRunner:
 
         self.state = RunnerState(lesson=lesson, filtered_steps=filtered)
 
-        # Resume from saved progress
+        # Resume from saved progress (only if depth matches)
         saved = self.progress.get(self.course_id, lesson.id)
-        if saved and not saved.completed:
+        if saved and not saved.completed and saved.depth == depth:
             self.state.current_index = min(saved.current_step, len(filtered) - 1)
             self._restored_code = saved.last_code
         else:

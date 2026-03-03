@@ -2,7 +2,7 @@
   "name": "sparktutor",
   "displayName": "SparkTutor",
   "description": "Interactive Apache Spark 4.1 learning environment with Claude-powered tutoring",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "sparktutor",
   "engines": {
     "vscode": "^1.85.0"
@@ -131,6 +131,16 @@
             "claude-opus-4-6"
           ],
           "description": "Claude model to use for code review and chat"
+        },
+        "sparktutor.autoCloseTabs": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically close exercise tabs from the previous course when switching courses"
+        },
+        "sparktutor.lakehouseStackPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to shared lakehouse stack (e.g. ~/lakehouse-stack). Used for courses requiring Spark/Kafka services. Leave empty to use per-course docker-compose."
         }
       }
     }
@@ -140,6 +150,9 @@
     "watch": "node esbuild.js --watch",
     "lint": "tsc --noEmit",
     "package": "npm run build && vsce package --no-dependencies"
+  },
+  "overrides": {
+    "cheerio": "1.0.0"
   },
   "devDependencies": {
     "@types/node": "^25.3.0",

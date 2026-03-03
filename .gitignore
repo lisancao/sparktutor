@@ -21,6 +21,9 @@ sparktutor-vscode/*.vsix
 !sparktutor-vscode/.vscode/
 *.swp
 
+# Reference materials (not public domain)
+references/
+
 # Secrets
 .env
 .env.*

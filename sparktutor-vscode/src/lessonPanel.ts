@@ -252,45 +252,77 @@ function escapeHtml(text: string): string {
     .replace(/"/g, "&quot;");
 }
 
-/** Markdown-to-HTML: code blocks, inline code, bold, italic, lists, links, line breaks. */
+/** Markdown-to-HTML: code blocks, inline code, bold, italic, lists, links, paragraphs. */
 function markdownToHtml(md: string): string {
-  let html = escapeHtml(md);
-
-  // Fenced code blocks: ```lang\n...\n```
-  html = html.replace(
+  // Extract fenced code blocks BEFORE escaping (they need raw content)
+  const codeBlocks: string[] = [];
+  let processed = md.replace(
     /```(\w*)\n([\s\S]*?)```/g,
-    (_m, lang, code) => `<pre><code${lang ? ` class="language-${lang}"` : ""}>${code}</code></pre>`
+    (_m, lang, code) => {
+      codeBlocks.push(
+        `<pre><code${lang ? ` class="language-${lang}"` : ""}>${escapeHtml(code)}</code></pre>`
+      );
+      return `%%CODE_BLOCK_${codeBlocks.length - 1}%%`;
+    }
   );
 
+  // Now escape the rest
+  processed = escapeHtml(processed);
+
+  // Restore code blocks (already escaped internally)
+  codeBlocks.forEach((block, i) => {
+    processed = processed.replace(`%%CODE_BLOCK_${i}%%`, block);
+  });
+
   // Inline code: `...`
-  html = html.replace(/`([^`\n]+)`/g, "<code>$1</code>");
+  processed = processed.replace(/`([^`\n]+)`/g, "<code>$1</code>");
 
   // Bold: **...**
-  html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+  processed = processed.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
 
   // Italic: *...* (but not inside <strong>)
-  html = html.replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, "<em>$1</em>");
+  processed = processed.replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, "<em>$1</em>");
 
   // Links: [text](url)
-  html = html.replace(
+  processed = processed.replace(
     /\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g,
     '<a href="$2">$1</a>'
   );
 
-  // Bullet lists: lines starting with - or *
-  html = html.replace(/^([*-]) (.+)$/gm, "<li>$2</li>");
-  html = html.replace(/((?:<li>.*<\/li>\n?)+)/g, "<ul>$1</ul>");
-
-  // Line breaks — protect <pre> blocks first
-  const preBlocks: string[] = [];
-  html = html.replace(/<pre>[\s\S]*?<\/pre>/g, (match) => {
-    preBlocks.push(match);
-    return `%%PRE_BLOCK_${preBlocks.length - 1}%%`;
-  });
-  html = html.replace(/\n/g, "<br>");
-  preBlocks.forEach((block, i) => {
-    html = html.replace(`%%PRE_BLOCK_${i}%%`, block);
+  // Numbered lists: lines starting with 1. 2. etc
+  processed = processed.replace(/^(\d+)\. (.+)$/gm, "<li>$2</li>");
+  processed = processed.replace(/((?:<li>.*<\/li>\n?)+)/g, (match) => {
+    // Detect if original had numbers (ol) or bullets (ul) — we already converted both to <li>
+    return `<ol>${match}</ol>`;
   });
 
-  return html;
+  // Bullet lists: lines starting with - or *  (after numbered, so * doesn't clash)
+  processed = processed.replace(/^[*-] (.+)$/gm, "<li>$1</li>");
+  processed = processed.replace(/((?:<li>.*<\/li>\n?)+)/g, (match) => {
+    // If already wrapped in <ol>, skip
+    if (match.startsWith("<ol>")) { return match; }
+    return `<ul>${match}</ul>`;
+  });
+
+  // Paragraphs: split on blank lines, wrap non-block content in <p>
+  const blocks = processed.split(/\n{2,}/);
+  const result = blocks
+    .map((block) => {
+      const trimmed = block.trim();
+      if (!trimmed) { return ""; }
+      // Don't wrap block-level elements
+      if (
+        trimmed.startsWith("<pre>") ||
+        trimmed.startsWith("<ul>") ||
+        trimmed.startsWith("<ol>") ||
+        trimmed.startsWith("<h")
+      ) {
+        return trimmed;
+      }
+      // Convert single newlines within a paragraph to <br>
+      return `<p>${trimmed.replace(/\n/g, "<br>")}</p>`;
+    })
+    .join("\n");
+
+  return result;
 }
