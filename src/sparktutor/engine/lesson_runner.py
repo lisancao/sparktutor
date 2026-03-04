@@ -261,6 +261,32 @@ class LessonRunner:
         if step is None:
             return ""
 
+    def get_first_starter_code(self) -> str:
+        """Scan ahead for the first code step's starter code.
+
+        Used to pre-populate exercise.py when a lesson starts on a text step,
+        so the editor isn't empty.
+        """
+        if self.state is None:
+            return ""
+        for step in self.state.filtered_steps:
+            if step.cls not in ("cmd_question", "script"):
+                continue
+            if step.starter_code:
+                starter_path = self.state.lesson.base_path / step.starter_code
+                if starter_path.exists():
+                    return starter_path.read_text()
+            from sparktutor.engine.scaffolding import generate_scaffold
+            return generate_scaffold(
+                step_output=step.output,
+                step_cls=step.cls,
+                depth=self.profile.depth.value,
+                correct_answer=step.correct_answer or "",
+                hint=step.hint or "",
+                lesson_title=self.state.lesson.title,
+            )
+        return ""
+
         # Use explicit starter file if available
         if step.starter_code and self.state:
             starter_path = self.state.lesson.base_path / step.starter_code

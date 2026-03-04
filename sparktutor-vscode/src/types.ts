@@ -70,6 +70,7 @@ export interface LoadLessonResult {
   lessonId: string;
   restoredCode: string;
   starterCode: string;
+  firstStarterCode?: string;
   coursePrerequisites?: string[];
 }
 

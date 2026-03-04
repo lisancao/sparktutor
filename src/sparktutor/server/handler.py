@@ -164,6 +164,7 @@ class ServerHandler:
             "lessonId": state.lesson.id,
             "restoredCode": restored_code,
             "starterCode": starter_code,
+            "firstStarterCode": self._runner.get_first_starter_code(),
         }
         if lesson_idx == 0 and course.prerequisites:
             result["coursePrerequisites"] = course.prerequisites

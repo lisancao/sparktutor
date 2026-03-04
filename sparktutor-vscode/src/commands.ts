@@ -438,8 +438,8 @@ async function openLesson(
         result.restoredCode || undefined
       );
     } else {
-      // Non-code steps: open exercise file (creates with header if missing)
-      await workspace.openExerciseIfExists(courseId, result.lessonId, result.lessonTitle);
+      // Non-code steps: open exercise file (pre-populated with first starter code if missing)
+      await workspace.openExerciseIfExists(courseId, result.lessonId, result.lessonTitle, result.firstStarterCode);
     }
 
     // THEN show the lesson panel (in Column Two) so it doesn't get displaced
