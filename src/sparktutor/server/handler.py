@@ -91,6 +91,9 @@ class ServerHandler:
             "detectMode": self._detect_mode,
             "resetLesson": self._reset_lesson,
             "getSolution": self._get_solution,
+            "buildReviewPrompt": self._build_review_prompt,
+            "buildChatPrompt": self._build_chat_prompt,
+            "parseReviewResponse": self._parse_review_response,
         }
 
         handler = handler_map.get(method)
@@ -315,6 +318,105 @@ class ServerHandler:
         # Clear the runner so the lesson reloads fresh
         self._runner = None
         return {"ok": True}
+
+    async def _build_review_prompt(self, params: dict) -> dict:
+        """Run local checks, then build review prompt if AI review is needed."""
+        if self._runner is None:
+            raise ValueError("No lesson loaded")
+
+        code = params["code"]
+        result, needs_ai, review_kwargs = await self._runner.submit_local(code)
+
+        response: dict = {"needsAiReview": needs_ai}
+
+        if result is not None:
+            response["localResult"] = {
+                "passed": result.passed,
+                "feedback": [_feedback_to_dict(f) for f in result.feedback],
+                "encouragement": result.encouragement,
+                "skillSignals": result.skill_signals,
+            }
+
+        if needs_ai and review_kwargs:
+            messages = self.evaluator.build_review_prompt(**review_kwargs)
+            response["messages"] = messages
+
+        return response
+
+    async def _build_chat_prompt(self, params: dict) -> dict:
+        """Build chat messages for external AI provider."""
+        question = params["question"]
+
+        step_context = ""
+        code_context = params.get("code", "")
+        lesson_title = ""
+        extra_context = ""
+
+        if self._runner and self._runner.state:
+            lesson_title = self._runner.state.lesson.title
+            step = self._runner.state.current_step
+            if step:
+                step_context = step.output
+
+            last_exec = self._runner.state.last_exec
+            if last_exec:
+                parts = []
+                if last_exec.stdout:
+                    parts.append(f"Last execution stdout:\n{last_exec.stdout[:2000]}")
+                if last_exec.stderr:
+                    parts.append(f"Last execution stderr:\n{last_exec.stderr[:2000]}")
+                if parts:
+                    extra_context += "\n".join(parts)
+
+            last_result = self._runner.state.last_result
+            if last_result and last_result.feedback:
+                fb_lines = []
+                for fb in last_result.feedback[:10]:
+                    cat = f"[{fb.category}] " if getattr(fb, "category", None) else ""
+                    fb_lines.append(f"  {cat}{fb.message}")
+                extra_context += "\nPrior feedback:\n" + "\n".join(fb_lines)
+
+        messages = self.evaluator.build_chat_messages(
+            question=question,
+            lesson_title=lesson_title,
+            step_context=step_context,
+            code_context=code_context,
+            depth=self._profile.depth.value,
+            extra_context=extra_context,
+        )
+        return {"messages": messages}
+
+    async def _parse_review_response(self, params: dict) -> dict:
+        """Parse raw AI response text into EvalResult."""
+        raw_text = params["rawText"]
+        result = self.evaluator.parse_review_response(raw_text)
+
+        # Complete the state tracking that submit_local() left pending
+        if self._runner and self._runner.state:
+            from sparktutor.engine.feedback import parse_stderr
+
+            if self._runner.state.last_exec and self._runner.state.last_exec.stderr:
+                stderr_items = parse_stderr(self._runner.state.last_exec.stderr)
+                result.feedback.extend(stderr_items)
+
+            self._runner.state.last_result = result
+            from sparktutor.engine.lesson_runner import StepState
+            self._runner.state.step_state = StepState.FEEDBACK
+
+            self._runner.profile.record_attempt(
+                passed=result.passed,
+                used_hint=False,
+                signals=result.skill_signals,
+            )
+            # Save with empty code since we already saved during submit_local
+            self._runner._save_progress("")
+
+        return {
+            "passed": result.passed,
+            "feedback": [_feedback_to_dict(f) for f in result.feedback],
+            "encouragement": result.encouragement,
+            "skillSignals": result.skill_signals,
+        }
 
     async def _detect_mode(self, params: dict) -> dict:
         mode = await self.executor.detect_mode()

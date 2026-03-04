@@ -3,6 +3,7 @@
  */
 
 import * as vscode from "vscode";
+import { AiRouter } from "./aiRouter";
 import { Bridge } from "./bridge";
 import { CourseTreeProvider } from "./courseTree";
 import { DiagnosticsManager } from "./diagnostics";
@@ -69,7 +70,8 @@ export function registerCommands(
   workspace: WorkspaceManager,
   diagnostics: DiagnosticsManager,
   outputChannel: SparkOutputChannel,
-  statusBar: StatusBarManager
+  statusBar: StatusBarManager,
+  aiRouter: AiRouter
 ): void {
   extensionContext = context;
   // Wire up webview button callbacks
@@ -84,7 +86,7 @@ export function registerCommands(
   lessonPanel.onHint = () =>
     vscode.commands.executeCommand("sparktutor.hint");
   lessonPanel.onChat = (question: string) => {
-    handleChat(bridge, lessonPanel, workspace, question);
+    handleChat(aiRouter, lessonPanel, workspace, question);
   };
   lessonPanel.onChoiceSelect = (choice: string) => {
     workspace.setSelectedChoice(choice);
@@ -118,7 +120,7 @@ export function registerCommands(
 
     vscode.commands.registerCommand("sparktutor.submit", async () => {
       await submitCode(
-        bridge,
+        aiRouter,
         lessonPanel,
         workspace,
         diagnostics,
@@ -486,7 +488,7 @@ async function runCode(
 }
 
 async function submitCode(
-  bridge: Bridge,
+  aiRouter: AiRouter,
   lessonPanel: LessonPanel,
   workspace: WorkspaceManager,
   diagnostics: DiagnosticsManager,
@@ -512,7 +514,7 @@ async function submitCode(
   outputChannel.appendLine("--- Submitting... ---\n");
 
   try {
-    const result = await bridge.call<EvalResult>("submit", { code });
+    const result = await aiRouter.submitCode({ code });
     lessonPanel.showFeedback(result);
 
     // Set diagnostics on the exercise file (code steps only)
@@ -678,17 +680,14 @@ async function showHint(
 }
 
 async function handleChat(
-  bridge: Bridge,
+  aiRouter: AiRouter,
   lessonPanel: LessonPanel,
   workspace: WorkspaceManager,
   question: string
 ): Promise<void> {
   try {
     const code = workspace.getCurrentCode();
-    const result = await bridge.call<{ answer: string }>("chat", {
-      question,
-      code,
-    });
+    const result = await aiRouter.chat({ question, code });
     lessonPanel.showChatResponse(result.answer);
   } catch (err) {
     lessonPanel.showChatResponse(

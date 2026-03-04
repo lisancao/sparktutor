@@ -15,8 +15,9 @@ SparkTutor is a learn-by-doing environment for Apache Spark 4.1. Instead of watc
 - **Real code editor** — write PySpark in Monaco with full syntax highlighting, autocomplete, and bracket matching
 - **Guided lessons** — 8 lessons covering SparkSession, transforms, I/O, pipeline framework, bronze/silver/gold layers, and full pipeline assembly
 - **Depth levels** — beginner (skeleton code + TODOs), intermediate (structural hints), advanced (just the objective)
-- **Claude-powered feedback** — submit code and get categorized feedback: bugs, conventions, and best practices
+- **AI-powered feedback** — submit code and get categorized feedback: bugs, conventions, and best practices (via Claude or GitHub Copilot)
 - **AI tutor chat** — ask questions about your code or Spark concepts, grounded in official Spark 4.1 documentation
+- **Zero-config in Codespaces** — works with GitHub Copilot out of the box, no API key needed
 - **Cumulative exercises** — code persists across steps so a SparkSession you build in step 3 is still there in step 7
 - **Session resume** — close VS Code, come back later, pick up where you left off
 
@@ -33,7 +34,7 @@ SparkTutor is a learn-by-doing environment for Apache Spark 4.1. Instead of watc
 │ │                │ │               │ │ ── Ask Tutor ──  │ │
 │ │                │ │               │ │ > question_      │ │
 │ └────────────────┘ └───────────────┘ └──────────────────┘ │
-│ ● Lakehouse │ Step 3/8 │ Beginner              Status Bar │
+│ ● Lakehouse │ Step 3/8 │ Beginner │ AI: Claude  Status Bar │
 └────────────────────────────────────────────────────────────┘
 ```
 
@@ -41,13 +42,23 @@ The extension uses a **bridge pattern**: TypeScript spawns a Python JSON-lines s
 
 ## Installation
 
-### Prerequisites
+### Option 1: GitHub Codespaces (zero setup)
 
-- VS Code 1.85+
+Click the button below to launch a fully configured environment in your browser — no local install needed:
+
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/lisancao/sparktutor?quickstart=1)
+
+The Codespace automatically installs all dependencies, builds the extension, and opens the SparkTutor sidebar. If you have a GitHub Copilot subscription, AI-powered code review and chat work out of the box — no API key required.
+
+### Option 2: Local VS Code install
+
+#### Prerequisites
+
+- VS Code 1.93+
 - Python 3.10+
-- An [Anthropic API key](https://console.anthropic.com/) for Claude-powered features (code review, chat, adaptive feedback)
+- Node.js 20+ (for building the extension)
 
-### Install from VSIX
+#### Build and install
 
 ```bash
 # Clone the repo
@@ -61,7 +72,7 @@ pip install -e .
 cd sparktutor-vscode
 npm install
 bash package-vsix.sh
-code --install-extension sparktutor-0.1.0.vsix
+code --install-extension sparktutor-0.3.0.vsix
 ```
 
 Then reload VS Code (`Ctrl+Shift+P` → "Reload Window").
@@ -72,10 +83,23 @@ Open VS Code settings (`Ctrl+,`) and search for "SparkTutor":
 
 | Setting | Description |
 |---------|-------------|
-| `sparktutor.anthropicApiKey` | Your Anthropic API key (or set `ANTHROPIC_API_KEY` env var) |
+| `sparktutor.aiProvider` | AI backend: `auto` (default), `anthropic`, or `copilot` |
+| `sparktutor.anthropicApiKey` | Anthropic API key (or set `ANTHROPIC_API_KEY` env var) |
 | `sparktutor.claudeModel` | Claude model for review/chat (default: `claude-sonnet-4-6`) |
 | `sparktutor.pythonPath` | Python interpreter path (default: `python3`) |
 | `sparktutor.projectPath` | Path to sparktutor repo root (auto-detected if installed via VSIX) |
+
+### AI provider options
+
+SparkTutor supports multiple AI backends for code review and chat:
+
+| Provider | How to enable | Best for |
+|----------|--------------|----------|
+| **Claude (Anthropic)** | Set `sparktutor.anthropicApiKey` or `ANTHROPIC_API_KEY` env var | Highest quality feedback |
+| **GitHub Copilot** | Install the [GitHub Copilot](https://marketplace.visualstudio.com/items?itemName=GitHub.copilot) extension | Codespaces, students with Copilot subscriptions |
+| **Local only** | No API key, no Copilot | Syntax/AST checks still work, no AI review |
+
+In `auto` mode (default), SparkTutor uses Claude if an API key is set, falls back to Copilot if available, and runs local-only checks otherwise. The active provider is shown in the status bar.
 
 ## Usage
 

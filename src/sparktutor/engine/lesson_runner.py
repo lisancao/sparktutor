@@ -149,6 +149,55 @@ class LessonRunner:
 
         return result
 
+    async def submit_local(self, user_input: str) -> tuple[Optional[EvalResult], bool, dict]:
+        """Submit and run local checks only. Returns (result, needs_ai, review_kwargs).
+
+        Handles execution and state tracking like submit(), but uses
+        evaluate_local() to stop before calling the AI review.
+        """
+        if self.state is None or self.state.current_step is None:
+            return EvalResult(passed=False, feedback=[]), False, {}
+
+        step = self.state.current_step
+        self.state.step_state = StepState.EVALUATING
+        self.state.attempts += 1
+
+        # Execute if needed
+        exec_result = None
+        if step.requires_execution and step.cls in ("script", "cmd_question"):
+            exec_result = await self.executor.execute(user_input)
+            self.state.last_exec = exec_result
+
+            if exec_result.stderr:
+                stderr_feedback = parse_stderr(exec_result.stderr)
+
+        # Evaluate locally
+        result, needs_ai, review_kwargs = await self.evaluator.evaluate_local(
+            code=user_input,
+            step=step,
+            depth=self.profile.depth.value,
+            exec_result=exec_result,
+            lesson_title=self.state.lesson.title,
+        )
+
+        if result is not None:
+            # Local checks were sufficient — merge execution feedback
+            if exec_result and exec_result.stderr:
+                stderr_items = parse_stderr(exec_result.stderr)
+                result.feedback.extend(stderr_items)
+
+            self.state.last_result = result
+            self.state.step_state = StepState.FEEDBACK
+
+            self.profile.record_attempt(
+                passed=result.passed,
+                used_hint=False,
+                signals=result.skill_signals,
+            )
+            self._save_progress(user_input)
+
+        return result, needs_ai, review_kwargs
+
     def advance(self, current_code: str = "") -> Optional[Step]:
         """Move to the next step (only if current step passed)."""
         if self.state is None:

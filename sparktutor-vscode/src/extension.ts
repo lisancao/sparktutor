@@ -3,6 +3,7 @@
  */
 
 import * as vscode from "vscode";
+import { AiRouter } from "./aiRouter";
 import { Bridge } from "./bridge";
 import { clearSavedSession, getSavedSession, registerCommands } from "./commands";
 import { CourseTreeProvider } from "./courseTree";
@@ -43,6 +44,9 @@ export async function activate(
   const treeProvider = new CourseTreeProvider(bridge);
   vscode.window.registerTreeDataProvider("sparktutorCourses", treeProvider);
 
+  // Create AI router (resolves provider after startup)
+  const aiRouter = new AiRouter(bridge);
+
   // Register all commands
   registerCommands(
     context,
@@ -52,7 +56,8 @@ export async function activate(
     workspace,
     diagnostics,
     outputChannel,
-    statusBar
+    statusBar,
+    aiRouter
   );
 
   // Stream output notifications to the output channel
@@ -70,6 +75,16 @@ export async function activate(
       statusBar.setMode("unknown");
     });
 
+  // Resolve AI provider on startup and show in status bar
+  aiRouter
+    .resolveProvider()
+    .then((provider) => {
+      statusBar.setAiProvider(provider);
+    })
+    .catch(() => {
+      statusBar.setAiProvider("none");
+    });
+
   context.subscriptions.push({
     dispose: () => {
       bridge.dispose();
@@ -83,6 +98,12 @@ export async function activate(
   // Show the output channel so the user knows it exists
   outputChannel.show();
   outputChannel.appendLine("SparkTutor extension activated");
+
+  // Auto-focus the SparkTutor sidebar so courses are visible on startup
+  vscode.commands.executeCommand("sparktutorCourses.focus").then(
+    () => {},
+    () => {} // Silently ignore if view isn't ready yet
+  );
 
   // Check for a saved session and offer to resume
   const saved = getSavedSession();

@@ -2,14 +2,21 @@
   "name": "SparkTutor",
   "image": "mcr.microsoft.com/devcontainers/python:3.12",
   "features": {
-    "ghcr.io/devcontainers/features/java:1": { "version": "17" }
+    "ghcr.io/devcontainers/features/java:1": { "version": "17" },
+    "ghcr.io/devcontainers/features/node:1": { "version": "20" }
   },
-  "postCreateCommand": "pip install pyspark==4.1.0",
+  "onCreateCommand": "pip install pyspark==4.1.0 pyyaml pydantic && cd sparktutor-vscode && npm install && bash package-vsix.sh",
+  "postCreateCommand": "code --install-extension sparktutor-vscode/sparktutor-*.vsix --force",
+  "postStartCommand": "sleep 2 && code --install-extension sparktutor-vscode/sparktutor-*.vsix --force 2>/dev/null || true",
   "customizations": {
     "vscode": {
       "settings": {
-        "sparktutor.executionMode": "local"
-      }
+        "sparktutor.executionMode": "local",
+        "sparktutor.aiProvider": "auto"
+      },
+      "extensions": [
+        "ms-python.python"
+      ]
     }
   },
   "forwardPorts": [4040]

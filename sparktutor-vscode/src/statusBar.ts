@@ -8,6 +8,7 @@ export class StatusBarManager {
   private modeItem: vscode.StatusBarItem;
   private stepItem: vscode.StatusBarItem;
   private depthItem: vscode.StatusBarItem;
+  private aiProviderItem: vscode.StatusBarItem;
 
   constructor() {
     this.modeItem = vscode.window.createStatusBarItem(
@@ -31,6 +32,13 @@ export class StatusBarManager {
     this.depthItem.name = "SparkTutor Depth";
     this.depthItem.command = "sparktutor.changeDepth";
     this.depthItem.tooltip = "Click to change difficulty level";
+
+    this.aiProviderItem = vscode.window.createStatusBarItem(
+      vscode.StatusBarAlignment.Left,
+      97
+    );
+    this.aiProviderItem.name = "SparkTutor AI Provider";
+    this.aiProviderItem.tooltip = "AI provider for code review and chat";
   }
 
   setMode(mode: string): void {
@@ -61,9 +69,20 @@ export class StatusBarManager {
     this.depthItem.show();
   }
 
+  setAiProvider(provider: string): void {
+    const labels: Record<string, string> = {
+      anthropic: "$(sparkle) AI: Claude",
+      copilot: "$(copilot) AI: Copilot",
+      none: "$(circle-slash) AI: Local",
+    };
+    this.aiProviderItem.text = labels[provider] || `AI: ${provider}`;
+    this.aiProviderItem.show();
+  }
+
   dispose(): void {
     this.modeItem.dispose();
     this.stepItem.dispose();
     this.depthItem.dispose();
+    this.aiProviderItem.dispose();
   }
 }

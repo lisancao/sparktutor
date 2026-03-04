@@ -2,16 +2,17 @@
   "name": "sparktutor",
   "displayName": "SparkTutor",
   "description": "Interactive Apache Spark 4.1 learning environment with Claude-powered tutoring",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "sparktutor",
   "engines": {
-    "vscode": "^1.85.0"
+    "vscode": "^1.93.0"
   },
   "categories": [
     "Education"
   ],
   "activationEvents": [
-    "onView:sparktutorCourses"
+    "onView:sparktutorCourses",
+    "onStartupFinished"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -146,6 +147,17 @@
           "default": "",
           "description": "Path to shared lakehouse stack (e.g. ~/lakehouse-stack). Used for courses requiring Spark/Kafka services. Leave empty to use per-course docker-compose."
         },
+        "sparktutor.aiProvider": {
+          "type": "string",
+          "default": "auto",
+          "enum": ["anthropic", "copilot", "auto"],
+          "enumDescriptions": [
+            "Use Anthropic API directly (requires API key)",
+            "Use VS Code Copilot (GitHub Copilot subscription required)",
+            "Auto: Anthropic if API key set, else Copilot if available, else local-only"
+          ],
+          "description": "Which AI provider to use for code review and chat"
+        },
         "sparktutor.executionMode": {
           "type": "string",
           "default": "local",
@@ -171,7 +183,7 @@
   },
   "devDependencies": {
     "@types/node": "^25.3.0",
-    "@types/vscode": "^1.85.0",
+    "@types/vscode": "^1.93.0",
     "@vscode/vsce": "^2.15.0",
     "esbuild": "^0.20.0",
     "typescript": "^5.3.0",

@@ -159,7 +159,7 @@ class Evaluator:
 
     # --- Layer 2: Claude API review (1-3s) ---
 
-    async def claude_review(
+    def build_review_prompt(
         self,
         code: str,
         lesson_title: str,
@@ -168,18 +168,8 @@ class Evaluator:
         stdout: str = "",
         stderr: str = "",
         solution_hint: str = "",
-    ) -> EvalResult:
-        """Use Claude API for deep code review and adaptive feedback."""
-        client = self._get_client()
-        if client is None:
-            return EvalResult(
-                passed=False,
-                feedback=[FeedbackItem(
-                    line=None, severity="info",
-                    message="Claude API not configured — using local checks only.",
-                )],
-            )
-
+    ) -> list[dict]:
+        """Build the review prompt messages. Returns [{"role": "user", "content": ...}]."""
         prompt = f"""You are a Spark tutor evaluating a student's PySpark code for a lesson on "{lesson_title}".
 
 Student depth level: {depth}
@@ -223,32 +213,79 @@ Rules:
 - For intermediate: include convention items, optional best_practice
 - For advanced: include all categories, challenge on edge cases and production readiness"""
 
+        return [{"role": "user", "content": prompt}]
+
+    def parse_review_response(self, text: str) -> EvalResult:
+        """Extract EvalResult from an AI response string (Claude or GPT-4o compatible)."""
+        # Strip markdown code fences (```json ... ```) for GPT-4o compatibility
+        stripped = text.strip()
+        if stripped.startswith("```"):
+            # Remove opening fence (e.g. ```json or ```)
+            first_newline = stripped.index("\n") if "\n" in stripped else len(stripped)
+            stripped = stripped[first_newline + 1:]
+            # Remove closing fence
+            if stripped.rstrip().endswith("```"):
+                stripped = stripped.rstrip()[:-3].rstrip()
+
+        json_match = re.search(r"\{[\s\S]*\}", stripped)
+        if json_match:
+            data = json.loads(json_match.group())
+            return EvalResult(
+                passed=data.get("passed", False),
+                feedback=[
+                    FeedbackItem(
+                        line=f.get("line"),
+                        severity=f.get("severity", "info"),
+                        message=f.get("message", ""),
+                        suggestion=f.get("suggestion"),
+                        category=f.get("category"),
+                    )
+                    for f in data.get("feedback", [])
+                ],
+                encouragement=data.get("encouragement", ""),
+                skill_signals=data.get("skill_signals", []),
+            )
+        return EvalResult(passed=False)
+
+    async def claude_review(
+        self,
+        code: str,
+        lesson_title: str,
+        objective: str,
+        depth: str,
+        stdout: str = "",
+        stderr: str = "",
+        solution_hint: str = "",
+    ) -> EvalResult:
+        """Use Claude API for deep code review and adaptive feedback."""
+        client = self._get_client()
+        if client is None:
+            return EvalResult(
+                passed=False,
+                feedback=[FeedbackItem(
+                    line=None, severity="info",
+                    message="Claude API not configured — using local checks only.",
+                )],
+            )
+
+        messages = self.build_review_prompt(
+            code=code,
+            lesson_title=lesson_title,
+            objective=objective,
+            depth=depth,
+            stdout=stdout,
+            stderr=stderr,
+            solution_hint=solution_hint,
+        )
+
         try:
             response = client.messages.create(
                 model=self.settings.claude.get_model(),
                 max_tokens=1024,
-                messages=[{"role": "user", "content": prompt}],
+                messages=messages,
             )
             text = response.content[0].text
-            # Extract JSON from response
-            json_match = re.search(r"\{[\s\S]*\}", text)
-            if json_match:
-                data = json.loads(json_match.group())
-                return EvalResult(
-                    passed=data.get("passed", False),
-                    feedback=[
-                        FeedbackItem(
-                            line=f.get("line"),
-                            severity=f.get("severity", "info"),
-                            message=f.get("message", ""),
-                            suggestion=f.get("suggestion"),
-                            category=f.get("category"),
-                        )
-                        for f in data.get("feedback", [])
-                    ],
-                    encouragement=data.get("encouragement", ""),
-                    skill_signals=data.get("skill_signals", []),
-                )
+            return self.parse_review_response(text)
         except Exception as e:
             return EvalResult(
                 passed=False,
@@ -348,7 +385,124 @@ Rules:
         # No validation rules — pass if syntax is OK
         return EvalResult(passed=True, encouragement="Code looks good!")
 
+    async def evaluate_local(
+        self,
+        code: str,
+        step,  # Step dataclass
+        depth: str = "beginner",
+        exec_result=None,  # ExecResult
+        lesson_title: str = "",
+    ) -> tuple[Optional[EvalResult], bool, dict]:
+        """Run local checks only. Returns (result, needs_ai, review_kwargs).
+
+        If local checks are sufficient, returns (EvalResult, False, {}).
+        If AI review is needed, returns (None, True, kwargs_for_build_review_prompt).
+        """
+        # Multiple choice
+        if step.cls == "mult_question" and step.correct_answer:
+            return self.check_mult_choice(code, step.correct_answer), False, {}
+
+        # Code questions: try local checks first
+        syntax = self.check_syntax(code)
+        if not syntax.passed:
+            return syntax, False, {}
+
+        # Exact match check
+        if step.correct_answer:
+            exact = self.check_code_exact(code, step.correct_answer)
+            if exact.passed:
+                return EvalResult(passed=True, encouragement="Correct!"), False, {}
+
+        # AST structural checks
+        ast_checks = [v.params for v in step.validation if v.type == "ast_contains"]
+        if ast_checks:
+            ast_result = self.check_ast_contains(code, ast_checks)
+            if not ast_result.passed:
+                return ast_result, False, {}
+
+        # Claude review for script steps or when local checks are insufficient
+        has_claude_review = any(v.type == "claude_review" for v in step.validation)
+        if has_claude_review or (step.cls == "script" and not step.correct_answer):
+            criteria = ""
+            for v in step.validation:
+                if v.type == "claude_review":
+                    criteria = v.params.get("criteria", "")
+                    break
+            kwargs = dict(
+                code=code,
+                lesson_title=lesson_title,
+                objective=criteria or step.output,
+                depth=depth,
+                stdout=exec_result.stdout if exec_result else "",
+                stderr=exec_result.stderr if exec_result else "",
+            )
+            return None, True, kwargs
+
+        # For cmd_question steps: if AST checks passed and execution succeeded,
+        # skip the slower Claude review and pass locally
+        if step.cls == "cmd_question" and ast_checks:
+            if exec_result is None or exec_result.exit_code != 0:
+                fb = []
+                if exec_result and exec_result.stderr:
+                    fb.append(FeedbackItem(
+                        line=None, severity="error",
+                        message=f"Code execution failed (exit code {exec_result.exit_code}).",
+                        suggestion="Check the Output panel for error details.",
+                        category="bug",
+                    ))
+                elif exec_result is None:
+                    fb.append(FeedbackItem(
+                        line=None, severity="error",
+                        message="Code requires execution but was not run.",
+                        suggestion="Make sure your code can be executed successfully.",
+                        category="bug",
+                    ))
+                return EvalResult(passed=False, feedback=fb), False, {}
+            return EvalResult(passed=True, encouragement="Well done!"), False, {}
+
+        # If we got past exact match without passing, do Claude review as fallback
+        if step.correct_answer:
+            kwargs = dict(
+                code=code,
+                lesson_title=lesson_title,
+                objective=step.output,
+                depth=depth,
+                stdout=exec_result.stdout if exec_result else "",
+                stderr=exec_result.stderr if exec_result else "",
+                solution_hint=step.correct_answer,
+            )
+            return None, True, kwargs
+
+        # No validation rules — pass if syntax is OK
+        return EvalResult(passed=True, encouragement="Code looks good!"), False, {}
+
     # --- Chat: freeform Q&A ---
+
+    def build_chat_messages(
+        self,
+        question: str,
+        lesson_title: str = "",
+        step_context: str = "",
+        code_context: str = "",
+        depth: str = "beginner",
+        extra_context: str = "",
+    ) -> list[dict]:
+        """Build chat messages. Returns [{"role": "system", ...}, {"role": "user", ...}]."""
+        from sparktutor.engine.spark_knowledge import get_system_prompt
+
+        user_msg = f"""The student is working on: "{lesson_title}"
+Current exercise: {step_context}
+Student depth level: {depth}
+
+{f'Their current code:\n```python\n{code_context}\n```' if code_context else '(no code yet)'}
+{extra_context}
+
+Student question: {question}"""
+
+        return [
+            {"role": "system", "content": get_system_prompt()},
+            {"role": "user", "content": user_msg},
+        ]
 
     async def chat(
         self,
@@ -360,27 +514,27 @@ Rules:
         extra_context: str = "",
     ) -> str:
         """Answer a freeform question about the current lesson/code using Claude."""
-        from sparktutor.engine.spark_knowledge import get_system_prompt
-
         client = self._get_client()
         if client is None:
             return "Claude API not configured. Set ANTHROPIC_API_KEY to enable chat."
 
-        user_msg = f"""The student is working on: "{lesson_title}"
-Current exercise: {step_context}
-Student depth level: {depth}
-
-{f'Their current code:\n```python\n{code_context}\n```' if code_context else '(no code yet)'}
-{extra_context}
-
-Student question: {question}"""
+        messages = self.build_chat_messages(
+            question=question,
+            lesson_title=lesson_title,
+            step_context=step_context,
+            code_context=code_context,
+            depth=depth,
+            extra_context=extra_context,
+        )
 
         try:
+            system_msg = messages[0]["content"]
+            user_messages = [m for m in messages if m["role"] != "system"]
             response = client.messages.create(
                 model=self.settings.claude.get_model(),
                 max_tokens=1024,
-                system=get_system_prompt(),
-                messages=[{"role": "user", "content": user_msg}],
+                system=system_msg,
+                messages=user_messages,
             )
             return response.content[0].text
         except Exception as e:
