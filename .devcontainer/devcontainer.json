@@ -3,7 +3,8 @@
   "image": "mcr.microsoft.com/devcontainers/python:3.12",
   "features": {
     "ghcr.io/devcontainers/features/java:1": { "version": "17" },
-    "ghcr.io/devcontainers/features/node:1": { "version": "20" }
+    "ghcr.io/devcontainers/features/node:1": { "version": "20" },
+    "ghcr.io/devcontainers/features/sshd:1": { "version": "latest" }
   },
   "onCreateCommand": "pip install pyspark==4.1.0 pyyaml pydantic && cd sparktutor-vscode && npm install && bash package-vsix.sh",
   "postCreateCommand": "code --install-extension sparktutor-vscode/sparktutor-*.vsix --force",
