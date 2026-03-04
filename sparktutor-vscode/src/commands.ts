@@ -295,6 +295,11 @@ async function pickExecutionMode(): Promise<string | undefined> {
       detail: "Requires lakehouse-stack and Docker Desktop",
     },
     {
+      label: "Databricks",
+      description: "Remote Databricks cluster via Spark Connect",
+      detail: "Requires databricks-connect and cluster access",
+    },
+    {
       label: "Auto",
       description: "Detect automatically",
       detail: "Uses lakehouse if containers are running, otherwise local",
@@ -433,8 +438,8 @@ async function openLesson(
         result.restoredCode || undefined
       );
     } else {
-      // Non-code steps: open existing exercise file if one exists for this course
-      await workspace.openExerciseIfExists(courseId, result.lessonId);
+      // Non-code steps: open exercise file (creates with header if missing)
+      await workspace.openExerciseIfExists(courseId, result.lessonId, result.lessonTitle);
     }
 
     // THEN show the lesson panel (in Column Two) so it doesn't get displaced
@@ -566,7 +571,7 @@ async function loadStepUI(
   workspace.setStepType(step.cls);
   statusBar.setStep(stepIndex, stepTotal);
 
-  // Open exercise file FIRST (Column One) for code steps
+  // Open exercise file FIRST (Column One)
   if (
     (step.cls === "script" || step.cls === "cmd_question") &&
     currentCourseId &&
@@ -578,6 +583,8 @@ async function loadStepUI(
       stepIndex,
       starterCode
     );
+  } else if (currentCourseId && currentLessonId) {
+    await workspace.openExerciseIfExists(currentCourseId, currentLessonId, currentLessonTitle);
   }
 
   // THEN show lesson panel (Column Two) so it stays visible

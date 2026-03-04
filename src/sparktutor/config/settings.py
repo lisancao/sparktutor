@@ -16,6 +16,21 @@ class ExecutionMode(str, Enum):
     LAKEHOUSE = "lakehouse"
     LOCAL = "local"
     DRY_RUN = "dry_run"
+    DATABRICKS = "databricks"
+
+
+class DatabricksConfig(BaseModel):
+    host: Optional[str] = None
+    token: Optional[str] = None
+    cluster_id: Optional[str] = None
+    profile: Optional[str] = None
+
+    def build_spark_remote(self) -> Optional[str]:
+        """Build a Spark Connect URL for Databricks, or None if fields are missing."""
+        if self.host and self.token and self.cluster_id:
+            h = self.host.rstrip("/")
+            return f"sc://{h}:443/;use_ssl=true;token={self.token};x-databricks-cluster-id={self.cluster_id}"
+        return None
 
 
 class DockerConfig(BaseModel):
@@ -37,6 +52,7 @@ class ClaudeConfig(BaseModel):
 class Settings(BaseModel):
     execution_mode: ExecutionMode = ExecutionMode.AUTO
     docker: DockerConfig = Field(default_factory=DockerConfig)
+    databricks: DatabricksConfig = Field(default_factory=DatabricksConfig)
     claude: ClaudeConfig = Field(default_factory=ClaudeConfig)
     timeout_seconds: int = 120
     data_dir: Path = Path.home() / ".sparktutor"
@@ -58,6 +74,20 @@ class Settings(BaseModel):
         env_lh_path = os.environ.get("SPARKTUTOR_LAKEHOUSE_PATH")
         if env_lh_path:
             data["lakehouse_path"] = env_lh_path
+
+        # Databricks env var overrides
+        db = data.get("databricks", {})
+        for key, env_name in [
+            ("host", "SPARKTUTOR_DATABRICKS_HOST"),
+            ("token", "SPARKTUTOR_DATABRICKS_TOKEN"),
+            ("cluster_id", "SPARKTUTOR_DATABRICKS_CLUSTER_ID"),
+            ("profile", "SPARKTUTOR_DATABRICKS_PROFILE"),
+        ]:
+            val = os.environ.get(env_name)
+            if val:
+                db[key] = val
+        if db:
+            data["databricks"] = db
 
         return cls(**data)
 

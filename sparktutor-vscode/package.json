@@ -161,13 +161,34 @@
         "sparktutor.executionMode": {
           "type": "string",
           "default": "local",
-          "enum": ["local", "lakehouse", "auto"],
+          "enum": ["local", "lakehouse", "databricks", "auto"],
           "enumDescriptions": [
             "Run Spark locally (pip install pyspark, no Docker needed)",
             "Run via lakehouse-stack Docker containers (Kafka, Iceberg)",
+            "Run on a Databricks cluster via Spark Connect",
             "Auto-detect: lakehouse if container running, otherwise local"
           ],
           "description": "How SparkTutor runs Spark code"
+        },
+        "sparktutor.databricksHost": {
+          "type": "string",
+          "default": "",
+          "description": "Databricks workspace host (e.g. adb-1234567890.12.azuredatabricks.net)"
+        },
+        "sparktutor.databricksToken": {
+          "type": "string",
+          "default": "",
+          "description": "Databricks personal access token"
+        },
+        "sparktutor.databricksClusterId": {
+          "type": "string",
+          "default": "",
+          "description": "Databricks cluster ID to connect to"
+        },
+        "sparktutor.databricksProfile": {
+          "type": "string",
+          "default": "",
+          "description": "Databricks config profile name from ~/.databrickscfg (alternative to host/token/cluster)"
         }
       }
     }

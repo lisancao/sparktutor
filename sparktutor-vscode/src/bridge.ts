@@ -83,6 +83,22 @@ export class Bridge extends EventEmitter {
       if (lakehousePath) {
         env.SPARKTUTOR_LAKEHOUSE_PATH = lakehousePath;
       }
+      const dbHost = config.get<string>("databricksHost");
+      if (dbHost) {
+        env.SPARKTUTOR_DATABRICKS_HOST = dbHost;
+      }
+      const dbToken = config.get<string>("databricksToken");
+      if (dbToken) {
+        env.SPARKTUTOR_DATABRICKS_TOKEN = dbToken;
+      }
+      const dbClusterId = config.get<string>("databricksClusterId");
+      if (dbClusterId) {
+        env.SPARKTUTOR_DATABRICKS_CLUSTER_ID = dbClusterId;
+      }
+      const dbProfile = config.get<string>("databricksProfile");
+      if (dbProfile) {
+        env.SPARKTUTOR_DATABRICKS_PROFILE = dbProfile;
+      }
 
       this.proc = spawn(this.pythonPath, ["-m", "sparktutor.server"], {
         stdio: ["pipe", "pipe", "pipe"],

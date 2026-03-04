@@ -46,12 +46,14 @@ export class StatusBarManager {
       lakehouse: "$(flame)",
       local: "$(terminal)",
       dry_run: "$(beaker)",
+      databricks: "$(cloud)",
       unknown: "$(question)",
     };
     const labels: Record<string, string> = {
       lakehouse: "Lakehouse",
       local: "Local",
       dry_run: "Dry-run",
+      databricks: "Databricks",
       unknown: "Unknown",
     };
     this.modeItem.text = `${icons[mode] || "$(question)"} ${labels[mode] || mode}`;

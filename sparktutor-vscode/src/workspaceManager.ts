@@ -225,15 +225,19 @@ export class WorkspaceManager {
    */
   async openExerciseIfExists(
     courseId: string,
-    lessonId: string
+    lessonId: string,
+    lessonTitle?: string
   ): Promise<void> {
     const filePath = this.getLessonFilePath(courseId, lessonId);
-    if (!fs.existsSync(filePath)) {
-      return;
-    }
-    const content = fs.readFileSync(filePath, "utf-8");
-    if (!content.trim()) {
-      return;
+
+    // If file doesn't exist or is empty, seed it with a header so the
+    // editor pane is always populated (avoids blank screen / Copilot chat
+    // taking over on first open).
+    if (!fs.existsSync(filePath) || !fs.readFileSync(filePath, "utf-8").trim()) {
+      const header = lessonTitle
+        ? `# ${lessonTitle}\n# Write your code below as you work through the lesson.\n`
+        : `# SparkTutor Exercise\n# Write your code below as you work through the lesson.\n`;
+      fs.writeFileSync(filePath, header, "utf-8");
     }
 
     const uri = vscode.Uri.file(filePath);

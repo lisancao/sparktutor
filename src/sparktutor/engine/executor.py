@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import tempfile
 from dataclasses import dataclass
 from enum import Enum
@@ -16,6 +17,7 @@ class ExecMode(str, Enum):
     LAKEHOUSE = "lakehouse"
     LOCAL = "local"
     DRY_RUN = "dry_run"
+    DATABRICKS = "databricks"
 
 
 @dataclass
@@ -60,6 +62,10 @@ class Executor:
         except (FileNotFoundError, asyncio.TimeoutError):
             pass
 
+        # Check for Databricks Spark Connect
+        if os.environ.get("SPARK_REMOTE") or self.settings.databricks.build_spark_remote():
+            return ExecMode.DATABRICKS
+
         # Check for local spark-submit
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -88,6 +94,8 @@ class Executor:
             return self._dry_run(code)
         elif mode == ExecMode.LAKEHOUSE:
             return await self._lakehouse_exec(code, on_output)
+        elif mode == ExecMode.DATABRICKS:
+            return await self._databricks_exec(code, on_output)
         else:
             return await self._local_exec(code, on_output)
 
@@ -154,6 +162,34 @@ class Executor:
         )
 
         result = await self._stream_process(proc, ExecMode.LOCAL, on_output)
+        Path(tmp_path).unlink(missing_ok=True)
+        return result
+
+    async def _databricks_exec(
+        self, code: str, on_output: Optional[Callable[[str], None]] = None,
+    ) -> ExecResult:
+        """Execute via Databricks Spark Connect (python3, not spark-submit)."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as tmp:
+            tmp.write(code)
+            tmp_path = tmp.name
+
+        env = {**os.environ}
+        # Set SPARK_REMOTE if explicit config provides it
+        remote_url = self.settings.databricks.build_spark_remote()
+        if remote_url:
+            env["SPARK_REMOTE"] = remote_url
+        # Set profile if configured
+        if self.settings.databricks.profile:
+            env["DATABRICKS_CONFIG_PROFILE"] = self.settings.databricks.profile
+
+        proc = await asyncio.create_subprocess_exec(
+            "python3", tmp_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+
+        result = await self._stream_process(proc, ExecMode.DATABRICKS, on_output)
         Path(tmp_path).unlink(missing_ok=True)
         return result
 
