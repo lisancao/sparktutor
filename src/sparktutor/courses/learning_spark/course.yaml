@@ -4,6 +4,10 @@ course:
   description: "Master Apache Spark from the ground up — DataFrames, SQL, streaming, optimization, and ML"
   version: "1.0.0"
   requires_lakehouse: false
+  prerequisites:
+    - "Python 3.10+"
+    - "Java 17+ (included with most PySpark installs)"
+    - "pip install pyspark"
   lessons:
     - 01_getting_started
     - 02_dataframes_schemas

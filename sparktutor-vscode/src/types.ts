@@ -7,6 +7,7 @@ export interface CourseMeta {
   lessonCount: number;
   requiresLakehouse: boolean;
   lessons: string[];
+  prerequisites: string[];
 }
 
 export interface CourseProgress {
@@ -69,6 +70,7 @@ export interface LoadLessonResult {
   lessonId: string;
   restoredCode: string;
   starterCode: string;
+  coursePrerequisites?: string[];
 }
 
 export interface StepResult {

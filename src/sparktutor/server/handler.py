@@ -110,6 +110,7 @@ class ServerHandler:
                     "lessonCount": len(c.lessons),
                     "requiresLakehouse": c.requires_lakehouse,
                     "lessons": c.lessons,
+                    "prerequisites": c.prerequisites,
                 }
                 for c in courses
             ]
@@ -152,7 +153,7 @@ class ServerHandler:
         restored_code = self._runner.get_restored_code()
         starter_code = self._runner.get_starter_code()
 
-        return {
+        result = {
             "step": _step_to_dict(step),
             "currentIndex": state.current_index,
             "totalSteps": len(state.filtered_steps),
@@ -161,6 +162,9 @@ class ServerHandler:
             "restoredCode": restored_code,
             "starterCode": starter_code,
         }
+        if lesson_idx == 0 and course.prerequisites:
+            result["coursePrerequisites"] = course.prerequisites
+        return result
 
     async def _get_step(self, params: dict) -> dict:
         if self._runner is None or self._runner.state is None:

@@ -17,6 +17,7 @@ class CourseMeta:
     version: str
     requires_lakehouse: bool = False
     lessons: list[str] = field(default_factory=list)
+    prerequisites: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -90,6 +91,7 @@ def load_course(course_dir: Path) -> CourseMeta:
         version=c["version"],
         requires_lakehouse=c.get("requires_lakehouse", False),
         lessons=c.get("lessons", []),
+        prerequisites=c.get("prerequisites", []),
     )
 
 

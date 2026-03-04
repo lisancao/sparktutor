@@ -4,6 +4,11 @@ course:
   description: "Build production-grade bronze-silver-gold data pipelines"
   version: "1.0.0"
   requires_lakehouse: true
+  prerequisites:
+    - "Python 3.10+"
+    - "pip install pyspark"
+    - "Docker Desktop (for Lakehouse Stack mode — Kafka, Iceberg)"
+    - "lakehouse-stack repo (optional, for full infrastructure)"
   lessons:
     - 01_spark_session
     - 02_functions_and_transforms

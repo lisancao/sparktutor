@@ -57,6 +57,10 @@
         "command": "sparktutor.resetLesson",
         "title": "SparkTutor: Reset Current Lesson",
         "icon": "$(trash)"
+      },
+      {
+        "command": "sparktutor.changeMode",
+        "title": "SparkTutor: Change Execution Mode"
       }
     ],
     "keybindings": [
@@ -141,6 +145,17 @@
           "type": "string",
           "default": "",
           "description": "Path to shared lakehouse stack (e.g. ~/lakehouse-stack). Used for courses requiring Spark/Kafka services. Leave empty to use per-course docker-compose."
+        },
+        "sparktutor.executionMode": {
+          "type": "string",
+          "default": "local",
+          "enum": ["local", "lakehouse", "auto"],
+          "enumDescriptions": [
+            "Run Spark locally (pip install pyspark, no Docker needed)",
+            "Run via lakehouse-stack Docker containers (Kafka, Iceberg)",
+            "Auto-detect: lakehouse if container running, otherwise local"
+          ],
+          "description": "How SparkTutor runs Spark code"
         }
       }
     }

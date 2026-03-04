@@ -1,0 +1,16 @@
+{
+  "name": "SparkTutor",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12",
+  "features": {
+    "ghcr.io/devcontainers/features/java:1": { "version": "17" }
+  },
+  "postCreateCommand": "pip install pyspark==4.1.0",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "sparktutor.executionMode": "local"
+      }
+    }
+  },
+  "forwardPorts": [4040]
+}

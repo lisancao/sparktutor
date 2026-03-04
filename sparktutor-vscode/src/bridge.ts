@@ -75,6 +75,14 @@ export class Bridge extends EventEmitter {
       if (model) {
         env.SPARKTUTOR_CLAUDE_MODEL = model;
       }
+      const executionMode = config.get<string>("executionMode");
+      if (executionMode) {
+        env.SPARKTUTOR_EXECUTION_MODE = executionMode;
+      }
+      const lakehousePath = config.get<string>("lakehouseStackPath");
+      if (lakehousePath) {
+        env.SPARKTUTOR_LAKEHOUSE_PATH = lakehousePath;
+      }
 
       this.proc = spawn(this.pythonPath, ["-m", "sparktutor.server"], {
         stdio: ["pipe", "pipe", "pipe"],

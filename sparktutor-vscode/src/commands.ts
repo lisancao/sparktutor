@@ -227,6 +227,10 @@ export function registerCommands(
       }
     }),
 
+    vscode.commands.registerCommand("sparktutor.changeMode", async () => {
+      await pickExecutionMode();
+    }),
+
     vscode.commands.registerCommand("sparktutor.resetLesson", async () => {
       if (!currentCourseId || !currentLessonId || currentLessonIdx === undefined) {
         vscode.window.showWarningMessage("No lesson is currently open.");
@@ -274,6 +278,38 @@ export function registerCommands(
       }
     })
   );
+}
+
+async function pickExecutionMode(): Promise<string | undefined> {
+  const items: vscode.QuickPickItem[] = [
+    {
+      label: "Local",
+      description: "pip install pyspark — no Docker needed",
+      detail: "Run Spark in the same Python environment",
+    },
+    {
+      label: "Lakehouse",
+      description: "Docker containers with Kafka, Iceberg, etc.",
+      detail: "Requires lakehouse-stack and Docker Desktop",
+    },
+    {
+      label: "Auto",
+      description: "Detect automatically",
+      detail: "Uses lakehouse if containers are running, otherwise local",
+    },
+  ];
+  const pick = await vscode.window.showQuickPick(items, {
+    placeHolder: "How should SparkTutor run Spark code?",
+    title: "SparkTutor — Execution Mode",
+  });
+  if (!pick) {
+    return undefined;
+  }
+  const value = pick.label.toLowerCase();
+  await vscode.workspace
+    .getConfiguration("sparktutor")
+    .update("executionMode", value, vscode.ConfigurationTarget.Global);
+  return value;
 }
 
 async function pickDepth(): Promise<string | undefined> {
@@ -355,6 +391,14 @@ async function openLesson(
       } else if (!choice) {
         return; // dismissed — do nothing
       }
+    }
+
+    // Prepend prerequisites banner to the first lesson's first step
+    if (result.coursePrerequisites?.length) {
+      const prereqMd = "## Prerequisites\n\n" +
+        result.coursePrerequisites.map(p => `- ${p}`).join("\n") +
+        "\n\n---\n\n";
+      result.step.output = prereqMd + result.step.output;
     }
 
     currentCourseId = courseId;

@@ -15,7 +15,12 @@ class CourseNode extends vscode.TreeItem {
   ) {
     super(course.title, vscode.TreeItemCollapsibleState.Expanded);
     this.description = `${course.lessonCount} lessons`;
-    this.tooltip = course.description;
+    if (course.prerequisites?.length) {
+      this.tooltip = course.description + "\n\nPrerequisites:\n" +
+        course.prerequisites.map(p => `• ${p}`).join("\n");
+    } else {
+      this.tooltip = course.description;
+    }
     this.contextValue = "course";
   }
 }

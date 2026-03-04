@@ -40,6 +40,7 @@ class Settings(BaseModel):
     claude: ClaudeConfig = Field(default_factory=ClaudeConfig)
     timeout_seconds: int = 120
     data_dir: Path = Path.home() / ".sparktutor"
+    lakehouse_path: Optional[str] = None
 
     @classmethod
     def load(cls) -> "Settings":
@@ -47,8 +48,18 @@ class Settings(BaseModel):
         if config_path.exists():
             with open(config_path) as f:
                 data = yaml.safe_load(f) or {}
-            return cls(**data)
-        return cls()
+        else:
+            data = {}
+
+        # Environment variable overrides (set by VS Code extension)
+        env_mode = os.environ.get("SPARKTUTOR_EXECUTION_MODE")
+        if env_mode:
+            data["execution_mode"] = env_mode
+        env_lh_path = os.environ.get("SPARKTUTOR_LAKEHOUSE_PATH")
+        if env_lh_path:
+            data["lakehouse_path"] = env_lh_path
+
+        return cls(**data)
 
     def save(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)

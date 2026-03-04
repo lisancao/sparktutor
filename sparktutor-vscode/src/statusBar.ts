@@ -15,6 +15,8 @@ export class StatusBarManager {
       100
     );
     this.modeItem.name = "SparkTutor Mode";
+    this.modeItem.command = "sparktutor.changeMode";
+    this.modeItem.tooltip = "Click to change execution mode";
 
     this.stepItem = vscode.window.createStatusBarItem(
       vscode.StatusBarAlignment.Left,
