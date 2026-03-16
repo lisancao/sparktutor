@@ -1,0 +1,153 @@
+- Class: meta
+  Lesson: "Silver — Data Quality Rules"
+  EstimatedMinutes: 40
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Beyond Type Casting: Business Rules
+
+    Silver has cast types. But what about: price must be > 0? Email must
+    match a pattern? Timestamp must be within a valid range? User_id must
+    not be empty?
+
+    These are **data quality rules** — expectations that go beyond
+    "is it a valid number." ShopStream's orders: amount > 0, customer_id
+    not null, created_at not in the future. Violations go to quarantine.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    ## Row-Level Validation
+
+    Each row is checked against rules. Pass → valid. Fail → quarantine.
+
+    ```python
+    valid = df.filter((f.col("amount") > 0) & (f.col("customer_id").isNotNull()))
+    invalid = df.filter(~((f.col("amount") > 0) & (f.col("customer_id").isNotNull())))
+    ```
+
+    For multiple rules, build a boolean column:
+    ```python
+    passes = (f.col("amount") > 0) & (f.col("customer_id").isNotNull()) & ...
+    valid = df.filter(passes)
+    invalid = df.filter(~passes)
+    ```
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Column-Level Checks
+
+    Not just per-row. Column-level: null rate, distinct count, min/max.
+
+    - **Null rate**: `f.sum(f.when(f.col("x").isNull(), 1).otherwise(0)) / count`
+    - **Distinct count**: `df.select("x").distinct().count()`
+    - **Statistical bounds**: `df.agg(f.min("price"), f.max("price")).collect()`
+
+    Use these for monitoring: "If null rate > 5%, alert." Or for
+    validation: "If distinct user_ids < expected, something is wrong."
+
+- Class: mult_question
+  Depth: all
+  Output: "A row has amount=-10. Where should it go?"
+  AnswerChoices: "Quarantine — business rule violation (amount > 0);Valid — it's a valid number;Bronze — reject at ingestion;Gold — aggregate as negative revenue"
+  CorrectAnswer: "Quarantine — business rule violation (amount > 0)"
+  Hint: "Type casting would succeed (it's a number). But business rules say amount must be positive. Quarantine."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Building a DataQualityChecker Class
+
+    ```python
+    class DataQualityChecker:
+        def __init__(self, rules):
+            self.rules = rules  # list of (name, condition)
+
+        def check(self, df):
+            passes = f.lit(True)
+            for name, cond in self.rules:
+                passes = passes & cond
+            valid = df.filter(passes)
+            invalid = df.filter(~passes)
+            return valid, invalid
+    ```
+
+    rules = [
+        ("amount_positive", f.col("amount") > 0),
+        ("customer_not_null", f.col("customer_id").isNotNull()),
+    ]
+
+    Extend: record which rule failed for each invalid row. Use
+    when/otherwise to set _failed_rule column.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "Why record which rule failed for each quarantined row?"
+  AnswerChoices: "To fix the right source — different rules have different fixes;To save storage;To make queries faster;Because Spark requires it"
+  CorrectAnswer: "To fix the right source — different rules have different fixes"
+  Hint: "amount_positive fails → fix payment system. customer_not_null fails → fix upstream."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write a filter that keeps rows where: amount > 0, customer_id is not
+    null, and created_at is not in the future (<= current_timestamp).
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+
+    valid = df.filter(
+        (f.col("amount") > 0) &
+        (f.col("customer_id").isNotNull()) &
+        (f.col("created_at") <= f.current_timestamp())
+    )
+  Hint: "Combine conditions with &. Use f.current_timestamp() for 'now'."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Email and Pattern Validation
+
+    ```python
+    df.withColumn("_email_valid", f.col("email").rlike(r"^[^@]+@[^@]+\.[^@]+$"))
+    ```
+
+    rlike uses regex. For complex patterns, use regexp_extract or
+    regexp_replace. Consider: very strict validation may reject valid
+    edge cases. Balance strictness with business needs.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: DataQualityChecker for ShopStream Orders
+
+    Implement a DataQualityChecker class and use it for orders:
+
+    1. DataQualityChecker(rules) — rules is list of (name, condition)
+    2. check(df) — returns (valid_df, invalid_df). Invalid rows get
+       _quarantine_reason = first failed rule name, _quarantine_at = now
+    3. For orders: amount > 0, customer_id not null, order_id not null
+
+    The test creates order data with one invalid row (amount=-5). Verify
+    valid has 2 rows, invalid has 1 with _quarantine_reason indicating
+    amount_positive or similar.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Build passes condition from all rules. valid=filter(passes), invalid=filter(~passes). For each invalid row, determine which rule failed (first one that fails)."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    Data quality rules in silver:
+
+    - **Row-level** — filter by conditions, split valid/invalid
+    - **Quarantine** — route failures with _quarantine_reason
+    - **DataQualityChecker** — reusable rule engine
+    - **Column-level** — null rate, distinct count for monitoring
+
+    In the next lesson, you will **enrich** silver data with joins —
+    product names, user segments, geo data — to create rich records for
+    gold aggregations.

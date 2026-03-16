@@ -1,0 +1,283 @@
+- Class: meta
+  Lesson: "Gold — Window Functions & Advanced Analytics"
+  EstimatedMinutes: 40
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    In the previous lesson you built gold aggregation tables for
+    ShopStream — daily revenue by category and hourly conversion rates.
+    Those tables answer "how much" and "how many." But executives want
+    more: "which products are winning?", "are we trending up or down?",
+    "how does this week compare to last week?"
+
+    These questions require **window functions** — operations that compute
+    across rows related to the current row without collapsing groups.
+
+    By the end of this lesson you will be able to:
+
+    - Rank products by revenue within categories
+    - Compute running totals and 7-day moving averages
+    - Calculate period-over-period percentage changes
+    - Understand window frame specifications (rows vs range)
+    - Build an executive dashboard gold table
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Window Functions vs GROUP BY
+
+    GROUP BY **collapses** rows — 100 rows become 5 groups. Window
+    functions **preserve** rows — 100 rows stay as 100 rows, but each
+    row gains new columns computed from related rows.
+
+    ```python
+    from pyspark.sql import Window
+
+    w = Window.partitionBy("category").orderBy(f.col("revenue").desc())
+    df.withColumn("rank", f.row_number().over(w))
+    ```
+
+    This adds a `rank` column to every row. Rows are partitioned by
+    category and ranked by revenue within each category. The original
+    data is untouched — you just gain a new computed column.
+
+    Window functions are essential for gold layer analytics because
+    executives want both the detail AND the ranking in the same view.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Think of window functions like a spreadsheet formula that looks at
+    other rows in the same column. If you have a column of daily revenues
+    and want a "running total" column, you write a formula that sums
+    everything above the current cell. That is exactly what a window
+    function does — it looks at a "window" of related rows and computes
+    a value.
+
+    The window has three parts:
+    1. **Partition** — which rows belong to the same group (like category)
+    2. **Order** — how to sort rows within the group (like by date)
+    3. **Frame** — which rows around the current row to include (like
+       "the 6 rows before me" for a 7-day average)
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Ranking: row_number, rank, dense_rank
+
+    Three ranking functions, each handles ties differently:
+
+    ```python
+    w = Window.partitionBy("category").orderBy(f.col("revenue").desc())
+
+    df.withColumn("row_num", f.row_number().over(w))  # 1,2,3,4,5
+    df.withColumn("rank", f.rank().over(w))            # 1,2,2,4,5
+    df.withColumn("dense", f.dense_rank().over(w))     # 1,2,2,3,4
+    ```
+
+    - `row_number()` — always unique, ties broken arbitrarily
+    - `rank()` — ties get the same rank, next rank skips
+    - `dense_rank()` — ties get the same rank, next rank is consecutive
+
+    For "top N products per category," use `row_number()` and filter
+    where `rank <= N`. For "products in the top 3 revenue tiers," use
+    `dense_rank()`.
+
+- Class: mult_question
+  Depth: all
+  Output: "Products A, B, C have revenues $100, $100, $80 in the same category. Using rank(), what ranks do they get?"
+  AnswerChoices: "A=1, B=1, C=3 (rank skips 2);A=1, B=2, C=3 (no ties);A=1, B=1, C=2 (dense ranking);A=1, B=1, C=4 (rank skips 2 and 3)"
+  CorrectAnswer: "A=1, B=1, C=3 (rank skips 2)"
+  Hint: "rank() assigns the same value for ties, then skips. Two items at rank 1 means the next is rank 3."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Running Totals
+
+    A running total sums all rows from the start up to the current row:
+
+    ```python
+    w = Window.orderBy("date").rowsBetween(
+        Window.unboundedPreceding, Window.currentRow)
+
+    df.withColumn("running_revenue", f.sum("revenue").over(w))
+    ```
+
+    `rowsBetween(unboundedPreceding, currentRow)` defines the frame:
+    "from the very first row in this partition up to and including the
+    current row." As you move down the rows (ordered by date), the sum
+    accumulates.
+
+    Running totals are essential for tracking progress toward goals:
+    "We are at $1.2M of our $2M quarterly target."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Moving Averages
+
+    A 7-day moving average smooths daily fluctuations:
+
+    ```python
+    w = Window.orderBy("date").rowsBetween(-6, 0)
+
+    df.withColumn("ma7", f.avg("revenue").over(w))
+    ```
+
+    `rowsBetween(-6, 0)` means "the current row and the 6 rows before
+    it" — a 7-row window. For the first 6 rows where there are not
+    enough preceding rows, Spark averages whatever is available.
+
+    Moving averages reveal trends that daily noise obscures. A single
+    bad day looks alarming in raw data but barely dents a 7-day average.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Given a DataFrame `daily_df` with columns `date`, `category`, and
+    `revenue`, add a column `category_rank` that ranks each day's
+    revenue within its category (highest revenue = rank 1). Use
+    `row_number()`.
+  CorrectAnswer: |
+    from pyspark.sql import Window, functions as f
+
+    w = Window.partitionBy("category").orderBy(f.col("revenue").desc())
+    result = daily_df.withColumn("category_rank", f.row_number().over(w))
+  Hint: "Partition by category, order by revenue descending, apply row_number().over(w)."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Period-over-Period Comparison
+
+    The `lag()` function looks at a previous row in the window:
+
+    ```python
+    w = Window.partitionBy("category", "product_id").orderBy("date")
+
+    df = df.withColumn("prev_revenue", f.lag("revenue", 1).over(w))
+    df = df.withColumn("pct_change",
+        f.when(
+            f.col("prev_revenue").isNotNull() &
+            (f.col("prev_revenue") != 0),
+            (f.col("revenue") - f.col("prev_revenue")) /
+                f.col("prev_revenue")
+        ).otherwise(None))
+    ```
+
+    `lag("revenue", 1)` returns the revenue from the previous row
+    (ordered by date, within the same category and product). The
+    percentage change shows growth or decline day over day.
+
+    Handle the edge cases: the first row has no previous value (None),
+    and division by zero if the previous value was 0.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "You compute pct_change as (current - prev) / prev. For the first day of each product, what should pct_change be?"
+  AnswerChoices: "None/null — there is no previous day to compare against;0 — no change from nothing;1.0 — 100% growth from zero;Spark raises an error"
+  CorrectAnswer: "None/null — there is no previous day to compare against"
+  Hint: "lag() returns null when there is no preceding row. You should propagate that null rather than compute a meaningless value."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Window Frame Specifications: Rows vs Range
+
+    Window frames can be defined in two ways:
+
+    **`rowsBetween(start, end)`** — counts physical rows. `-6, 0` means
+    "the current row and the 6 rows before it," regardless of the values
+    in the order column. Gaps in dates are ignored.
+
+    **`rangeBetween(start, end)`** — counts by value. For a date-ordered
+    window, `rangeBetween(-6, 0)` would mean "rows whose date value is
+    within 6 units of the current date." But this requires numeric order
+    columns; Spark does not natively support date ranges in rangeBetween.
+
+    For most analytics, `rowsBetween` is what you want. If your data
+    has gaps (missing days), you need to fill them first with a date
+    spine before computing a true calendar-based moving average.
+
+    The default frame when no `rowsBetween`/`rangeBetween` is specified
+    depends on whether there is an ORDER BY:
+    - With ORDER BY: `rangeBetween(unboundedPreceding, currentRow)`
+    - Without ORDER BY: `rowsBetween(unboundedPreceding, unboundedFollowing)`
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Sessionization with Window Functions
+
+    For ShopStream click data, you might want to group clicks into
+    sessions — sequences of activity with gaps of less than 30 minutes.
+
+    ```python
+    w = Window.partitionBy("user_id").orderBy("click_time")
+
+    df = (df
+        .withColumn("prev_time", f.lag("click_time").over(w))
+        .withColumn("gap_minutes",
+            (f.unix_timestamp("click_time") -
+             f.unix_timestamp("prev_time")) / 60)
+        .withColumn("new_session",
+            f.when(f.col("gap_minutes") > 30, 1).otherwise(0))
+        .withColumn("session_id",
+            f.sum("new_session").over(w.rowsBetween(
+                Window.unboundedPreceding, Window.currentRow))))
+    ```
+
+    The running sum of `new_session` flags increments each time a gap
+    exceeds 30 minutes, creating a natural session identifier.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Executive Dashboard Gold Table
+
+    Build the executive dashboard gold table for ShopStream. Implement
+    `gold_executive_dashboard(daily_revenue_df)` that takes a DataFrame
+    with columns `date`, `category`, `product_id`, `revenue` and adds:
+
+    1. `rank` — row_number ranking by revenue within each category
+       (highest = 1)
+    2. `running_revenue` — cumulative sum of revenue ordered by date
+    3. `ma7` — 7-day moving average of revenue (current + 6 prior rows)
+    4. `pct_change` — day-over-day revenue percentage change within
+       each category+product (null for the first day, handle zero
+       division)
+
+    Drop the intermediate `prev_revenue` column. Return the enriched
+    DataFrame.
+
+    This exercise combines window functions from this lesson with the
+    aggregation patterns from lesson 8.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Define four window specs: one for ranking (partitionBy category, orderBy revenue desc), one for running total (orderBy date, unboundedPreceding to currentRow), one for MA7 (orderBy date, -6 to 0), one for lag (partitionBy category+product, orderBy date)."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    In this lesson you learned:
+
+    - **Window vs GROUP BY** — windows preserve rows while adding
+      computed columns; GROUP BY collapses rows
+    - **Ranking** — row_number (unique), rank (ties skip), dense_rank
+      (ties consecutive)
+    - **Running totals** — unboundedPreceding to currentRow frame
+    - **Moving averages** — fixed-size row frames like rowsBetween(-6, 0)
+    - **Period-over-period** — lag() for previous values, handle nulls
+      and zero division
+    - **Frame types** — rowsBetween counts rows, rangeBetween counts
+      values
+
+    Your gold layer now has rankings, trends, and comparisons — the
+    metrics executives actually look at. In the next lesson, you will
+    wire everything together with **pipeline orchestration**.

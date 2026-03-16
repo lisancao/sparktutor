@@ -1,0 +1,160 @@
+- Class: meta
+  Lesson: "Variant Type & Semi-Structured Data"
+  EstimatedMinutes: 40
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Product Catalog Migration
+
+    Your e-commerce pipeline stores product metadata as JSON strings. In Spark 3,
+    you used `get_json_object` or `from_json` to parse them. Spark 4 introduces
+    the **VARIANT** type — a native semi-structured column type with better
+    performance and simpler querying. This lesson migrates your product catalog
+    JSON handling to VARIANT.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The VARIANT Type
+
+    VARIANT is Spark's native type for semi-structured data (JSON, BSON). Unlike
+    a string column holding JSON, VARIANT stores the parsed structure internally.
+    You can index into it with `variant_get()` and infer schema with
+    `schema_of_variant()`.
+
+    ```python
+    from pyspark.sql import functions as f
+
+    df = df.withColumn("attrs", f.parse_json(f.col("json_str")))
+    df = df.withColumn("name", f.variant_get(f.col("attrs"), "$.name"))
+    df = df.withColumn("price", f.variant_get(f.col("attrs"), "$.price"))
+    ```
+
+    `parse_json` converts a string to VARIANT. `variant_get(col, path)` extracts
+    a value at a JSON path. Paths use `$.` notation like JSONPath.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Spark 3 Way: get_json_object / from_json
+
+    In Spark 3, you typically did:
+
+    ```python
+    # Spark 3 — string-based JSON
+    df.withColumn("name", f.get_json_object(f.col("json_str"), "$.name"))
+    df.withColumn("price", f.get_json_object(f.col("json_str"), "$.price"))
+    ```
+
+    Or with from_json and a schema:
+
+    ```python
+    schema = "name STRING, price DOUBLE, tags ARRAY<STRING>"
+    df.withColumn("parsed", f.from_json(f.col("json_str"), schema))
+    ```
+
+    Problems: get_json_object parses the string repeatedly per column;
+    from_json requires a fixed schema. VARIANT avoids both.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Spark 4 Way: parse_json and variant_get
+
+    ```python
+    df = df.withColumn("variant_col", f.parse_json(f.col("json_str")))
+    df = df.withColumn("name", f.variant_get(f.col("variant_col"), "$.name"))
+    df = df.withColumn("price", f.variant_get(f.col("variant_col"), "$.price"))
+    ```
+
+    Benefits:
+    - Parse once, extract many — the JSON is parsed into VARIANT once
+    - No fixed schema — extract any path on demand
+    - Native storage — VARIANT can be stored in columnar format efficiently
+    - schema_of_variant(col) — returns the inferred schema for the variant
+
+- Class: text
+  Depth: all
+  Output: |
+    ## schema_of_variant
+
+    To discover the structure of a VARIANT column:
+
+    ```python
+    df.select(f.schema_of_variant(f.col("variant_col"))).show(truncate=False)
+    ```
+
+    Returns a schema string (e.g., "STRUCT<name: STRING, price: DOUBLE>") that
+    you can use with from_json if you need to flatten to a struct. For ad-hoc
+    extraction, variant_get is usually enough.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Performance Advantages
+
+    With get_json_object, each call re-parses the JSON string. With VARIANT:
+    parse_json runs once; variant_get reads from the in-memory structure. For
+    wide JSON with many extracted columns, VARIANT is significantly faster.
+    Storage: VARIANT in Delta/Iceberg can use columnar encoding; JSON strings
+    cannot.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## VARIANT and Unity Catalog
+
+    VARIANT is supported in Unity Catalog tables. You can create a column with
+    VARIANT type and store semi-structured data natively. Schema evolution is
+    easier: new JSON fields don't require ALTER TABLE.
+
+- Class: mult_question
+  Depth: all
+  Output: "What is the main performance advantage of VARIANT over get_json_object?"
+  AnswerChoices: "VARIANT uses less memory;Parse once, extract many;VARIANT is smaller on disk;VARIANT supports streaming"
+  CorrectAnswer: "Parse once, extract many"
+  Hint: "get_json_object parses the JSON string for each column. VARIANT parses once; variant_get reads from the parsed structure."
+
+- Class: mult_question
+  Depth: all
+  Output: "When would you use schema_of_variant?"
+  AnswerChoices: "To validate JSON;To discover the structure of a VARIANT column;To convert to string;To filter rows"
+  CorrectAnswer: "To discover the structure of a VARIANT column"
+  Hint: "schema_of_variant returns the inferred schema of the variant's structure."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Given a DataFrame with a string column "json_str" containing JSON like
+    {"product":"Widget","price":19.99}, add columns "product" and "price"
+    using parse_json and variant_get.
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+
+    df = df.withColumn("variant_col", f.parse_json(f.col("json_str")))
+    df = df.withColumn("product", f.variant_get(f.col("variant_col"), "$.product"))
+    df = df.withColumn("price", f.variant_get(f.col("variant_col"), "$.price"))
+  Hint: "parse_json first, then variant_get with $.product and $.price paths."
+
+- Class: mult_question
+  Depth: all
+  Output: "Why might VARIANT be preferable to from_json with a fixed schema?"
+  AnswerChoices: "VARIANT is faster;VARIANT handles schema evolution without ALTER TABLE;VARIANT uses less memory;VARIANT supports joins"
+  CorrectAnswer: "VARIANT handles schema evolution without ALTER TABLE"
+  Hint: "from_json requires a fixed schema. New JSON fields need schema changes. VARIANT is flexible."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Exercise: Migrate Product Catalog to VARIANT
+
+    The product catalog stores attributes as JSON: name, category, tags, price.
+    Migrate from get_json_object to VARIANT. Implement `migrate_catalog_to_variant`
+    that: 1) adds a variant column from json_str, 2) extracts name, category,
+    price using variant_get, 3) returns the DataFrame with the new columns.
+    Handle Spark 3 fallback: if parse_json/variant_get are not available, use
+    get_json_object (with a clear comment that it's the Spark 3 fallback).
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "parse_json, variant_get for $.name, $.category, $.price. Try/except for Spark 3 fallback to get_json_object."

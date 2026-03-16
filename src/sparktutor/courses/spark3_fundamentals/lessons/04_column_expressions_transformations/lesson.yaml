@@ -1,0 +1,177 @@
+- Class: meta
+  Lesson: "Column Expressions & Transformations"
+  EstimatedMinutes: 35
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Building on Lessons 2 and 3
+
+    You have filtered trips, added fare_per_mile, and defined schemas for
+    trips, drivers, and ratings. Now we go deeper into column expressions:
+    the three ways to reference columns (col, expr, bracket), conditional
+    logic with when/otherwise, and the string, date, and math functions
+    that power ride-sharing analytics. These patterns will appear in every
+    aggregation and window function from here on.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Three Ways to Reference Columns
+
+    Spark gives you three equivalent ways to build column expressions:
+
+    ```python
+    from pyspark.sql import functions as f
+
+    df.select(f.col("fare") * 2)
+    df.select(df["fare"] * 2)
+    df.select(f.expr("fare * 2"))
+    ```
+
+    - **col("name")** — type-safe, works with autocomplete. Use for
+      DataFrame API style.
+    - **df["name"]** — bracket notation. Shorter, but no autocomplete.
+    - **expr("SQL expression")** — full SQL syntax. Use for complex
+      expressions: `f.expr("CASE WHEN fare > 20 THEN 'premium' ELSE 'standard' END")`
+
+    All produce the same logical plan. Choose based on readability.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## when/otherwise: Conditional Logic
+
+    For ride-sharing, you need conditional logic: surge pricing, distance
+    categories, time-of-day buckets. Use `f.when()` and `f.otherwise()`:
+
+    ```python
+    from pyspark.sql import functions as f
+
+    df.withColumn("fare_tier",
+        f.when(f.col("fare") >= 20, "premium")
+        .when(f.col("fare") >= 10, "standard")
+        .otherwise("budget"))
+    ```
+
+    This is equivalent to SQL `CASE WHEN ... THEN ... ELSE ... END`.
+    Chain multiple `.when()` for multiple conditions; `.otherwise()` is
+    the default.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## String, Date, and Math Functions
+
+    The `f` module provides hundreds of functions:
+
+    - **String**: `f.upper`, `f.lower`, `f.substring`, `f.split`, `f.regexp_extract`
+    - **Date**: `f.to_timestamp`, `f.date_format`, `f.hour`, `f.dayofweek`
+    - **Math**: `f.round`, `f.abs`, `f.sqrt`, `f.log`
+
+    For time-of-day buckets from a timestamp string:
+
+    ```python
+    df.withColumn("pickup_ts", f.to_timestamp("pickup_time"))
+      .withColumn("hour", f.hour("pickup_ts"))
+      .withColumn("time_bucket",
+          f.when(f.col("hour").between(6, 9), "morning_rush")
+          .when(f.col("hour").between(17, 20), "evening_rush")
+          .otherwise("off_peak"))
+    ```
+
+- Class: text
+  Depth: all
+  Output: |
+    ## User-Defined Expressions with expr()
+
+    When the built-in functions are cumbersome, `f.expr()` lets you write
+    SQL-style expressions:
+
+    ```python
+    df.withColumn("fare_per_mile", f.expr("fare / distance_miles"))
+    df.withColumn("is_surge", f.expr("fare > 15 AND distance_miles < 3"))
+    ```
+
+    Useful for complex formulas, nested CASE statements, or when you are
+    more comfortable with SQL than the DataFrame API.
+
+- Class: mult_question
+  Depth: all
+  Output: "What is the main advantage of using f.expr() over f.col() for column expressions?"
+  AnswerChoices: "expr is faster;expr supports full SQL syntax for complex expressions;expr uses less memory;expr is required for joins"
+  CorrectAnswer: "expr supports full SQL syntax for complex expressions"
+  Hint: "expr() accepts a string that can contain SQL operators, functions, and CASE expressions."
+
+- Class: mult_question
+  Depth: all
+  Output: "In f.when(cond1, val1).when(cond2, val2).otherwise(val3), what happens if both cond1 and cond2 are true?"
+  AnswerChoices: "Both values are returned;val2 is used;val1 is used;An error is thrown"
+  CorrectAnswer: "val1 is used"
+  Hint: "when/otherwise is evaluated top to bottom. The first matching condition wins."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Given a DataFrame with columns fare and distance_miles, write a
+    withColumn that adds is_surge_pricing (True when fare > 15 and
+    distance_miles < 5, else False).
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+
+    result = df.withColumn("is_surge_pricing",
+        (f.col("fare") > 15) & (f.col("distance_miles") < 5))
+  Hint: "Combine two conditions with & for AND. The result is a boolean column."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Distance Categories and Enrichment Patterns
+
+    For the ride-sharing platform, common enrichments:
+
+    - **distance_category**: short (<3 mi), medium (3-10), long (>10)
+    - **time_of_day**: morning_rush (6-9), midday (9-17), evening_rush (17-20), late_night
+    - **surge_flag**: true when fare/distance is unusually high
+
+    These become dimensions for dashboards (Lesson 6) and inputs to window
+    functions (Lesson 8). Define them once in a silver layer; reuse everywhere.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Using f.expr(), add a column distance_category where: "short" if
+    distance_miles < 3, "medium" if < 10, else "long".
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+
+    result = df.withColumn("distance_category",
+        f.expr("CASE WHEN distance_miles < 3 THEN 'short' "
+               "WHEN distance_miles < 10 THEN 'medium' "
+               "ELSE 'long' END"))
+  Hint: "Use expr with CASE WHEN ... THEN ... WHEN ... THEN ... ELSE ... END."
+
+- Class: mult_question
+  Depth: all
+  Output: "Which function extracts the hour from a timestamp column?"
+  AnswerChoices: "f.extract;f.hour;f.time;f.get_hour"
+  CorrectAnswer: "f.hour"
+  Hint: "The pyspark.sql.functions module has hour(), minute(), second() for timestamp parts."
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Enrich Trips with Time Buckets, Surge Flags, and Distance Categories
+
+    Implement `enrich_trips` that takes a trips DataFrame (with city,
+    fare, distance_miles, pickup_time) and adds:
+    1. **time_bucket**: "morning_rush" (hour 6-9), "evening_rush" (17-20),
+       "off_peak" otherwise. Use to_timestamp and hour.
+    2. **is_surge**: True when fare > 15 and distance_miles < 5, else False
+    3. **distance_category**: "short" (<3 mi), "medium" (3-10), "long" (>10)
+
+    Reuses the trip structure from Lessons 2-3 and prepares data for the
+    city dashboard (Lesson 6) and driver profiles (Lesson 7).
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Use to_timestamp on pickup_time, then hour(). Chain when/otherwise for time_bucket and distance_category."

@@ -1,0 +1,282 @@
+- Class: meta
+  Lesson: "Collation Support & String Handling"
+  EstimatedMinutes: 30
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    String comparison in Spark 3 was always binary — `"Widget"` and
+    `"WIDGET"` are different values in JOINs, GROUP BY, DISTINCT, and
+    filters. For our e-commerce pipeline, this means a customer searching
+    for "widget" would miss products named "Widget" or "WIDGET."
+
+    Spark 4 introduces **collation support** — locale-aware, case-sensitive
+    or case-insensitive string comparisons built into the engine.
+
+    By the end of this lesson you will be able to:
+
+    - Explain what collations are and why they matter
+    - Use the COLLATE clause on columns and expressions
+    - Understand the impact on JOINs, GROUP BY, and DISTINCT
+    - Migrate Spark 3 workarounds (lower/upper) to native collations
+    - Handle multi-language product catalogs correctly
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Spark 3 Problem: Binary String Comparison
+
+    In Spark 3, all string comparisons are **binary** — byte-by-byte.
+    This creates real problems for our e-commerce product catalog:
+
+    ```python
+    # Spark 3: These are three DIFFERENT groups
+    products = [("Widget",), ("WIDGET",), ("widget",)]
+    df = spark.createDataFrame(products, ["name"])
+    df.groupBy("name").count().show()
+    # +------+-----+
+    # |  name|count|
+    # +------+-----+
+    # |Widget|    1|
+    # |WIDGET|    1|
+    # |widget|    1|
+    # +------+-----+
+    ```
+
+    The workaround was to normalize everything with `lower()` or
+    `upper()`:
+
+    ```python
+    df.groupBy(f.lower("name")).count()
+    ```
+
+    This works for English but fails for languages where lowercasing
+    is not straightforward (Turkish dotted I, German ß, etc.).
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Think of collation like sorting rules in a library. An English
+    library might file "A" and "a" together because they are the same
+    letter. A computer without collation treats them as completely
+    different characters (A=65, a=97 in ASCII).
+
+    Collation tells Spark: "these characters should be treated as
+    equivalent for comparison purposes." Case-insensitive collation
+    means `"Widget" == "WIDGET"` evaluates to `true`.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Spark 4: Native Collation Support
+
+    Spark 4 lets you specify collation at the column level or in
+    expressions:
+
+    ```sql
+    -- Column-level collation in CREATE TABLE
+    CREATE TABLE products (
+        product_id STRING,
+        name STRING COLLATE 'UTF8_LCASE'
+    );
+
+    -- Expression-level collation
+    SELECT * FROM products
+    WHERE name COLLATE 'UTF8_LCASE' = 'widget';
+    ```
+
+    In PySpark:
+
+    ```python
+    from pyspark.sql.types import StringType
+
+    df.filter(
+        f.col("name").collate("UTF8_LCASE") == "widget"
+    )
+    ```
+
+    `UTF8_LCASE` means UTF-8 encoding with lowercase comparison —
+    effectively case-insensitive matching. Spark handles the comparison
+    at the engine level, no Python UDF needed.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Available Collation Types
+
+    Spark 4 supports several collation providers:
+
+    | Collation | Behavior |
+    |-----------|----------|
+    | `UTF8_BINARY` | Default — byte-by-byte (Spark 3 behavior) |
+    | `UTF8_LCASE` | Case-insensitive using Unicode lowercase |
+    | `UNICODE` | Unicode Collation Algorithm — locale-aware |
+    | `UNICODE_CI` | Unicode case-insensitive |
+
+    `UTF8_LCASE` handles most Latin-script needs. For proper
+    multi-language support (CJK, Arabic, Cyrillic), use `UNICODE_CI`.
+
+    Collation affects: `=`, `<>`, `<`, `>`, `LIKE`, `IN`, `GROUP BY`,
+    `DISTINCT`, `ORDER BY`, and JOIN conditions. Basically every
+    operation that compares strings.
+
+- Class: mult_question
+  Depth: all
+  Output: "In Spark 3, you use lower(name) = lower('Widget') for case-insensitive matching. What problem does this NOT solve?"
+  AnswerChoices: "Multi-language case folding (Turkish İ/i, German ß/SS);Performance of the comparison;Column type compatibility;Null handling"
+  CorrectAnswer: "Multi-language case folding (Turkish İ/i, German ß/SS)"
+  Hint: "Think about languages where lowercasing is not a simple letter-by-letter mapping."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Impact on JOINs and GROUP BY
+
+    Collation changes how joins match rows:
+
+    ```python
+    # Spark 3: these DON'T match without lower()
+    orders = [("1", "Widget")]
+    products = [("Widget",), ("WIDGET",)]
+
+    # Spark 4 with collation: they DO match
+    orders_df = spark.createDataFrame(orders, ["id", "product"])
+    products_df = spark.createDataFrame(products, ["name"])
+
+    joined = orders_df.join(
+        products_df,
+        orders_df["product"].collate("UTF8_LCASE") ==
+            products_df["name"].collate("UTF8_LCASE")
+    )
+    ```
+
+    For GROUP BY, collation collapses groups that differ only in case:
+
+    ```python
+    df.groupBy(f.col("name").collate("UTF8_LCASE")).count()
+    # Now "Widget", "WIDGET", "widget" are ONE group
+    ```
+
+    This is the correct behavior for product analytics — you want a
+    single count for the product regardless of how users typed the name.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "You have a products table with UTF8_LCASE collation on the name column. What happens when you GROUP BY name?"
+  AnswerChoices: "'Widget', 'WIDGET', and 'widget' are grouped together as one group;Each distinct casing creates a separate group;Spark raises an error because collation is incompatible with GROUP BY;The query runs but ignores the collation"
+  CorrectAnswer: "'Widget', 'WIDGET', and 'widget' are grouped together as one group"
+  Hint: "Collation applies to all comparison-based operations, including the equality checks in GROUP BY."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Given a DataFrame `products_df` with a `name` column, filter for
+    products matching "widget" case-insensitively. Use the `lower()`
+    fallback approach that works on both Spark 3 and 4.
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+
+    result = products_df.filter(
+        f.lower(f.col("name")) == f.lower(f.lit("widget"))
+    )
+  Hint: "Apply lower() to both the column and the literal value so the comparison is case-insensitive."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Collation and Performance
+
+    Native collation in Spark 4 is faster than the `lower()` workaround
+    because:
+
+    1. **No expression evaluation** — collation is a property of the
+       comparison, not an extra function call on every row
+    2. **Predicate pushdown** — collated comparisons can push down to
+       data sources (Parquet, Iceberg) that support collation-aware
+       predicates
+    3. **Hash optimization** — GROUP BY and JOIN hash tables use
+       collation-aware hashing, so "Widget" and "WIDGET" hash to the
+       same bucket directly
+
+    The `lower()` approach creates a derived column, preventing predicate
+    pushdown and adding a function evaluation per row. On a 1B row table,
+    this difference is significant.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Migration Strategy
+
+    When migrating the e-commerce pipeline:
+
+    **Step 1**: Identify all `lower()`/`upper()` calls used for
+    case-insensitive matching.
+
+    **Step 2**: Replace with collation where running on Spark 4:
+    ```python
+    # Before (Spark 3)
+    df.filter(f.lower("name") == f.lower(f.lit("widget")))
+
+    # After (Spark 4)
+    df.filter(f.col("name").collate("UTF8_LCASE") == "widget")
+    ```
+
+    **Step 3**: For code that must run on both Spark 3 and 4, use a
+    compatibility wrapper:
+    ```python
+    def ci_equals(col, value):
+        try:
+            return col.collate("UTF8_LCASE") == value
+        except (AttributeError, TypeError):
+            return f.lower(col) == f.lower(f.lit(value))
+    ```
+
+    **Step 4**: For new tables on Spark 4, define collation at the
+    column level in DDL so all queries benefit automatically.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Fix Multi-Language Product Catalog Matching
+
+    The ShopStream product catalog has products entered with inconsistent
+    casing. Customer searches fail because "widget" doesn't match
+    "Widget" in the database.
+
+    Implement `match_products_case_insensitive(spark, name)` that:
+
+    1. Creates a DataFrame from the PRODUCTS_DATA constant
+    2. Filters for products whose name matches the given name
+       case-insensitively
+    3. Uses collation if available (Spark 4), falls back to `lower()`
+       (Spark 3 compatible)
+    4. Returns the matching DataFrame
+
+    This exercise practices the migration pattern from lesson 4 (ANSI
+    mode compatibility) — write code that works on both Spark versions.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Try collate() in a try/except block, fall back to lower() for Spark 3 compatibility."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    In this lesson you learned:
+
+    - **Binary comparison** — Spark 3's default treats "Widget" and
+      "WIDGET" as different values, breaking case-insensitive use cases
+    - **Native collation** — Spark 4 supports UTF8_LCASE, UNICODE_CI,
+      and other collation types at the column and expression level
+    - **Impact on operations** — collation affects =, GROUP BY, JOIN,
+      DISTINCT, ORDER BY, and LIKE
+    - **Performance benefits** — native collation enables predicate
+      pushdown and avoids per-row function evaluation
+    - **Migration pattern** — use try/except wrappers for code that
+      must run on both Spark 3 and 4
+
+    In the next lesson, you will learn about Python UDTFs — a powerful
+    new way to write table-generating functions in Spark 4.

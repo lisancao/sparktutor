@@ -1,0 +1,175 @@
+- Class: meta
+  Lesson: "Default Column Values & Table Features"
+  EstimatedMinutes: 35
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Table Schema Evolution
+
+    Your e-commerce pipeline creates product and order tables. In Spark 3, you
+    defined columns and inserted rows with explicit values for every column.
+    Spark 4 adds **DEFAULT** values, **generated columns**, and **governance**
+    features (column masks, row filters). This lesson creates product and order
+    tables using these new capabilities.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## DEFAULT Keyword
+
+    In CREATE TABLE and ALTER TABLE, you can specify a default for a column:
+
+    ```sql
+    CREATE TABLE products (
+        product_id STRING,
+        name STRING,
+        created_at TIMESTAMP DEFAULT current_timestamp(),
+        updated_at TIMESTAMP DEFAULT current_timestamp()
+    );
+    ```
+
+    When you INSERT without specifying created_at or updated_at, Spark uses the
+    default. For INSERT ... VALUES, omit the column or use DEFAULT keyword:
+
+    ```sql
+    INSERT INTO products (product_id, name) VALUES ('p1', 'Widget');
+    ```
+
+    This reduces boilerplate and ensures consistency (e.g., audit timestamps).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Generated Columns (GENERATED ALWAYS AS)
+
+    A generated column is computed from other columns. You define it in the
+    schema; Spark maintains it automatically:
+
+    ```sql
+    CREATE TABLE order_lines (
+        order_id STRING,
+        product_id STRING,
+        quantity INT,
+        unit_price DOUBLE,
+        line_total DOUBLE GENERATED ALWAYS AS (quantity * unit_price)
+    );
+    ```
+
+    You cannot insert into line_total — it's always computed. This enforces
+    correctness and avoids drift between quantity/price and line_total.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Column Masks and Row Filters
+
+    For governance, Spark supports:
+
+    - **Column masks** — Transform a column's value based on the user's
+      permissions. E.g., mask email to "***@***.com" for unprivileged users.
+    - **Row filters** — Filter rows based on the user. E.g., show only rows
+      where region = user_region.
+
+    These are typically configured in the catalog (Unity Catalog in Databricks).
+    The syntax varies by catalog implementation. The concept: sensitive columns
+    and rows are protected at read time.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Spark 3 vs Spark 4 Table DDL
+
+    Spark 3: No DEFAULT in standard Spark SQL. Some runtimes (Delta, etc.) had
+    extensions. Spark 4: DEFAULT and GENERATED ALWAYS AS are part of the SQL
+    standard support. Your migration can add defaults to existing tables via
+    ALTER TABLE ... ADD COLUMN ... DEFAULT value.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Creating Tables Programmatically
+
+    In PySpark, you use spark.sql() for DDL:
+
+    ```python
+    spark.sql("""
+        CREATE TABLE IF NOT EXISTS products (
+            product_id STRING,
+            name STRING,
+            category STRING DEFAULT 'Uncategorized',
+            created_at TIMESTAMP DEFAULT current_timestamp()
+        )
+        USING DELTA
+        LOCATION '/tmp/products'
+    """)
+    ```
+
+    For Delta tables, you need a Delta-enabled Spark session. For in-memory
+    tables, omit USING and LOCATION.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Generated Column Limitations
+
+    Generated columns can only reference other columns in the same row. No
+    aggregations, no subqueries. The expression must be deterministic. Some
+    catalogs restrict which functions can be used in generated columns.
+
+- Class: mult_question
+  Depth: all
+  Output: "What is the benefit of a GENERATED ALWAYS AS column?"
+  AnswerChoices: "Faster inserts;Computed automatically, no drift;Smaller storage;Enables streaming"
+  CorrectAnswer: "Computed automatically, no drift"
+  Hint: "The value is always derived from other columns. You cannot insert a wrong value."
+
+- Class: mult_question
+  Depth: all
+  Output: "When would you use a column DEFAULT in CREATE TABLE?"
+  AnswerChoices: "For primary keys;For audit timestamps or common fallbacks;For foreign keys;Never"
+  CorrectAnswer: "For audit timestamps or common fallbacks"
+  Hint: "Defaults reduce boilerplate when most inserts use the same value (e.g., current_timestamp)."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write a spark.sql() call to CREATE TABLE orders with columns: order_id STRING,
+    customer_id STRING, status STRING DEFAULT 'pending', created_at TIMESTAMP
+    DEFAULT current_timestamp(). Use USING DELTA and LOCATION '/tmp/orders'.
+  CorrectAnswer: |
+    spark.sql("""
+        CREATE TABLE IF NOT EXISTS orders (
+            order_id STRING,
+            customer_id STRING,
+            status STRING DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT current_timestamp()
+        )
+        USING DELTA
+        LOCATION '/tmp/orders'
+    """)
+  Hint: "Standard CREATE TABLE syntax with DEFAULT and USING DELTA."
+
+- Class: mult_question
+  Depth: all
+  Output: "Can you INSERT a value into a GENERATED ALWAYS AS column?"
+  AnswerChoices: "Yes;No — it is computed automatically;Only with OVERRIDE;Only for Delta"
+  CorrectAnswer: "No — it is computed automatically"
+  Hint: "Generated columns are read-only. Spark computes them from the expression."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Exercise: Product and Order Tables with Defaults
+
+    Create product and order tables with DEFAULT and generated columns. Use
+    spark.sql() to run DDL. The product table: product_id, name, category
+    DEFAULT 'Uncategorized'. The order_lines table: order_id, product_id,
+    quantity, unit_price, line_total GENERATED ALWAYS AS (quantity * unit_price).
+    Use a temp or in-memory location for testing. Implement
+    `create_ecommerce_tables(spark)` that creates both tables and returns
+    their names. Handle Delta availability: if Delta is not available, use
+    PARQUET or skip USING.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "CREATE TABLE with DEFAULT and GENERATED ALWAYS AS. Use /tmp or memory for testing."

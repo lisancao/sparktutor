@@ -1,0 +1,168 @@
+- Class: meta
+  Lesson: "Reading & Writing Data"
+  EstimatedMinutes: 35
+
+- Class: text
+  Depth: all
+  Output: |
+    ## From In-Memory to Files
+
+    Lessons 1-4 used DataFrames built from Python data or with inferred
+    schemas. Now we connect to the real world: reading raw trip CSVs
+    with the schemas from Lesson 3, and writing to Parquet for efficient
+    downstream processing. This is the ingestion layer of our ride-sharing
+    analytics platform — the foundation for the aggregations and joins
+    in Lessons 6 and 7.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## DataFrameReader: format → options → schema → load
+
+    The read API follows a consistent pattern:
+
+    ```python
+    df = (spark.read
+        .format("csv")
+        .option("header", "true")
+        .option("sep", ",")
+        .schema(trips_schema)
+        .load("/path/to/trips/"))
+    ```
+
+    - **format** — csv, json, parquet, orc
+    - **option** — format-specific settings (header, sep, nullValue for CSV)
+    - **schema** — use the StructType from Lesson 3; avoids inferSchema
+    - **load** — path to file or directory (supports globs)
+
+    Order matters: options before schema, schema before load.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## CSV, JSON, Parquet, ORC: When to Use Each
+
+    - **CSV**: Human-readable, universal. Use for raw ingestion, exports.
+      Slow for analytics (no column pruning, full scan).
+    - **JSON**: Semi-structured, good for APIs. Similar tradeoffs to CSV.
+    - **Parquet**: Columnar, compressed. Spark's preferred format. Fast
+      reads (column pruning), small files. Use for processed/silver data.
+    - **ORC**: Like Parquet, popular in Hive. Slightly different compression.
+
+    For our platform: CSV for raw trip logs, Parquet for cleaned data
+    that Lesson 6 and 7 will consume.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    ## Performance Comparison (Conceptual)
+
+    Reading 1GB of trip data:
+    - CSV with inferSchema: ~2x read (two passes) + full scan
+    - CSV with explicit schema: 1 pass, but still full scan
+    - Parquet: Columnar read — only requested columns are read. 5-10x
+      faster for typical analytical queries.
+
+    Writing: Parquet compresses well (often 5-10x smaller than CSV).
+    Partitioning (next section) makes reads even faster when you filter
+    by partition columns.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## DataFrameWriter: Modes and Partitioning
+
+    ```python
+    (df.write
+        .format("parquet")
+        .mode("overwrite")
+        .partitionBy("city", "date")
+        .save("/path/to/output/"))
+    ```
+
+    **Modes**:
+    - `error` (default) — fail if path exists
+    - `overwrite` — replace existing data
+    - `append` — add to existing (use with care for partitioned data)
+    - `ignore` — do nothing if path exists
+
+    **partitionBy** — creates subdirectories (e.g., city=SF/date=2024-01-15/).
+    Reads that filter by city and date can skip entire partitions.
+
+- Class: mult_question
+  Depth: all
+  Output: "Why is Parquet typically faster than CSV for analytical queries?"
+  AnswerChoices: "Parquet is smaller;Parquet is columnar — only needed columns are read;Parquet uses less memory;Parquet runs on GPU"
+  CorrectAnswer: "Parquet is columnar — only needed columns are read"
+  Hint: "Columnar format stores data by column. A query that selects 3 of 20 columns reads only those 3."
+
+- Class: mult_question
+  Depth: all
+  Output: "What happens with write.mode('append') when the output path already has data?"
+  AnswerChoices: "Data is replaced;Data is merged;New data is added to existing;An error is thrown"
+  CorrectAnswer: "New data is added to existing"
+  Hint: "Append adds new files/partitions without removing existing data."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write code to read a CSV file at path `/data/trips.csv` with header,
+    using the schema variable `trips_schema`, and load into `trips_df`.
+  CorrectAnswer: |
+    trips_df = (spark.read
+        .format("csv")
+        .option("header", "true")
+        .schema(trips_schema)
+        .load("/data/trips.csv"))
+  Hint: "Use spark.read.format('csv').option('header','true').schema(...).load(...)."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Partitioning Output by Date and Region
+
+    For ride-sharing analytics, partitioning by date lets you process
+    incremental data (e.g., only yesterday's trips). Partitioning by
+    city supports regional dashboards. Combine both:
+
+    ```python
+    df.write.mode("overwrite").partitionBy("date", "city").parquet("/output/")
+    ```
+
+    The directory structure becomes date=2024-01-15/city=SF/, etc. A
+    query filtering `WHERE date = '2024-01-15'` skips all other date
+    partitions — partition pruning.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write code to write DataFrame `df` to Parquet at `/output/trips/`,
+    overwriting if exists, partitioned by column `date`.
+  CorrectAnswer: |
+    df.write.format("parquet").mode("overwrite").partitionBy("date").save("/output/trips/")
+  Hint: "Use write.format, mode, partitionBy, save."
+
+- Class: mult_question
+  Depth: all
+  Output: "What is partition pruning?"
+  AnswerChoices: "Removing duplicate partitions;Skipping partitions that don't match filter predicates;Compressing partitions;Splitting large partitions"
+  CorrectAnswer: "Skipping partitions that don't match filter predicates"
+  Hint: "When you filter by a partition column, Spark can skip reading those partition directories entirely."
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Read CSV, Write Parquet Partitioned by Date
+
+    Implement `ingest_trips_to_parquet` that:
+    1. Reads CSV from `input_path` using `get_trips_schema()` from Lesson 3
+       (header=true). The CSV has columns: trip_id, city, driver_id, rider_id,
+       fare, distance_miles, pickup_time.
+    2. Adds a `date` column extracted from pickup_time (first 10 chars: YYYY-MM-DD)
+    3. Writes to Parquet at `output_path` in overwrite mode, partitioned by date
+
+    Reuses the trips schema from Lesson 3 and prepares data for the city
+    dashboard (Lesson 6) and driver profiles (Lesson 7).
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Use substring or to_date on pickup_time for date. Read with schema, add date column, write with partitionBy('date')."

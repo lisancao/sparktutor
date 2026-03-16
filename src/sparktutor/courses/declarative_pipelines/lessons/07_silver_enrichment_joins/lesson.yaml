@@ -1,0 +1,139 @@
+- Class: meta
+  Lesson: "Silver — Enrichment Joins & Lookups"
+  EstimatedMinutes: 40
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Enriching Click Events
+
+    Bronze clicks have product_id. Silver has cast types and passed
+    quality checks. But the executive dashboard needs **product names**,
+    **user segments**, and **geo data**. That requires joining with
+    lookup tables.
+
+    ShopStream's lookups: product catalog (product_id → name, category),
+    user profiles (user_id → segment), geo (ip/country → region). This
+    lesson builds the enrichment joins that create rich silver records.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    ## Joining Bronze Tables
+
+    Silver can join multiple bronze (or silver) tables:
+
+    ```python
+    clicks = spark.table("bronze_clicks")
+    products = spark.table("product_catalog")
+    enriched = clicks.join(products, "product_id", "left")
+    ```
+
+    Use **left** join to preserve all clicks. Products not in catalog
+    get null for product name. Use **inner** only when you want to drop
+    clicks with unknown products.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Lookup Tables
+
+    Lookups are typically small: product catalog (thousands of rows),
+    user segments (millions but still small vs events). Best practices:
+
+    - **Broadcast** small lookups: `f.broadcast(products)` in join.
+      Spark sends the small table to every executor. Avoids shuffle.
+    - **Refresh strategy**: Lookups change. Product catalog updates
+      daily. User segments might be batch. Decide: full refresh or
+      incremental. For this course we assume lookups are provided as
+      DataFrames.
+
+- Class: mult_question
+  Depth: all
+  Output: "Why use left join instead of inner when enriching clicks with product names?"
+  AnswerChoices: "To preserve all clicks — unknown products get null;To reduce data size;To avoid duplicates;Because inner join is slower"
+  CorrectAnswer: "To preserve all clicks — unknown products get null"
+  Hint: "Inner join drops clicks with no matching product. Left keeps them with null product name."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Broadcast Optimization
+
+    When one side of the join is small (< 10MB typically), broadcast it:
+
+    ```python
+    enriched = clicks.join(f.broadcast(products), "product_id", "left")
+    ```
+
+    Spark sends the products table to every executor. No shuffle of the
+    large clicks table. Join happens locally. Set
+    spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "10m") to
+    let Spark auto-broadcast small tables.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "When should you use broadcast join?"
+  AnswerChoices: "When one side is small — avoids shuffle of large table;When both tables are huge;When you need a full outer join;Never — it uses more memory"
+  CorrectAnswer: "When one side is small — avoids shuffle of large table"
+  Hint: "Broadcast sends the small table to executors. The large table stays put. No shuffle."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Slowly Changing Dimensions (SCD)
+
+    **Type 1**: Overwrite. Product name changes? Update the row. No
+    history. Simple.
+
+    **Type 2**: Keep history. Product name changes? Add new row with
+    effective_from, effective_to. Queries use effective_to is null for
+    current. Complex but supports point-in-time correctness.
+
+    For ShopStream we use Type 1 — product catalog is overwritten daily.
+    Silver joins on product_id. No history needed for this course.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write a left join of clicks (cols: event_id, user_id, product_id)
+    with products (cols: product_id, product_name, category) on product_id.
+  CorrectAnswer: |
+    enriched = clicks.join(products, "product_id", "left")
+  Hint: "clicks.join(products, 'product_id', 'left'). Join on product_id keeps one product_id column."
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Enrich Click Events
+
+    Implement `enrich_clicks(spark, clicks_df, products_df, users_df)`:
+
+    1. Join clicks with products on product_id (left). Add product_name,
+       category from products.
+    2. Join result with users on user_id (left). Add segment from users.
+    3. Use broadcast for products and users (they are small lookups).
+    4. Return enriched DataFrame with all click columns plus product_name,
+       category, segment.
+
+    The test creates clicks, products, users DataFrames. Verify enriched
+    has product_name and segment columns, and row count equals clicks count.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Two left joins. broadcast() on the lookup tables. Join on product_id, then user_id."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    Silver enrichment with joins:
+
+    - **Left join** — preserve all fact rows, lookups add columns
+    - **Broadcast** — optimize small lookup joins
+    - **Multiple lookups** — chain joins: clicks → products → users
+    - **SCD** — Type 1 for simple overwrite, Type 2 for history
+
+    Enriched silver feeds gold. In the next lesson, you will build
+    **gold aggregations** — daily revenue by category, conversion rates —
+    the business metrics for dashboards.

@@ -1,0 +1,203 @@
+- Class: meta
+  Lesson: "From Batch to Streaming — The Mental Model"
+  EstimatedMinutes: 30
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The PayGuard Fraud Detection Challenge
+
+    **PayGuard** is a fintech company processing millions of transactions daily.
+    Their fraud team needs to detect suspicious activity *as it happens* — not
+    hours later when a batch job finishes. A stolen card used for 10 purchases
+    in 5 minutes must trigger an alert before the 11th transaction.
+
+    Over the next 12 lessons, you will build PayGuard's real-time fraud
+    detection system. Every lesson adds a real capability: streaming ingestion,
+    enrichment, windowed velocity checks, watermarks for late data, and
+    production alerting. By the capstone, you will have a complete pipeline.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Why Batch Processing Isn't Enough
+
+    Imagine PayGuard runs a daily batch job at midnight. It processes all
+    transactions from the previous day and flags suspicious patterns. By the
+    time the report is ready at 6 AM, the fraudster has already drained the
+    victim's account. **Latency matters.** For fraud detection, seconds and
+    minutes — not hours — separate effective prevention from damage control.
+
+    Batch processing assumes you have a *bounded* dataset: a fixed set of
+    files or table partitions. Streaming assumes *unbounded* data: events
+    arrive continuously, and you process them as they come.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    ## Analogy: The Security Guard vs. The Night Auditor
+
+    **Batch processing** is like a night auditor who reviews all the day's
+    transactions after the hotel closes. They find problems, but the damage
+    is already done. **Streaming** is like a security guard watching the
+    lobby in real time. They see each transaction as it happens and can
+    intervene immediately when something looks wrong.
+
+    PayGuard needs the security guard model — continuous monitoring, not
+    post-mortem analysis.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Unbounded Table Model
+
+    Structured Streaming treats a stream as a **continuously appended table**.
+    New events are like new rows being inserted. Your query runs incrementally:
+    each micro-batch processes the new rows and updates the result. You never
+    "finish" — the table keeps growing.
+
+    ```
+    Input stream (unbounded):     Output table (incremental):
+    t1: tx_1, tx_2               → result_1
+    t2: tx_3, tx_4, tx_5          → result_2 (builds on result_1)
+    t3: tx_6, tx_7                → result_3 (builds on result_2)
+    ...
+    ```
+
+    The same DataFrame API you use for batch works for streaming. Spark
+    figures out how to run it incrementally.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## readStream vs read, writeStream vs write
+
+    The API is nearly identical. Swap `read` for `readStream` and `write`
+    for `writeStream`:
+
+    ```python
+    # Batch: read once, process, write once
+    batch_df = spark.read.csv("/data/transactions/")
+    result = batch_df.groupBy("user_id").count()
+    result.write.parquet("/output/")
+
+    # Streaming: read continuously, process incrementally, write continuously
+    stream_df = spark.readStream.schema(schema).csv("/data/transactions/")
+    result = stream_df.groupBy("user_id").count()
+    result.writeStream.outputMode("complete").format("console").start()
+    ```
+
+    The transformations (`groupBy`, `count`) are the same. The execution
+    model changes: batch runs once; streaming runs forever in micro-batches.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Why Schema Is Required for Streaming
+
+    In batch, you can use `inferSchema=True` — Spark samples the data to
+    guess the schema. In streaming, there is no "complete" dataset to sample.
+    Data arrives over time. You must provide an explicit schema:
+
+    ```python
+    from pyspark.sql.types import StructType, StructField, StringType, DoubleType, TimestampType
+
+    tx_schema = StructType([
+        StructField("tx_id", StringType(), False),
+        StructField("user_id", StringType(), False),
+        StructField("amount", DoubleType(), False),
+        StructField("event_time", TimestampType(), False),
+    ])
+    stream_df = spark.readStream.schema(tx_schema).csv("/data/transactions/")
+    ```
+
+    This schema is used for every micro-batch. PayGuard's transaction schema
+    includes tx_id, user_id, merchant_id, amount, event_time, and more.
+
+- Class: mult_question
+  Depth: all
+  Output: "Why does Structured Streaming require an explicit schema for streaming sources?"
+  AnswerChoices: "To improve performance;Because there is no complete dataset to sample at read time;To enforce data quality;To support Kafka"
+  CorrectAnswer: "Because there is no complete dataset to sample at read time"
+  Hint: "In batch, inferSchema samples the data. In streaming, data arrives continuously — there is nothing to sample."
+
+- Class: mult_question
+  Depth: all
+  Output: "What is the key difference between batch and streaming execution in Spark?"
+  AnswerChoices: "Streaming uses different SQL syntax;Batch runs once, streaming runs continuously in micro-batches;Streaming is faster;Batch requires more memory"
+  CorrectAnswer: "Batch runs once, streaming runs continuously in micro-batches"
+  Hint: "Both use the same DataFrame API. The execution model differs: one-shot vs. incremental."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Same Transformations, Different Execution
+
+    When you write `stream_df.groupBy("user_id").count()`, Spark builds a
+    logical plan. For batch, it executes once. For streaming, it executes
+    incrementally: each micro-batch gets new rows, Spark updates the
+    aggregation state, and outputs the new/changed results. The *logic* is
+    identical; the *runtime behavior* is different.
+
+    This means you can develop and test streaming logic using batch
+    DataFrames. The same code that works for `stream_df` works for `batch_df`
+    — a powerful pattern for unit testing and dry-run validation.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Given a batch DataFrame `transactions_df` with columns (tx_id, user_id, amount, event_time),
+    write code to count transactions per user_id and order by count descending.
+    Use the same transformations you would use for a streaming query.
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+
+    result = (transactions_df
+        .groupBy("user_id")
+        .count()
+        .orderBy(f.col("count").desc()))
+  Hint: "groupBy user_id, count, orderBy count descending. Same code works for batch and streaming."
+
+- Class: mult_question
+  Depth: all
+  Output: "In the unbounded table model, what does 'new data' represent?"
+  AnswerChoices: "Rows appended to the input table;New partitions;New files only;Kafka offsets"
+  CorrectAnswer: "Rows appended to the input table"
+  Hint: "The stream is treated as a table that grows. New events = new rows."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Micro-Batch Execution Under the Hood
+
+    Spark runs streaming queries in **micro-batches**. Each trigger (e.g.,
+    every 10 seconds) fetches new data from the source, runs your
+    transformations on that batch, and writes results to the sink. Stateful
+    operations (aggregations, joins) maintain state across batches. The
+    micro-batch model balances latency (small batches = faster) with
+    throughput (larger batches = fewer overheads). PayGuard's pipeline will
+    process transaction events in micro-batches of a few seconds.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Batch vs Streaming Transaction Count
+
+    Implement `transaction_count_batch` and `transaction_count_streaming_logic`
+    that produce the same result: transaction count per user_id, ordered by
+    count descending.
+
+    - `transaction_count_batch`: Uses `spark.read` (batch) with the provided
+      transaction data. Returns the aggregated DataFrame.
+    - `transaction_count_streaming_logic`: Takes a DataFrame (simulating
+      stream input) and applies the *exact same transformations* you would use
+      in a streaming query. Returns the result. The test harness passes a
+      batch DataFrame to simulate the stream; in production, this would be
+      the output of readStream.
+
+    This validates that both approaches produce identical results. The same
+    transformation logic works for batch and streaming — only the source
+    differs.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Create batch DataFrame from data, apply groupBy count. For streaming_logic, receive df as arg, apply same groupBy + count + orderBy."

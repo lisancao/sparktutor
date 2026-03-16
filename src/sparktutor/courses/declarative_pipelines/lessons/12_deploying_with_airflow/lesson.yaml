@@ -1,0 +1,712 @@
+- Class: meta
+  Lesson: "Deploying Pipelines with Apache Airflow"
+  EstimatedMinutes: 45
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    You have a tested, idempotent pipeline that processes ShopStream data
+    through bronze, silver, and gold layers. But it only runs when you
+    execute it manually. Production pipelines need to run **on a schedule**,
+    **retry on failure**, handle **dependencies between pipelines**, and
+    provide **visibility** into what ran, when, and whether it succeeded.
+
+    Apache Airflow is the most widely adopted orchestrator for data
+    pipelines. It defines workflows as Python code (DAGs), manages
+    scheduling and retries, and provides a web UI for monitoring.
+
+    By the end of this lesson you will be able to:
+
+    - Explain what Airflow is and why pipelines need orchestration
+    - Write an Airflow DAG that runs your ShopStream pipeline
+    - Use the dedicated `SparkPipelinesOperator` to run Spark
+      Declarative Pipelines via the `spark-pipelines` CLI
+    - Understand how `SparkPipelinesOperator` relates to
+      `SparkSubmitOperator` and `PythonOperator`
+    - Write pipeline spec YAML files that define your SDP pipeline
+    - Use `dry-run` mode to validate pipelines before execution
+    - Configure retries, timeouts, and SLAs
+    - Handle inter-task dependencies and data handoffs
+    - Design DAGs for daily batch and hourly incremental patterns
+    - Integrate pipeline monitoring and alerting
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Why You Need an Orchestrator
+
+    Running a pipeline manually works for development. In production,
+    you face questions your Pipeline class cannot answer:
+
+    - **When?** — Run daily at 2 AM UTC after upstream data lands
+    - **What if it fails?** — Retry 3 times with exponential backoff
+    - **What about dependencies?** — Don't run gold until silver succeeds
+    - **What ran yesterday?** — Full audit trail of every execution
+    - **How do I backfill?** — Re-run last Tuesday's pipeline for a data fix
+
+    Airflow handles all of these. Your Pipeline class handles the
+    **what** (transform data). Airflow handles the **when**, **how
+    often**, **what if**, and **in what order**.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Think of Airflow as a **train schedule system**. Your pipeline is
+    the train (it moves data from A to B). Airflow is the dispatcher
+    that decides when each train departs, monitors whether it arrived
+    on time, re-dispatches if it breaks down, and logs everything.
+
+    Without Airflow, you are manually pushing a train down the tracks
+    every time you want it to run. With Airflow, trains run on schedule
+    and you only get a phone call when something goes wrong.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Airflow Core Concepts
+
+    **DAG (Directed Acyclic Graph):** A collection of tasks with
+    dependencies. The DAG defines the order: "run bronze, then silver,
+    then gold." No cycles — a task cannot depend on itself.
+
+    **Task:** A single unit of work. For ShopStream: "run bronze_clicks"
+    is a task, "run silver_clicks" is another.
+
+    **Operator:** The type of work a task performs. Common operators:
+    - `PythonOperator` — run a Python function
+    - `SparkSubmitOperator` — submit a Spark job
+    - `BashOperator` — run a shell command
+
+    **Schedule:** When the DAG runs. `@daily`, `@hourly`, or a cron
+    expression like `0 2 * * *` (2 AM daily).
+
+    **Execution Date:** The logical date the DAG run represents. A daily
+    DAG running at 2 AM on Jan 16 processes Jan 15's data. The
+    execution date is Jan 15, not Jan 16.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Your First Airflow DAG
+
+    An Airflow DAG for ShopStream's daily pipeline:
+
+    ```python
+    from airflow import DAG
+    from airflow.operators.python import PythonOperator
+    from datetime import datetime, timedelta
+
+    default_args = {
+        "owner": "data-team",
+        "retries": 3,
+        "retry_delay": timedelta(minutes=5),
+        "execution_timeout": timedelta(hours=2),
+    }
+
+    with DAG(
+        dag_id="shopstream_daily_pipeline",
+        default_args=default_args,
+        schedule="0 2 * * *",
+        start_date=datetime(2024, 1, 1),
+        catchup=False,
+        tags=["shopstream", "production"],
+    ) as dag:
+
+        bronze = PythonOperator(
+            task_id="bronze_ingestion",
+            python_callable=run_bronze,
+        )
+        silver = PythonOperator(
+            task_id="silver_validation",
+            python_callable=run_silver,
+        )
+        gold = PythonOperator(
+            task_id="gold_aggregation",
+            python_callable=run_gold,
+        )
+
+        bronze >> silver >> gold
+    ```
+
+    The `>>` operator defines the dependency chain: bronze must
+    complete before silver starts, silver before gold. If bronze fails,
+    silver and gold are skipped automatically.
+
+- Class: mult_question
+  Depth: all
+  Output: "In the ShopStream DAG, silver_validation fails on its second retry. What happens to gold_aggregation?"
+  AnswerChoices: "It is skipped — gold depends on silver, and silver failed after all retries;It runs anyway with stale data;Airflow runs it with empty input;The entire DAG restarts from bronze"
+  CorrectAnswer: "It is skipped — gold depends on silver, and silver failed after all retries"
+  Hint: "DAG dependencies mean downstream tasks are skipped when an upstream task fails. Gold won't run if silver didn't succeed."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## SparkSubmitOperator vs PythonOperator
+
+    Two ways to run Spark from Airflow:
+
+    **`PythonOperator`** — runs a Python function inside the Airflow
+    worker process. Works for local-mode Spark or Spark Connect:
+    ```python
+    def run_bronze(**context):
+        spark = SparkSession.builder.appName("Bronze").getOrCreate()
+        bronze_clicks(spark, "/data/clicks.csv")
+        spark.stop()
+
+    PythonOperator(task_id="bronze", python_callable=run_bronze)
+    ```
+
+    **`SparkSubmitOperator`** — submits a Spark job to a cluster via
+    `spark-submit`. Better for production clusters:
+    ```python
+    from airflow.providers.apache.spark.operators.spark_submit import (
+        SparkSubmitOperator,
+    )
+
+    SparkSubmitOperator(
+        task_id="bronze",
+        application="/path/to/pipeline.py",
+        conn_id="spark_default",
+        conf={"spark.sql.shuffle.partitions": "200"},
+        application_args=["--layer", "bronze", "--date", "{{ ds }}"],
+    )
+    ```
+
+    Use `PythonOperator` for development and small workloads. Use
+    `SparkSubmitOperator` for production clusters where Spark needs its
+    own resource allocation.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## SparkPipelinesOperator — The Dedicated SDP Operator
+
+    Spark Declarative Pipelines (Lakeflow SDP) has a **dedicated Airflow
+    operator** in the Apache Spark provider: `SparkPipelinesOperator`.
+    This wraps the `spark-pipelines` CLI — a purpose-built binary for
+    executing declarative pipelines defined in YAML specification files.
+
+    Unlike `SparkSubmitOperator` (which calls `spark-submit` with a
+    Python script), `SparkPipelinesOperator` calls `spark-pipelines`
+    with a **pipeline spec** — a YAML file that declares your pipeline's
+    name, storage location, and library paths:
+
+    ```yaml
+    # pipeline.yml — Spark Declarative Pipeline Spec
+    name: shopstream_daily
+    storage: file:///data/pipeline-storage
+    libraries:
+      - glob:
+          include: transformations/**
+    ```
+
+    The operator:
+    ```python
+    from airflow.providers.apache.spark.operators.spark_pipelines import (
+        SparkPipelinesOperator,
+    )
+
+    run_pipeline = SparkPipelinesOperator(
+        task_id="run_shopstream_pipeline",
+        pipeline_spec="/path/to/pipeline.yml",
+        pipeline_command="run",
+        conn_id="spark_default",
+        num_executors=4,
+        executor_cores=4,
+        executor_memory="4G",
+        driver_memory="2G",
+    )
+    ```
+
+    Key parameters:
+    - **`pipeline_spec`** — path to your pipeline YAML definition
+    - **`pipeline_command`** — `"run"` to execute, `"dry-run"` to
+      validate without executing (useful in CI)
+    - Standard Spark resource configs: `num_executors`, `executor_cores`,
+      `executor_memory`, `driver_memory`
+    - **`conn_id`** — Spark connection configured in Airflow
+
+    Under the hood, `SparkPipelinesOperator` uses `SparkPipelinesHook`,
+    which extends `SparkSubmitHook` — so it inherits connection
+    management, environment variables, deploy mode, and YARN queue
+    support. The key difference is the binary: `spark-pipelines`
+    instead of `spark-submit`.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Dry-Run Validation in CI
+
+    One major advantage of the dedicated operator is the `dry-run`
+    command. In your CI/CD pipeline, validate your pipeline definition
+    without actually processing data:
+
+    ```python
+    validate_pipeline = SparkPipelinesOperator(
+        task_id="validate_shopstream",
+        pipeline_spec="/path/to/pipeline.yml",
+        pipeline_command="dry-run",
+        conn_id="spark_default",
+    )
+
+    run_pipeline = SparkPipelinesOperator(
+        task_id="run_shopstream",
+        pipeline_spec="/path/to/pipeline.yml",
+        pipeline_command="run",
+        conn_id="spark_default",
+        num_executors=4,
+        executor_memory="4G",
+    )
+
+    validate_pipeline >> run_pipeline
+    ```
+
+    The dry-run catches schema mismatches, missing tables, and
+    configuration errors before you spend compute running the full
+    pipeline. Gate production runs behind a successful dry-run.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Choosing the Right Operator
+
+    You now have three Airflow operators for Spark workloads. Here is
+    when to use each:
+
+    | Operator | Binary | Use Case |
+    |---|---|---|
+    | `PythonOperator` | (in-process) | Dev/test, Spark Connect, small jobs |
+    | `SparkSubmitOperator` | `spark-submit` | Ad-hoc Spark scripts, JARs, PySpark apps |
+    | `SparkPipelinesOperator` | `spark-pipelines` | Declarative pipelines defined in YAML specs |
+
+    For ShopStream's declarative pipeline architecture:
+
+    ```python
+    with DAG(dag_id="shopstream_sdp", schedule="0 2 * * *", ...) as dag:
+
+        validate = SparkPipelinesOperator(
+            task_id="validate",
+            pipeline_spec="/pipelines/shopstream.yml",
+            pipeline_command="dry-run",
+            conn_id="spark_default",
+        )
+
+        run = SparkPipelinesOperator(
+            task_id="run_pipeline",
+            pipeline_spec="/pipelines/shopstream.yml",
+            pipeline_command="run",
+            conn_id="spark_default",
+            num_executors=4,
+            executor_memory="4G",
+            conf={"spark.sql.shuffle.partitions": "200"},
+        )
+
+        monitor = PythonOperator(
+            task_id="monitor",
+            python_callable=check_pipeline_health,
+            trigger_rule="all_done",
+        )
+
+        validate >> run >> monitor
+    ```
+
+    The pipeline spec YAML handles the bronze → silver → gold dependency
+    graph internally. Airflow handles scheduling, retries, and
+    monitoring. Each tool does what it does best.
+
+- Class: mult_question
+  Depth: all
+  Output: "What is the key difference between SparkSubmitOperator and SparkPipelinesOperator?"
+  AnswerChoices: "SparkPipelinesOperator uses the spark-pipelines CLI with a YAML pipeline spec, while SparkSubmitOperator uses spark-submit with a Python/JAR application;SparkPipelinesOperator is faster;SparkSubmitOperator cannot run on YARN;They are identical operators with different names"
+  CorrectAnswer: "SparkPipelinesOperator uses the spark-pipelines CLI with a YAML pipeline spec, while SparkSubmitOperator uses spark-submit with a Python/JAR application"
+  Hint: "Think about what each operator wraps — different CLI binaries, different input formats (YAML spec vs Python script)."
+
+- Class: cmd_question
+  Depth: intermediate
+  Output: |
+    Write two SparkPipelinesOperator tasks: one that validates
+    ("dry-run") a pipeline spec at "/pipelines/shopstream.yml", and
+    one that runs it. Chain them so validation happens first. Use
+    conn_id="spark_default", 4 executors, and 4G executor memory for
+    the run task.
+  CorrectAnswer: |
+    from airflow.providers.apache.spark.operators.spark_pipelines import (
+        SparkPipelinesOperator,
+    )
+
+    validate = SparkPipelinesOperator(
+        task_id="validate",
+        pipeline_spec="/pipelines/shopstream.yml",
+        pipeline_command="dry-run",
+        conn_id="spark_default",
+    )
+
+    run = SparkPipelinesOperator(
+        task_id="run_pipeline",
+        pipeline_spec="/pipelines/shopstream.yml",
+        pipeline_command="run",
+        conn_id="spark_default",
+        num_executors=4,
+        executor_memory="4G",
+    )
+
+    validate >> run
+  Hint: "Import SparkPipelinesOperator, create two instances with pipeline_command='dry-run' and 'run', chain with >>."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Parameterizing with Execution Date
+
+    Airflow provides **template variables** that inject runtime context
+    into your tasks. The most important is `{{ ds }}` — the execution
+    date as `YYYY-MM-DD`:
+
+    ```python
+    def run_bronze(**context):
+        execution_date = context["ds"]  # "2024-01-15"
+        data_path = f"/data/raw/{execution_date}/"
+        output_path = f"/data/bronze/{execution_date}/"
+        spark = SparkSession.builder.getOrCreate()
+        bronze_clicks(spark, data_path, output_path)
+        spark.stop()
+    ```
+
+    This makes your pipeline **date-aware**:
+    - Each run processes one day's data
+    - Re-running Jan 15 reprocesses only Jan 15's data
+    - Backfilling a date range processes each date independently
+
+    Combined with overwrite-by-partition writes, this gives you
+    idempotent, backfillable pipeline runs.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Retries, Timeouts, and SLAs
+
+    Production pipelines fail. Network issues, data delays, cluster
+    problems. Airflow's retry mechanism handles transient failures:
+
+    ```python
+    default_args = {
+        "retries": 3,
+        "retry_delay": timedelta(minutes=5),
+        "retry_exponential_backoff": True,
+        "max_retry_delay": timedelta(minutes=30),
+        "execution_timeout": timedelta(hours=2),
+    }
+    ```
+
+    - **retries**: how many times to retry a failed task
+    - **retry_delay**: wait time before first retry
+    - **retry_exponential_backoff**: double the delay each retry
+      (5 min, 10 min, 20 min)
+    - **execution_timeout**: kill the task if it runs too long
+    - **sla**: alert if the task hasn't completed within a time window
+
+    Set SLAs on gold tasks that power dashboards. If gold hasn't
+    completed by 6 AM, the dashboard team needs to know:
+
+    ```python
+    gold = PythonOperator(
+        task_id="gold_aggregation",
+        python_callable=run_gold,
+        sla=timedelta(hours=4),  # must complete within 4 hours of DAG start
+    )
+    ```
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "Your bronze task fails because the upstream data file hasn't landed yet. With retries=3 and retry_delay=5 minutes, what happens?"
+  AnswerChoices: "Airflow retries 3 times (at ~5, ~10, ~20 min with backoff), then marks the task as failed if all retries fail;The task immediately fails permanently;Airflow waits indefinitely for the file;Airflow skips bronze and runs silver"
+  CorrectAnswer: "Airflow retries 3 times (at ~5, ~10, ~20 min with backoff), then marks the task as failed if all retries fail"
+  Hint: "Retries handle transient failures. With exponential backoff, the delays grow. After all retries are exhausted, the task is marked failed."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## DAG Design Patterns for ShopStream
+
+    **Pattern 1: Linear chain** — simple bronze → silver → gold:
+    ```python
+    bronze >> silver >> gold
+    ```
+
+    **Pattern 2: Fan-out / fan-in** — multiple bronze sources converge:
+    ```python
+    bronze_clicks = PythonOperator(...)
+    bronze_payments = PythonOperator(...)
+    bronze_inventory = PythonOperator(...)
+
+    silver_clicks = PythonOperator(...)
+    silver_payments = PythonOperator(...)
+
+    gold_revenue = PythonOperator(...)
+
+    [bronze_clicks, bronze_payments, bronze_inventory] >> silver_clicks
+    [bronze_clicks, bronze_payments] >> silver_payments
+    [silver_clicks, silver_payments] >> gold_revenue
+    ```
+
+    Bronze sources run **in parallel** (no dependencies between them).
+    Silver waits for its required bronze sources. Gold waits for all
+    silver tasks. This maximizes parallelism while respecting data
+    dependencies.
+
+    **Pattern 3: Sensor-gated** — wait for upstream data to arrive:
+    ```python
+    from airflow.sensors.filesystem import FileSensor
+
+    wait_for_clicks = FileSensor(
+        task_id="wait_for_clicks",
+        filepath="/data/raw/{{ ds }}/clicks.csv",
+        poke_interval=300,
+        timeout=7200,
+    )
+
+    wait_for_clicks >> bronze_clicks >> silver_clicks >> gold
+    ```
+
+    The `FileSensor` polls for the file every 5 minutes, timing out
+    after 2 hours. Bronze only starts once the data has landed.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## XComs: Passing Data Between Tasks
+
+    Tasks communicate via **XComs** (cross-communications). A task can
+    push a value, and downstream tasks pull it:
+
+    ```python
+    def run_bronze(**context):
+        spark = SparkSession.builder.getOrCreate()
+        df = bronze_clicks(spark, "/data/clicks.csv")
+        row_count = df.count()
+        context["ti"].xcom_push(key="bronze_rows", value=row_count)
+        spark.stop()
+
+    def run_silver(**context):
+        bronze_rows = context["ti"].xcom_pull(
+            task_ids="bronze_ingestion", key="bronze_rows")
+        if bronze_rows == 0:
+            print("No data from bronze, skipping silver")
+            return
+        # ... run silver
+    ```
+
+    Use XComs for **metadata** (row counts, file paths, quality scores)
+    — not for large DataFrames. XCom values are stored in Airflow's
+    metadata database and should be small (strings, numbers, short
+    lists).
+
+    For ShopStream, push the pipeline report dict (bronze_rows,
+    silver_valid, silver_quarantine, quality_score) from each task.
+    The monitoring task at the end collects all XComs and decides
+    whether to alert.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Backfilling and Catchup
+
+    When you deploy a new DAG with `start_date=datetime(2024, 1, 1)`
+    and `catchup=True`, Airflow creates a run for **every scheduled
+    interval** from start_date to now. For a daily DAG, that is 365+
+    runs.
+
+    **When to use catchup=True:**
+    - You have historical data to process
+    - Your pipeline is date-partitioned and idempotent
+    - You want to backfill the entire history on first deploy
+
+    **When to use catchup=False (default for ShopStream):**
+    - You only want to process going forward
+    - Historical data was already loaded by another process
+
+    **Manual backfill:** Even with `catchup=False`, you can backfill
+    specific dates via the CLI:
+    ```bash
+    airflow dags backfill shopstream_daily \
+        --start-date 2024-01-10 \
+        --end-date 2024-01-15
+    ```
+
+    This is safer than catchup — you control exactly which dates
+    to reprocess. Combined with overwrite-by-partition, backfilling
+    is idempotent.
+
+- Class: mult_question
+  Depth: advanced
+  Output: "You discover that silver validation had a bug last week. You fix it and need to reprocess Jan 10-15. What's the safest approach?"
+  AnswerChoices: "Use airflow dags backfill with the date range — each date is reprocessed independently and idempotently;Delete all data and re-run the entire pipeline from scratch;Manually edit the gold tables;Set catchup=True and restart the DAG"
+  CorrectAnswer: "Use airflow dags backfill with the date range — each date is reprocessed independently and idempotently"
+  Hint: "Backfill re-runs specific dates. Combined with overwrite-by-partition, each date is reprocessed cleanly without affecting other dates."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write an Airflow DAG definition with dag_id "shopstream_daily",
+    scheduled at 2 AM UTC daily, with 3 retries and a 5-minute retry
+    delay. Define three PythonOperator tasks (bronze, silver, gold) in
+    a linear dependency chain. Use `catchup=False`.
+  CorrectAnswer: |
+    from airflow import DAG
+    from airflow.operators.python import PythonOperator
+    from datetime import datetime, timedelta
+
+    default_args = {
+        "retries": 3,
+        "retry_delay": timedelta(minutes=5),
+    }
+
+    with DAG(
+        dag_id="shopstream_daily",
+        default_args=default_args,
+        schedule="0 2 * * *",
+        start_date=datetime(2024, 1, 1),
+        catchup=False,
+    ) as dag:
+        bronze = PythonOperator(task_id="bronze", python_callable=run_bronze)
+        silver = PythonOperator(task_id="silver", python_callable=run_silver)
+        gold = PythonOperator(task_id="gold", python_callable=run_gold)
+        bronze >> silver >> gold
+  Hint: "DAG with schedule='0 2 * * *' for 2 AM, default_args for retries, three PythonOperator tasks chained with >>."
+
+- Class: cmd_question
+  Depth: intermediate
+  Output: |
+    Write a function `run_bronze_task` that Airflow will call as a
+    PythonOperator. It should: get the execution date from the context
+    (`context["ds"]`), build a data path like `/data/raw/{date}/`, run
+    bronze ingestion using that path, push the row count to XCom, and
+    stop the SparkSession.
+  CorrectAnswer: |
+    def run_bronze_task(**context):
+        from pyspark.sql import SparkSession
+        execution_date = context["ds"]
+        data_path = f"/data/raw/{execution_date}/"
+        spark = SparkSession.builder.appName("Bronze").getOrCreate()
+        df = bronze_clicks(spark, data_path)
+        row_count = df.count()
+        context["ti"].xcom_push(key="bronze_rows", value=row_count)
+        spark.stop()
+  Hint: "Extract ds from context, build path, create SparkSession, run bronze, push row_count to XCom with ti.xcom_push, stop Spark."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Monitoring Your DAG
+
+    Airflow's web UI shows:
+    - **Tree view** — status of every task for every DAG run (green =
+      success, red = failed, yellow = running, pink = retrying)
+    - **Gantt chart** — execution timeline showing parallelism and
+      bottlenecks
+    - **Task logs** — stdout/stderr for each task execution
+
+    For ShopStream, add a final monitoring task that collects XComs
+    from all pipeline tasks and raises an alert if quality_score drops
+    below threshold:
+
+    ```python
+    def check_pipeline_health(**context):
+        ti = context["ti"]
+        bronze_rows = ti.xcom_pull(task_ids="bronze", key="bronze_rows")
+        quality = ti.xcom_pull(task_ids="silver", key="quality_score")
+        if quality is not None and quality < 0.95:
+            raise ValueError(f"Quality score {quality} below 95% threshold")
+        if bronze_rows == 0:
+            print("WARNING: No bronze data ingested")
+
+    monitor = PythonOperator(
+        task_id="monitor",
+        python_callable=check_pipeline_health,
+        trigger_rule="all_done",
+    )
+    gold >> monitor
+    ```
+
+    `trigger_rule="all_done"` means the monitor runs even if upstream
+    tasks failed — it should always report the pipeline's health.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: ShopStream Airflow Pipeline
+
+    Build the complete ShopStream deployment configuration. Since we
+    can't run Airflow in the exercise, you will implement the **pipeline
+    runner functions** that Airflow would call, plus a **DAG builder**
+    function that returns the task dependency structure.
+
+    Implement three functions:
+
+    **`build_dag_config()`**
+    Return a dict describing the DAG:
+    ```python
+    {
+        "dag_id": "shopstream_daily",
+        "schedule": "0 2 * * *",
+        "retries": 3,
+        "retry_delay_minutes": 5,
+        "tasks": ["bronze_clicks", "bronze_payments", "silver_clicks",
+                  "silver_payments", "gold_revenue", "monitor"],
+        "dependencies": {
+            "silver_clicks": ["bronze_clicks", "bronze_payments"],
+            "silver_payments": ["bronze_payments"],
+            "gold_revenue": ["silver_clicks", "silver_payments"],
+            "monitor": ["gold_revenue"],
+        },
+    }
+    ```
+
+    **`run_pipeline_task(spark, task_name, execution_date, data_dir)`**
+    Given a task name, run the appropriate pipeline step:
+    - "bronze_clicks": read clicks CSV, add metadata, dedup → return row count
+    - "bronze_payments": read payments JSON, add metadata → return row count
+    - "silver_clicks": read bronze_clicks view, cast timestamp, filter invalid → return (valid_count, quarantine_count)
+    - "silver_payments": read bronze_payments view, cast amount → return row count
+    - "gold_revenue": read silver_payments, groupBy date + category, sum amount → return row count
+    - "monitor": collect counts from prior steps (passed as kwargs), return report dict
+
+    **`run_full_pipeline(spark, data_dir, execution_date)`**
+    Execute tasks in dependency order (topological sort), collecting
+    results. Return the final monitoring report with keys: bronze_rows,
+    silver_valid, silver_quarantine, gold_rows, quality_score.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "build_dag_config: return the dict. run_pipeline_task: switch on task_name, run the appropriate bronze/silver/gold function. run_full_pipeline: execute tasks in order, pass results between steps."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    In this lesson you learned:
+
+    - **Why orchestration** — scheduling, retries, dependencies, audit,
+      backfill — things your Pipeline class cannot do alone
+    - **Airflow DAGs** — define workflows as Python code with tasks and
+      dependency operators (`>>`)
+    - **Operators** — `PythonOperator` for in-process Spark,
+      `SparkSubmitOperator` for cluster submission,
+      `SparkPipelinesOperator` for declarative pipelines via YAML specs
+    - **SparkPipelinesOperator** — the dedicated SDP operator that wraps
+      the `spark-pipelines` CLI with `run` and `dry-run` commands
+    - **Execution date** — parameterize tasks by date for idempotent,
+      backfillable runs
+    - **Retries and SLAs** — handle transient failures and alert on
+      delayed completion
+    - **DAG patterns** — linear chains, fan-out/fan-in, sensor-gated
+    - **XComs** — pass metadata between tasks (row counts, quality scores)
+    - **Monitoring** — trigger_rule="all_done" for health checks that
+      always run
+
+    In the final lesson, you will build the complete ShopStream
+    capstone — the production pipeline with all patterns from the
+    course, ready for Airflow deployment.

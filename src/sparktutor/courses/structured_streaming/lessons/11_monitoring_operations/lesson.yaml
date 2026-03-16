@@ -1,0 +1,125 @@
+- Class: meta
+  Lesson: "Monitoring & Operations"
+  EstimatedMinutes: 35
+
+- Class: text
+  Depth: all
+  Output: |
+    ## PayGuard's Production Operations
+
+    A streaming query can run for weeks. You need to know: Is it healthy?
+    Is it keeping up? Is state growing? **StreamingQueryListener** and
+    progress metrics give you visibility. Backpressure, scaling, and
+    alerting complete the operations picture.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## StreamingQueryListener for Metrics
+
+    Attach a listener to capture metrics on each batch:
+
+    ```python
+    from pyspark.sql.streaming import StreamingQueryListener
+
+    class MetricsListener(StreamingQueryListener):
+        def onQueryProgress(self, event):
+            progress = event.progress
+            print(f"Batch: {progress.batchId}, Rows: {progress.numInputRows}, "
+                  f"Duration: {progress.batchDuration}")
+
+    spark.streams.addListener(MetricsListener())
+    ```
+
+    Progress includes: numInputRows, processedRowsPerSecond, batchDuration,
+    stateOperators (state size). Log these to your monitoring system.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Key Metrics to Track
+
+    - **numInputRows**: Rows in this batch. Sudden drop to 0? Source
+      might be empty or stalled.
+    - **processedRowsPerSecond**: Throughput. Declining? Backpressure.
+    - **batchDuration**: Time to process. Growing? Slowdown.
+    - **stateOperators**: State size per operator. Growing unbounded?
+      Check watermarks.
+    - **inputRowsPerSecond**: Rate from source. Compare to processed.
+
+    PayGuard alerts when batchDuration > 60s or stateOperators grows
+    >10% per hour. Early warning for OOM or stall.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Backpressure and Rate Limiting
+
+    If the source produces data faster than Spark can process, the
+    buffer grows. **maxOffsetsPerTrigger** limits how much to read per
+    batch: `option("maxOffsetsPerTrigger", 10000)` for Kafka. Slows
+    ingestion, prevents overload. Use when you can't scale processing
+    fast enough.
+
+    **minOffsetsPerTrigger** (Kafka): Wait until at least N offsets
+    available. Reduces empty batches when data is sparse.
+
+- Class: mult_question
+  Depth: all
+  Output: "What does numInputRows in streaming progress represent?"
+  AnswerChoices: "Rows written to sink;Rows read from source in this batch;Total rows processed;State size"
+  CorrectAnswer: "Rows read from source in this batch"
+  Hint: "It's the input for the current micro-batch."
+
+- Class: mult_question
+  Depth: all
+  Output: "Why would you use maxOffsetsPerTrigger for a Kafka source?"
+  AnswerChoices: "To increase throughput;To limit how much data is read per batch and prevent overload;To enable exactly-once;To support multiple topics"
+  CorrectAnswer: "To limit how much data is read per batch and prevent overload"
+  Hint: "Backpressure — when the source is faster than processing."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write a StreamingQueryListener subclass that prints batchId and
+    numInputRows when onQueryProgress is called.
+  CorrectAnswer: |
+    from pyspark.sql.streaming import StreamingQueryListener
+
+    class MyListener(StreamingQueryListener):
+        def onQueryProgress(self, event):
+            p = event.progress
+            print(f"Batch: {p.batchId}, Rows: {p.numInputRows}")
+  Hint: "Subclass StreamingQueryListener, implement onQueryProgress, access event.progress."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Scaling Strategies
+
+    - **More partitions**: Increase Kafka partitions or file source
+      parallelism. More partitions = more parallel tasks.
+    - **More executors**: Scale out the cluster. Each executor handles
+      a subset of partitions.
+    - **Partition-aware processing**: If your aggregation is skewed
+      (e.g., one user has 80% of traffic), consider salting the key or
+      splitting hot keys. Advanced topic for later.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Monitoring Wrapper
+
+    Implement `collect_batch_metrics` that simulates extracting metrics
+    from a "progress" object. In production, progress comes from
+    query.lastProgress. For batch simulation, we create a simple object
+    with batchId, numInputRows, batchDurationMs. Return a dict with
+    batch_id, rows_processed, duration_ms, and is_healthy (healthy if
+    duration_ms < 60000 and rows_processed > 0 or duration reasonable).
+
+    Also implement `alert_on_anomaly`: given a list of metric dicts,
+    return True if any batch has duration > 60s or rows_processed
+    drops to 0 for 2+ consecutive batches. Simulates alert logic.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Extract batchId, numInputRows, batchDuration from progress. Check thresholds."

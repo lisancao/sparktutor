@@ -1,0 +1,154 @@
+- Class: meta
+  Lesson: "Silver — Type Casting & Validation"
+  EstimatedMinutes: 40
+
+- Class: text
+  Depth: all
+  Output: |
+    ## From Bronze Strings to Silver Types
+
+    Bronze preserved everything as strings. Silver's first job: cast to
+    proper types. ShopStream's click events have timestamp, product_id,
+    event_type. Payments have amount (double), created_at (timestamp).
+    Inventory has quantity (int).
+
+    But what happens when a value fails to cast? "pending" for price.
+    "invalid" for timestamp. Empty string for quantity. This lesson shows
+    the failure first, then the fix: safe casting with quarantine.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    ## The Failure: What Happens When Casting Fails
+
+    ```python
+    df.withColumn("price", f.col("price").cast("double"))
+    ```
+
+    If price contains "pending", "N/A", or "", the cast produces null.
+    The row stays, but you lose the original value. Downstream: revenue
+    aggregation ignores nulls (correct) but you have no record of what
+    failed. No audit. No fix.
+
+    Worse: if you use `.cast()` and expect it to throw — it doesn't.
+    Spark's cast returns null for invalid values. Silent data loss.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Safe Casting with try_cast and when/otherwise
+
+    **try_cast** (Spark 3.0+): Like cast, but returns null on failure.
+    Same as cast for most types. Use when you want null for bad values.
+
+    **when/otherwise**: Explicit handling:
+    ```python
+    f.when(f.col("price").cast("double").isNotNull(), f.col("price").cast("double"))
+      .otherwise(None)
+    ```
+    Or: check if the string matches a pattern before casting.
+
+    **Custom logic**: Detect bad values, route to quarantine:
+    ```python
+    valid = df.filter(f.col("price").rlike(r"^\d+\.?\d*$"))
+    invalid = df.filter(~f.col("price").rlike(r"^\d+\.?\d*$"))
+    ```
+
+- Class: mult_question
+  Depth: all
+  Output: "If a price column contains 'pending' and you cast to double, what happens?"
+  AnswerChoices: "The value becomes null — Spark's cast does not throw;Spark throws an exception;The row is dropped;The value becomes 0.0"
+  CorrectAnswer: "The value becomes null — Spark's cast does not throw"
+  Hint: "Spark's cast is permissive. Invalid values become null. No exception."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Building a cast_columns Helper
+
+    A reusable pattern:
+
+    ```python
+    def cast_columns(df, casts):
+        for col_name, target_type in casts.items():
+            df = df.withColumn(col_name, f.col(col_name).cast(target_type))
+        return df
+    ```
+
+    casts = {"price": "double", "quantity": "int", "ts": "timestamp"}
+
+    To log failures: before casting, identify rows that will fail. Add a
+    _cast_failures column that records which columns failed. Split into
+    valid and quarantine DataFrames. Write quarantine to a separate table.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "Why route failed casts to a quarantine table instead of dropping them?"
+  AnswerChoices: "To audit and fix bad data — no silent data loss;To save storage;To make queries faster;Because Spark requires it"
+  CorrectAnswer: "To audit and fix bad data — no silent data loss"
+  Hint: "Quarantine preserves the raw values. You can fix the source, backfill, or analyze patterns."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write code to cast column "amount" to double, and "created_at" to
+    timestamp. Use f.col().cast(). Handle the case where amount might
+    be null or empty string.
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+
+    df = df.withColumn("amount", f.col("amount").cast("double"))
+    df = df.withColumn("created_at", f.to_timestamp(f.col("created_at")))
+  Hint: "f.col().cast('double') and f.to_timestamp() for timestamp. Empty string becomes null on cast."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Quarantine Table Schema
+
+    Quarantine rows need: original columns (as strings), _quarantine_reason,
+    _quarantine_at. Store the raw values so you can fix and backfill.
+
+    ```python
+    quarantine = invalid_df.withColumn("_quarantine_reason", f.lit("price_cast_failed"))
+    quarantine = quarantine.withColumn("_quarantine_at", f.current_timestamp())
+    ```
+
+    Production: write quarantine to a Delta/Iceberg table. Set up alerts
+    when quarantine count exceeds threshold. Weekly review to fix sources.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Cast Bronze Clicks to Silver
+
+    Implement `silver_clicks(spark, bronze_df)` that:
+
+    1. Casts timestamp to TimestampType using f.to_timestamp()
+    2. Keeps event_id, user_id, product_id, event_type as strings
+    3. Splits into valid and quarantine: rows where timestamp cast fails
+       (result is null) go to quarantine with _quarantine_reason and
+       _quarantine_at
+    4. Returns (valid_df, quarantine_df) as a tuple
+
+    The test creates bronze data with one row having timestamp "invalid".
+    Verify valid has 2 rows, quarantine has 1 row with _quarantine_reason.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Cast timestamp. Filter: valid = where cast is not null, quarantine = where cast is null. Add _quarantine_reason and _quarantine_at to quarantine."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    Silver type casting with quarantine:
+
+    - **Safe casting** — f.col().cast(), f.to_timestamp()
+    - **Failure handling** — null for bad values; don't drop silently
+    - **Quarantine** — route failed rows to a separate DataFrame with
+      _quarantine_reason, _quarantine_at
+    - **Auditability** — preserve raw values in quarantine for fix/backfill
+
+    In the next lesson, you will add **data quality rules** — row-level
+    and column-level validation beyond type casting.

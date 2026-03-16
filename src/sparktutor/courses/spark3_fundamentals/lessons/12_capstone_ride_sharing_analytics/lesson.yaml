@@ -1,0 +1,152 @@
+- Class: meta
+  Lesson: "Capstone — Ride-Sharing Analytics Platform"
+  EstimatedMinutes: 50
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Complete Platform
+
+    You have built every piece: SparkSession, DataFrames, schemas,
+    column expressions, read/write, aggregations, joins, windows,
+    SQL, query plans, and tuning. This capstone wires everything
+    into a single end-to-end ride-sharing analytics platform. Raw
+    data flows in, gets cleaned, joined, aggregated, and written out.
+    This is the system you would deploy in production.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Pipeline Architecture
+
+    ```
+    Raw CSV (trips, drivers, ratings)
+         ↓
+    Read with explicit schemas (Lesson 3, 5)
+         ↓
+    Enrich trips (time_bucket, fare_per_mile) (Lesson 4)
+         ↓
+    Join trips + drivers + ratings (Lesson 7)
+         ↓
+    City dashboard + Driver profiles (Lesson 6, 7)
+         ↓
+    Rank top drivers per city (Lesson 8)
+         ↓
+    Write Parquet (Lesson 5) + Cache for reuse (Lesson 11)
+    ```
+
+    Each stage uses patterns from prior lessons. The capstone
+    exercise implements this full pipeline.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Error Handling and Validation
+
+    In production, add:
+    - **Schema validation** — reject rows that don't match the schema
+    - **Null checks** — filter or fill nulls in critical columns
+    - **Date range validation** — ensure pickup_time is reasonable
+    - **Idempotent writes** — overwrite mode or merge for reruns
+
+    For the capstone, we keep it simple: assume valid input. In a
+    real system, you would add checks and log bad rows to a dead-letter
+    path.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Assembling the Outputs
+
+    The platform produces:
+    1. **Cleaned trips** — Parquet, partitioned by date
+    2. **City dashboard** — trips per day, avg fare, peak hour
+    3. **Driver profiles** — total trips, total fare, avg rating
+    4. **Top performers** — drivers ranked by earnings per city
+
+    These feed dashboards, reports, and downstream ML models. The
+    capstone exercise builds all four from the same source data.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## From Learning to Production
+
+    What you built in 12 lessons maps to production patterns:
+    - Bronze: raw CSV/JSON ingestion with schemas
+    - Silver: cleaned, enriched, joined DataFrames
+    - Gold: aggregated dashboards and profiles
+    - Optimization: broadcast, cache, partition tuning
+
+    Add scheduling (Airflow, Databricks Jobs), monitoring, and
+    incremental processing for a full production system.
+
+- Class: mult_question
+  Depth: all
+  Output: "In the capstone pipeline, why do we cache the joined DataFrame before building city dashboard and driver profiles?"
+  AnswerChoices: "To save disk space;To avoid recomputing the join for each aggregation;To compress the data;To enable streaming"
+  CorrectAnswer: "To avoid recomputing the join for each aggregation"
+  Hint: "The same joined data feeds multiple downstream aggregations. Cache once, reuse."
+
+- Class: mult_question
+  Depth: all
+  Output: "What is the purpose of partitioning the output Parquet by date?"
+  AnswerChoices: "To compress better;To enable partition pruning when querying by date;To sort the data;To reduce file count"
+  CorrectAnswer: "To enable partition pruning when querying by date"
+  Hint: "Partitioning by date lets readers skip entire directories when filtering by date."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    In one sentence, describe the flow of data in the capstone pipeline
+    from raw CSV to final outputs.
+  CorrectAnswer: |
+    Raw CSVs are read with schemas, trips are enriched, joined with
+    drivers and ratings, then aggregated into city dashboard and
+    driver profiles, with top drivers ranked per city, and results
+    written to Parquet.
+  Hint: "Read → Enrich → Join → Aggregate → Rank → Write."
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Full End-to-End Platform
+
+    Implement `run_analytics_platform` that:
+    1. Creates a tuned SparkSession (shuffle partitions=8)
+    2. Reads trips, drivers, ratings from CSV paths (with schemas from Lesson 3)
+    3. Enriches trips with time_bucket and fare_per_mile (Lesson 4)
+    4. Joins trips with drivers (broadcast) and ratings (Lesson 7)
+    5. Caches the joined DataFrame
+    6. Builds: (a) city_dashboard (trips per day, avg fare per city),
+       (b) driver_profiles (total_trips, total_fare, avg_rating per driver),
+       (c) top_drivers (rank drivers by total_fare within city, filter rank<=3)
+    7. Writes city_dashboard and driver_profiles to Parquet (overwrite)
+    8. Unpersists the cache
+    9. Returns (city_dashboard, driver_profiles, top_drivers)
+
+    This is the complete platform. Use patterns from Lessons 1-11.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Chain: read with schema, enrich, join (broadcast drivers), cache. Build 3 outputs. Write 2 to Parquet. Unpersist. Return all 3."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary: What You Built
+
+    Over 12 lessons you built a complete ride-sharing analytics platform:
+
+    - **Lesson 1-2**: SparkSession, DataFrames, transformations
+    - **Lesson 3**: Explicit schemas for type safety
+    - **Lesson 4**: Column expressions, when/otherwise, enrichment
+    - **Lesson 5**: Read CSV, write Parquet partitioned
+    - **Lesson 6**: Aggregations, city dashboard
+    - **Lesson 7**: Joins, broadcast, driver profiles
+    - **Lesson 8**: Window functions, ranking, moving averages
+    - **Lesson 9**: SQL views and reporting layer
+    - **Lesson 10**: Query plans and Catalyst
+    - **Lesson 11**: Performance tuning, cache, config
+    - **Lesson 12**: End-to-end pipeline
+
+    You now have the foundation to build production Spark applications.

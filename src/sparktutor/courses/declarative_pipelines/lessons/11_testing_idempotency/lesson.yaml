@@ -1,0 +1,155 @@
+- Class: meta
+  Lesson: "Testing & Idempotency"
+  EstimatedMinutes: 35
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Why Idempotency Matters
+
+    Pipelines run on a schedule. They retry on failure. They backfill.
+    **Idempotency**: running the pipeline twice with the same input
+    produces the same output. No duplicate rows. No double-counting.
+
+    Without idempotency: retry after a partial failure → duplicate rows
+    in gold. Backfill last week → revenue counted twice. This lesson
+    teaches how to achieve idempotency and how to test it.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    ## Overwrite vs Append: The Idempotency Trap
+
+    **Append**: Each run adds rows. Run twice → double the rows. Not
+    idempotent unless you deduplicate at read or use merge/upsert.
+
+    **Overwrite**: Each run replaces the table. Run twice → same result.
+    Idempotent. But: you lose history. For daily gold tables, overwrite
+    by partition (e.g. overwrite only today's partition) is common.
+
+    **Merge/Upsert**: Insert new, update changed. Idempotent if keys are
+    correct. Delta and Iceberg support merge.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Unit Testing Pipeline Functions
+
+    ```python
+    def test_bronze_clicks():
+        spark = SparkSession.builder.master("local[*]").getOrCreate()
+        df = bronze_clicks(spark, "test.csv")
+        assert df.count() == 2
+        assert "_ingested_at" in df.columns
+        assert df.schema["event_id"].dataType == StringType()
+    ```
+
+    Use mock DataFrames: createDataFrame with known data. Assert schema,
+    row count, specific values. No external files needed for pure logic
+    tests. For I/O, use temp files.
+
+- Class: mult_question
+  Depth: all
+  Output: "What does idempotency mean for a data pipeline?"
+  AnswerChoices: "Running twice with same input produces same output;Running as fast as possible;Running in parallel;Running only once"
+  CorrectAnswer: "Running twice with same input produces same output"
+  Hint: "Idempotent = same effect no matter how many times you run it."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Integration Testing with Test Fixtures
+
+    Create fixtures: sample CSV, JSON files that represent real data
+    (including edge cases: duplicates, nulls, invalid values). Run the
+    full pipeline. Assert final gold row counts, key values.
+
+    ```python
+    def test_full_pipeline():
+        with tempfile.TemporaryDirectory() as tmp:
+            create_fixture_clicks(tmp)
+            report = run_pipeline(spark, tmp)
+            gold = spark.table("gold_daily")
+            assert gold.filter(f.col("date") == "2024-01-15").count() > 0
+    ```
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "Why use overwrite by partition instead of full table overwrite?"
+  AnswerChoices: "Preserve history — only replace today's data;It's faster;It uses less memory;Spark requires it"
+  CorrectAnswer: "Preserve history — only replace today's data"
+  Hint: "Full overwrite loses yesterday's data. Partition overwrite keeps it."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write a unit test that creates a DataFrame with one row, passes it to
+    silver_clicks, and asserts the valid output has 1 row and quarantine
+    has 0 rows.
+  CorrectAnswer: |
+    def test_silver_clicks_valid():
+        spark = SparkSession.builder.master("local[*]").getOrCreate()
+        bronze = spark.createDataFrame([("e1","u1","p1","click","2024-01-15 10:00:00")],
+            ["event_id","user_id","product_id","event_type","timestamp"])
+        valid, quarantine = silver_clicks(spark, bronze)
+        assert valid.count() == 1
+        assert quarantine.count() == 0
+  Hint: "createDataFrame with valid timestamp. silver_clicks returns (valid, quarantine). Assert counts."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Verifying Idempotency in Tests
+
+    ```python
+    def test_bronze_idempotent():
+        df1 = bronze_clicks(spark, path)
+        df2 = bronze_clicks(spark, path)
+        assert df1.count() == df2.count()
+        # Or: run pipeline twice, compare gold
+        run_pipeline(spark, path)
+        gold1 = spark.table("gold_daily").collect()
+        run_pipeline(spark, path)
+        gold2 = spark.table("gold_daily").collect()
+        assert gold1 == gold2
+    ```
+
+    For overwrite mode, second run replaces first. Same result. For
+    append, you'd need merge or dedup to achieve idempotency.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Unit Tests for Pipeline Functions
+
+    Implement three test functions:
+
+    1. `test_bronze_dedup()` — create CSV with duplicate event_id, run
+       bronze_clicks, assert count is 2 (not 3)
+    2. `test_silver_quarantine()` — create bronze DataFrame with one
+       row having timestamp "invalid", run silver_clicks, assert valid
+       has 2 rows, quarantine has 1
+    3. `test_gold_idempotent()` — run gold_daily_revenue_by_category
+       twice on same orders_df, assert both results are equal (same
+       rows, same values)
+
+    Use pytest or plain assert. The test harness runs all three and
+    verifies they pass.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "test_bronze: temp CSV with dup, bronze_clicks, assert count. test_silver: createDataFrame with invalid ts, assert valid/quarantine counts. test_gold: same orders_df twice, collect both, assert equal."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    Testing and idempotency:
+
+    - **Idempotency** — same input → same output. Overwrite, merge, dedup.
+    - **Unit tests** — mock DataFrames, assert schema, counts, values
+    - **Integration tests** — fixtures, full pipeline, assert gold
+    - **Idempotency tests** — run twice, compare output
+
+    In the final lesson, you will build the **capstone** — the complete
+    production ShopStream pipeline with all patterns from the course.

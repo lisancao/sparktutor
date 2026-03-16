@@ -1,0 +1,189 @@
+- Class: meta
+  Lesson: "Spark Connect — Client-Server Architecture"
+  EstimatedMinutes: 35
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Continuing the E-Commerce Migration
+
+    In Lesson 01 you built a version-aware SparkSession factory. Now we tackle
+    **Spark Connect** — the client-server architecture that separates your Python
+    client from the Spark driver. This is a major shift for the e-commerce
+    pipeline: it enables running notebooks against a remote cluster, IDE
+    integrations, and multi-language clients.
+
+    We'll refactor the pipeline to work over Spark Connect and handle
+    operations that Connect does not support.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Old Model: Driver-Collocated
+
+    In Spark 3, when you run PySpark locally, the **driver** (JVM process) and
+    your Python process share the same machine. The driver plans jobs, the
+    executors run them. The Python process is tightly coupled to the JVM via
+    Py4J — a bridge that serializes calls across the process boundary.
+
+    Problems: heavy startup, no true separation of client and cluster, Python
+    must be on the same network as the driver. Your e-commerce pipeline runs
+    entirely inside the driver's process space.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The New Model: Spark Connect
+
+    Spark Connect introduces a **thin client** and a **remote server**:
+
+    - **Client** — Your Python code, running in a notebook, IDE, or script.
+      Sends logical plan fragments (DataFrame operations) over the network via
+      a protocol buffer protocol.
+
+    - **Server** — The Spark driver (JVM) runs on the cluster. It receives
+      plans, builds the execution graph, and coordinates with executors. Results
+      stream back to the client.
+
+    Connect: `SparkSession.builder.remote("sc://host:port")
+    .getOrCreate()`
+
+    Local: `SparkSession.builder.master("local[*]").getOrCreate()`
+
+- Class: text
+  Depth: all
+  Output: |
+    ## How to Connect
+
+    ```python
+    # Remote Spark Connect
+    spark = (SparkSession.builder
+        .remote("sc://spark-cluster.example.com:15002")
+        .appName("ECommerceClient")
+        .getOrCreate())
+
+    # Local (unchanged)
+    spark = (SparkSession.builder
+        .master("local[*]")
+        .appName("ECommerceLocal")
+        .getOrCreate())
+    ```
+
+    The `remote()` URL uses the `sc://` scheme. The server must be running
+    the Spark Connect gateway. In Databricks, the workspace URL is configured
+    automatically when you use the Databricks Connect client.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What Works Over Connect
+
+    **Supported:** DataFrame API (select, filter, join, groupBy, agg), SQL
+    via `spark.sql()`, most built-in functions, Spark ML (DataFrame-based),
+    Structured Streaming (DataFrame API). Your e-commerce pipeline's core
+    transformations — reading orders, joining products, aggregating revenue —
+    all work over Connect.
+
+    **Limited:** UDFs (Python UDFs require special handling; use Pandas UDFs
+    or UDTFs when possible). Some config options.
+
+    **Not supported:** RDD API, accumulators, broadcast variables (use
+    broadcast joins instead), `sc` (SparkContext) — use `spark.sql` for SQL.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What Breaks: RDD and Accumulators
+
+    In Spark 3, you might have used:
+
+    ```python
+    # Spark 3 — does NOT work over Connect
+    rdd = spark.sparkContext.parallelize([1, 2, 3])
+    acc = spark.sparkContext.accumulator(0)
+    rdd.foreach(lambda x: acc.add(x))
+    ```
+
+    Over Connect, `spark.sparkContext` is not available. Migrate to DataFrame
+    API: `spark.createDataFrame([(x,) for x in data], ["value"])` and use
+    `agg` for aggregations. Accumulators are replaced by DataFrame aggregations.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Refactoring for Connect
+
+    When refactoring the e-commerce pipeline:
+
+    1. **Audit** — Replace any `.rdd`, `sparkContext`, accumulators, broadcast
+       variables with DataFrame equivalents.
+
+    2. **UDFs** — If you use Python UDFs, ensure they're registered and
+       invoked via SQL or DataFrame API. Avoid UDFs that capture driver-side
+       state.
+
+    3. **Fallback** — Use a Connect-capable flag: if `use_connect` is True,
+       build with `.remote()`; else use `.master("local[*]")`. This lets you
+       run the same code locally for testing and remotely for production.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Protocol Buffer Protocol
+
+    Spark Connect uses a request/response protocol. Each DataFrame operation
+    (select, filter, etc.) is serialized as a logical plan node. The client
+    sends `ExecutePlan` requests; the server returns `ExecutePlanResponse` with
+    result rows or relation IDs. Large results are streamed. The protocol is
+    language-agnostic — Scala, Python, and future clients share the same wire format.
+
+- Class: mult_question
+  Depth: all
+  Output: "What is the main advantage of Spark Connect's thin client architecture?"
+  AnswerChoices: "Faster execution;Client can run anywhere, driver on cluster;Smaller JAR;More UDFs"
+  CorrectAnswer: "Client can run anywhere, driver on cluster"
+  Hint: "The client sends logical plans over the network. The driver runs on the cluster; the client can be a laptop, CI, or IDE."
+
+- Class: mult_question
+  Depth: all
+  Output: "Which of these is NOT supported over Spark Connect?"
+  AnswerChoices: "DataFrame select and filter;groupBy and agg;RDD operations;spark.sql()"
+  CorrectAnswer: "RDD operations"
+  Hint: "RDD API requires SparkContext. Connect exposes the DataFrame API and SQL, not RDD."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write a function `create_session(use_connect: bool, url: str = "sc://localhost:15002")`
+    that returns a SparkSession. If use_connect is True, use remote(url);
+    otherwise use master("local[*]"). App name always "ECommerce".
+  CorrectAnswer: |
+    from pyspark.sql import SparkSession
+
+    def create_session(use_connect: bool, url: str = "sc://localhost:15002"):
+        builder = SparkSession.builder.appName("ECommerce")
+        if use_connect:
+            return builder.remote(url).getOrCreate()
+        return builder.master("local[*]").getOrCreate()
+  Hint: "Branch on use_connect; use .remote(url) or .master('local[*]')."
+
+- Class: mult_question
+  Depth: all
+  Output: "How should you replace an accumulator that counts rows across a distributed pipeline?"
+  AnswerChoices: "Use a broadcast variable;Use DataFrame count() or agg;Use RDD reduce;Use SparkContext"
+  CorrectAnswer: "Use DataFrame count() or agg"
+  Hint: "Accumulators are not available over Connect. Use df.count() or df.agg(f.count('*')) for aggregations."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Exercise: Refactor for Spark Connect
+
+    You will refactor a Spark 3 pipeline that uses `sparkContext.parallelize`
+    and a simple filter. The pipeline loads order data and filters by status.
+    Your task: implement it using only DataFrame API so it works over Connect.
+    Use `create_session(use_connect=False)` for local testing; the same code
+    must work with `use_connect=True` when a Connect server is available.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Replace parallelize with createDataFrame. Use filter() or where() for DataFrame filtering."

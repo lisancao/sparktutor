@@ -1,0 +1,170 @@
+- Class: meta
+  Lesson: "Migration Capstone — Upgrade a Complete Pipeline"
+  EstimatedMinutes: 50
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Complete E-Commerce Pipeline
+
+    You have migrated each component across nine lessons: version-aware session,
+    Connect-compatible code, transform() composition, ANSI-safe aggregates,
+    VARIANT for JSON, table defaults, collation, UDTF/explode patterns, and
+    streaming aggregation. This capstone wires everything into one **Spark 4
+    native** pipeline and delivers a systematic migration checklist.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Systematic Migration Checklist
+
+    1. **Version detection** — Use create_spark_session() or spark.version to
+       branch behavior. Test on Spark 3 and 4.
+
+    2. **Connect compatibility** — Remove RDD, sparkContext, accumulators.
+       Use DataFrame API only.
+
+    3. **ANSI mode** — Replace / with try_divide, * with try_multiply where
+       overflow or divide-by-zero is possible. Use try_cast for risky casts.
+
+    4. **JSON to VARIANT** — Migrate get_json_object to parse_json +
+       variant_get. Parse once, extract many.
+
+    5. **Table features** — Add DEFAULT and GENERATED ALWAYS AS where
+       appropriate. Plan for governance (masks, filters).
+
+    6. **String handling** — Use collation for case-insensitive matching, or
+       lower() as fallback.
+
+    7. **Explode patterns** — Prefer explode + filter; use UDTF when you need
+       validation or complex per-row logic.
+
+    8. **Streaming** — Migrate flatMapGroupsWithState to transformWithState.
+       Use RocksDB for large state.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Testing Strategy
+
+    Run Spark 3 and 4 side by side:
+
+    - **Dual runtime** — Install both pyspark 3.5 and 4.0. Run the pipeline
+      on each; compare outputs with a diff or checksum.
+
+    - **Golden output** — Capture Spark 3 output as "golden". After migration,
+      assert Spark 4 output matches (within tolerance for floating point).
+
+    - **Incremental migration** — Migrate one module at a time. Use version
+      branching so the same codebase runs on both during transition.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Pipeline Architecture
+
+    The full e-commerce pipeline:
+
+    1. **Ingest** — Orders (order_id, status, total), line items (order_id,
+       product_id, quantity, price), products (product_id, name, category from
+       JSON).
+
+    2. **Transform** — Add revenue (quantity * price), filter valid rows,
+       join with products for category. Aggregate revenue by product and
+       category.
+
+    3. **Output** — Top products by revenue, revenue by category, order counts.
+
+    All steps use: Connect-compatible API, try_* for ANSI safety, transform()
+    for composition, VARIANT or get_json_object fallback for products.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Wire-Together Pattern
+
+    ```python
+    def full_pipeline(spark):
+        orders = load_orders(spark)
+        lines = load_line_items(spark)
+        products = load_products_variant(spark)
+        enriched = (lines
+            .transform(add_revenue)
+            .transform(filter_valid)
+            .join(products, "product_id"))
+        return enriched.groupBy("category").agg(f.sum("revenue").alias("total"))
+    ```
+
+    Each function (load_orders, add_revenue, etc.) was built in prior lessons.
+    The capstone assembles them.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Production Considerations
+
+    - **Checkpointing** — For streaming, use a dedicated checkpoint path.
+      Do not reuse Spark 3 checkpoints with Spark 4 without testing.
+
+    - **Config migration** — spark.sql.ansi.enabled, spark.sql.session.timeZone,
+      etc. Document all config changes.
+
+    - **Dependency versions** — PySpark 4.x, Delta 3.x, etc. Ensure
+      compatibility matrix.
+
+- Class: mult_question
+  Depth: all
+  Output: "What is the main benefit of running Spark 3 and 4 side by side during migration?"
+  AnswerChoices: "Faster execution;Compare outputs to validate correctness;Smaller codebase;Enables streaming"
+  CorrectAnswer: "Compare outputs to validate correctness"
+  Hint: "Dual runtime lets you diff outputs and catch regressions before full cutover."
+
+- Class: mult_question
+  Depth: all
+  Output: "Which migration step should you do first?"
+  AnswerChoices: "ANSI fixes;Version detection and Connect compatibility;VARIANT migration;Streaming"
+  CorrectAnswer: "Version detection and Connect compatibility"
+  Hint: "Without version detection you cannot branch. Without Connect compatibility, remote execution fails."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write a function `merge_pipelines(spark, orders_df, lines_df, products_df)` that
+    joins lines with orders on order_id, joins with products on product_id,
+    adds revenue = quantity * price, and returns the enriched DataFrame.
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+
+    def merge_pipelines(spark, orders_df, lines_df, products_df):
+        return (lines_df
+            .join(orders_df, "order_id")
+            .join(products_df, "product_id")
+            .withColumn("revenue", f.col("quantity") * f.col("price")))
+  Hint: "Join lines to orders, then to products. Add revenue column."
+
+- Class: mult_question
+  Depth: all
+  Output: "Why use a golden output when migrating?"
+  AnswerChoices: "To speed up tests;To validate Spark 4 output matches Spark 3;To reduce memory;To enable broadcast"
+  CorrectAnswer: "To validate Spark 4 output matches Spark 3"
+  Hint: "Golden output is the known-good Spark 3 result. You assert Spark 4 matches it."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Exercise: Full E-Commerce Pipeline
+
+    Implement `full_ecommerce_pipeline(spark)` that:
+    1. Creates version-aware session (or uses provided spark)
+    2. Loads orders, line items, and products (with VARIANT or get_json_object)
+    3. Joins line items with orders and products
+    4. Adds revenue with try_multiply (ANSI-safe)
+    5. Aggregates total revenue by product and category
+    6. Returns the final DataFrame
+
+    Use components from prior lessons. The starter provides the raw data.
+    The solution must pass assertions: correct row counts, revenue totals,
+    and column presence.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Chain: createDataFrames, join, withColumn try_multiply, groupBy category and product_id, agg sum."

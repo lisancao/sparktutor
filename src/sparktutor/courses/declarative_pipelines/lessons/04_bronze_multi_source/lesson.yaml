@@ -1,0 +1,183 @@
+- Class: meta
+  Lesson: "Bronze — Multi-Source Ingestion"
+  EstimatedMinutes: 40
+
+- Class: text
+  Depth: all
+  Output: |
+    ## ShopStream's Multiple Data Sources
+
+    ShopStream receives data from three systems:
+
+    1. **Clicks** — CSV from web analytics. Columns: event_id, user_id,
+       product_id, event_type, timestamp.
+    2. **Payments** — JSON from Stripe webhooks. Nested: payment_id,
+       amount, currency, customer_id, created_at.
+    3. **Inventory** — JSON from warehouse. Nested: sku, quantity,
+       warehouse_id, updated_at. Different structure than payments.
+
+    Each source has different formats, schemas, and evolution patterns.
+    This lesson teaches how to ingest all three into bronze tables while
+    handling schema differences and preparing for union-compatible silver.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    ## Different Sources, Different Formats
+
+    **CSV**: Flat, header row, comma-separated. Use spark.read.csv with
+    schema. Good for clicks, exports, logs.
+
+    **JSON**: Semi-structured. spark.read.json infers schema from data,
+    or you provide schema. Handles nested objects. Payments and inventory
+    arrive as JSON.
+
+    **Nested JSON**: Use schema with StructType containing nested
+    StructTypes. Or use inferSchema and let Spark figure it out (risky for
+    production — schema can change between files).
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Schema Registry Pattern
+
+    Centralize schema definitions in one place:
+
+    ```python
+    SCHEMAS = {
+        "clicks": StructType([...]),
+        "payments": StructType([...]),
+        "inventory": StructType([...]),
+    }
+    ```
+
+    Benefits: single source of truth, easy to evolve, reuse across
+    ingestion functions. When a source adds a column, update the schema
+    once. Bronze ingestion functions reference SCHEMAS["source_name"].
+
+- Class: mult_question
+  Depth: all
+  Output: "Why use a schema registry instead of defining schemas in each ingestion function?"
+  AnswerChoices: "Single source of truth — evolve schemas in one place;It makes reads faster;Spark requires it;It reduces memory usage"
+  CorrectAnswer: "Single source of truth — evolve schemas in one place"
+  Hint: "When a source adds a column, you update one schema definition, not N functions."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Handling Schema Evolution
+
+    When a source adds a column:
+    - **Bronze**: Add the column to your schema as StringType (or
+      optional). Existing files won't have it — they get null. New files
+      will have it. No reprocessing of old data required.
+    - **Schema evolution in table formats**: Delta and Iceberg support
+      ALTER TABLE ADD COLUMN. You can add columns without rewriting.
+
+    When a column is renamed: Trickier. You may need a mapping layer
+    (old_name -> new_name) for backward compatibility during transition.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "A new column 'campaign_id' appears in click events. What should bronze do?"
+  AnswerChoices: "Add campaign_id to schema as StringType — old files get null;Reject the new column;Stop ingestion until silver is updated;Merge with previous schema"
+  CorrectAnswer: "Add campaign_id to schema as StringType — old files get null"
+  Hint: "Bronze absorbs schema changes. Old data gets null for new columns; new data gets the value."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Union-Compatible Ingestion
+
+    To combine clicks, payments, and inventory in silver, we need
+    union-compatible schemas. Options:
+
+    1. **Separate bronze tables** — bronze_clicks, bronze_payments,
+       bronze_inventory. Silver joins them. No union needed.
+    2. **Unified bronze** — One bronze table with a _source column.
+       Each source's columns map to a common schema. Missing columns
+       get null. Use unionByName(allowMissingColumns=True) in Spark 3.1+.
+
+    For ShopStream, we keep separate bronze tables. Silver will join
+    them on business keys (user_id, product_id, etc.).
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write a function that reads JSON from path with a schema that has
+    payment_id, amount (DoubleType), customer_id, created_at (StringType).
+    Add _ingested_at and _source_file. Deduplicate by payment_id.
+  CorrectAnswer: |
+    from pyspark.sql.types import StructType, StructField, StringType, DoubleType
+
+    schema = StructType([
+        StructField("payment_id", StringType()),
+        StructField("amount", DoubleType()),
+        StructField("customer_id", StringType()),
+        StructField("created_at", StringType()),
+    ])
+    df = (spark.read.json(path, schema=schema)
+        .withColumn("_ingested_at", f.current_timestamp())
+        .withColumn("_source_file", f.input_file_name())
+        .dropDuplicates(["payment_id"]))
+  Hint: "spark.read.json(path, schema=schema). For JSON, schema can have typed columns. Add metadata, dedup."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Nested JSON: Flatten or Preserve?
+
+    Payments JSON: `{"payment_id": "p1", "amount": 99.99, "customer": {"id": "c1", "email": "x@y.com"}}`
+
+    **Flatten at bronze**: customer_id, customer_email. Simpler for
+    silver. Loses structure.
+
+    **Preserve at bronze**: customer as StructType. Silver flattens.
+    Keeps raw structure for debugging.
+
+    For this course we flatten at read using a schema that has
+    customer_id, customer_email as top-level columns. The JSON reader
+    can use dot notation or we pre-process. Simpler: use a schema that
+    matches the flattened structure and let Spark's from_json handle it.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Ingest Three ShopStream Sources
+
+    Implement three ingestion functions:
+
+    1. `bronze_clicks(spark, csv_path)` — same as lesson 3: CSV, schema
+       event_id, user_id, product_id, event_type, timestamp. Metadata.
+       Dedup by event_id.
+
+    2. `bronze_payments(spark, json_path)` — JSON with payment_id,
+       amount, customer_id, created_at.
+       Use schema. Add metadata. Dedup by payment_id.
+
+    3. `bronze_inventory(spark, json_path)` — JSON with sku, quantity,
+       warehouse_id, updated_at. Add metadata. Dedup by (sku, warehouse_id).
+
+    Use a shared SCHEMAS dict for schema definitions. The test harness
+    creates CSV and JSON fixtures and verifies all three functions return
+    correct row counts and schemas.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Define SCHEMAS with StructType for each. bronze_clicks: read csv. bronze_payments and bronze_inventory: read json. All add _ingested_at, _source_file, dedup."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    You now ingest multiple ShopStream sources:
+
+    - **Clicks** — CSV with schema-on-read
+    - **Payments** — JSON with schema
+    - **Inventory** — JSON with schema
+    - **Schema registry** — centralized definitions
+    - **Metadata and dedup** — same pattern for all
+
+    These bronze tables feed into silver in the next lessons. Silver will
+    cast types, validate, and join them. First: **type casting and
+    validation** in lesson 5.

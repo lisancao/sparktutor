@@ -1,0 +1,208 @@
+- Class: meta
+  Lesson: "Sources & Sinks Deep Dive"
+  EstimatedMinutes: 35
+
+- Class: text
+  Depth: all
+  Output: |
+    ## PayGuard's Data Pipeline Architecture
+
+    PayGuard receives transactions from multiple sources: file drops from
+    legacy systems, Kafka topics from real-time gateways, and synthetic
+    rate streams for testing. Alerts must go to the console (debugging),
+    files (audit trail), and Kafka (downstream systems). This lesson
+    covers the major sources and sinks you will use in production.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## File Source: CSV, JSON, Parquet
+
+    The file source watches a directory. New files = new micro-batches.
+    Spark uses file modification time to order and assign files. Options:
+
+    ```python
+    # CSV
+    stream = (spark.readStream.format("csv")
+        .option("header", "true")
+        .schema(schema).load("/data/incoming/"))
+
+    # JSON
+    stream = (spark.readStream.format("json")
+        .schema(schema).load("/data/incoming/"))
+
+    # Parquet (often best for performance)
+    stream = (spark.readStream.format("parquet")
+        .load("/data/incoming/"))
+    ```
+
+    Parquet can infer schema from files, but for consistency with other
+    formats, providing schema is recommended. PayGuard's legacy system
+    drops JSON files; the real-time gateway writes Parquet.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Kafka Source — The Production Standard
+
+    Kafka is the dominant streaming platform. PayGuard's real-time
+    gateway publishes transactions to the `payguard-transactions` topic:
+
+    ```python
+    stream = (spark.readStream.format("kafka")
+        .option("kafka.bootstrap.servers", "broker1:9092,broker2:9092")
+        .option("subscribe", "payguard-transactions")
+        .option("startingOffsets", "latest")
+        .load())
+    ```
+
+    Kafka returns rows with `key`, `value`, `topic`, `partition`, `offset`,
+    `timestamp`. You typically parse `value` (bytes) into your schema:
+
+    ```python
+    from pyspark.sql.functions import from_json
+    parsed = stream.select(from_json(col("value").cast("string"), schema).alias("data"))
+    transactions = parsed.select("data.*")
+    ```
+
+- Class: text
+  Depth: beginner
+  Output: |
+    ## Rate Source — Synthetic Data for Testing
+
+    When you need to test streaming logic without Kafka or files, the
+    rate source generates rows at a configurable rate:
+
+    ```python
+    rate_stream = (spark.readStream.format("rate")
+        .option("rowsPerSecond", 10)
+        .option("numPartitions", 2)
+        .load())
+    ```
+
+    Each row has `timestamp` and `value` (incrementing long). You can
+    join this with static data or use it to simulate event timing. Useful
+    for load testing and development when no real stream exists.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Sinks: Where Results Go
+
+    | Sink      | Use Case                    | Output Mode      |
+    |-----------|-----------------------------|------------------|
+    | console   | Debugging, development      | append, update, complete |
+    | memory    | In-process testing          | append, complete  |
+    | file      | Parquet/ORC for audit       | append only      |
+    | foreach   | Custom logic per row        | append, update   |
+    | foreachBatch | Batch-level custom write | append, update   |
+    | Kafka     | Downstream consumers         | append, update   |
+
+    PayGuard writes alerts to console (dev), Parquet (audit), and Kafka
+    (alerting service). File sink requires `path` and `checkpointLocation`.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## foreach and foreachBatch
+
+    **foreach**: Called for each row. Use for custom sinks (e.g., call an
+    API, write to a database per row). Must be idempotent for exactly-once.
+
+    **foreachBatch**: Called with each micro-batch as a DataFrame. You can
+    use batch APIs (e.g., `df.write.parquet()`). More efficient for
+    bulk writes. PayGuard uses foreachBatch to write alerts to both
+    Parquet and a REST API in one pass:
+
+    ```python
+    def write_batch(batch_df, batch_id):
+        batch_df.write.mode("append").parquet("/alerts/")
+        batch_df.write.format("jdbc").option("url", "...").save()
+    ```
+
+- Class: mult_question
+  Depth: all
+  Output: "Which source is best for generating synthetic data when you don't have Kafka or files?"
+  AnswerChoices: "File source;Kafka source;Rate source;Socket source"
+  CorrectAnswer: "Rate source"
+  Hint: "Rate source generates rows at a configurable rate for testing."
+
+- Class: mult_question
+  Depth: all
+  Output: "What columns does the Kafka source produce before parsing?"
+  AnswerChoices: "tx_id, user_id, amount;key, value, topic, partition, offset;timestamp only;schema columns"
+  CorrectAnswer: "key, value, topic, partition, offset"
+  Hint: "Kafka returns raw bytes in key/value. You parse value into your schema."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Writing to Multiple Sinks
+
+    A single streaming query writes to one sink. To write to multiple
+    sinks (e.g., console and file), you have two options:
+
+    1. **Multiple queries**: Start two writeStreams from the same
+       DataFrame. Each consumes the source independently. Use with
+       replayable sources (Kafka, checkpointed file source).
+    2. **foreachBatch**: In the batch function, write to multiple
+       destinations. One query, one sink type, but multiple outputs.
+
+    PayGuard uses foreachBatch to write alerts to Parquet and Kafka in
+    one pass — avoids duplicate processing.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write code to create a Kafka readStream that subscribes to topic
+    "payguard-tx", uses bootstrap servers "localhost:9092", and starts
+    from latest offset. Assign to variable `kafka_stream`.
+  CorrectAnswer: |
+    kafka_stream = (spark.readStream.format("kafka")
+        .option("kafka.bootstrap.servers", "localhost:9092")
+        .option("subscribe", "payguard-tx")
+        .option("startingOffsets", "latest")
+        .load())
+  Hint: "readStream, format kafka, options for bootstrap.servers, subscribe, startingOffsets."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Kafka Sink for Alerts
+
+    PayGuard publishes fraud alerts to a Kafka topic for downstream
+    consumers (e.g., blocklist service, customer notification):
+
+    ```python
+    (alerts_df.writeStream
+        .format("kafka")
+        .option("kafka.bootstrap.servers", "broker:9092")
+        .option("topic", "payguard-alerts")
+        .option("checkpointLocation", "/checkpoints/alerts")
+        .start())
+    ```
+
+    The DataFrame must have `key` and `value` columns (or `topic`).
+    Kafka sink supports append and update modes. Exactly-once requires
+    idempotent Kafka producer and transaction support.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Multi-Sink Alert Simulation
+
+    Implement `process_and_route_alerts` that:
+    1. Takes a DataFrame of transactions (simulating Kafka stream output)
+    2. Filters transactions with amount > 500 (alert threshold)
+    3. Adds an alert_type column with value "high_amount"
+    4. Returns a tuple: (console_df, file_df) — both are the same
+       DataFrame. In production, you'd write console_df to console sink
+       and file_df to file sink. Here we return both for validation.
+
+    The test harness creates sample transactions and validates that
+    high-amount transactions are correctly flagged. Same logic would
+    work with readStream + writeStream to console and foreachBatch
+    to file in production.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Filter amount > 500, withColumn alert_type. Return (result_df, result_df)."

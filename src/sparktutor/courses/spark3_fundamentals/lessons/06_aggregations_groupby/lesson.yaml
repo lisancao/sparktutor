@@ -1,0 +1,167 @@
+- Class: meta
+  Lesson: "Aggregations & GroupBy"
+  EstimatedMinutes: 40
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Building the City Dashboard
+
+    You have ingested trips to Parquet (Lesson 5) and enriched them with
+    time buckets and distance categories (Lesson 4). Now we aggregate:
+    trips per day per city, average fare, peak hours. This is the core of
+    the ride-sharing analytics dashboard — the metrics that operations
+    teams use to understand demand and pricing.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## groupBy + agg: The Fundamental Pattern
+
+    Every aggregation in Spark follows the same pattern:
+
+    ```python
+    df.groupBy("city").agg(f.count("*").alias("trip_count"))
+    df.groupBy("city", "date").agg(
+        f.count("*").alias("trips"),
+        f.avg("fare").alias("avg_fare"),
+        f.sum("distance_miles").alias("total_miles"))
+    ```
+
+    - **groupBy** — partition rows by unique values of the key columns
+    - **agg** — apply aggregate functions to each group. Multiple aggs
+      in one call are more efficient than multiple groupBys.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Built-in Aggregate Functions
+
+    - **count**, **countDistinct** — number of rows, unique values
+    - **sum**, **avg** — totals and averages
+    - **min**, **max** — extremes
+    - **first**, **last** — first/last value in group (order-dependent)
+
+    For ride-sharing: count trips, avg fare, sum distance, countDistinct
+    riders/drivers. Use alias() to name output columns for clarity.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Pivot Tables: Reshaping Data
+
+    Sometimes you want columns to become rows, or vice versa. **pivot**
+    reshapes:
+
+    ```python
+    df.groupBy("city").pivot("time_bucket").agg(f.count("*"))
+    ```
+
+    Produces columns like city, morning_rush, evening_rush, off_peak —
+    one column per pivot value. Useful for dashboards that need
+    cross-tabulated metrics.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## cube and rollup: Multi-Dimensional Aggregations
+
+    **cube** produces aggregations for all combinations of grouping
+    columns (including grand total). **rollup** produces hierarchical
+    subtotals (e.g., by city, then by city+date, then total).
+
+    ```python
+    df.cube("city", "date").agg(f.count("*").alias("trips"))
+    df.rollup("city", "date").agg(f.count("*").alias("trips"))
+    ```
+
+    Use when you need multiple levels of aggregation in one pass.
+
+- Class: mult_question
+  Depth: all
+  Output: "What is the difference between count(*) and countDistinct(column)?"
+  AnswerChoices: "count is faster;count counts all rows, countDistinct counts unique values;countDistinct requires a sort;They are the same"
+  CorrectAnswer: "count counts all rows, countDistinct counts unique values"
+  Hint: "count(*) counts every row in the group. countDistinct counts how many unique values appear."
+
+- Class: mult_question
+  Depth: all
+  Output: "When would you use pivot instead of a simple groupBy?"
+  AnswerChoices: "When you need faster aggregation;When you want to reshape so pivot column values become output columns;When you have too many groups;When data is sorted"
+  CorrectAnswer: "When you want to reshape so pivot column values become output columns"
+  Hint: "Pivot turns unique values of one column into separate columns in the output."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Given a trips DataFrame with city, date, fare, write code to group by
+    city and date, computing trip count (alias trips), avg fare (alias
+    avg_fare), and sum of fare (alias total_fare).
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+
+    result = (trips_df.groupBy("city", "date")
+        .agg(
+            f.count("*").alias("trips"),
+            f.avg("fare").alias("avg_fare"),
+            f.sum("fare").alias("total_fare")))
+  Hint: "Use groupBy with multiple columns, agg with count, avg, sum, and alias for each."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Peak Hours and Dashboard Metrics
+
+    For the city dashboard, we want:
+    - Trips per day per city
+    - Average fare per city
+    - Peak hour (hour with most trips) — use groupBy city and hour,
+      count, then orderBy and take the top hour per city. Or use
+      window functions (Lesson 8) for a cleaner approach.
+
+    The aggregation layer feeds directly into dashboards and reports.
+    Cache the result if multiple downstream consumers need it.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Using pivot, reshape trips_df (with city and time_bucket) so that
+    each time_bucket value becomes a column with the trip count.
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+
+    result = trips_df.groupBy("city").pivot("time_bucket").agg(f.count("*"))
+  Hint: "groupBy the dimension you want to keep, pivot the column whose values become new columns, agg the metric."
+
+- Class: mult_question
+  Depth: all
+  Output: "What does rollup produce that cube does not?"
+  AnswerChoices: "More rows;Hierarchical subtotals (e.g., city, then city+date, then total);Fewer columns;Faster execution"
+  CorrectAnswer: "Hierarchical subtotals (e.g., city, then city+date, then total)"
+  Hint: "Rollup produces subtotals in a hierarchy. Cube produces all combinations including grand total."
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: City-Level Dashboard
+
+    Implement `city_dashboard` that takes a trips DataFrame (from Lesson 5
+    Parquet: city, date, fare, distance_miles, and optionally time_bucket
+    if enriched) and returns a DataFrame with:
+    - city
+    - trips_per_day (avg trips per date for that city)
+    - avg_fare
+    - peak_hour (the hour 0-23 with the most trips; use pickup_time to
+      extract hour, group by city and hour, then for each city take the
+      hour with max count — use a self-join or window; for simplicity,
+      return the hour with max trips per city via groupBy city, hour,
+      count, then orderBy and first)
+
+    For the peak_hour simplification: group by city and hour, count,
+    then use a window (row_number) partitioned by city ordered by count
+    desc, filter for rank=1, select city and hour. Or: aggregate to
+    (city, hour, cnt), then for each city take argmax of cnt. Use
+    struct(cnt, hour) and max to get the hour with max count.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "First groupBy city, date for trips_per_day and avg_fare. For peak_hour: extract hour, groupBy city+hour, count, then use max(struct(count, hour)) per city and extract hour."

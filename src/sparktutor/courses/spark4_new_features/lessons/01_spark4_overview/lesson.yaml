@@ -1,0 +1,177 @@
+- Class: meta
+  Lesson: "Spark 4 Overview — What Changed and Why"
+  EstimatedMinutes: 30
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The E-Commerce Migration Story
+
+    Over the next 10 lessons, you will migrate a **real e-commerce analytics
+    pipeline** from Spark 3 to Spark 4. The pipeline processes product orders,
+    customer sessions, inventory, and revenue metrics. Each lesson tackles a
+    migration area: you'll see what worked in Spark 3, what breaks in Spark 4,
+    and how to fix it.
+
+    This first lesson sets the stage: Spark 4's philosophy, breaking changes,
+    and how to detect your runtime version so you can write code that adapts.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Philosophy Behind Spark 4
+
+    Spark 4 is not just a version bump. It reflects three design principles:
+
+    1. **Stricter defaults** — Spark 3 tolerated silent overflow, implicit casts,
+       and permissive SQL. Spark 4 defaults to ANSI mode: errors surface instead
+       of corrupting data. You must opt-in to legacy behavior when needed.
+
+    2. **Better Python experience** — Spark Connect makes Python a thin client; the
+       driver runs remotely. The DataFrame API is type-annotated; UDTFs are
+       first-class. Python is no longer a second-class citizen.
+
+    3. **Protocol-first architecture** — Spark Connect uses a protocol buffer
+       protocol. Clients (Python, Scala, etc.) talk to the same server. This
+       enables notebook-to-cluster workflows, IDE integrations, and language
+       parity.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Breaking Changes Overview
+
+    When migrating Spark 3 → 4, expect these categories:
+
+    **ANSI mode default** — Integer overflow throws, division by zero throws,
+    implicit casts fail. Use `try_cast`, `try_divide`, `try_add` for safe fallbacks.
+
+    **Removed APIs** — Deprecated methods in Spark 3 are removed. Examples:
+    `spark.sql.udf.register` (use `spark.udf.register`), `DataFrame.toPandas()` with
+    certain options (use Arrow). Check your codebase for deprecation warnings.
+
+    **Behavior changes** — `collect()` on empty DataFrame returns `[]`; some
+    join semantics changed. Null handling in aggregations is stricter.
+
+    **Python UDFs** — Arrow-optimized by default; some legacy UDF patterns may
+    need adjustment.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Version Detection
+
+    Your migration code must know which Spark version it runs on. Use:
+
+    ```python
+    from pyspark.sql import SparkSession
+
+    spark = SparkSession.builder.appName("ECommerce").master("local[*]").getOrCreate()
+    version = spark.version
+    major = int(version.split(".")[0])
+    is_spark4 = major >= 4
+    ```
+
+    Spark 3.5.x returns `"3.5"`; Spark 4.0.0 returns `"4.0"`. Use `major >= 4`
+    for forward compatibility.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Compatibility Patterns
+
+    **Pattern 1: Runtime branching** — If you must support both Spark 3 and 4
+    during migration, branch on version:
+
+    ```python
+    if is_spark4:
+        df = df.withColumn("amount", f.col("price") * f.col("qty"))
+    else:
+        df = df.withColumn("amount", f.col("price") * f.col("qty"))
+    ```
+
+    For most cases, Spark 4 code runs on Spark 3 if you avoid Spark 4-only APIs.
+
+    **Pattern 2: Config at session creation** — ANSI mode, timezone, etc. are
+    configured when building the SparkSession. A version-aware factory can set
+    different configs for Spark 3 vs 4.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## SparkSession Builder: Spark 3 vs Spark 4
+
+    In Spark 3, you might configure:
+
+    ```python
+    spark = (SparkSession.builder
+        .appName("ECommerce")
+        .master("local[*]")
+        .config("spark.sql.ansi.enabled", "false")
+        .getOrCreate())
+    ```
+
+    In Spark 4, ANSI is on by default. To match Spark 3 behavior during
+    migration, you explicitly disable it. A version-aware factory would:
+    - For Spark 4: set ANSI if you want strict mode; otherwise leave default.
+    - For Spark 3: optionally enable ANSI to test migration early.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## What Happens When You Call spark.version
+
+    The version string comes from Spark's build metadata. It's set at compile
+    time and reflects the Spark runtime, not PySpark. PySpark 4.x bundles
+    Spark 4.0.0+; the client and server versions should match when using
+    Spark Connect. Mismatches can cause protocol errors.
+
+- Class: mult_question
+  Depth: all
+  Output: "Why does Spark 4 default to ANSI mode instead of keeping Spark 3's permissive behavior?"
+  AnswerChoices: "To improve performance;To surface data quality issues early;To reduce memory usage;To enable streaming"
+  CorrectAnswer: "To surface data quality issues early"
+  Hint: "Silent overflow and implicit casts can corrupt data. ANSI mode throws errors so you fix them before bad data propagates."
+
+- Class: mult_question
+  Depth: all
+  Output: "What is the main benefit of Spark Connect's protocol-first architecture?"
+  AnswerChoices: "Faster execution;Language parity and thin clients;Smaller JAR size;More UDFs"
+  CorrectAnswer: "Language parity and thin clients"
+  Hint: "The protocol buffer protocol lets any client (Python, Scala, etc.) talk to the same server. The client is thin; the driver runs remotely."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write a function `get_spark_version(spark)` that returns a tuple of two integers:
+    (major, minor). For example, spark.version "4.0.0" returns (4, 0).
+  CorrectAnswer: |
+    def get_spark_version(spark):
+        parts = spark.version.split(".")
+        major = int(parts[0]) if len(parts) > 0 else 0
+        minor = int(parts[1]) if len(parts) > 1 else 0
+        return (major, minor)
+  Hint: "Split spark.version by '.', convert to int, handle edge cases."
+
+- Class: mult_question
+  Depth: all
+  Output: "Which approach is most maintainable when migrating a large pipeline from Spark 3 to 4?"
+  AnswerChoices: "Rewrite everything at once;Migrate incrementally with version-aware branching;Keep Spark 3 forever;Use Spark 3 only for UDFs"
+  CorrectAnswer: "Migrate incrementally with version-aware branching"
+  Hint: "Incremental migration reduces risk. Version-aware code lets you run both during the transition."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Exercise: Version-Aware SparkSession Factory
+
+    You will implement `create_spark_session()` that:
+    - Creates a SparkSession with app name `"ECommerceMigration"` and master `"local[*]"`
+    - Returns the session and a boolean `is_spark4` indicating if the runtime is Spark 4+
+    - For Spark 4: optionally enable ANSI (your choice for migration testing)
+    - For Spark 3: optionally enable ANSI to test migration early
+
+    The factory will be used throughout the course for all e-commerce pipeline exercises.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Create session, parse spark.version, set is_spark4 = major >= 4, return (spark, is_spark4)."

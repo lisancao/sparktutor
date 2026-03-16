@@ -1,0 +1,147 @@
+- Class: meta
+  Lesson: "Capstone — Production ShopStream Pipeline"
+  EstimatedMinutes: 50
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Complete Production Pipeline
+
+    You have built every layer: bronze (single and multi-source), silver
+    (casting, quality, enrichment), gold (aggregations, windows),
+    orchestration, testing, and Airflow deployment patterns. This
+    capstone assembles them into one **production ShopStream pipeline**.
+
+    Requirements: multi-source bronze → validated silver → analytics
+    gold. Monitoring hooks (row counts, freshness, quality scores). Edge
+    case handling (empty files, all-null batches, duplicate deliveries).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Pipeline Architecture
+
+    ```
+    [clicks.csv]  → bronze_clicks  → silver_clicks  → gold_daily_revenue
+    [payments.json] → bronze_payments → silver_payments ─┘
+    [inventory.json] → bronze_inventory → (used for product lookup)
+    [products.csv]  → product_catalog (lookup)
+    ```
+
+    Silver clicks: cast, validate, enrich with products. Silver payments:
+    cast, validate. Gold: join clicks and payments for conversion,
+    aggregate revenue by date and category.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    ## Edge Case: Empty Files
+
+    What if a file has only a header? spark.read.csv returns 0 rows.
+    Bronze handles it: 0 rows with metadata. Silver: 0 rows. Gold: no
+    new data for that run. Pipeline should not fail. Log: "bronze_clicks:
+    0 rows" and continue.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Edge Case: All-Null Batch
+
+    What if every row fails validation? Silver: valid=0, quarantine=N.
+    Gold reads valid. 0 rows. Gold table might have no new rows for that
+    date. Pipeline succeeds. Optional: alert if quarantine rate > 50%.
+
+- Class: mult_question
+  Depth: all
+  Output: "When an empty file is ingested, what should the pipeline do?"
+  AnswerChoices: "Succeed with 0 rows — log and continue;Fail with error;Skip the file;Retry indefinitely"
+  CorrectAnswer: "Succeed with 0 rows — log and continue"
+  Hint: "Empty files are valid. 0 rows is a valid result. Don't fail."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Monitoring Hooks
+
+    - **Row counts per layer**: bronze, silver, gold. Log after each step.
+    - **Data freshness**: max(timestamp) in gold. Alert if stale.
+    - **Quality score**: valid / (valid + quarantine). Alert if < 95%.
+
+    Implement as simple functions that return metrics. In production,
+    send to monitoring (Datadog, Prometheus) or write to a metrics table.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "What is a useful quality score for silver validation?"
+  AnswerChoices: "valid / (valid + quarantine) — percentage of rows passing;quarantine count;valid count;total rows"
+  CorrectAnswer: "valid / (valid + quarantine) — percentage of rows passing"
+  Hint: "Quality = how many rows passed validation. Ratio of valid to total."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write a function that takes (valid_count, quarantine_count) and
+    returns quality_score as a float between 0 and 1. Handle total=0.
+  CorrectAnswer: |
+    def quality_score(valid_count, quarantine_count):
+        total = valid_count + quarantine_count
+        return valid_count / total if total > 0 else 1.0
+  Hint: "total = valid + quarantine. If total > 0, return valid/total. Else 1.0 (no data = perfect?)."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Duplicate Deliveries
+
+    A source might deliver the same file twice. Bronze deduplication
+    handles it: dropDuplicates by key. If we're appending to bronze,
+    we'd get duplicates. Solution: overwrite bronze by partition (e.g.
+    by date) or use merge. For this capstone we assume overwrite: each
+    run overwrites the bronze table for that source. Idempotent.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Complete Production Pipeline
+
+    Implement `run_production_pipeline(spark, data_dir)` that:
+
+    1. **Bronze**: Ingest clicks (CSV), payments (JSON) from data_dir.
+       Use bronze_clicks and bronze_payments from earlier lessons.
+       Handle empty files (0 rows is ok).
+
+    2. **Silver**: Cast and validate both. Silver_clicks: cast timestamp,
+       quarantine failures. Silver_payments: cast amount, validate.
+       Enrich clicks with a product lookup (create minimal products df).
+
+    3. **Gold**: gold_daily_revenue from silver_payments (aggregate by
+       date, category). gold_conversion from silver_clicks + silver_payments
+       (hourly conversion rate).
+
+    4. **Monitoring**: Return a report dict with keys: bronze_rows,
+       silver_valid, silver_quarantine, gold_rows, quality_score.
+
+    The test creates a minimal data_dir with clicks.csv and payments.json.
+    Verifies pipeline runs and report contains expected keys.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Wire bronze, silver, gold. Use products from lesson 7 or inline. Report: collect counts per layer. quality_score = valid/(valid+quarantine)."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    You have built the complete production ShopStream pipeline:
+
+    - **Multi-source bronze** — clicks, payments, inventory
+    - **Validated silver** — type casting, quality rules, enrichment
+    - **Analytics gold** — revenue, conversion, rankings
+    - **Orchestration** — Pipeline framework, error handling
+    - **Testing** — unit tests, idempotency
+    - **Monitoring** — row counts, quality score
+    - **Edge cases** — empty files, all-null, duplicates
+
+    Congratulations! You now have a production-grade data platform
+    built from raw events to executive dashboards. Apply these patterns
+    to your own pipelines.

@@ -1,0 +1,324 @@
+- Class: meta
+  Lesson: "Spark SQL & the Catalog"
+  EstimatedMinutes: 35
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    You have been working entirely with the DataFrame API — Python method
+    calls on DataFrame objects. But Spark has a second interface for the
+    exact same engine: **SQL**. Every DataFrame query you have written so
+    far can be expressed as a SQL string, and vice versa.
+
+    In this lesson you will bridge these two worlds by building a SQL-based
+    reporting layer on top of the ride-sharing DataFrames from prior
+    lessons.
+
+    By the end of this lesson you will be able to:
+
+    - Register DataFrames as temporary views
+    - Write complex SQL queries with `spark.sql()`
+    - Mix SQL and DataFrame API in the same pipeline
+    - Create and use UDFs (User-Defined Functions)
+    - Understand why SQL and DataFrames produce the same execution plan
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Temporary Views: Making DataFrames Queryable with SQL
+
+    To query a DataFrame with SQL, you first register it as a **view**:
+
+    ```python
+    trips_df.createOrReplaceTempView("trips")
+    drivers_df.createOrReplaceTempView("drivers")
+
+    result = spark.sql("""
+        SELECT driver_id, COUNT(*) AS trip_count
+        FROM trips
+        GROUP BY driver_id
+        ORDER BY trip_count DESC
+    """)
+    ```
+
+    `createOrReplaceTempView` creates a session-scoped view — visible only
+    within the current SparkSession. If you call it again with the same
+    name, it replaces the old view. This is safe for iterative development
+    and pipeline steps that re-run.
+
+    For application-wide visibility across sessions, use
+    `createOrReplaceGlobalTempView` and reference it as
+    `global_temp.view_name`.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Think of views as **aliases**. When you register `trips_df` as the
+    view `"trips"`, you are telling Spark: "whenever someone writes
+    `FROM trips` in SQL, use this DataFrame." The data is not copied or
+    moved — the view is just a named reference to the DataFrame's
+    logical plan.
+
+    This is exactly how database views work. The SQL engine resolves
+    the name, finds the plan, and optimizes the whole query together.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## SQL + DataFrame API: Same Engine, Different Syntax
+
+    A critical insight: **SQL and the DataFrame API produce the same
+    execution plan.** The Catalyst optimizer does not care which syntax
+    you used — it receives a logical plan either way.
+
+    This means you can freely mix them:
+
+    ```python
+    trips_df.createOrReplaceTempView("trips")
+
+    top_cities = spark.sql("""
+        SELECT city, SUM(fare) AS total_revenue
+        FROM trips
+        GROUP BY city
+    """)
+
+    top_cities.filter(f.col("total_revenue") > 1000).show()
+    ```
+
+    The SQL query produces a DataFrame. You can chain DataFrame methods
+    on it. Going the other direction, you can register a filtered
+    DataFrame as a view and query it with SQL. Choose whichever is more
+    readable for each part of your pipeline.
+
+- Class: mult_question
+  Depth: all
+  Output: "You register a DataFrame as a view and query it with SQL. Does the SQL query re-read the underlying data from disk?"
+  AnswerChoices: "No — the view references the DataFrame's logical plan, and Catalyst optimizes the combined query;Yes — SQL always reads from the original source;It depends on the file format;Only if the DataFrame was cached"
+  CorrectAnswer: "No — the view references the DataFrame's logical plan, and Catalyst optimizes the combined query"
+  Hint: "A view is a named reference to a plan, not a materialized copy. Catalyst sees the whole picture."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Complex SQL Queries
+
+    SQL shines for multi-table joins and subqueries that would be verbose
+    in the DataFrame API:
+
+    ```python
+    spark.sql("""
+        SELECT t.driver_id, d.name,
+               COUNT(*) AS total_trips,
+               SUM(t.fare) AS total_fare,
+               AVG(r.rating) AS avg_rating
+        FROM trips t
+        JOIN drivers d ON t.driver_id = d.driver_id
+        LEFT JOIN ratings r ON t.trip_id = r.trip_id
+        GROUP BY t.driver_id, d.name
+        ORDER BY total_fare DESC
+    """)
+    ```
+
+    This three-table join with aggregation is readable as SQL. The
+    equivalent DataFrame code would require `.join()` twice, then
+    `.groupBy().agg()`, then `.orderBy()` — functional but longer.
+
+    Neither approach is universally better. Use SQL for ad-hoc analysis
+    and complex joins. Use the DataFrame API for programmatic pipelines
+    where you build queries dynamically.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Register a DataFrame `trips_df` as a view called `"trips"` and write
+    a SQL query that returns the top 3 cities by total fare, with columns
+    `city` and `total_fare`, ordered descending.
+  CorrectAnswer: |
+    trips_df.createOrReplaceTempView("trips")
+    result = spark.sql("""
+        SELECT city, SUM(fare) AS total_fare
+        FROM trips
+        GROUP BY city
+        ORDER BY total_fare DESC
+        LIMIT 3
+    """)
+  Hint: "Register with createOrReplaceTempView, then use spark.sql with GROUP BY, ORDER BY DESC, and LIMIT 3."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## User-Defined Functions (UDFs)
+
+    When Spark's built-in functions are not enough, you can define custom
+    logic with UDFs:
+
+    ```python
+    from pyspark.sql.types import StringType
+
+    @f.udf(StringType())
+    def fare_category(fare):
+        if fare is None:
+            return "unknown"
+        if fare < 10:
+            return "budget"
+        elif fare < 30:
+            return "standard"
+        else:
+            return "premium"
+
+    trips_df.withColumn("fare_tier", fare_category(f.col("fare")))
+    ```
+
+    **Warning**: UDFs serialize data to Python, process it row by row,
+    and send it back. This disables Tungsten's optimized memory layout
+    and Catalyst's expression optimization. A UDF can be 10-100x slower
+    than the equivalent built-in expression.
+
+    **Rule**: always try to express logic with built-in functions first.
+    Use `f.when().otherwise()` chains before reaching for a UDF.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Why UDFs Kill Performance
+
+    Spark's execution engine (Tungsten) stores data in off-heap binary
+    format optimized for CPU cache lines. When you call a UDF:
+
+    1. Each row is **deserialized** from Tungsten format to a Python object
+    2. The Python function runs on the object
+    3. The result is **serialized** back to Tungsten format
+
+    This serialization round-trip happens for **every row**. On a 100M
+    row DataFrame, that is 100M serialize/deserialize cycles.
+
+    Additionally, Catalyst cannot see inside a UDF — it cannot push
+    predicates through it, fold constants, or reorder operations. The
+    UDF is an opaque black box in the query plan.
+
+    Pandas UDFs (vectorized UDFs) improve this by processing batches of
+    rows as pandas Series, reducing serialization overhead by ~10x. But
+    built-in functions are still faster.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "A colleague wrote a UDF that categorizes trip distances into 'short', 'medium', and 'long'. You suggest replacing it with built-in functions. Why?"
+  AnswerChoices: "Built-in functions avoid Python serialization and allow Catalyst to optimize the expression;UDFs cannot return strings;Built-in functions support more data types;UDFs require Scala"
+  CorrectAnswer: "Built-in functions avoid Python serialization and allow Catalyst to optimize the expression"
+  Hint: "Think about what happens to every row when it passes through a UDF vs a built-in when() expression."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Registering UDFs for SQL
+
+    To use a UDF in SQL queries, register it with `spark.udf.register`:
+
+    ```python
+    def fare_category(fare):
+        if fare is None:
+            return "unknown"
+        if fare < 10:
+            return "budget"
+        elif fare < 30:
+            return "standard"
+        else:
+            return "premium"
+
+    spark.udf.register("fare_category", fare_category, StringType())
+
+    spark.sql("""
+        SELECT trip_id, fare, fare_category(fare) AS tier
+        FROM trips
+    """)
+    ```
+
+    Registered UDFs are available in all SQL queries for the session.
+    The same performance caveats apply — this is still a Python UDF
+    behind the scenes.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Catalog API: Inspecting Your Data
+
+    The `spark.catalog` namespace lets you explore registered tables,
+    views, functions, and databases programmatically:
+
+    ```python
+    spark.catalog.listTables()       # all tables and views
+    spark.catalog.listColumns("trips")  # columns in a table/view
+    spark.catalog.tableExists("trips")  # check if registered
+    spark.catalog.dropTempView("trips") # remove a view
+    ```
+
+    This is useful for dynamic pipelines where you need to check what
+    data is available at runtime, or for cleanup after processing.
+
+- Class: cmd_question
+  Depth: intermediate
+  Output: |
+    You have registered three views: `trips`, `drivers`, `ratings`.
+    Write a SQL query using `spark.sql()` that joins all three and
+    returns `driver_id`, `name`, `total_trips` (count), `total_fare`
+    (sum of fare), and `avg_rating` (average of rating), grouped by
+    driver_id and name.
+  CorrectAnswer: |
+    result = spark.sql("""
+        SELECT t.driver_id, d.name,
+               COUNT(*) AS total_trips,
+               SUM(t.fare) AS total_fare,
+               AVG(r.rating) AS avg_rating
+        FROM trips t
+        JOIN drivers d ON t.driver_id = d.driver_id
+        LEFT JOIN ratings r ON t.trip_id = r.trip_id
+        GROUP BY t.driver_id, d.name
+    """)
+  Hint: "JOIN trips to drivers on driver_id, LEFT JOIN ratings on trip_id, GROUP BY driver_id and name."
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: SQL Reporting Layer for the Ride-Sharing Platform
+
+    Build a SQL-based reporting layer on top of the ride-sharing
+    DataFrames from prior lessons.
+
+    Implement `build_sql_reporting_layer(spark, trips_df, drivers_df,
+    ratings_df)` that:
+
+    1. Registers trips, drivers, and ratings as temporary views
+    2. Runs a SQL query that joins all three tables:
+       - `trips` JOIN `drivers` on `driver_id`
+       - LEFT JOIN `ratings` on `trip_id`
+    3. Aggregates per driver: `total_trips`, `total_fare`, `avg_rating`
+    4. Returns the result DataFrame
+
+    This exercise combines SQL joins (lesson 7), aggregations (lesson 6),
+    and the view registration you just learned.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Register views with createOrReplaceTempView, then write a single SQL query with JOINs and GROUP BY."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    In this lesson you learned:
+
+    - **Temporary views** — register DataFrames with
+      `createOrReplaceTempView` to query them with SQL
+    - **SQL + DataFrame API** — both produce the same execution plan;
+      mix them freely in your pipelines
+    - **Complex SQL** — multi-table joins and subqueries are often
+      more readable as SQL than chained DataFrame methods
+    - **UDFs** — custom Python functions for logic not covered by
+      built-ins, with significant performance trade-offs
+    - **Catalog API** — programmatically inspect and manage views
+
+    You now have two complementary interfaces to the same engine. In
+    the next lesson, you will look under the hood at the **query plan**
+    — the execution strategy Spark builds from your code.

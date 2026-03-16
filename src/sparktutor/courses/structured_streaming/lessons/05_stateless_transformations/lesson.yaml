@@ -1,0 +1,147 @@
+- Class: meta
+  Lesson: "Stateless Transformations"
+  EstimatedMinutes: 35
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Enriching PayGuard Transactions
+
+    Raw transaction events have tx_id, user_id, amount, event_time. For
+    fraud detection, you need more: risk scores, merchant categories,
+    time-of-day features. These come from **stateless** transformations —
+    each row is processed independently. No history, no memory across
+    batches. The same operations you use in batch work identically in
+    streaming.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## filter, select, withColumn — Identical to Batch
+
+    Stateless transforms operate on each row in isolation. They do not
+    need to remember previous rows. For streaming, this means append
+    mode works: each new row is output once.
+
+    ```python
+    enriched = (stream_df
+        .filter(f.col("amount") > 0)
+        .select("tx_id", "user_id", "amount", "event_time")
+        .withColumn("amount_usd", f.col("amount").cast("double")))
+    ```
+
+    PayGuard uses filter to drop test transactions (amount=0), select to
+    project columns, and withColumn to add derived fields.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Adding Derived Columns
+
+    Fraud detection needs features. You can compute them per-row:
+
+    ```python
+    from pyspark.sql.functions import hour, when
+
+    enriched = (stream_df
+        .withColumn("hour_of_day", hour("event_time"))
+        .withColumn("time_of_day", when(hour("event_time") < 6, "night")
+            .when(hour("event_time") < 12, "morning")
+            .when(hour("event_time") < 18, "afternoon")
+            .otherwise("evening"))
+        .withColumn("risk_score", f.when(f.col("amount") > 1000, 0.8)
+            .when(f.col("amount") > 500, 0.5)
+            .otherwise(0.2)))
+    ```
+
+    risk_score is a simple rule-based heuristic. Later you might join with
+    a model-scored table. time_of_day helps detect anomalies (e.g., night
+    purchases in unusual time zones).
+
+- Class: text
+  Depth: beginner
+  Output: |
+    ## Analogy: The Assembly Line
+
+    Stateless transforms are like an assembly line where each worker
+    handles one item at a time. Worker A filters; Worker B adds a
+    sticker; Worker C packs. No worker remembers what came before. Each
+    transaction flows through independently. This is fast and scalable —
+    no state to manage, no memory growth.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## flatMap and explode
+
+    Sometimes one row becomes many. `explode` turns an array into
+    multiple rows: [a, b, c] → 3 rows. `flatMap` applies a function
+    that returns an iterator. For PayGuard, you might explode a list
+    of linked transactions (e.g., a split payment) into separate rows.
+
+    ```python
+    from pyspark.sql.functions import explode
+
+    # If tx has "linked_tx_ids" array
+    exploded = stream_df.withColumn("linked_id", explode("linked_tx_ids"))
+    ```
+
+    Each row with N linked IDs becomes N rows. Stateless — no cross-row
+    memory. Works with append mode.
+
+- Class: mult_question
+  Depth: all
+  Output: "Why do stateless transforms work with append output mode?"
+  AnswerChoices: "They are faster;Each row is processed independently, so new rows can be output immediately;They require less memory;They use watermarks"
+  CorrectAnswer: "Each row is processed independently, so new rows can be output immediately"
+  Hint: "No state = no need to wait for late data. Each row is final when processed."
+
+- Class: mult_question
+  Depth: all
+  Output: "Which operation is stateless?"
+  AnswerChoices: "groupBy().count();filter();windowed aggregation;stream-stream join"
+  CorrectAnswer: "filter()"
+  Hint: "filter() processes each row independently. groupBy, window, and joins maintain state."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Given a DataFrame `df` with columns tx_id, amount, event_time, add
+    a column "is_high_value" that is True when amount >= 500, else False.
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+
+    df = df.withColumn("is_high_value", f.col("amount") >= 500)
+  Hint: "withColumn with a boolean expression. f.col('amount') >= 500."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## map vs withColumn
+
+    `map` applies a function to each row and returns a new Row or dict.
+    `withColumn` adds a column via an expression. For most cases,
+    withColumn is preferred — it's optimized and works with the Catalyst
+    optimizer. Use map when you need complex Python logic (e.g., calling
+    an external API per row). For PayGuard's risk_score, withColumn is
+    sufficient; for a model inference call, you might use map or a UDF.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Transaction Enrichment Pipeline
+
+    Implement `enrich_transactions` that takes a transactions DataFrame
+    and adds:
+
+    1. risk_score: 0.3 if amount < 100, 0.6 if amount < 500, 0.9 if >= 500
+    2. merchant_category: "retail" if amount < 200, else "premium"
+    3. time_of_day: "night" (hour < 6), "morning" (6-11), "afternoon"
+       (12-17), "evening" (18+)
+
+    Use hour() from pyspark.sql.functions for event_time. Return the
+    enriched DataFrame with original columns plus the three new ones.
+    Same logic works for batch and streaming.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "withColumn for each. Use f.when() for risk_score and merchant_category, hour() for time_of_day."

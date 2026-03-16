@@ -1,0 +1,135 @@
+- Class: meta
+  Lesson: "Stateful Aggregations"
+  EstimatedMinutes: 40
+
+- Class: text
+  Depth: all
+  Output: |
+    ## PayGuard's Running Counts
+
+    To detect fraud, PayGuard needs to know: how many transactions per
+    user so far? What's the total amount per merchant this hour? These
+    **stateful aggregations** accumulate across micro-batches. Each new
+    batch updates the existing state. Spark maintains this state in
+    memory (and checkpoint) — and without bounds, it grows forever.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## groupBy on Streams — State Accumulation
+
+    When you run `stream_df.groupBy("user_id").count()`, Spark does not
+    recompute from scratch each batch. It maintains a hash map: user_id →
+    count. New rows update the map. The state grows with the number of
+    distinct keys. For PayGuard, that's one entry per user_id, one per
+    merchant_id — potentially millions.
+
+    ```python
+    counts = stream_df.groupBy("user_id").count()
+    sums = stream_df.groupBy("merchant_id").agg(f.sum("amount").alias("total"))
+    ```
+
+    Both are stateful. State is stored in the Spark state store (RocksDB
+    by default). Checkpoint location persists it across restarts.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The State Management Problem
+
+    Without bounds, state grows unbounded. New users → new keys. New
+    merchants → new keys. After days of processing, you might have 10M
+    keys. Each key holds aggregation state. Memory grows. Eventually:
+    OOM (Out of Memory). The query crashes or the cluster becomes
+    unstable.
+
+    PayGuard learned this the hard way: a running count per user ran for
+    a week, state grew to 50GB, and the cluster OOM'd. The fix: use
+    **windows** (Lesson 7) and **watermarks** (Lesson 8) to bound state.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    ## Analogy: The Tally Sheet
+
+    Imagine a security guard with a tally sheet. Each transaction: find
+    the user's row, add 1 to the count. The sheet grows: one row per
+    user. After a month, the sheet has thousands of rows. The guard
+    runs out of paper. Stateful aggregation is like that — you need a
+    way to "close the book" on old rows (windows) or discard old data
+    (watermarks).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Memory Implications — A Query That Would OOM
+
+    ```python
+    # DANGER: Unbounded state
+    stream_df.groupBy("user_id").count().writeStream.outputMode("update")...
+    ```
+
+    If PayGuard has 10M users and the stream runs for 30 days, the state
+    store holds 10M keys. Each key: count (maybe 8 bytes) + overhead.
+    With RocksDB and indexing, that's hundreds of MB to GB. Scale to
+    groupBy(user_id, merchant_id, date) and you get millions of
+    combinations. Production: use windows to bound by time.
+
+- Class: mult_question
+  Depth: all
+  Output: "What happens to state in a groupBy aggregation when there is no watermark or window?"
+  AnswerChoices: "State is cleared every batch;State grows unbounded forever;State is limited to 1000 keys;State is written to disk only"
+  CorrectAnswer: "State grows unbounded forever"
+  Hint: "Without bounds, every new key adds to state. No way to discard old keys."
+
+- Class: mult_question
+  Depth: all
+  Output: "Which aggregation is stateful?"
+  AnswerChoices: "select;filter;groupBy().count();withColumn"
+  CorrectAnswer: "groupBy().count()"
+  Hint: "groupBy maintains state across micro-batches. select, filter, withColumn are stateless."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write code to group a DataFrame `stream_df` by user_id and compute
+    both count (alias tx_count) and sum(amount) (alias amount_sum).
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+
+    result = stream_df.groupBy("user_id").agg(
+        f.count("*").alias("tx_count"),
+        f.sum("amount").alias("amount_sum")
+    )
+  Hint: "groupBy user_id, agg with count and sum."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## State Store Internals (Advanced)
+
+    Spark stores state in a **state store** — typically RocksDB. Each
+    partition has its own store. Keys are (group keys, optional window).
+    Values are the aggregation buffer. On checkpoint, state is written
+    to HDFS/S3. On recovery, state is restored. State store size is
+    visible in the Spark UI under the Streaming tab. Monitor it — if it
+    grows without bound, add watermarks or windows.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Running Aggregation with State Inspection
+
+    Implement `running_aggregation` that groups transactions by user_id
+    and merchant_id, computing tx_count and amount_sum. Return the result.
+
+    For "state inspection" in batch mode: we simulate by returning the
+    full aggregation. In streaming, you'd query the state store or use
+    the StreamingQuery progress to see state size. Here we validate the
+    aggregation logic and that the result has the expected structure.
+
+    The test harness creates transactions for multiple users and
+    merchants, validates counts and sums per (user_id, merchant_id).
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "groupBy user_id, merchant_id. agg count and sum(amount)."

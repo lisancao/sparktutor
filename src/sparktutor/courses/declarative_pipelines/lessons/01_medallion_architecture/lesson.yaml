@@ -1,0 +1,206 @@
+- Class: meta
+  Lesson: "The Medallion Architecture — Why Layers Matter"
+  EstimatedMinutes: 30
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The ShopStream Story
+
+    Meet **ShopStream** — an e-commerce company whose data platform is in
+    chaos. Raw events pour in from web clicks, mobile apps, payment
+    processors, and inventory systems. Each source has different formats,
+    schemas change without notice, and duplicate deliveries are common.
+
+    By the end of this course, you will build the complete pipeline that
+    turns this mess into executive dashboards. Every lesson adds a real
+    layer. The bronze function from lesson 3 is literally used in lesson
+    10's orchestration. Code accumulates.
+
+    This first lesson answers: **why do we need layers at all?**
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Problem: Raw Data Is Messy
+
+    Consider what ShopStream's raw data looks like:
+
+    - **Web clicks**: CSV files, sometimes with extra columns, sometimes
+      missing them. Timestamps in ISO format... or not.
+    - **Payments**: JSON from Stripe. Nested structures. Webhook retries
+      mean the same payment appears multiple times.
+    - **Inventory**: Another JSON format. Product IDs that don't match
+      the click stream. Schema changes when the warehouse system upgrades.
+
+    If you transform this data in one big step — cast types, join tables,
+    aggregate — what happens when a source format changes? You reprocess
+    everything. You lose the ability to trace a bad row back to its
+    origin. You cannot fix a silver bug without re-ingesting from scratch.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    ## Bronze, Silver, Gold: A Separation of Concerns
+
+    The **medallion architecture** splits your pipeline into three layers:
+
+    - **Bronze**: Raw ingestion. Preserve everything. Add metadata
+      (_ingested_at, _source_file). Deduplicate. No transformations.
+    - **Silver**: Clean, typed, validated. Cast columns. Apply quality
+      rules. Enrich with lookups. Business-ready records.
+    - **Gold**: Aggregations for consumption. KPIs, dashboards, reports.
+      Pre-computed for speed.
+
+    Think of it like a restaurant: Bronze is receiving the delivery
+    (check the boxes, log what arrived). Silver is prep (wash, chop,
+    portion). Gold is plating (the final dish for the customer).
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Why NOT Transform in Bronze
+
+    Two critical reasons to keep bronze dumb:
+
+    **1. Reprocessability** — If your silver logic has a bug, you fix it
+    and re-run. Bronze is already correct. You never re-ingest from the
+    source. Reprocessing from bronze is fast; re-fetching from APIs or
+    re-reading terabytes of raw files is slow and sometimes impossible.
+
+    **2. Auditability** — Every row in silver and gold can be traced back
+    to bronze. You can answer: "Where did this bad value come from?"
+    Bronze is your source of truth. Transform it and you lose the trail.
+
+- Class: mult_question
+  Depth: all
+  Output: "If a payment webhook is delivered twice due to a retry, where should deduplication happen?"
+  AnswerChoices: "Bronze — before any transformation;Silver — after type casting;Gold — during aggregation;Nowhere — duplicates are fine"
+  CorrectAnswer: "Bronze — before any transformation"
+  Hint: "Deduplication preserves one copy of raw data. It's an ingestion concern, not a business transform."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Single-Step ETL vs Medallion: What Breaks
+
+    **Single-step approach**: Read CSV → cast types → join → aggregate →
+    write. One job. Simple.
+
+    What breaks:
+    - Source adds a new column. Your schema breaks. Job fails.
+    - You find a bug in the aggregation. You must re-read the raw CSV
+      and re-run everything. Raw files may be gone or overwritten.
+    - A customer asks: "Why does this order show wrong revenue?" You
+      cannot trace it. The transformation is lost.
+
+    **Medallion approach**: Bronze preserves raw. Silver cleans. Gold
+    aggregates. Each layer is independently fixable and auditable.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "A price column in raw data contains 'pending' instead of a number. Where should this be handled?"
+  AnswerChoices: "Silver — during type casting and validation;Bronze — filter it out immediately;Gold — ignore during aggregation;The source system — fix before ingestion"
+  CorrectAnswer: "Silver — during type casting and validation"
+  Hint: "Bronze preserves everything. Silver decides: cast to null, quarantine, or apply a default. Bronze never loses data."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Schema Evolution and the Medallion
+
+    When a source adds a column, medallion layers handle it differently:
+
+    - **Bronze**: New column appears as string (schema-on-read). No code
+      change if you use a flexible schema. Existing rows get null for the
+      new column. Reprocessability: you can backfill by re-reading.
+    - **Silver**: You explicitly add the new column to your cast_columns
+      logic. Or you use schema evolution in your table format (Delta,
+      Iceberg) to add columns without rewriting.
+    - **Gold**: Aggregations may or may not need the new column. You
+      decide. No raw re-ingestion required.
+
+    Single-step ETL: new column = schema change = job fails until you
+    update and redeploy. Medallion: bronze absorbs it; silver and gold
+    evolve independently.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Given a list of operations, which belongs in the bronze layer?
+    Operations: "Add _ingested_at timestamp", "Cast price to DoubleType",
+    "Join with product catalog", "Sum revenue by category"
+  CorrectAnswer: |
+    bronze_op = "Add _ingested_at timestamp"
+  Hint: "Bronze = ingest + metadata + dedup only. No business logic."
+
+- Class: mult_question
+  Depth: advanced
+  Output: "Why does bronze use schema-on-read (all strings) instead of inferring types?"
+  AnswerChoices: "To avoid losing rows when casting fails — silver handles type casting;To save memory;Because CSV cannot convey types;To make reads faster"
+  CorrectAnswer: "To avoid losing rows when casting fails — silver handles type casting"
+  Hint: "If price='pending', inferSchema or cast would produce null and lose the original. Bronze keeps it; silver decides."
+
+- Class: cmd_question
+  Depth: intermediate
+  Output: |
+    For ShopStream, which layer would contain: "Filter out rows where
+    user_id is null"?
+  CorrectAnswer: |
+    layer = "silver"
+  Hint: "Bronze preserves. Silver validates and cleans. Filtering bad rows is validation."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Active Recall: Revenue Aggregation
+
+    If a price column contains the string "pending" and you aggregate
+    revenue with `f.sum("price")` without type casting, what happens?
+
+    Spark will either fail (if price is string, sum is undefined) or
+    produce wrong results. The fix: cast in silver, handle "pending"
+    explicitly (null, 0, or quarantine), then aggregate in gold.
+
+    This is failure-driven learning: we will show the failure first,
+    then teach the fix.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Sketch the ShopStream Pipeline
+
+    Implement `categorize_transform(transform_name)` that returns the
+    layer ("bronze", "silver", or "gold") for each ShopStream transform.
+
+    Transforms to categorize:
+    - "add_metadata_columns" → bronze
+    - "deduplicate_by_event_id" → bronze
+    - "cast_price_to_double" → silver
+    - "validate_email_format" → silver
+    - "join_product_catalog" → silver
+    - "daily_revenue_by_category" → gold
+    - "hourly_conversion_rates" → gold
+
+    The function receives a transform name (string) and returns the
+    correct layer. Handle unknown transforms by returning "unknown".
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Use a dictionary mapping transform names to layers, or if/elif. Bronze = ingest/metadata/dedup. Silver = cast/validate/enrich. Gold = aggregate."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    You now understand why the medallion architecture exists:
+
+    - **Raw data is messy** — formats change, duplicates arrive, schemas evolve
+    - **Bronze preserves** — ingest, metadata, dedup. No transforms.
+    - **Silver cleans** — type casting, validation, enrichment
+    - **Gold aggregates** — KPIs, dashboards, business metrics
+    - **Reprocessability and auditability** — fix bugs without re-ingesting
+
+    In the next lesson, you will build the **Pipeline** class — a
+    declarative framework that wires these layers together with
+    dependency detection and topological execution order.

@@ -1,0 +1,158 @@
+- Class: meta
+  Lesson: "Pipeline Orchestration & Error Handling"
+  EstimatedMinutes: 40
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Wiring the Full ShopStream Pipeline
+
+    You have: bronze_clicks (lesson 3), silver_clicks (lesson 5),
+    gold_daily_revenue (lesson 8). You have: the Pipeline class (lesson 2).
+    Now: wire them together. Bronze → Silver → Gold. One run. One report.
+
+    This lesson adds: error handling (try/except per step), partial runs
+    (continue or abort on failure), structured logging, and pipeline run
+    reports (JSON metadata about what happened).
+
+- Class: text
+  Depth: beginner
+  Output: |
+    ## Error Handling: Try/Except Per Step
+
+    ```python
+    for name in order:
+        try:
+            df = run_step(name)
+            report.append({"step": name, "status": "ok", "rows": df.count()})
+        except Exception as e:
+            report.append({"step": name, "status": "failed", "error": str(e)})
+            if abort_on_failure:
+                raise
+    ```
+
+    Each step runs in try/except. On failure: log, add to report, optionally
+    re-raise to stop the pipeline. Downstream steps depend on upstream —
+    if bronze fails, silver cannot run. So abort_on_failure=True is typical.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Partial Pipeline Runs
+
+    Sometimes you want to resume: bronze and silver succeeded yesterday.
+    Today, only run silver and gold (bronze reads new files). Implement
+    with a `from_step` parameter: skip steps before from_step in the
+    topological order. Or: check if a step's output already exists (table
+    or path), skip if fresh.
+
+    For this course we run the full pipeline. Partial runs are an
+    extension.
+
+- Class: mult_question
+  Depth: all
+  Output: "If bronze_clicks fails with an exception, should silver run?"
+  AnswerChoices: "No — silver depends on bronze output;Yes — they are independent;Only if we have cached bronze;Depends on configuration"
+  CorrectAnswer: "No — silver depends on bronze output"
+  Hint: "Silver reads from bronze. No bronze output = silver has nothing to read. Abort."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Structured Logging
+
+    ```python
+    import logging
+    import json
+
+    log = {"step": name, "rows": count, "duration_sec": duration, "status": "ok"}
+    logging.info(json.dumps(log))
+    ```
+
+    Structured logs (JSON) are parseable. Tools like Datadog, Splunk can
+    index and alert. Include: step name, row count, duration, status,
+    error message if failed. Pipeline run ID for correlation.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "Why use JSON for pipeline logs instead of plain text?"
+  AnswerChoices: "Parseable — tools can index and alert on fields;Smaller file size;Faster to write;Human readability"
+  CorrectAnswer: "Parseable — tools can index and alert on fields"
+  Hint: "Structured data enables querying: 'show me all failed steps in the last hour'."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write a run_step wrapper that executes func(), catches Exception,
+    returns (success: bool, row_count: int, error: str|None). On success,
+    row_count = df.count(); on failure, row_count=0, error=str(e).
+  CorrectAnswer: |
+    def run_step(func):
+        try:
+            df = func()
+            return (True, df.count(), None)
+        except Exception as e:
+            return (False, 0, str(e))
+  Hint: "try/except. On success: df.count(). On except: return False, 0, str(e)."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Pipeline Run Reports
+
+    At the end of a run, emit a report:
+
+    ```json
+    {
+      "run_id": "uuid",
+      "started_at": "2024-01-15T10:00:00",
+      "finished_at": "2024-01-15T10:05:00",
+      "steps": [
+        {"name": "bronze_clicks", "status": "ok", "rows": 10000},
+        {"name": "silver_clicks", "status": "ok", "rows": 9998},
+        {"name": "gold_daily", "status": "ok", "rows": 50}
+      ]
+    }
+    ```
+
+    Write to a file, send to a monitoring system, or store in a table.
+    Enables: "How many rows did each step produce?" "Did any step fail?"
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Orchestrate ShopStream Pipeline
+
+    Implement `run_shopstream_pipeline(spark, clicks_path)` that:
+
+    1. Uses the Pipeline class from lesson 2 (or a minimal version)
+    2. Registers: bronze_clicks (from lesson 3), silver_clicks (from
+       lesson 5 — use only valid output), gold_daily_revenue (from
+       lesson 8 — needs orders; for this exercise, create a minimal
+       gold step that aggregates silver_clicks by date and event_type)
+    3. Each step wrapped in try/except. On failure, log and abort.
+    4. Returns a report: list of dicts with keys step, status, rows,
+       error (if failed)
+
+    Simplify: gold can just be count of silver by date. The test
+    verifies the pipeline runs, report has 3 steps, all ok (or reports
+    failure correctly).
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Import bronze_clicks, silver_clicks. Pipeline with 3 steps. bronze reads path; silver reads spark.table(bronze); gold reads spark.table(silver). run() with try/except per step. Return report."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    Pipeline orchestration with error handling:
+
+    - **Try/except per step** — catch, log, report, abort
+    - **Structured logging** — JSON for parseability
+    - **Run reports** — step, status, rows, error
+    - **Dependency order** — topological sort from lesson 2
+
+    In the next lesson, you will add **testing and idempotency** —
+    unit tests for pipeline functions, and ensuring re-runs produce
+    the same result.

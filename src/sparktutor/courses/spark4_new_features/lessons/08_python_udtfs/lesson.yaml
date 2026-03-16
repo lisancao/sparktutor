@@ -1,0 +1,198 @@
+- Class: meta
+  Lesson: "Python UDTFs — User-Defined Table Functions"
+  EstimatedMinutes: 40
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Exploding Nested Order Data
+
+    Your e-commerce pipeline has order records with nested line items (array of
+    structs). In Spark 3, you used `explode` or `flatMap` to flatten them. Spark 4
+    makes **Python UDTFs** first-class: you can write a table function in Python
+    that takes one row and returns multiple rows, with validation and state. This
+    lesson replaces a complex flatMap chain with a UDTF.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What UDTFs Are
+
+    A **User-Defined Table Function** (UDTF) takes one or more input rows and
+    produces zero or more output rows. It's "1-row-in, N-rows-out". Contrast with
+    UDFs (1-row-in, 1-row-out) and UDAFs (N-rows-in, 1-row-out).
+
+    Use cases: explode nested structures with validation, split strings into
+    rows, generate sequences, lookup tables that return multiple matches.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The @udtf Decorator
+
+    In Spark 4, you define a UDTF with the `@udtf` decorator and a return schema:
+
+    ```python
+    from pyspark.sql.functions import udtf
+    from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType
+
+    @udtf(returnType=StructType([
+        StructField("order_id", StringType()),
+        StructField("product_id", StringType()),
+        StructField("quantity", IntegerType()),
+        StructField("price", DoubleType()),
+    ]))
+    class ExplodeOrderLines:
+        def eval(self, order_id: str, line_items: list):
+            for item in line_items:
+                yield (order_id, item["product_id"], item["quantity"], item["price"])
+    ```
+
+    The class has an `eval` method. Each `yield` produces one output row.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Using the UDTF
+
+    Register and use it like a built-in table function:
+
+    ```python
+    spark.udtf.register("explode_order_lines", ExplodeOrderLines)
+
+    df = spark.sql("""
+        SELECT * FROM explode_order_lines(
+            LATERAL VIEW inline(order_data)
+        )
+    """)
+    ```
+
+    Or with the DataFrame API:
+
+    ```python
+    df = df.join(ExplodeOrderLines(f.col("order_id"), f.col("line_items")), how="cross")
+    ```
+
+    The UDTF is invoked per input row; its yields become the output rows.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Stateful UDTFs: __init__ and terminate
+
+    For stateful processing, use `__init__` and `terminate`:
+
+    ```python
+    @udtf(returnType=...)
+    class StatefulUDTF:
+        def __init__(self):
+            self.buffer = []
+
+        def eval(self, ...):
+            self.buffer.append(...)
+            yield (...)
+
+        def terminate(self):
+            for item in self.buffer:
+                yield item
+    ```
+
+    `terminate` is called after all input rows; use it to flush buffered output.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Polymorphic UDTFs with analyze()
+
+    When the UDTF needs to infer schema from arguments, use `analyze`:
+
+    ```python
+    @udtf(returnType=...)
+    class PolymorphicUDTF:
+        @staticmethod
+        def analyze(order_id, line_items):
+            return StructType([...])
+    ```
+
+    `analyze` returns the schema for the given argument types. This enables
+    UDTFs that adapt to different input schemas.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Replacing flatMap with UDTF
+
+    Spark 3 flatMap pattern:
+
+    ```python
+    rdd.flatMap(lambda row: [(row.order_id, item) for item in row.line_items])
+    ```
+
+    Over Spark Connect, RDD is not available. UDTF is the DataFrame-native
+    replacement: it runs on the server, integrates with the optimizer, and
+    supports Python.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## UDTF vs explode + withColumn
+
+    For simple array explosion, `explode` is sufficient. UDTFs shine when you
+    need: validation (skip invalid items), transformation (compute derived
+    columns), or multiple outputs per input (e.g., generate date range). The
+    UDTF gives you full Python logic per row.
+
+- Class: mult_question
+  Depth: all
+  Output: "When would you use a UDTF instead of explode()?"
+  AnswerChoices: "Always;When you need validation or complex per-row logic;Never;Only for streaming"
+  CorrectAnswer: "When you need validation or complex per-row logic"
+  Hint: "explode() is for simple array flattening. UDTFs allow Python logic, validation, and multiple outputs."
+
+- Class: mult_question
+  Depth: all
+  Output: "What does the terminate() method in a stateful UDTF do?"
+  AnswerChoices: "Stops execution;Flushes buffered output after all input rows;Validates input;Returns schema"
+  CorrectAnswer: "Flushes buffered output after all input rows"
+  Hint: "terminate is called after eval has processed all rows. Use it to yield buffered results."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write a simple UDTF that takes (word: str) and yields (word, len(word)).
+    Use @udtf with returnType StructType([StructField("word", StringType()),
+    StructField("length", IntegerType())]).
+  CorrectAnswer: |
+    from pyspark.sql.functions import udtf
+    from pyspark.sql.types import StructType, StructField, StringType, IntegerType
+
+    @udtf(returnType=StructType([
+        StructField("word", StringType()),
+        StructField("length", IntegerType()),
+    ]))
+    class WordLength:
+        def eval(self, word: str):
+            yield (word, len(word))
+  Hint: "eval takes word, yields (word, len(word))."
+
+- Class: mult_question
+  Depth: all
+  Output: "Why might a UDTF be preferable to a flatMap over RDD for Spark Connect?"
+  AnswerChoices: "UDTFs are faster;RDD is not available over Connect;UDTFs use less memory;UDTFs support SQL"
+  CorrectAnswer: "RDD is not available over Connect"
+  Hint: "Spark Connect does not support RDD. UDTFs are the DataFrame-native way to do 1-in-N-out."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Exercise: Order Line Exploder UDTF
+
+    Build a UDTF that explodes nested order line items. Input: order_id (str),
+    line_items (array of struct with product_id, quantity, price). Output: one
+    row per line item with order_id, product_id, quantity, price, line_total.
+    Add validation: skip items with quantity <= 0. Replace the flatMap/explode
+    chain from the Spark 3 pipeline. Handle Spark 3: if @udtf is not available,
+    use explode + withColumn as fallback.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "UDTF eval yields (order_id, product_id, qty, price, qty*price). Skip when qty<=0. Fallback: explode + withColumn."

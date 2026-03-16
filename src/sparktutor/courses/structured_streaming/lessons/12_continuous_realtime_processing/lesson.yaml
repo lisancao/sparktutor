@@ -1,0 +1,400 @@
+- Class: meta
+  Lesson: "Continuous & Real-Time Processing Modes"
+  EstimatedMinutes: 45
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    Everything you have built so far uses **micro-batch** processing —
+    Spark collects data into small batches and processes them one at a
+    time. This gives good throughput and exactly-once guarantees, but
+    each batch has overhead: scheduling, planning, committing offsets.
+    For PayGuard, micro-batch latency of 1-10 seconds may be acceptable.
+    But some fraud patterns need **sub-second** detection.
+
+    Spark offers two alternatives to micro-batch: **continuous processing
+    mode** and the newer **async offset tracking**. This lesson covers
+    both, along with the tradeoffs that determine which mode fits your
+    use case.
+
+    By the end of this lesson you will be able to:
+
+    - Explain the three processing modes: micro-batch, continuous, async
+    - Configure continuous processing with `trigger(continuous="1 second")`
+    - Understand the latency vs. exactly-once tradeoff
+    - Use async offset tracking for low-overhead micro-batch
+    - Choose the right mode for different fraud detection rules
+    - Design hybrid pipelines that mix processing modes
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Micro-Batch Model — What You've Been Using
+
+    In micro-batch mode, Spark processes data in discrete batches:
+
+    ```
+    Time:   0s     2s     4s     6s     8s
+            |---B1---|---B2---|---B3---|---B4---|
+            plan     plan     plan     plan
+            execute  execute  execute  execute
+            commit   commit   commit   commit
+    ```
+
+    Each batch has three phases: **plan** (check source for new data,
+    build query plan), **execute** (process the data), **commit** (write
+    offsets to checkpoint). The planning and commit overhead is fixed —
+    even a batch with 1 row pays the same overhead as one with 100K rows.
+
+    This fixed overhead means micro-batch has a latency floor. Even with
+    `trigger(processingTime="0 seconds")` (as-fast-as-possible), each
+    batch takes at minimum 50-200ms for the planning/commit cycle.
+
+    For PayGuard's velocity detection (lesson 7), this latency is fine.
+    But for blocking a fraudulent transaction before it completes, you
+    may need latency under 10ms.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Think of micro-batch like a bus route: the bus (batch) leaves every
+    2 minutes whether it has 1 passenger or 50. If you arrive just after
+    the bus leaves, you wait 2 minutes. The bus has overhead: stopping,
+    opening doors, closing doors — even for one passenger.
+
+    Continuous mode is like a taxi: each passenger (record) is picked up
+    immediately and taken to the destination. No waiting for a full bus.
+    But the taxi doesn't batch passengers, so it's less efficient when
+    there's heavy traffic.
+
+    The choice depends on what matters more: **latency** (taxi) or
+    **throughput** (bus).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Continuous Processing Mode
+
+    Spark 3.x introduced **continuous processing** as an experimental
+    feature. Instead of planning and committing per batch, Spark
+    launches long-running tasks that continuously poll the source and
+    process records one at a time (or in very small groups):
+
+    ```python
+    query = (result_df.writeStream
+        .outputMode("append")
+        .format("console")
+        .trigger(continuous="1 second")    # epoch interval
+        .start())
+    ```
+
+    The `"1 second"` is the **epoch interval** — how often Spark
+    commits offsets for fault tolerance. Records are processed
+    immediately as they arrive; the epoch interval only controls how
+    often checkpoints happen.
+
+    This achieves **true millisecond-level latency** — records are
+    processed as soon as they arrive, not batched.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Continuous Mode Limitations
+
+    Continuous processing comes with significant restrictions:
+
+    **Supported operations only:**
+    - Projection and selection (`select`, `filter`, `withColumn`)
+    - `map`-like operations (stateless transforms)
+
+    **NOT supported:**
+    - Aggregations (`groupBy`, `count`, `sum`)
+    - Joins (any kind)
+    - `dropDuplicates`
+    - Windowed operations
+    - `foreachBatch` sink
+
+    **Fault tolerance:**
+    - Provides **at-least-once** guarantees (not exactly-once)
+    - Records between the last epoch commit and a failure are
+      reprocessed on restart
+
+    This means our velocity detection rule (windowed aggregation)
+    **cannot** run in continuous mode. But our amount threshold rule
+    (stateless filter) and blocklist rule (stateless filter or
+    broadcast lookup) can.
+
+- Class: mult_question
+  Depth: all
+  Output: "PayGuard has two detection rules: velocity (windowed groupBy counting transactions per user in 10 minutes) and amount threshold (filter where amount > 1000). Which can use continuous processing mode?"
+  AnswerChoices: "Only amount threshold — it's a stateless filter; velocity requires aggregation which continuous mode doesn't support;Both rules — continuous mode supports all operations;Only velocity — it needs the lowest latency;Neither — continuous mode is only for console output"
+  CorrectAnswer: "Only amount threshold — it's a stateless filter; velocity requires aggregation which continuous mode doesn't support"
+  Hint: "Continuous mode supports only stateless transforms: select, filter, withColumn. Aggregations like groupBy are not supported."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Async Offset Tracking — The Middle Ground
+
+    Spark 3.4+ introduced **asynchronous offset tracking** — a mode
+    that keeps the micro-batch execution model but removes the
+    synchronous offset commit from the critical path:
+
+    ```python
+    query = (result_df.writeStream
+        .outputMode("append")
+        .option("asyncProgressTrackingEnabled", "true")
+        .option("asyncProgressTrackingCheckpointIntervalMs", "1000")
+        .trigger(processingTime="0 seconds")
+        .start())
+    ```
+
+    In standard micro-batch, each batch waits for the offset commit
+    to complete before starting the next batch. With async tracking,
+    the commit happens in a background thread. The next batch starts
+    immediately.
+
+    **Result:** micro-batch latency drops significantly (often 2-5x
+    improvement) while still supporting aggregations, joins, and
+    windowed operations.
+
+    **Tradeoff:** on failure, Spark may reprocess a few more batches
+    than standard micro-batch (those whose offsets hadn't committed
+    yet). With an idempotent sink, this is acceptable.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Comparing the Three Modes
+
+    | Feature | Micro-batch | Async Micro-batch | Continuous |
+    |---------|------------|-------------------|------------|
+    | Latency | 100ms-10s | 50ms-2s | 1-10ms |
+    | Throughput | Highest | High | Lower |
+    | Aggregations | Yes | Yes | No |
+    | Joins | Yes | Yes | No |
+    | Windows | Yes | Yes | No |
+    | Exactly-once | Yes | Needs idempotent sink | No (at-least-once) |
+    | Production ready | Yes | Yes (3.4+) | Experimental |
+    | Checkpointing | Synchronous | Async (background) | Epoch-based |
+
+    For PayGuard:
+    - **Velocity rule** → Async micro-batch (needs aggregation, want low latency)
+    - **Amount threshold** → Continuous (stateless, needs sub-second)
+    - **Blocklist** → Continuous (stateless lookup)
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "Async offset tracking reduces latency compared to standard micro-batch. What's the tradeoff?"
+  AnswerChoices: "On failure, a few extra batches may be reprocessed because their offset commits hadn't completed yet;Throughput decreases by 50%;Aggregations are no longer supported;Checkpoints become unreliable"
+  CorrectAnswer: "On failure, a few extra batches may be reprocessed because their offset commits hadn't completed yet"
+  Hint: "The offset commit is async — it happens in the background. If a failure occurs before the commit completes, those batches need to be re-run."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Designing Hybrid Pipelines
+
+    Real systems rarely use a single processing mode. PayGuard's
+    production architecture splits rules by their latency needs:
+
+    ```
+    Kafka topic: transactions
+        │
+        ├── Stream 1: Continuous mode
+        │   ├── Amount threshold filter (> $1000) → immediate block
+        │   └── Blocklist filter → immediate block
+        │
+        └── Stream 2: Async micro-batch
+            ├── Velocity detection (10-min window) → review queue
+            └── Geo-impossible detection (join + window) → review queue
+    ```
+
+    Two separate streaming queries read the same Kafka topic. Each
+    has its own checkpoint location. The continuous stream fires
+    sub-second alerts for simple rules. The micro-batch stream handles
+    complex stateful rules with slightly higher latency.
+
+    Both write to the same alerts sink (Kafka topic or database).
+    Downstream services don't care which mode produced the alert.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Continuous Mode Internals
+
+    In micro-batch mode, Spark's driver orchestrates each batch:
+    1. Driver queries source for new offsets
+    2. Driver creates a physical plan
+    3. Driver schedules tasks on executors
+    4. Executors process data
+    5. Driver commits offsets
+
+    In continuous mode, the driver launches **long-running tasks**
+    (one per partition). Each task:
+    1. Polls the source partition directly
+    2. Processes each record immediately (no batching)
+    3. Writes to the sink immediately
+
+    The driver only intervenes for epoch commits — it signals tasks
+    to report their current offsets, collects them, and writes to the
+    checkpoint. Between epochs, tasks run autonomously.
+
+    This architecture eliminates the per-batch scheduling overhead but
+    means the driver has less control. State-dependent operations would
+    require cross-task coordination, which is why they're not supported.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Exactly-Once with Idempotent Sinks
+
+    Continuous mode provides at-least-once, not exactly-once. But you
+    can achieve **effectively exactly-once** by making your sink
+    idempotent:
+
+    **Database with upsert:** Write alerts keyed by `(tx_id, rule_name)`.
+    If the same alert is produced twice (due to reprocessing after
+    failure), the second write is a no-op update.
+
+    **Kafka with deduplication:** Include a unique key in each message.
+    Downstream consumers deduplicate by key.
+
+    **Idempotent file writes:** Use a deterministic filename derived from
+    the data (e.g., `alert_{tx_id}_{rule_name}.json`). Rewriting the
+    same file is idempotent.
+
+    For async micro-batch, the same idempotent sink strategy handles
+    the small window of potential reprocessing. Most production systems
+    already need idempotent sinks for other reasons (network retries,
+    duplicate messages from Kafka), so this is not an extra burden.
+
+- Class: mult_question
+  Depth: advanced
+  Output: "In a hybrid pipeline, the continuous stream and the micro-batch stream both read the same Kafka topic. What must be different between them?"
+  AnswerChoices: "The checkpoint location — each query must have its own checkpoint directory;The Kafka broker address;The SparkSession — they need separate JVMs;The source topic — they must read different topics"
+  CorrectAnswer: "The checkpoint location — each query must have its own checkpoint directory"
+  Hint: "Each streaming query tracks its own offsets in its own checkpoint. Two queries reading the same topic is fine — they maintain independent progress."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write a streaming query that uses continuous processing mode with a
+    1-second epoch interval. The query should filter a DataFrame
+    `transactions_df` for amounts greater than 1000 and write to console
+    in append mode.
+  CorrectAnswer: |
+    query = (transactions_df
+        .filter(f.col("amount") > 1000)
+        .writeStream
+        .outputMode("append")
+        .format("console")
+        .trigger(continuous="1 second")
+        .start())
+  Hint: "trigger(continuous='1 second') enables continuous mode. Only append output mode is supported. The query must be stateless."
+
+- Class: cmd_question
+  Depth: intermediate
+  Output: |
+    Configure a streaming query with async offset tracking enabled and
+    a checkpoint interval of 2000ms. The query aggregates transaction
+    counts by merchant_id and writes to console in update mode.
+  CorrectAnswer: |
+    query = (transactions_df
+        .groupBy("merchant_id")
+        .count()
+        .writeStream
+        .outputMode("update")
+        .format("console")
+        .option("asyncProgressTrackingEnabled", "true")
+        .option("asyncProgressTrackingCheckpointIntervalMs", "2000")
+        .trigger(processingTime="0 seconds")
+        .start())
+  Hint: "Set asyncProgressTrackingEnabled and asyncProgressTrackingCheckpointIntervalMs as options on writeStream. Use processingTime='0 seconds' for fastest micro-batch."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## When to Use Each Mode — A Decision Framework
+
+    Ask these questions about your streaming use case:
+
+    **1. Does your query need aggregation, joins, or windows?**
+    - Yes → micro-batch or async micro-batch. Continuous is out.
+    - No → all three modes are options.
+
+    **2. What latency does your use case require?**
+    - Sub-10ms → continuous (if stateless)
+    - 50ms-2s → async micro-batch
+    - 1s-10s → standard micro-batch
+
+    **3. Do you need exactly-once guarantees?**
+    - Yes, without idempotent sink → standard micro-batch only
+    - Yes, with idempotent sink → any mode works
+    - At-least-once is fine → any mode works
+
+    **4. Is the feature production-ready for your Spark version?**
+    - Standard micro-batch → always production-ready
+    - Async tracking → production-ready in Spark 3.4+
+    - Continuous → experimental (use with caution in production)
+
+    For most production workloads, **async micro-batch** is the sweet
+    spot: it supports all operations and provides significantly lower
+    latency than standard micro-batch.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Multi-Mode Fraud Detection Design
+
+    PayGuard needs to split its fraud detection into two streams with
+    different processing characteristics. Implement two functions that
+    simulate what each stream would do:
+
+    **`realtime_stateless_rules(transactions_df, blocked_merchants)`**
+    This simulates the continuous-mode stream. Apply ONLY stateless
+    rules (no groupBy, no windows):
+    1. Amount threshold: filter amount > 1000
+    2. Blocklist: filter merchant_id in blocked_merchants list
+    3. Add columns: `rule_name` (string), `severity` ("high" for
+       amount, "medium" for blocklist), `evidence` (description)
+    4. Union the two alert DataFrames and return
+
+    **`nearrealtime_stateful_rules(transactions_df)`**
+    This simulates the async micro-batch stream. Apply stateful rules:
+    1. Add a 10-minute tumbling window on event_time with watermark
+    2. Group by window + user_id, count transactions
+    3. Filter where count > 3 (velocity violation)
+    4. Add columns: `rule_name` ("velocity"), `severity` ("high"),
+       `evidence` (concat "count=" with the count)
+    5. Return the velocity alerts DataFrame
+
+    The test harness validates that both functions produce correct
+    alerts for a test dataset, and that the stateless function does
+    NOT use any aggregation (no groupBy in its plan).
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Stateless: two filter queries, add rule_name/severity/evidence columns, union. Stateful: withWatermark, window, groupBy, count, filter. Keep them separate — that's the hybrid design."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    In this lesson you learned:
+
+    - **Micro-batch** — the default mode with highest throughput and
+      exactly-once guarantees, but 100ms+ latency per batch
+    - **Continuous processing** — sub-10ms latency for stateless
+      transforms, but no aggregation/joins and only at-least-once
+    - **Async offset tracking** — best of both worlds: micro-batch
+      capabilities with 2-5x lower latency, production-ready in 3.4+
+    - **Hybrid design** — split rules by latency requirement, run
+      multiple queries on the same source with separate checkpoints
+    - **Idempotent sinks** — make any mode effectively exactly-once
+
+    In the next lesson, you will assemble the complete fraud detection
+    capstone — combining hybrid processing modes, all detection rules,
+    and production monitoring into one system.

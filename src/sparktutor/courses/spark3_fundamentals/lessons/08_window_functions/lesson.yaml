@@ -1,0 +1,161 @@
+- Class: meta
+  Lesson: "Window Functions"
+  EstimatedMinutes: 40
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Beyond GroupBy: Per-Row Context
+
+    Aggregations (Lesson 6) collapse rows into groups. Sometimes you need
+    to compute a value for each row while seeing other rows in its
+    partition — e.g., "rank drivers by earnings per city" or "7-day moving
+    average of trip counts". **Window functions** give you that: they
+    operate on a window of rows (partition + order + frame) and produce
+    one value per row.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Window Spec: partitionBy + orderBy + frame
+
+    A window is defined by:
+
+    ```python
+    from pyspark.sql.window import Window
+
+    w = Window.partitionBy("city").orderBy(f.col("total_fare").desc())
+    df.withColumn("rank", f.row_number().over(w))
+    ```
+
+    - **partitionBy** — group rows (like groupBy, but no collapse)
+    - **orderBy** — order within each partition
+    - **frame** (optional) — which rows to include (e.g., "current row
+      and 6 preceding" for 7-day moving avg). Default: unbounded
+      preceding to current row for ranking functions.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Ranking: row_number, rank, dense_rank
+
+    - **row_number** — unique rank 1,2,3,... (ties get arbitrary order)
+    - **rank** — ties get same rank, next rank has gaps (1,2,2,4)
+    - **dense_rank** — ties get same rank, no gaps (1,2,2,3)
+
+    For "top 5 drivers per city", use row_number and filter rank <= 5.
+    For "percentile within city", dense_rank is often cleaner.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Aggregation Windows: Running Totals, Moving Averages
+
+    Use sum, avg, etc. over a window:
+
+    ```python
+    w = Window.partitionBy("city").orderBy("date")
+    df.withColumn("running_trips", f.sum("trips").over(w))
+
+    w_ma = Window.partitionBy("city").orderBy("date").rowsBetween(-6, 0)
+    df.withColumn("trips_7d_ma", f.avg("trips").over(w_ma))
+    ```
+
+    `rowsBetween(-6, 0)` means current row and 6 preceding. For moving
+    average you need enough preceding rows; handle boundaries (e.g.,
+    first 6 days) — avg over fewer rows or null.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Lead and Lag: Sequential Analysis
+
+    **lag** — value from a previous row. **lead** — value from a next row.
+
+    ```python
+    w = Window.partitionBy("driver_id").orderBy("pickup_time")
+    df.withColumn("prev_fare", f.lag("fare", 1).over(w))
+    df.withColumn("next_fare", f.lead("fare", 1).over(w))
+    ```
+
+    Useful for "trip-to-trip" analysis: fare change, time gap between
+    trips. Default offset 1; use 2, 3, etc. for further back/forward.
+
+- Class: mult_question
+  Depth: all
+  Output: "What is the difference between rank and dense_rank when there are ties?"
+  AnswerChoices: "rank has gaps, dense_rank does not;dense_rank is faster;rank uses integers only;There is no difference"
+  CorrectAnswer: "rank has gaps, dense_rank does not"
+  Hint: "rank: 1,2,2,4. dense_rank: 1,2,2,3."
+
+- Class: mult_question
+  Depth: all
+  Output: "What does rowsBetween(-6, 0) mean in a window?"
+  AnswerChoices: "6 rows after current;Current row and 6 preceding rows;6 rows total;Rows 0 to 6"
+  CorrectAnswer: "Current row and 6 preceding rows"
+  Hint: "Negative offset is preceding, 0 is current row."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Given a DataFrame with city and total_fare, add a column rank that
+    ranks drivers by total_fare descending within each city (use
+    row_number).
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+    from pyspark.sql.window import Window
+
+    w = Window.partitionBy("city").orderBy(f.col("total_fare").desc())
+    result = df.withColumn("rank", f.row_number().over(w))
+  Hint: "Define Window with partitionBy city and orderBy total_fare desc, then row_number().over(w)."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## 7-Day Moving Average: Handling Boundaries
+
+    For a 7-day moving average, the first 6 rows in each partition have
+    fewer than 7 preceding rows. Spark's avg over rowsBetween(-6,0)
+    computes the average of available rows (e.g., first row gets just
+    itself). That's often acceptable. For strict "only when 7 values
+    exist", use a conditional or filter.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Add a column prev_fare to trips_df (with driver_id, pickup_time, fare)
+    using lag to get the previous trip's fare for the same driver.
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+    from pyspark.sql.window import Window
+
+    w = Window.partitionBy("driver_id").orderBy("pickup_time")
+    result = trips_df.withColumn("prev_fare", f.lag("fare", 1).over(w))
+  Hint: "Partition by driver_id, order by pickup_time. lag(fare, 1) gets previous row's fare."
+
+- Class: mult_question
+  Depth: all
+  Output: "When would you use lead instead of lag?"
+  AnswerChoices: "When you need the next row's value;When data is sorted descending;When there are nulls;When the partition is empty"
+  CorrectAnswer: "When you need the next row's value"
+  Hint: "Lead looks forward, lag looks backward in the ordered partition."
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Rank Drivers and 7-Day Moving Average
+
+    Implement two functions:
+    1. `rank_drivers_by_earnings(trips_df)` — trips has driver_id, city,
+       fare. For each (city, driver_id), compute total fare. Rank drivers
+       by total fare within each city (row_number). Return DataFrame with
+       city, driver_id, total_fare, rank.
+    2. `trips_7d_moving_avg(daily_trips_df)` — daily_trips has city, date,
+       trips. Add column trips_7d_ma = 7-day moving average of trips
+       (partition by city, order by date, rowsBetween(-6, 0)).
+
+    Reuses aggregation (sum fare per driver per city) and introduces
+    window functions for ranking and moving average.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "For rank: groupBy city+driver_id, sum fare. Then window partitionBy city orderBy total_fare desc, row_number. For MA: window partitionBy city orderBy date rowsBetween(-6,0), avg(trips)."

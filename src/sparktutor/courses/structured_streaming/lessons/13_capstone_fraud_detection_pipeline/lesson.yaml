@@ -1,0 +1,113 @@
+- Class: meta
+  Lesson: "Capstone — Real-Time Fraud Detection Pipeline"
+  EstimatedMinutes: 50
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Complete PayGuard Pipeline
+
+    You have built every piece: streaming ingestion, enrichment, windowed
+    velocity checks, watermarks, joins, checkpointing, monitoring, and
+    hybrid processing modes (continuous + async micro-batch). Now wire
+    them into one **real-time fraud detection pipeline**. Multiple
+    detection rules, combined stream-static enrichment, windowed
+    aggregations, and alert output with severity.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Pipeline Architecture
+
+    ```
+    Transactions (stream) → Enrich (account lookup) → Windowed velocity
+    → Amount threshold → Merchant blocklist → Alerts (output)
+    ```
+
+    - **Enrich**: Stream-static join with account table (tier, risk_level)
+    - **Velocity**: >5 tx per user in 10 min (window + watermark)
+    - **Amount**: Single tx > 1000
+    - **Blocklist**: Merchant in blocked set
+    - **Alerts**: Combine all, add severity, output
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Multiple Detection Rules
+
+    PayGuard runs several rules in parallel (or in sequence):
+
+    1. **Velocity**: groupBy window + user_id, count > 5
+    2. **Amount threshold**: filter amount > 1000
+    3. **Geo-impossible**: (future) same user, two locations in 5 min
+    4. **Merchant blocklist**: join with blocked merchants
+
+    Each rule produces alerts. You can union them or run separate
+    queries. For the capstone, we combine velocity and amount in one
+    pipeline.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Alert Output with Severity
+
+    Each alert should have: tx_id, user_id, rule_name, severity, evidence.
+    Severity: "high" (velocity, amount), "medium" (single high amount),
+    "low" (blocklist). Evidence: e.g., "count=6 in window" or "amount=1500".
+
+    ```python
+    alerts = alerts.withColumn("severity", f.when(...).otherwise(...))
+    ```
+
+    Downstream systems consume alerts by severity. High → immediate
+    block. Medium → review queue. Low → log only.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Combining Stream-Static and Windowed
+
+    Order matters: enrich first (add account tier), then apply rules.
+    Velocity rule needs window + watermark. Amount rule is stateless.
+    Blocklist rule needs stream-static join with blocked_merchants_df.
+
+    In batch simulation: we have transactions_df, accounts_df,
+    blocked_merchants_df. Apply enrich, then apply each rule, union
+    alerts, add severity column.
+
+- Class: mult_question
+  Depth: all
+  Output: "What is the purpose of adding severity to fraud alerts?"
+  AnswerChoices: "To reduce storage;To prioritize downstream handling;To enable watermarks;To improve performance"
+  CorrectAnswer: "To prioritize downstream handling"
+  Hint: "High severity = immediate action. Low = log. Prioritization."
+
+- Class: mult_question
+  Depth: all
+  Output: "Which detection rule requires a watermark?"
+  AnswerChoices: "Amount threshold;Merchant blocklist;Velocity (windowed aggregation);All of them"
+  CorrectAnswer: "Velocity (windowed aggregation)"
+  Hint: "Windowed aggregations need watermarks to bound state."
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Complete PayGuard Fraud Detection Pipeline
+
+    Implement `run_fraud_detection_pipeline` that:
+
+    1. Enriches transactions with accounts (stream-static join on user_id)
+    2. Applies velocity rule: 10-min window + watermark, count > 5 per user
+    3. Applies amount rule: amount > 1000
+    4. Applies blocklist rule: merchant_id in blocked_merchants
+    5. Unions all alerts, adds severity (high for velocity, high for amount
+       >1000, medium for blocklist), adds rule_name and evidence
+    6. Returns the alerts DataFrame
+
+    Input: transactions_df, accounts_df, blocked_merchants_df (list of
+    merchant_ids). Output: alerts with tx_id, user_id, rule_name, severity,
+    evidence. Same logic works for streaming with readStream, writeStream,
+    checkpoint. Batch simulation validates the full pipeline.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Enrich join. Velocity: withWatermark, window, groupBy, filter. Amount: filter. Blocklist: join or isin. Union, add severity."

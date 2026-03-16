@@ -1,0 +1,173 @@
+- Class: meta
+  Lesson: "Schemas & Type Safety"
+  EstimatedMinutes: 35
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Why Schemas Matter for the Ride-Sharing Platform
+
+    In Lessons 1 and 2 you built DataFrames from Python data and applied
+    transformations. When reading from files (CSV, JSON), Spark can infer
+    schemas — but that leads to problems. This lesson shows what goes wrong
+    with schema inference, then teaches explicit schemas that will be the
+    foundation for our file-based pipeline in Lesson 5.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What Goes Wrong with inferSchema
+
+    When you read CSV with `inferSchema=True`, Spark samples the data to
+    guess types. Problems:
+
+    1. **Wrong types**: A column with mostly integers but one "N/A" becomes
+       string. A date column might become string or get misparsed.
+    2. **Doubled read time**: Spark makes two passes — one to sample and
+       infer, another to load. For large files, this doubles I/O.
+    3. **Inconsistent across runs**: Different samples can produce different
+       schemas. A job that worked yesterday may fail today if new data
+       changes the inferred type.
+
+    For our trips table, `fare` could be inferred as string if a single row
+    has "pending". `pickup_time` might become string when we need timestamp.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    ## Failure First: See the Garbled Types
+
+    Try reading a trip CSV without a schema:
+
+    ```python
+    df = spark.read.csv("trips.csv", header=True, inferSchema=True)
+    df.printSchema()
+    ```
+
+    You might see `fare` as `string` (because of one null or bad value),
+    or `distance_miles` as `double` when you expected `int`. Aggregations
+    and joins will behave unexpectedly. The fix: define the schema
+    explicitly so Spark (and you) know exactly what each column is.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## StructType and StructField: Explicit Schemas
+
+    You define a schema with `StructType` and `StructField`:
+
+    ```python
+    from pyspark.sql.types import StructType, StructField, StringType, DoubleType, IntegerType
+
+    trips_schema = StructType([
+        StructField("trip_id", StringType(), False),
+        StructField("city", StringType(), False),
+        StructField("driver_id", StringType(), True),
+        StructField("rider_id", StringType(), False),
+        StructField("fare", DoubleType(), False),
+        StructField("distance_miles", DoubleType(), False),
+        StructField("pickup_time", StringType(), False),
+    ])
+
+    df = spark.read.schema(trips_schema).csv("trips.csv", header=True)
+    ```
+
+    - `StructField(name, dataType, nullable)` — one column
+    - `nullable=True` — allows nulls; `False` — rejects nulls (validates at read)
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Complex Types: ArrayType, MapType, Nested StructType
+
+    Ride-sharing data can have structure. A driver's available vehicles,
+    a rider's payment methods, or tags on a trip:
+
+    ```python
+    from pyspark.sql.types import ArrayType, MapType
+
+    StructField("vehicle_ids", ArrayType(StringType()), True),
+    StructField("payment_prefs", MapType(StringType(), StringType()), True),
+    StructField("metadata", StructType([
+        StructField("source", StringType(), True),
+        StructField("version", IntegerType(), True),
+    ]), True),
+    ```
+
+    - **ArrayType** — list of values (e.g., `["v1", "v2"]`)
+    - **MapType** — key-value pairs (e.g., `{"card": "visa"}`)
+    - **StructType** — nested object
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Nullable vs Non-Nullable: Catching Data Issues Early
+
+    When `nullable=False`, Spark rejects rows with null in that column.
+    This fails fast — you discover bad data at read time instead of
+    downstream when a join or aggregation produces wrong results.
+
+    Use `nullable=False` for columns that must always be present (trip_id,
+    city, fare). Use `nullable=True` for optional fields (driver_id if
+    some trips are rider-only, ratings if not all trips are rated).
+
+- Class: mult_question
+  Depth: all
+  Output: "Why does inferSchema double read time for CSV files?"
+  AnswerChoices: "It validates every row;Spark makes two passes — one to sample, one to load;It compresses the data;It writes a temporary file"
+  CorrectAnswer: "Spark makes two passes — one to sample, one to load"
+  Hint: "Spark first scans the file to infer types, then reads again to actually load the data."
+
+- Class: mult_question
+  Depth: all
+  Output: "What happens when you set nullable=False on a StructField and the data contains nulls in that column?"
+  AnswerChoices: "Spark fills with default values;Spark rejects those rows or fails;Spark converts null to empty string;The job always succeeds"
+  CorrectAnswer: "Spark rejects those rows or fails"
+  Hint: "Non-nullable means the column cannot contain null. Spark will fail or drop invalid rows depending on configuration."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Define a StructType schema for a `drivers` table with columns:
+    driver_id (string, non-nullable), name (string, non-nullable),
+    city (string, nullable), vehicle_count (integer, nullable).
+  CorrectAnswer: |
+    from pyspark.sql.types import StructType, StructField, StringType, IntegerType
+
+    drivers_schema = StructType([
+        StructField("driver_id", StringType(), False),
+        StructField("name", StringType(), False),
+        StructField("city", StringType(), True),
+        StructField("vehicle_count", IntegerType(), True),
+    ])
+  Hint: "Use StructType([StructField(...), ...]). Third arg is nullable: False for non-nullable."
+
+- Class: mult_question
+  Depth: all
+  Output: "Which type would you use for a column that stores a list of trip IDs?"
+  AnswerChoices: "StringType;ArrayType(StringType);MapType;StructType"
+  CorrectAnswer: "ArrayType(StringType)"
+  Hint: "A list of values uses ArrayType with the element type inside."
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Define Schemas for Trips, Drivers, and Ratings
+
+    Implement `get_trips_schema`, `get_drivers_schema`, and `get_ratings_schema`
+    that return StructType schemas for our ride-sharing platform:
+
+    - **trips**: trip_id (string, non-null), city (string, non-null),
+      driver_id (string, nullable), rider_id (string, non-null), fare
+      (double, non-null), distance_miles (double, non-null),
+      pickup_time (string, non-null)
+    - **drivers**: driver_id (string, non-null), name (string, non-null),
+      city (string, nullable), vehicle_count (int, nullable)
+    - **ratings**: rating_id (string, non-null), trip_id (string, non-null),
+      rider_id (string, non-null), rating (int, non-null), comment (string, nullable)
+
+    These schemas will be used in Lesson 5 when we read CSV files and in
+    Lesson 7 when we join trips with drivers and ratings.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Use StructType and StructField for each column. Import StringType, DoubleType, IntegerType."

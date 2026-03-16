@@ -1,0 +1,185 @@
+- Class: meta
+  Lesson: "DataFrames — The Core Abstraction"
+  EstimatedMinutes: 30
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Building on Lesson 1
+
+    In Lesson 1 you created a SparkSession and computed trips per city. The
+    trips DataFrame was built from Python data. Now we extend the ride-sharing
+    platform with the core DataFrame operations: selecting columns, filtering
+    rows, and adding computed columns. Every transformation you learn here
+    will be reused in later lessons when we read from files, join tables,
+    and build dashboards.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Immutability: Why It Matters for Distributed Systems
+
+    Spark DataFrames are **immutable**. When you call `filter()` or
+    `withColumn()`, you get a *new* DataFrame. The original is unchanged.
+    This is not just a style choice — it enables:
+
+    - **Fault tolerance**: If an executor fails, Spark can recompute from
+      the immutable lineage. No need to restore mutated state.
+    - **Optimization**: The optimizer can reorder or fuse operations
+      because it knows no transformation modifies data in place.
+    - **Parallelism**: Different partitions can be processed independently
+      without coordination. Mutations would require locks.
+
+    Think of it like Git: each commit is immutable; you never edit a
+    commit, you create a new one.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## select, filter, withColumn, drop, withColumnRenamed
+
+    The DataFrame API provides a small set of primitives that compose:
+
+    - **select** — pick columns (and add expressions). `df.select("city", "fare")`
+    - **filter** / **where** — keep rows matching a condition. `df.filter(f.col("fare") > 10)`
+    - **withColumn** — add or replace a column. `df.withColumn("fare_doubled", f.col("fare") * 2)`
+    - **drop** — remove columns. `df.drop("rider_id")`
+    - **withColumnRenamed** — rename a column. `df.withColumnRenamed("city", "pickup_city")`
+
+    Each returns a new DataFrame. You chain them to build pipelines.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    ## Chaining: The Fluent API
+
+    Spark's DataFrame API is **fluent** — you chain method calls:
+
+    ```python
+    enriched = (trips_df
+        .filter(f.col("fare") > 10)
+        .withColumn("fare_per_mile", f.col("fare") / f.col("distance_miles"))
+        .select("city", "fare", "distance_miles", "fare_per_mile"))
+    ```
+
+    Each step produces a new DataFrame; the next step operates on it. No
+    intermediate variables needed. The plan is built lazily; execution
+    happens only when you call an action like `show()`.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Filtering by Date Range
+
+    For ride-sharing analytics, you often filter trips by date. If
+    `pickup_time` is a string, you can compare lexicographically for
+    ISO-style dates:
+
+    ```python
+    trips_df.filter(
+        (f.col("pickup_time") >= "2024-01-15") &
+        (f.col("pickup_time") < "2024-01-16")
+    )
+    ```
+
+    In Lesson 4 we will cast to proper date/timestamp types and use date
+    functions. For now, string comparison works for well-formatted dates.
+
+- Class: mult_question
+  Depth: all
+  Output: "Why does Spark use immutable DataFrames instead of allowing in-place mutations?"
+  AnswerChoices: "To make code shorter;To enable fault tolerance and optimizer rewrites;To reduce memory usage;To support Python"
+  CorrectAnswer: "To enable fault tolerance and optimizer rewrites"
+  Hint: "Immutability lets Spark recompute from lineage on failure and reorder operations safely."
+
+- Class: mult_question
+  Depth: all
+  Output: "What does withColumn do when the column name already exists?"
+  AnswerChoices: "Throws an error;Adds a duplicate column;Replaces the existing column;Ignores the operation"
+  CorrectAnswer: "Replaces the existing column"
+  Hint: "withColumn adds a new column or overwrites an existing one with the same name."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Given a DataFrame `trips_df` with columns `fare` and `distance_miles`,
+    write code to add a column `fare_per_mile` as fare divided by distance_miles.
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+
+    result = trips_df.withColumn("fare_per_mile", f.col("fare") / f.col("distance_miles"))
+  Hint: "Use withColumn with an expression: f.col('fare') / f.col('distance_miles')."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Computed Columns for Trip Analytics
+
+    For our ride-sharing platform, useful computed columns include:
+
+    - **trip_duration** — if you have start and end timestamps, the difference
+    - **fare_per_mile** — fare / distance_miles (pricing efficiency)
+    - **is_long_trip** — distance_miles > 10 (for surge or premium logic)
+
+    These enrich the raw data for downstream aggregations and dashboards.
+    In Lesson 6 we will aggregate these; in Lesson 8 we will use them in
+    window functions.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Column Expressions and f.col()
+
+    When you write `f.col("fare")`, you get a **Column** object representing
+    that column in an expression. You can combine columns with operators:
+
+    ```python
+    f.col("fare") / f.col("distance_miles")
+    f.col("fare") > 10
+    f.col("city").isin("SF", "NYC", "LA")
+    ```
+
+    For string columns, use `f.col("city") == "SF"`. For numeric, use
+    `f.col("fare").between(5, 20)`. The `f` module (`pyspark.sql.functions`)
+    provides hundreds of functions: `f.sum`, `f.avg`, `f.when`, etc.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Given a DataFrame `trips_df` with columns city, fare, distance_miles,
+    write code to filter for trips where fare is greater than 10 and
+    distance_miles is at least 5, then add a column fare_per_mile.
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+
+    result = (trips_df
+        .filter((f.col("fare") > 10) & (f.col("distance_miles") >= 5))
+        .withColumn("fare_per_mile", f.col("fare") / f.col("distance_miles")))
+  Hint: "Chain filter (with & for AND) and withColumn."
+
+- Class: mult_question
+  Depth: all
+  Output: "What is the difference between select and withColumn?"
+  AnswerChoices: "select replaces all columns; withColumn adds one;select is faster;There is no difference"
+  CorrectAnswer: "select replaces all columns; withColumn adds one"
+  Hint: "select chooses which columns to keep (or replace the whole set). withColumn adds or overwrites a single column."
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Filter and Enrich Trips
+
+    Implement `filter_and_enrich_trips` that takes a trips DataFrame (with
+    city, rider_id, fare, distance_miles, pickup_time) and:
+    1. Filters for trips where pickup_time is between "2024-01-15" and
+       "2024-01-16" (inclusive start, exclusive end)
+    2. Adds `trip_duration` as a placeholder 0 (we will compute real duration
+       in Lesson 4 when we have proper timestamps)
+    3. Adds `fare_per_mile` as fare / distance_miles
+    4. Returns the enriched DataFrame
+
+    Reuses the trip schema from Lesson 1 and introduces filter, withColumn,
+    and chaining — patterns you will use in every subsequent lesson.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Filter with (f.col('pickup_time') >= '2024-01-15') & (f.col('pickup_time') < '2024-01-15' + one day). Add fare_per_mile with withColumn."

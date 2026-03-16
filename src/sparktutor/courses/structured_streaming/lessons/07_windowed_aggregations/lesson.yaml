@@ -1,0 +1,139 @@
+- Class: meta
+  Lesson: "Windowed Aggregations"
+  EstimatedMinutes: 45
+
+- Class: text
+  Depth: all
+  Output: |
+    ## PayGuard's Velocity Rule
+
+    A key fraud signal: **velocity** — too many transactions in a short
+    window. A stolen card might be used 10 times in 5 minutes. PayGuard
+    needs to detect "more than 5 transactions per user in 10 minutes."
+    **Windowed aggregations** group events by time buckets. They bound
+    state naturally: each window is a finite bucket. When the window
+    closes, you output and discard.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Tumbling Windows: Non-Overlapping Buckets
+
+    **Tumbling windows** partition time into fixed-size, non-overlapping
+    buckets. 10-minute tumbling: [0-10), [10-20), [20-30), ...
+
+    ```python
+    from pyspark.sql.functions import window
+
+    windowed = (stream_df
+        .groupBy(window("event_time", "10 minutes"), "user_id")
+        .count()
+        .filter(f.col("count") > 5))
+    ```
+
+    Each event falls into exactly one window. State is bounded: you
+    only keep windows that might still receive data (watermarks handle
+    when to discard — Lesson 8). For now, tumbling gives you
+    "transactions per user per 10-minute bucket."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Sliding Windows: Overlapping Buckets
+
+    **Sliding windows** overlap. A 10-minute window sliding every 5
+    minutes: [0-10), [5-15), [10-20), ... Each event can appear in
+    multiple windows. Use for smoothed metrics: "transactions in the
+    last 10 minutes, updated every 5."
+
+    ```python
+    windowed = (stream_df
+        .groupBy(window("event_time", "10 minutes", "5 minutes"), "user_id")
+        .count())
+    ```
+
+    Sliding increases state (more windows) but gives finer granularity.
+    PayGuard uses tumbling for velocity — simpler and less state.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Session Windows (Spark 3.2+)
+
+    **Session windows** are gap-based: a new session starts when there's
+    a gap larger than the timeout. Useful for "bursts" of activity: a
+    user's shopping session might be 30 minutes of activity, then 2
+    hours of nothing. Session windows group the burst without fixed
+    boundaries.
+
+    ```python
+    from pyspark.sql.functions import session_window
+    windowed = stream_df.groupBy(session_window("event_time", "30 minutes"), "user_id").count()
+    ```
+
+    PayGuard could use sessions for "transactions per shopping session"
+    — a different fraud signal than fixed windows.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Why Windows Bound State
+
+    Without windows, groupBy("user_id") keeps state for every user
+    forever. With groupBy(window(...), "user_id"), state is per
+    (window, user_id). Old windows can be discarded once you know no
+    more data will arrive (watermarks). So state = (number of active
+    windows) × (users per window). Bounded by time, not unbounded.
+
+- Class: mult_question
+  Depth: all
+  Output: "In a 10-minute tumbling window, how many windows does a single event belong to?"
+  AnswerChoices: "0;1;2;Depends on slide"
+  CorrectAnswer: "1"
+  Hint: "Tumbling windows are non-overlapping. Each event falls into exactly one bucket."
+
+- Class: mult_question
+  Depth: all
+  Output: "Why do windowed aggregations bound state better than plain groupBy?"
+  AnswerChoices: "They use less memory;Windows are finite — old windows can be discarded;They run faster;They support append mode only"
+  CorrectAnswer: "Windows are finite — old windows can be discarded"
+  Hint: "With watermarks, Spark knows when a window is 'closed' and can drop its state."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write code to group a DataFrame `stream_df` by a 10-minute tumbling
+    window on event_time and user_id, then count. Use f.window().
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+
+    result = stream_df.groupBy(f.window("event_time", "10 minutes"), "user_id").count()
+  Hint: "groupBy f.window('event_time', '10 minutes'), user_id. count()."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Window Column Structure
+
+    The `window` function returns a struct column with `start` and `end`
+    timestamps. You can select them: `df.select("window.start", "window.end")`.
+    For ordering: `orderBy("window")` or `orderBy(f.col("window.start"))`.
+    The window is inclusive of start, exclusive of end: [start, end).
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Velocity Detection with Tumbling Windows
+
+    Implement `detect_velocity_anomaly` that:
+    1. Groups transactions by 10-minute tumbling window on event_time and user_id
+    2. Counts transactions per (window, user_id)
+    3. Filters to rows where count > 5 (suspicious velocity)
+    4. Returns the result with columns: window, user_id, count
+
+    The test harness creates transactions with 6 from u1 in one 10-minute
+    window — that user should be flagged. Same logic works for streaming
+    with append mode + watermark (Lesson 8).
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "groupBy f.window('event_time', '10 minutes'), user_id. count(). filter count > 5."

@@ -1,0 +1,153 @@
+- Class: meta
+  Lesson: "Performance Tuning"
+  EstimatedMinutes: 45
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Making the Platform Fast
+
+    The ride-sharing analytics platform is complete. Now we make it
+    performant. Slow pipelines waste money and delay insights. This
+    lesson covers the tuning process: Spark UI, skew, shuffles,
+    partitions, and caching. You will take a deliberately slow
+    pipeline and optimize it.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Tuning Process: Spark UI → Skew → Shuffles → Partitions → Caching
+
+    1. **Spark UI** — identify slow stages, tasks that run much longer
+       than others (skew), and where time is spent (read, shuffle, compute).
+    2. **Skew** — one partition has way more data. Fix with salting
+       (Lesson 7), or repartition by a different key.
+    3. **Shuffles** — minimize them. Filter early, avoid unnecessary
+       groupBys, use broadcast for small joins.
+    4. **Partitions** — too many = overhead; too few = underutilization.
+       Rule of thumb: 2-4x number of cores. For shuffle output,
+       `spark.sql.shuffle.partitions` (default 200) is often too high
+       for small data.
+    5. **Caching** — when a DataFrame is reused, cache it. But cache
+       has cost (memory); use only when the same data is read multiple
+       times.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Key Configs
+
+    - **spark.sql.shuffle.partitions** — partitions after shuffle.
+      Default 200. For development/small data, set to 8-16.
+    - **spark.executor.memory** — RAM per executor. Increase for
+      memory-intensive workloads.
+    - **spark.sql.autoBroadcastJoinThreshold** — max size (bytes) for
+      auto-broadcast. Default 10MB. Increase to broadcast larger tables.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## repartition vs coalesce
+
+    - **repartition(n)** — shuffle data into n partitions. Use when
+      increasing partitions or changing distribution.
+    - **coalesce(n)** — reduce to n partitions without full shuffle.
+      Merges partitions (no data movement across executors). Use when
+      reducing partition count (e.g., before writing a small result).
+
+    repartition(8) before a chain of narrow transformations spreads
+    work. coalesce(1) before write.parquet() avoids many small files.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Caching Strategy
+
+    **When to cache**: DataFrame used 2+ times in the same job (e.g.,
+    base trips table joined with drivers, then with ratings, then
+    aggregated). Cache the base after it is fully built.
+
+    **When not to cache**: One-time use, or when memory is tight.
+    Caching evicts other data; can cause recomputation elsewhere.
+
+    **Storage levels**: `cache()` = MEMORY_AND_DISK. `persist(StorageLevel.MEMORY_ONLY)` for
+    smaller datasets. `unpersist()` when done to free memory.
+
+- Class: mult_question
+  Depth: all
+  Output: "When should you use coalesce instead of repartition?"
+  AnswerChoices: "When increasing partitions;When reducing partitions without a full shuffle;When sorting data;When joining"
+  CorrectAnswer: "When reducing partitions without a full shuffle"
+  Hint: "Coalesce merges partitions on the same executor — no shuffle. Repartition always shuffles."
+
+- Class: mult_question
+  Depth: all
+  Output: "What does a skewed partition indicate?"
+  AnswerChoices: "Data is sorted;One partition has much more data than others;Partitions are too small;The cluster is overloaded"
+  CorrectAnswer: "One partition has much more data than others"
+  Hint: "Skew = imbalance. One task does way more work than the others."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Configure SparkSession to set shuffle partitions to 16 and
+    autoBroadcastJoinThreshold to 50MB.
+  CorrectAnswer: |
+    spark = (SparkSession.builder
+        .appName("Tuned")
+        .config("spark.sql.shuffle.partitions", "16")
+        .config("spark.sql.autoBroadcastJoinThreshold", "52428800")
+        .getOrCreate())
+  Hint: "50MB = 50 * 1024 * 1024 = 52428800 bytes. Use .config() before getOrCreate()."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Optimizing the Ride-Sharing Pipeline
+
+    For our platform: (1) Read Parquet with schema, filter by date early.
+    (2) Broadcast drivers and ratings (small tables). (3) Set
+    shuffle.partitions to match data size. (4) Cache the enriched
+    trips DataFrame if it feeds multiple aggregations. (5) Coalesce
+    before writing small outputs to avoid many small files.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Given a DataFrame df used multiple times, cache it. Then, after
+    use, unpersist it.
+  CorrectAnswer: |
+    df.cache()
+    result1 = df.filter(...)
+    result2 = df.groupBy(...)
+    df.unpersist()
+  Hint: "cache() before use. unpersist() when done to free memory."
+
+- Class: mult_question
+  Depth: all
+  Output: "What is the default value of spark.sql.shuffle.partitions?"
+  AnswerChoices: "8;16;200;1000"
+  CorrectAnswer: "200"
+  Hint: "The default is 200, which is often too high for small to medium datasets."
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Optimize a Slow Pipeline
+
+    Implement `optimize_pipeline` that takes trips_df, drivers_df,
+    ratings_df and:
+    1. Creates a SparkSession with shuffle.partitions=8 and
+       autoBroadcastJoinThreshold=20MB
+    2. Broadcast-joins trips with drivers, then left-joins with ratings
+    3. Caches the joined DataFrame (it will be used for multiple aggs)
+    4. Builds two aggregations from it: (a) city-level trip count,
+       (b) driver-level total fare
+    5. Unpersists the cached DataFrame
+    6. Returns (city_stats, driver_stats)
+
+    This exercises the tuning techniques: config, broadcast, cache,
+    unpersist. Reuses joins from Lesson 7.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Create tuned SparkSession. Join with broadcast. Cache the joined df. Run both aggs. Unpersist. Return both result DataFrames."

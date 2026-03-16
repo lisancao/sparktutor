@@ -1,0 +1,165 @@
+- Class: meta
+  Lesson: "Output Modes & Triggers"
+  EstimatedMinutes: 35
+
+- Class: text
+  Depth: all
+  Output: |
+    ## PayGuard's Aggregation Outputs
+
+    PayGuard runs multiple streaming queries: one counts transactions per
+    user (for velocity checks), another sums amounts per merchant. Each
+    query needs the right **output mode** — what gets written to the sink
+    each trigger. Use the wrong mode and you get errors or incorrect
+    results. This lesson teaches you to choose correctly.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Append Mode: Only New Rows
+
+    **Append** mode writes only rows that are *new* since the last trigger.
+    Use for stateless transforms (select, filter, map) or for aggregations
+    *with watermarks* (where late data can arrive).
+
+    ```python
+    # Stateless: each new row is output once
+    (stream_df.filter(col("amount") > 100)
+        .writeStream.outputMode("append").format("console").start())
+    ```
+
+    For aggregations *without* watermarks, append mode is **not supported** —
+    Spark cannot know when a row is "final" for an unbounded group. You will
+    get an error if you try.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Update Mode: Changed Rows Only
+
+    **Update** mode writes only rows that *changed* since the last trigger.
+    Use for aggregations (groupBy, count, sum) where you care about the
+    latest value per key. Each micro-batch may update existing keys.
+
+    ```python
+    # Aggregation: output updated counts per user
+    (stream_df.groupBy("user_id").count()
+        .writeStream.outputMode("update").format("console").start())
+    ```
+
+    If user u1 had 3 transactions, then 2 more arrive, update mode outputs
+    the row (u1, 5) — not (u1, 3) and (u1, 5). Only the changed row.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Complete Mode: Entire Result Table
+
+    **Complete** mode writes the *entire* result table every trigger. Use
+    for aggregations without watermarks (e.g., global count, top-N). The
+    sink receives the full table each time.
+
+    ```python
+    (stream_df.groupBy("user_id").count()
+        .writeStream.outputMode("complete").format("console").start())
+    ```
+
+    For large result tables, complete mode can be expensive — you're
+    rewriting everything. For small tables (e.g., a few dashboard metrics),
+    it's fine. PayGuard's merchant count dashboard uses complete mode.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What Happens When You Use the Wrong Mode
+
+    | Operation     | Append | Update | Complete |
+    |---------------|--------|--------|----------|
+    | select, filter| ✓      | ✓      | ✓        |
+    | groupBy (no wm)| ✗     | ✓      | ✓        |
+    | groupBy (wm)   | ✓      | ✓      | ✓        |
+
+    **Wrong**: append mode without watermark on aggregation → Spark throws
+    "Append output mode not supported when there are streaming aggregations
+    on streaming DataFrames/DataSets without watermarking."
+
+    **Wrong**: using complete for a huge result table → memory pressure,
+    slow writes. Use update with watermark when possible.
+
+- Class: mult_question
+  Depth: all
+  Output: "Which output mode writes only rows that changed since the last trigger?"
+  AnswerChoices: "append;update;complete;overwrite"
+  CorrectAnswer: "update"
+  Hint: "Update mode outputs only changed rows — useful for aggregations."
+
+- Class: mult_question
+  Depth: all
+  Output: "Why does append mode fail for aggregations without watermarks?"
+  AnswerChoices: "Append is slower;Spark cannot know when a group is final for unbounded data;Append requires Kafka;Watermarks are required for all modes"
+  CorrectAnswer: "Spark cannot know when a group is final for unbounded data"
+  Hint: "With unbounded groups, new data can always arrive. Spark needs watermarks to bound state and know when to output."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Trigger Types
+
+    | Trigger           | Behavior                              |
+    |-------------------|---------------------------------------|
+    | (default)         | Process as fast as possible           |
+    | processingTime    | Every N seconds (e.g., "10 seconds")   |
+    | availableNow      | Process all available data, then stop |
+    | once              | Process one micro-batch, then stop    |
+    | continuous        | Low-latency mode (experimental)       |
+
+    ```python
+    .trigger(processingTime="30 seconds")
+    .trigger(availableNow=True)
+    .trigger(once=True)
+    ```
+
+    PayGuard uses `processingTime="10 seconds"` for real-time detection.
+    For batch-style testing, `availableNow` processes all pending data
+    then stops — no need to keep the query running.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Given a streaming DataFrame `agg_df` with groupBy aggregation, write
+    the writeStream call to output in update mode with a processing
+    time trigger of 15 seconds, format console.
+  CorrectAnswer: |
+    agg_df.writeStream.outputMode("update").format("console").trigger(processingTime="15 seconds").start()
+  Hint: "outputMode update, format console, trigger processingTime."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Failure-Driven Learning: Wrong Mode in Action
+
+    Imagine you run a groupBy count with append mode and no watermark.
+    Spark fails with a clear error. The fix: add a watermark (if you use
+    event time and can bound lateness) or switch to update/complete.
+
+    If you use complete mode for a query that grows to millions of keys,
+    you will see memory and I/O grow. The fix: add a watermark and use
+    append or update so only new/changed rows are written.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Aggregation for All Output Modes
+
+    Implement `aggregate_by_user` that groups transactions by user_id and
+    computes tx_count (count) and amount_sum (sum of amount). This
+    aggregation produces the same result regardless of output mode — the
+    mode only affects *what gets written* each trigger (new rows, changed
+    rows, or full table). In batch simulation we return the full result.
+
+    The test harness validates: (1) each user has correct count and sum,
+    (2) the aggregation logic would work with update or complete mode in
+    a real streaming query. Append would require a watermark (Lesson 8).
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "groupBy user_id, agg f.count('*').alias('tx_count'), f.sum('amount').alias('amount_sum')."

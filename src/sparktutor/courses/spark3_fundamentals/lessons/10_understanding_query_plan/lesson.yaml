@@ -1,0 +1,135 @@
+- Class: meta
+  Lesson: "Understanding the Query Plan"
+  EstimatedMinutes: 40
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What Spark Does Behind the Scenes
+
+    You have written transformations, joins, and aggregations. Spark
+    converts them into an execution plan. Understanding that plan helps
+    you write faster code and debug performance. This lesson covers
+    explain(), the Catalyst optimizer, and Adaptive Query Execution.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## explain(): Reading Logical and Physical Plans
+
+    Call `df.explain()` or `df.explain(True)` to see the plan:
+
+    ```python
+    df.filter(f.col("city") == "SF").groupBy("date").agg(f.sum("fare")).explain()
+    ```
+
+    - **Logical plan** — what you asked for (filter, aggregate)
+    - **Physical plan** — how Spark will run it (Exchange for shuffle,
+      HashAggregate, etc.)
+
+    Look for: Exchange (shuffle), number of partitions, BroadcastHashJoin
+    (good for small tables), SortMergeJoin (default for large tables).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Catalyst Optimizer: What It Does for You
+
+    Catalyst rewrites your logical plan before execution:
+
+    - **Predicate pushdown** — push filters down to the data source.
+      Reading Parquet with `WHERE city = 'SF'` can skip entire row groups.
+    - **Column pruning** — only read columns you use. Parquet benefits
+      greatly (columnar format).
+    - **Join reordering** — put the smaller table on the build side
+      when possible.
+    - **Constant folding** — evaluate constant expressions at plan time.
+
+    You get these optimizations for free. Writing clear, filter-early
+    code helps Catalyst do its job.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Adaptive Query Execution (AQE)
+
+    Spark 3.0+ includes AQE — runtime re-optimization:
+
+    - **Coalesce partitions** — reduce excessive partitions after a
+      shuffle (e.g., 200 → 8 when data is small).
+    - **Convert sort-merge join to broadcast** — if the build side
+      turns out small at runtime, switch to broadcast.
+    - **Optimize skew joins** — split skewed partitions.
+
+    Enable with `spark.sql.adaptive.enabled=true` (default in Spark 3).
+    AQE fixes many "wrong partition count" and "skew" issues automatically.
+
+- Class: mult_question
+  Depth: all
+  Output: "What does predicate pushdown do?"
+  AnswerChoices: "Sorts the data;Pushes filters down to the data source to skip reading unnecessary data;Adds indexes;Caches the result"
+  CorrectAnswer: "Pushes filters down to the data source to skip reading unnecessary data"
+  Hint: "Predicate = filter condition. Pushdown = apply it as early as possible, ideally at the source."
+
+- Class: mult_question
+  Depth: all
+  Output: "What does an Exchange node in the physical plan indicate?"
+  AnswerChoices: "A cache operation;A shuffle (data movement across partitions);A filter;A sort"
+  CorrectAnswer: "A shuffle (data movement across partitions)"
+  Hint: "Exchange is the shuffle operator — data is redistributed across the cluster."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Given a DataFrame df, write code to print the full explain output
+    (logical + physical plans).
+  CorrectAnswer: |
+    df.explain(True)
+  Hint: "explain(True) or explain('extended') shows both logical and physical plans."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Comparing Plans: Same Query, Different Writes
+
+    Two equivalent queries can produce different plans. Example: filter
+    before join vs. after join. Catalyst often pushes the filter down
+    anyway, but not always. Use explain() to verify. The more selective
+    filter is applied first, the less data flows through the pipeline.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write two versions of a query: (A) filter trips by city then join
+    with drivers, (B) join first then filter. Call explain(True) on both
+    and describe which might be more efficient (conceptually).
+  CorrectAnswer: |
+    plan_a = trips_df.filter(f.col("city") == "SF").join(drivers_df, "driver_id")
+    plan_b = trips_df.join(drivers_df, "driver_id").filter(f.col("city") == "SF")
+    plan_a.explain(True)
+    plan_b.explain(True)
+  Hint: "Filter-then-join typically reduces data before the expensive join. Catalyst may optimize B to match A."
+
+- Class: mult_question
+  Depth: all
+  Output: "What does AQE's coalesce partitions do?"
+  AnswerChoices: "Merge small partitions after a shuffle;Split large partitions;Add more partitions;Cache partitions"
+  CorrectAnswer: "Merge small partitions after a shuffle"
+  Hint: "Coalesce reduces the number of partitions when there are too many for the data size."
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Compare Plans and Identify Efficiency
+
+    Implement `compare_plans` that takes trips_df and drivers_df and
+    returns two equivalent result DataFrames:
+    - **df_a**: Filter trips where fare > 10, then inner join with drivers on driver_id
+    - **df_b**: Inner join trips with drivers on driver_id first, then filter fare > 10
+
+    Return (df_a, df_b). Both should produce the same rows; use explain(True)
+    on each to see how Catalyst may produce similar or different plans.
+    Reuses join from Lesson 7 and introduces plan analysis.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Build both pipelines. Filter-then-join vs join-then-filter. Return tuple (df_a, df_b)."

@@ -1,0 +1,156 @@
+- Class: meta
+  Lesson: "Joins — Combining Datasets"
+  EstimatedMinutes: 45
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Why Joins Are the Most Expensive Operation
+
+    In Lessons 5 and 6 you read trips, wrote Parquet, and built the city
+    dashboard. Now we combine trips with drivers and ratings to build
+    driver performance profiles. Joins are the most expensive Spark
+    operation: they require shuffling data so that rows with matching
+    keys end up on the same partition. A bad join can dominate runtime.
+    This lesson teaches join types, broadcast optimization, and skew handling.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Join Types: Inner, Left, Right, Full Outer, Cross, Anti, Semi
+
+    - **inner** — keep only rows with matches in both tables
+    - **left** — keep all left rows; right columns null when no match
+    - **right** — keep all right rows; left columns null when no match
+    - **full_outer** — keep all rows from both; nulls where no match
+    - **cross** — Cartesian product (every left row × every right row)
+    - **left_anti** — keep left rows that have NO match in right
+    - **left_semi** — keep left rows that HAVE a match in right (no right columns)
+
+    For driver profiles: inner join trips with drivers (we want only
+    trips with known drivers), then left join with ratings (not all
+    trips have ratings).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Join Syntax
+
+    ```python
+    trips.join(drivers, trips.driver_id == drivers.driver_id, "inner")
+    trips.join(drivers, "driver_id", "left")
+    ```
+
+    When the join key has the same name in both tables, use the string
+    form: `"driver_id"`. Spark automatically handles the duplicate
+    column (one copy in output). With different names, use the condition
+    form and alias or drop the duplicate column afterward.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Broadcast Joins: When the Right Table Is Small
+
+    If one table is small (e.g., drivers with 10K rows), broadcast it
+    to every executor. No shuffle of the large table:
+
+    ```python
+    from pyspark.sql.functions import broadcast
+
+    trips.join(broadcast(drivers), "driver_id")
+    ```
+
+    Spark may auto-broadcast if the small table is under
+    `spark.sql.autoBroadcastJoinThreshold` (default 10MB). Explicit
+    broadcast guarantees it and can override the threshold for
+    slightly larger tables.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Handling Join Skew: Salting
+
+    When one key (e.g., a superstar driver with 50% of trips) dominates,
+    one partition gets most of the data — skew. **Salting** adds a random
+    suffix to the key, spreading the hot key across partitions:
+
+    ```python
+    from pyspark.sql import functions as f
+
+    trips_salted = trips.withColumn("salt", (f.rand() * 10).cast("int"))
+    drivers_salted = drivers.withColumn("salt", f.explode(f.array([f.lit(i) for i in range(10)])))
+    trips_salted.join(drivers_salted, ["driver_id", "salt"])
+    ```
+
+    The driver row is replicated 10 times (one per salt); each trip
+    gets a random salt. The join distributes the hot driver across
+    10 partitions.
+
+- Class: mult_question
+  Depth: all
+  Output: "When would you use a left_anti join?"
+  AnswerChoices: "To find rows in the left table with no match in the right;To combine all columns from both tables;To get the intersection;To sort the result"
+  CorrectAnswer: "To find rows in the left table with no match in the right"
+  Hint: "Anti means 'against' — it excludes rows that have a match."
+
+- Class: mult_question
+  Depth: all
+  Output: "Why is broadcasting the small table in a join beneficial?"
+  AnswerChoices: "It compresses the data;It avoids shuffling the large table;It sorts the output;It caches the result"
+  CorrectAnswer: "It avoids shuffling the large table"
+  Hint: "The small table is sent to every executor; the large table stays put. No shuffle of the big side."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write code to inner join trips_df and drivers_df on driver_id,
+    keeping only trips that have a matching driver.
+  CorrectAnswer: |
+    result = trips_df.join(drivers_df, "driver_id", "inner")
+  Hint: "Use join with the key column and join type. When key names match, use the string form."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Driver Performance Profiles
+
+    For our platform, we build: trips joined with drivers (driver name,
+    city) and left joined with ratings (rating, comment). Then aggregate
+    per driver: total trips, total fare, avg rating. This becomes the
+    driver profile table that powers "top performers" and "driver
+    analytics" dashboards.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write code to left join trips_df with ratings_df on trip_id, so we
+    keep all trips and add rating/comment when available.
+  CorrectAnswer: |
+    result = trips_df.join(ratings_df, "trip_id", "left")
+  Hint: "Left join keeps all left (trips) rows. Use 'trip_id' as the key."
+
+- Class: mult_question
+  Depth: all
+  Output: "What problem does salting solve in a join?"
+  AnswerChoices: "Slow reads;Join skew when one key has most of the data;Memory limits;Schema mismatch"
+  CorrectAnswer: "Join skew when one key has most of the data"
+  Hint: "Skew means one partition gets way more data than others. Salting spreads the hot key."
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Driver Performance Profiles
+
+    Implement `driver_performance_profiles` that:
+    1. Inner joins trips with drivers on driver_id (use broadcast for drivers)
+    2. Left joins with ratings on trip_id
+    3. Aggregates per driver_id: total_trips, total_fare, avg_rating
+      (avg_rating only over non-null ratings; use avg which ignores nulls)
+    4. Returns the profile DataFrame
+
+    Reuses schemas from Lesson 3 (trips, drivers, ratings) and the
+    join patterns from this lesson. The result feeds the "top performers"
+    view in the capstone (Lesson 12).
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Join trips-drivers (inner, broadcast drivers), then join with ratings (left). groupBy driver_id, agg count, sum fare, avg rating."

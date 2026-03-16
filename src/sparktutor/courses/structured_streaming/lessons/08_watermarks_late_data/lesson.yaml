@@ -1,0 +1,125 @@
+- Class: meta
+  Lesson: "Watermarks & Late Data"
+  EstimatedMinutes: 45
+
+- Class: text
+  Depth: all
+  Output: |
+    ## PayGuard's Late Data Problem
+
+    Transactions arrive out of order. Network delays, retries, mobile
+    offline sync — event_time 10:00 might arrive at 10:15. Without
+    handling this, you either (a) wait forever (never output, state
+    grows) or (b) output too early (late data arrives, wrong results).
+    **Watermarks** solve this: "I expect data to be at most X late."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Watermark Concept
+
+    A watermark is a threshold on event time. Spark tracks the maximum
+    event_time seen. Watermark = max - threshold. Example: max = 10:20,
+    threshold = 10 minutes → watermark = 10:10. Spark assumes no event
+    with event_time < 10:10 will arrive. It can safely discard state
+    for windows that end before 10:10.
+
+    ```python
+    (stream_df.withWatermark("event_time", "10 minutes")
+        .groupBy(f.window("event_time", "5 minutes"), "user_id")
+        .count())
+    ```
+
+    Windows with end <= watermark get output and their state is dropped.
+    Events arriving "late" (event_time < watermark) are dropped.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## How Watermarks Bound State
+
+    Without watermark: Spark keeps state for every window forever. With
+    watermark: Spark drops state for windows older than the watermark.
+    State size = (windows within watermark range) × (keys per window).
+    Bounded. No more OOM from unbounded state.
+
+    The trade-off: too tight a watermark (e.g., 1 minute) → you drop
+    valid late data. Too loose (e.g., 24 hours) → state grows large,
+    memory pressure. PayGuard uses 10 minutes: most transactions arrive
+    within 5 minutes; 10 gives headroom without excessive state.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    ## Analogy: The Cutoff Time
+
+    Imagine a bank that closes its daily ledger at midnight. Any
+    transaction dated before yesterday is rejected — "too late." The
+    watermark is like that cutoff. Spark says: "I've seen events up to
+    10:20. I'll assume nothing before 10:10 will arrive. I can close
+    the books for windows before 10:10."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Show the Failure: Without Watermark
+
+    Run a windowed aggregation without watermark. State grows. After
+    hours, check the state store size in the Spark UI — it keeps
+    increasing. Add a watermark, restart — state stabilizes. The
+    watermark is not optional for production windowed aggregations;
+    it's required for sustainability.
+
+- Class: mult_question
+  Depth: all
+  Output: "What happens to events that arrive with event_time older than the watermark?"
+  AnswerChoices: "They are buffered;They are dropped;They trigger an error;They are written to a dead letter queue"
+  CorrectAnswer: "They are dropped"
+  Hint: "Spark assumes they will never arrive. When they do, they're too late — dropped."
+
+- Class: mult_question
+  Depth: all
+  Output: "If max event_time is 10:20 and watermark threshold is 10 minutes, what is the watermark value?"
+  AnswerChoices: "10:30;10:20;10:10;10:00"
+  CorrectAnswer: "10:10"
+  Hint: "Watermark = max_event_time - threshold. 10:20 - 10 min = 10:10."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Add a 5-minute watermark on column "event_time" to a streaming
+    DataFrame `stream_df`. Use withWatermark.
+  CorrectAnswer: |
+    stream_df.withWatermark("event_time", "5 minutes")
+  Hint: "withWatermark('event_time', '5 minutes')"
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Tuning Watermarks
+
+    - **Too tight** (e.g., 1 min): Many late events dropped. If your
+      data often arrives 2-3 minutes late, use at least 5 minutes.
+    - **Too loose** (e.g., 24 hours): State holds 24 hours of windows.
+      For 10-min windows, that's 144 windows per key. Scale by users →
+      huge state. Use the minimum that covers your actual latency.
+    - **Rule of thumb**: watermark >= 2× your p99 event latency.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Velocity Detection with Watermark
+
+    Implement `detect_velocity_with_watermark` that:
+    1. Adds a 10-minute watermark on event_time
+    2. Groups by 10-minute tumbling window and user_id, counts
+    3. Filters count > 5
+    4. Returns the result
+
+    In batch mode, withWatermark has no effect (no late data to drop).
+    The same code in streaming would bound state and handle late
+    transactions. The test validates the aggregation logic; the
+    watermark is applied for streaming compatibility.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "withWatermark before groupBy. Same window + filter as Lesson 7."

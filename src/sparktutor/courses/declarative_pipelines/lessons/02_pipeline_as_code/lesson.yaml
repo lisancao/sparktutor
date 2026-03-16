@@ -1,0 +1,202 @@
+- Class: meta
+  Lesson: "Pipeline as Code — The Decorator Framework"
+  EstimatedMinutes: 35
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Why Declarative Over Imperative
+
+    **Imperative**: "First run bronze, then silver, then gold. Call each
+    function in order. If silver fails, catch the exception and log it."
+    You write the execution order. You maintain the dependency graph by
+    hand. Add a new step? Update three places.
+
+    **Declarative**: "Here are my pipeline steps. Each one declares what
+    it reads and what it writes. Figure out the order." The framework
+    infers dependencies from `spark.table()` calls. Add a new step? Just
+    register it. Order is automatic.
+
+    For ShopStream, we want: bronze_clicks → silver_clicks → gold_daily.
+    The Pipeline class will detect that silver_clicks reads bronze_clicks
+    and gold_daily reads silver_clicks, then execute in topological order.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    ## The @materialized_view() Decorator
+
+    A materialized view is a named result that gets computed and stored.
+    In our Pipeline, each step is a function that produces a DataFrame
+    and registers it as a table:
+
+    ```python
+    pipeline = Pipeline(spark)
+
+    @pipeline.materialized_view("bronze_clicks")
+    def bronze_clicks():
+        return spark.read.csv("/data/clicks.csv", header=True)
+    ```
+
+    When the pipeline runs, it will execute `bronze_clicks()`, take the
+    result, and register it as the table `bronze_clicks`. Any later step
+    that does `spark.table("bronze_clicks")` depends on this step.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Dependency Detection via spark.table()
+
+    The Pipeline inspects each function's implementation. If the body
+    contains a call to `spark.table("some_name")`, that step depends on
+    the step that produces `some_name`.
+
+    ```python
+    @pipeline.materialized_view("silver_clicks")
+    def silver_clicks():
+        raw = spark.table("bronze_clicks")  # dependency!
+        return raw.withColumn("price", f.col("price").cast("double"))
+    ```
+
+    The Pipeline parses this, builds a graph: bronze_clicks → silver_clicks.
+    Topological sort yields execution order: bronze_clicks first, then
+    silver_clicks.
+
+    **Limitation**: This requires static analysis. Dynamic table names
+    like `spark.table(tbl)` won't be detected. For this course we use
+    literal strings.
+
+- Class: mult_question
+  Depth: all
+  Output: "What does the Pipeline use to infer execution order?"
+  AnswerChoices: "spark.table() references in function bodies;The order functions are registered;A manually specified dependency list;Configuration file"
+  CorrectAnswer: "spark.table() references in function bodies"
+  Hint: "The framework inspects what each step reads. Reading a table means depending on the step that produces it."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Topological Sort for Execution
+
+    A directed acyclic graph (DAG) of steps: A → B → C means A must run
+    before B, B before C. Topological sort produces a valid order: [A, B, C].
+
+    Algorithm: repeatedly pick a node with no unvisited predecessors,
+    add it to the order, mark it visited. Repeat until all nodes are done.
+
+    If the graph has a cycle (A → B → C → A), no valid order exists. The
+    Pipeline should detect this and raise an error.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write a Pipeline class with a `materialized_view(name)` decorator that
+    appends (name, func) to a list `self.steps`. Assume `__init__(self, spark)`
+    stores spark and initializes steps.
+  CorrectAnswer: |
+    class Pipeline:
+        def __init__(self, spark):
+            self.spark = spark
+            self.steps = []
+
+        def materialized_view(self, name):
+            def decorator(func):
+                self.steps.append((name, func))
+                return func
+            return decorator
+  Hint: "The decorator is a function that returns a decorator. The inner decorator receives func and appends (name, func) to self.steps."
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "Why is declarative pipeline ordering better than manually calling functions in sequence?"
+  AnswerChoices: "Dependencies are inferred — add steps without updating call order;It runs faster;It uses less memory;It supports streaming only"
+  CorrectAnswer: "Dependencies are inferred — add steps without updating call order"
+  Hint: "Declarative means you declare what each step does; the framework figures out the order."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Extracting spark.table() References
+
+    To detect dependencies, the Pipeline must parse each function's source
+    code. Options:
+
+    1. **ast.parse** — Parse the function's `__code__` or inspect.getsource.
+      Walk the AST for `Call` nodes where the function is `spark.table`
+      or `self.spark.table`, and the argument is a string literal.
+    2. **Regex** — Simpler but fragile: match `spark\.table\s*\(\s*["'](\w+)["']`
+      to extract table names.
+
+    For this course, a simple regex or AST walk is sufficient. Production
+    pipelines might use more sophisticated analysis or explicit dependency
+    declarations.
+
+- Class: cmd_question
+  Depth: intermediate
+  Output: |
+    Given a list of steps [(name, func), ...] where func may call
+    spark.table("dep_name"), write a function `get_dependencies(step_name, func)`
+    that returns a list of table names the func depends on. Use a simple
+    regex: spark\.table\s*\(\s*["'](\w+)["']\s*\)
+  CorrectAnswer: |
+    import re
+    def get_dependencies(step_name, func):
+        import inspect
+        src = inspect.getsource(func)
+        return re.findall(r'spark\.table\s*\(\s*["\'](\w+)["\']\s*\)', src)
+  Hint: "inspect.getsource(func) gives the source; re.findall with the pattern extracts table names."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Run Method
+
+    Once you have steps and dependencies, `run()` does:
+
+    1. Build the dependency graph
+    2. Topological sort to get execution order
+    3. For each step in order: call the function, register the result
+       as a temp view or table with the step name
+    4. Return a report (steps run, row counts, duration)
+
+    The spark session must be passed to each function (or captured in
+    closure). Each step's output becomes available for the next.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Build the Pipeline Class
+
+    Implement the Pipeline class with:
+
+    1. `__init__(self, spark)` — store spark, init empty steps list
+    2. `materialized_view(self, name)` — decorator that appends (name, func)
+       to steps
+    3. `_get_dependencies(self, func)` — extract table names from
+       spark.table("name") calls in func source (use regex or ast)
+    4. `_topological_order(self)` — return step names in dependency order
+    5. `run(self)` — execute steps in order, register each result as
+       spark.createOrReplaceTempView(name), return list of (name, row_count)
+
+    Register 3 dummy functions: step_a (no deps), step_b (reads step_a),
+    step_c (reads step_b). Verify run() executes in order a, b, c and
+    row counts are correct.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Use inspect.getsource for dependency extraction. Topological sort: while nodes remain, pick one with no unsatisfied deps. run() creates DataFrames, registers temp views, counts rows."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    You built a declarative Pipeline framework:
+
+    - **@materialized_view(name)** — registers a step that produces a named table
+    - **Dependency detection** — spark.table() references define the graph
+    - **Topological sort** — execution order is automatic
+    - **run()** — executes in order, registers results, returns report
+
+    In the next lesson, you will implement **bronze ingestion** for
+    ShopStream click events — the first real data layer that this
+    Pipeline will orchestrate.

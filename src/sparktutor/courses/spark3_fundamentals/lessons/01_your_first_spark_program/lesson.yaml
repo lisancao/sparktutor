@@ -1,0 +1,226 @@
+- Class: meta
+  Lesson: "Your First Spark Program"
+  EstimatedMinutes: 30
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Ride-Sharing Analytics Platform
+
+    Over the next 12 lessons, you will build a complete **ride-sharing analytics
+    platform** — the kind of system that powers companies like Uber and Lyft.
+    Your data includes trips, drivers, riders, payments, and ratings. Every lesson
+    adds a real capability to this platform. By the capstone, you will have a
+    working end-to-end pipeline.
+
+    This first lesson gets you from zero to your first Spark program. You will
+    create a SparkSession, build a DataFrame from trip data, and understand
+    why Spark's lazy evaluation model matters.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Why Distributed Computing Exists
+
+    Imagine your ride-sharing company stores 10 billion trip records. A single
+    machine cannot hold that data in memory. Even if it could, processing it
+    sequentially would take days. **Distributed computing** splits the work
+    across many machines. Each machine processes its slice in parallel. What
+    would take one machine a week might take 100 machines a few hours.
+
+    Apache Spark is built for exactly this: processing data that does not fit
+    on one machine, across a cluster of machines, with a simple programming
+    model. You write transformations; Spark figures out how to run them in
+    parallel.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    ## Analogy: The Trip Coordinator
+
+    Think of Spark like a ride-sharing operations center:
+
+    - The **Driver** is the **dispatcher** — it receives your program (the
+      "order"), plans which workers handle which data, and coordinates the
+      result. It does not process trip records itself.
+    - **Executors** are the **field analysts** — each one processes its
+      assigned chunk of trips (filtering, aggregating, joining). They work
+      in parallel across the cluster.
+    - When you ask "how many trips per city?", the dispatcher breaks the
+      question into tasks and sends them to analysts. Each analyst counts
+      their partition; results are combined and returned.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## SparkSession: The Entry Point
+
+    Every Spark program starts with a **SparkSession**. It is the gateway to
+    DataFrames, SQL, and the catalog. You create one using the **builder pattern**:
+
+    ```python
+    from pyspark.sql import SparkSession
+
+    spark = (SparkSession.builder
+        .appName("RideShareAnalytics")
+        .master("local[*]")
+        .getOrCreate())
+    ```
+
+    - `appName` — identifies your application in the Spark UI
+    - `master("local[*]")` — run locally using all CPU cores (for development)
+    - `getOrCreate()` — creates a new session or returns the existing one
+
+    For production, you would set `master` to a cluster URL (e.g., `spark://host:7077`).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Your First DataFrame: Trip Data
+
+    Let's create a DataFrame from Python data representing ride-sharing trips.
+    Each row is one trip: city, rider_id, fare, distance_miles, and timestamp.
+
+    ```python
+    trips_data = [
+        ("SF", "r1", 12.50, 5.2, "2024-01-15 08:30:00"),
+        ("NYC", "r2", 22.00, 8.1, "2024-01-15 09:15:00"),
+        ("SF", "r3", 8.75, 3.0, "2024-01-15 10:00:00"),
+        ("LA", "r1", 15.00, 6.5, "2024-01-15 11:00:00"),
+    ]
+    columns = ["city", "rider_id", "fare", "distance_miles", "pickup_time"]
+
+    trips_df = spark.createDataFrame(trips_data, columns)
+    trips_df.show()
+    ```
+
+    `createDataFrame` turns Python structures into a distributed DataFrame.
+    The data is partitioned across executors; you work with it as one logical
+    table.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Actions vs Transformations: The Lazy Evaluation Model
+
+    Spark uses **lazy evaluation**. When you call `select()`, `filter()`, or
+    `withColumn()`, Spark does *not* execute immediately. It builds a **logical
+    plan** — a recipe for what to compute. Nothing runs until you call an
+    **action** — a method that produces a result or side effect.
+
+    **Transformations** (lazy): `select`, `filter`, `withColumn`, `groupBy`, `join`
+    **Actions** (eager): `show()`, `count()`, `collect()`, `write`
+
+    Why lazy? Spark can analyze the entire plan, optimize it (e.g., push filters
+    down to the data source), and execute it in one shot. If you called
+    `count()` and then `show()`, Spark would run the plan twice. Lazy
+    evaluation lets it fuse operations and run once.
+
+- Class: mult_question
+  Depth: all
+  Output: "What would happen if Spark executed every transformation immediately instead of lazily?"
+  AnswerChoices: "Spark could not optimize across the full pipeline;Execution would be faster;Data would be cached automatically;Transformations would fail"
+  CorrectAnswer: "Spark could not optimize across the full pipeline"
+  Hint: "The optimizer needs to see the whole plan to apply predicate pushdown, column pruning, and other optimizations."
+
+- Class: mult_question
+  Depth: all
+  Output: "Which of these is an action that triggers execution?"
+  AnswerChoices: "select();filter();count();withColumn()"
+  CorrectAnswer: "count()"
+  Hint: "Actions produce a result or side effect. count() returns a number; select() returns a DataFrame (a transformation)."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Create a SparkSession with app name `'TripCounter'` and master `'local[*]'`.
+    Store it in a variable named `spark`.
+  CorrectAnswer: |
+    from pyspark.sql import SparkSession
+
+    spark = SparkSession.builder.appName("TripCounter").master("local[*]").getOrCreate()
+  Hint: "Use SparkSession.builder, chain .appName() and .master(), then .getOrCreate()."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Counting Rides per City
+
+    To answer "how many trips per city?", you chain transformations and finish
+    with an action:
+
+    ```python
+    from pyspark.sql import functions as f
+
+    trips_per_city = (trips_df
+        .groupBy("city")
+        .agg(f.count("*").alias("trip_count"))
+        .orderBy(f.col("trip_count").desc()))
+
+    trips_per_city.show()
+    ```
+
+    - `groupBy("city")` — groups rows by city
+    - `agg(f.count("*").alias("trip_count"))` — counts rows per group
+    - `orderBy(f.col("trip_count").desc())` — sorts by count descending
+
+    The `show()` at the end is the action that triggers execution.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## What Happens When You Call an Action
+
+    When you call `show()` or `count()`, Spark's execution engine kicks in:
+
+    1. **DAG Scheduler** — converts your logical plan into a Directed Acyclic
+       Graph (DAG) of stages. Stages are separated at **shuffle boundaries** —
+       points where data must be redistributed (e.g., after `groupBy`).
+
+    2. **Task Scheduler** — creates one task per partition per stage. Tasks
+       run in parallel on executors.
+
+    3. **Shuffle** — for `groupBy`, rows with the same key (city) must end up
+       on the same partition. Spark shuffles data across the network. This is
+       the most expensive operation; we will learn to optimize it later.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Given a DataFrame `trips_df` with a `city` column, write code to group by
+    city, count the number of rows (alias as `ride_count`), and order by
+    ride_count descending.
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+
+    result = (trips_df
+        .groupBy("city")
+        .agg(f.count("*").alias("ride_count"))
+        .orderBy(f.col("ride_count").desc()))
+  Hint: "Use groupBy, agg with f.count('*') and alias, then orderBy with desc()."
+
+- Class: mult_question
+  Depth: all
+  Output: "Why does Spark use lazy evaluation for transformations?"
+  AnswerChoices: "To avoid running code;To enable whole-plan optimization;To reduce memory usage;To support streaming"
+  CorrectAnswer: "To enable whole-plan optimization"
+  Hint: "The Catalyst optimizer analyzes the full logical plan before execution to apply optimizations."
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Trips per City
+
+    Implement `trips_per_city` that:
+    1. Creates a SparkSession with app name `"RideShare"` and master `"local[*]"`
+    2. Builds a trips DataFrame from the provided Python data (city, rider_id,
+       fare, distance_miles, pickup_time)
+    3. Groups by city and counts rides (alias as `ride_count`)
+    4. Orders by ride_count descending
+    5. Returns the resulting DataFrame
+
+    This exercises SparkSession creation, createDataFrame, groupBy, agg, and
+    orderBy — the foundation for everything that follows.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Create SparkSession, createDataFrame with columns, groupBy city, agg with f.count('*').alias('ride_count'), orderBy desc."

@@ -1,0 +1,174 @@
+- Class: meta
+  Lesson: "The New Python DataFrame API"
+  EstimatedMinutes: 35
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Building on Connect
+
+    Lessons 01 and 02 gave you version detection and Connect-compatible code.
+    Now we focus on **Spark 4's new Python DataFrame API** — type-annotated
+    columns, improved chaining, and the `.transform()` method for composable
+    pipelines. Your e-commerce product analytics will use these patterns.
+
+    We'll rewrite product queries using the new API and compose them with
+    `.transform()`.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Type-Annotated Column Class
+
+    In Spark 3, `Column` had no type hints. In Spark 4, the Python API is
+    fully type-annotated:
+
+    ```python
+    # Spark 4 — Column is typed
+    from pyspark.sql import Column
+    def add_tax(col: Column, rate: float) -> Column:
+        return col * (1 + rate)
+    ```
+
+    IDEs and type checkers can infer types. Method signatures like
+    `DataFrame.select(*cols: Column) -> DataFrame` make chaining predictable.
+    Error messages improve: "expected Column, got str" instead of cryptic JVM
+    stack traces.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## New Chaining Patterns
+
+    Spark 4 encourages fluent chaining. Methods return `DataFrame` so you can
+    chain without intermediate variables:
+
+    ```python
+    # Spark 3 — same, but Spark 4 has better inference
+    df = (orders_df
+        .select("order_id", "product_id", "quantity", "price")
+        .withColumn("line_total", f.col("quantity") * f.col("price"))
+        .filter(f.col("quantity") > 0))
+    ```
+
+    Spark 4 adds `.transform()` — pass a function that takes a DataFrame and
+    returns a DataFrame. This enables reusable pipeline stages.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The .transform() Method
+
+    `.transform(func)` applies a function to the DataFrame and returns the
+    result. The function signature: `(df: DataFrame) -> DataFrame`.
+
+    ```python
+    def add_line_total(df):
+        return df.withColumn("line_total", f.col("quantity") * f.col("price"))
+
+    def filter_valid_quantity(df):
+        return df.filter(f.col("quantity") > 0)
+
+    result = (orders_df
+        .transform(add_line_total)
+        .transform(filter_valid_quantity))
+    ```
+
+    This is composable: each function is a pipeline stage. You can test
+    stages in isolation and combine them in different orders.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Python-Native Type Hints
+
+    Throughout the API you'll see:
+
+    - `DataFrame.select(*cols: Union[str, Column]) -> DataFrame`
+    - `DataFrame.filter(condition: Column) -> DataFrame`
+    - `functions.col(name: str) -> Column`
+
+    Use these for better tooling. Your product analytics functions can be
+    annotated:
+
+    ```python
+    def product_revenue_by_category(df: DataFrame) -> DataFrame:
+        return df.groupBy("category").agg(f.sum("revenue").alias("total_revenue"))
+    ```
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Improved Error Messages
+
+    Spark 3 often surfaced JVM exceptions. Spark 4's Python layer validates
+    arguments and raises clearer errors:
+
+    - Passing a string where a Column is expected: "condition must be a
+      Column expression"
+    - Invalid column name: "column 'xyz' not found"
+    - Type mismatch in UDF: Python-side validation before JVM call
+
+    This speeds up debugging during migration.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## transform() Under the Hood
+
+    `df.transform(func)` is equivalent to `func(df)`. It's syntactic sugar
+    for function composition. The logical plan is unchanged — Spark still
+    optimizes the full pipeline. The benefit is code organization: small
+    functions, each doing one thing, composed via transform.
+
+- Class: mult_question
+  Depth: all
+  Output: "What is the main benefit of using .transform() for pipeline stages?"
+  AnswerChoices: "Faster execution;Composable, testable stages;Smaller plans;Fewer shuffles"
+  CorrectAnswer: "Composable, testable stages"
+  Hint: "Each transform is a function (df) -> df. You can test stages in isolation and reuse them."
+
+- Class: mult_question
+  Depth: all
+  Output: "Why does Spark 4 add type annotations to the Python DataFrame API?"
+  AnswerChoices: "To improve performance;For better IDE support and error messages;To reduce memory;To enable streaming"
+  CorrectAnswer: "For better IDE support and error messages"
+  Hint: "Type hints enable autocomplete, refactoring, and clearer validation errors."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write a function `add_discount(df)` that adds a column "discounted_price"
+    = price * (1 - 0.1) when a column "price" exists. Use .transform() in
+    the caller. Return the transformed DataFrame.
+  CorrectAnswer: |
+    from pyspark.sql import DataFrame
+    from pyspark.sql import functions as f
+
+    def add_discount(df: DataFrame) -> DataFrame:
+        return df.withColumn("discounted_price", f.col("price") * 0.9)
+  Hint: "withColumn with price * 0.9. The caller uses df.transform(add_discount)."
+
+- Class: mult_question
+  Depth: all
+  Output: "How does transform(func) differ from calling func(df) directly?"
+  AnswerChoices: "transform is faster;No difference — transform is syntactic sugar;transform runs on executor;transform caches the result"
+  CorrectAnswer: "No difference — transform is syntactic sugar"
+  Hint: "df.transform(func) returns func(df). It's for readability and chaining."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Exercise: Product Analytics with transform()
+
+    Rewrite product analytics using the new API. You will:
+    1. Implement `add_revenue(df)` — add column revenue = quantity * price
+    2. Implement `top_products_by_revenue(df, n)` — group by product_id, sum
+       revenue, order desc, limit n
+    3. Compose them: `df.transform(add_revenue).transform(lambda d: top_products_by_revenue(d, 3))`
+
+    Use the orders line items data from the starter. This builds on the
+    Connect-compatible pipeline from Lesson 02.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "add_revenue: withColumn revenue = quantity * price. top_products: groupBy product_id, agg sum revenue, orderBy desc, limit n."

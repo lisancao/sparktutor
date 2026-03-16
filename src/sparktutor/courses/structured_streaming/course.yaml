@@ -1,0 +1,24 @@
+course:
+  id: structured_streaming
+  title: "Spark Structured Streaming: Building Real-Time Fraud Detection"
+  description: "Master real-time data processing by building a production fraud detection system — from first stream to windowed aggregations, watermarks, and alerting"
+  version: "1.0.0"
+  requires_lakehouse: false
+  prerequisites:
+    - "Python 3.10+"
+    - "pip install pyspark"
+    - "Completed Spark 3 Fundamentals course (recommended)"
+  lessons:
+    - 01_batch_to_streaming
+    - 02_your_first_stream
+    - 03_sources_sinks_deep_dive
+    - 04_output_modes_triggers
+    - 05_stateless_transformations
+    - 06_stateful_aggregations
+    - 07_windowed_aggregations
+    - 08_watermarks_late_data
+    - 09_stream_static_stream_joins
+    - 10_checkpointing_fault_tolerance
+    - 11_monitoring_operations
+    - 12_continuous_realtime_processing
+    - 13_capstone_fraud_detection_pipeline

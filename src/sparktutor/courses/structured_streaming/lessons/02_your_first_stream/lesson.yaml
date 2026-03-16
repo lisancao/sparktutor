@@ -1,0 +1,188 @@
+- Class: meta
+  Lesson: "Your First Stream"
+  EstimatedMinutes: 30
+
+- Class: text
+  Depth: all
+  Output: |
+    ## PayGuard's Transaction Stream
+
+    PayGuard receives transaction events from payment gateways, mobile apps,
+    and point-of-sale systems. These events arrive as files dropped into a
+    directory (or as Kafka messages). Your first streaming job will read
+    new PayGuard transaction files and print summaries to the console —
+    the foundation for all downstream fraud detection.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## readStream with File Source
+
+    The file source watches a directory for new files. When a new file
+    appears, Spark reads it as the next micro-batch. Supported formats:
+    CSV, JSON, Parquet, ORC. PayGuard receives transactions as JSON files:
+
+    ```python
+    stream_df = (spark.readStream
+        .format("json")
+        .schema(tx_schema)
+        .load("/data/payguard/transactions/"))
+    ```
+
+    **Critical**: You must provide `.schema()`. `inferSchema` does not
+    exist for streaming — there is no complete dataset to sample.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    ## Why New Files = New Data
+
+    Think of the directory as a mailbox. Each new file is a new letter.
+    Spark periodically checks the mailbox. When it finds new letters
+    (files), it reads them and processes them as one micro-batch. Files
+    are processed exactly once (based on modification time). If you add
+    files while the stream is running, they will be picked up in the
+    next trigger.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## writeStream to Console Sink
+
+    The console sink prints results to stdout — perfect for debugging.
+    Each micro-batch produces a table output:
+
+    ```python
+    query = (result_df.writeStream
+        .outputMode("append")
+        .format("console")
+        .start())
+
+    query.awaitTermination()
+    ```
+
+    `start()` returns a `StreamingQuery` object. `awaitTermination()`
+    blocks until the query is stopped (e.g., Ctrl+C). For stateless
+    transforms like `select` and `filter`, `append` mode outputs only
+    new rows each batch.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## StreamingQuery Lifecycle
+
+    ```python
+    query = result_df.writeStream.format("console").start()
+
+    query.id
+    query.runId
+    query.status
+    query.lastProgress
+    query.stop()
+    query.awaitTermination()
+    ```
+
+    - `start()` — begins the query; returns immediately
+    - `awaitTermination()` — blocks until stopped
+    - `stop()` — gracefully stops the query
+    - `lastProgress` — latest batch info (rows processed, duration)
+    - `status` — current state (ACTIVE, STOPPED, etc.)
+
+    In production, you might run `start()` and then monitor `lastProgress`
+    from another thread or a monitoring system.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## A Complete File-Based Stream (Conceptual)
+
+    ```python
+    stream_df = (spark.readStream
+        .format("json")
+        .schema(tx_schema)
+        .load("/data/payguard/transactions/"))
+
+    summary = stream_df.select("tx_id", "user_id", "amount", "event_time")
+
+    query = (summary.writeStream
+        .outputMode("append")
+        .format("console")
+        .start("/tmp/checkpoint"))
+
+    query.awaitTermination()
+    ```
+
+    We use `select` (stateless) so `append` mode works. The checkpoint
+    location (optional but recommended) enables fault tolerance — we will
+    cover this in Lesson 10.
+
+- Class: mult_question
+  Depth: all
+  Output: "Why must you provide an explicit schema when using readStream with a file source?"
+  AnswerChoices: "To improve performance;There is no complete dataset to infer from at read time;To support Parquet;To enable checkpointing"
+  CorrectAnswer: "There is no complete dataset to infer from at read time"
+  Hint: "inferSchema samples data. In streaming, data arrives over time — nothing to sample."
+
+- Class: mult_question
+  Depth: all
+  Output: "What does awaitTermination() do?"
+  AnswerChoices: "Starts the query;Blocks until the query is stopped;Writes to the sink;Checks for new data"
+  CorrectAnswer: "Blocks until the query is stopped"
+  Hint: "It keeps the main thread alive so the streaming query can run."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## File Source Behavior: Exactly-Once Semantics
+
+    The file source assigns each file to exactly one micro-batch based on
+    its modification time. Once processed, Spark tracks which files were
+    read (in the checkpoint). On restart, it will not re-read them. This
+    gives exactly-once processing for file sources — no duplicates, no
+    missed files (as long as you use checkpointing).
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write the code to create a readStream from JSON files at path "/data/tx",
+    using schema `tx_schema`, and assign the result to `stream_df`.
+  CorrectAnswer: |
+    stream_df = (spark.readStream
+        .format("json")
+        .schema(tx_schema)
+        .load("/data/tx"))
+  Hint: "readStream, format json, schema, load with path."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## What Happens When No New Files Arrive?
+
+    If the directory is empty or no new files appear, Spark still triggers
+    (based on the trigger setting). Each trigger produces an empty
+    micro-batch — no output is written. The query stays active, waiting.
+    This is normal. PayGuard's transaction stream might have quiet
+    periods (e.g., overnight) with no new files. The query keeps running.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: File-Based Stream Simulation
+
+    Implement `process_transaction_stream` that simulates a file-based
+    stream using batch DataFrames. The function receives a list of
+    transaction DataFrames (each representing one "file" or micro-batch),
+    processes them with the same logic a stream would use, and returns
+    a combined summary.
+
+    Requirements:
+    1. For each "batch" (DataFrame), select tx_id, user_id, amount, event_time
+    2. Union all batches and return the result (simulating append output)
+    3. The test harness creates sample data mimicking multiple files
+    4. Same transformations would work with readStream in production
+
+    This validates your streaming logic without requiring actual files or
+    a running stream. The same code structure applies to readStream.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "For each batch df, select the columns. Union all results. Use reduce or a loop."

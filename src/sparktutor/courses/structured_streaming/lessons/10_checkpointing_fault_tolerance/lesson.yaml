@@ -1,0 +1,123 @@
+- Class: meta
+  Lesson: "Checkpointing & Fault Tolerance"
+  EstimatedMinutes: 35
+
+- Class: text
+  Depth: all
+  Output: |
+    ## PayGuard's Streaming Uptime
+
+    PayGuard's fraud detection runs 24/7. When a node crashes, a deploy
+    fails, or the cluster restarts, the query must recover without data
+    loss or duplication. **Checkpointing** is the mechanism. Without it:
+    restart from scratch and reprocess everything (or worse, lose
+    offsets and duplicate or skip data).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What Happens Without Checkpoints
+
+    When your streaming query crashes:
+    - **No checkpoint**: Spark doesn't know which offsets were processed.
+      On restart, it might re-read from the beginning (duplicates) or
+      use a default (skip data). State is lost. Exactly-once is
+      impossible.
+    - **With checkpoint**: Spark stores offsets, state, and metadata in
+      the checkpoint directory. On restart, it reads the checkpoint,
+      resumes from the last committed offset, and restores state. No
+      duplicates, no gaps (for idempotent sinks).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Checkpoint Location
+
+    ```python
+    query = (result_df.writeStream
+        .outputMode("update")
+        .option("checkpointLocation", "/checkpoints/payguard_fraud")
+        .format("console")
+        .start())
+    ```
+
+    The checkpoint stores:
+    - **Offsets**: Which source records were processed (Kafka offsets,
+      file paths)
+    - **State**: Aggregation state (for groupBy, windows)
+    - **Metadata**: Query ID, batch IDs, etc.
+
+    Never share a checkpoint between two different queries. Never clear
+    the checkpoint without understanding the consequences.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Exactly-Once Semantics
+
+    Exactly-once requires:
+    1. **Replayable source**: Kafka, file source — can re-read from
+       offsets. Socket is not replayable.
+    2. **Checkpoint**: Tracks what was processed.
+    3. **Idempotent sink**: Writing the same data twice produces the
+       same result. Parquet with unique paths per batch (e.g., batch_id
+       in path) is idempotent. Console is not (you'd see duplicates).
+    4. **Deterministic processing**: Same input → same output.
+
+    PayGuard uses Kafka (replayable) + checkpoint + Parquet (idempotent
+    with batch_id in path). Exactly-once for alerts.
+
+- Class: mult_question
+  Depth: all
+  Output: "What does the checkpoint store?"
+  AnswerChoices: "Only offsets;Offsets, state, and metadata;Only state;Only metadata"
+  CorrectAnswer: "Offsets, state, and metadata"
+  Hint: "Checkpoint stores everything needed to resume: where we are, what we've computed, and query info."
+
+- Class: mult_question
+  Depth: all
+  Output: "Which of these is NOT required for exactly-once in Structured Streaming?"
+  AnswerChoices: "Replayable source;Checkpoint;Idempotent sink;Socket source"
+  CorrectAnswer: "Socket source"
+  Hint: "Socket is not replayable. You need Kafka or file source for exactly-once."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Add checkpoint location "/checkpoints/my_query" to a writeStream
+    for result_df. Use option().
+  CorrectAnswer: |
+    result_df.writeStream.option("checkpointLocation", "/checkpoints/my_query").start()
+  Hint: "option('checkpointLocation', '/checkpoints/my_query')"
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Recovery: When to Clear the Checkpoint
+
+    - **Logic change** (e.g., you change the aggregation): The old
+      checkpoint has incompatible state. Clear it and restart. You will
+      reprocess from the beginning. For Kafka, use "earliest" or
+      specific offsets to start fresh.
+    - **Bug fix** (same logic): Keep checkpoint. Restart. Spark resumes.
+    - **New query**: Never reuse an old checkpoint. Use a new path.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Checkpointed Query Config and Batch Processing
+
+    Implement two functions:
+
+    1. `build_checkpointed_query_config`: Returns a dict with keys
+       checkpoint_location and output_mode. Takes path and mode as args.
+       Simulates the options you'd pass to writeStream.option().
+
+    2. `process_batches_with_aggregation`: Given a list of transaction
+       DataFrames (simulating micro-batches), union them and aggregate
+       by user_id (count, sum amount). Return the result. In streaming,
+       each batch would update state; checkpoint would persist it. Here
+       we union all and aggregate to validate the logic.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Config: dict with checkpointLocation, outputMode. Process: union DataFrames, groupBy user_id, agg."

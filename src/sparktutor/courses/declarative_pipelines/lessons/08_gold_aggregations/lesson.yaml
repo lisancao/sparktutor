@@ -1,0 +1,145 @@
+- Class: meta
+  Lesson: "Gold — Business Aggregations"
+  EstimatedMinutes: 40
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Designing Gold Around Business Questions
+
+    Silver has clean, enriched records. Gold answers business questions:
+    "What was daily revenue by product category?" "What's the hourly
+    conversion rate?" "Which products sell best?"
+
+    Gold tables are **pre-aggregated** for dashboards. Instead of
+    querying silver with complex groupBy every time, we materialize the
+    result. Dashboards read gold. Fast. Simple.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    ## groupBy + agg Patterns
+
+    ```python
+    daily_revenue = (orders
+        .groupBy(f.to_date("created_at").alias("date"), "category")
+        .agg(f.sum("amount").alias("revenue"), f.count("*").alias("order_count"))
+        .orderBy("date", f.col("revenue").desc()))
+    ```
+
+    Key: choose the right grouping columns (date, category, product).
+    Aggregations: sum, count, avg, min, max. Alias for clarity.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Pre-Aggregated vs Ad-Hoc
+
+    **Pre-aggregate** when:
+    - The query is run often (dashboard refresh)
+    - The aggregation is expensive (large silver table)
+    - You need consistent metrics (same logic for everyone)
+
+    **Ad-hoc** when:
+    - One-off analysis
+    - Exploratory queries
+    - Metrics change frequently
+
+    ShopStream: daily revenue by category — pre-aggregate. Ad-hoc:
+    "Revenue by zip code last Tuesday" — query silver or a more granular
+    gold table.
+
+- Class: mult_question
+  Depth: all
+  Output: "When should you pre-aggregate a gold table instead of querying silver directly?"
+  AnswerChoices: "When the query runs often and aggregation is expensive;Always — gold is always faster;Never — silver is sufficient;Only for small datasets"
+  CorrectAnswer: "When the query runs often and aggregation is expensive"
+  Hint: "Pre-aggregation trades storage for query speed. Use when the same aggregation is needed repeatedly."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Conversion Rate as a KPI
+
+    Conversion = (purchases / sessions) or (orders / clicks). Requires
+    joining or aggregating different event types.
+
+    ```python
+    clicks_per_hour = (clicks.filter(f.col("event_type") == "click")
+        .groupBy(f.date_trunc("hour", "timestamp").alias("hour"))
+        .agg(f.count("*").alias("clicks")))
+    orders_per_hour = orders.groupBy(...).agg(f.count("*").alias("orders"))
+    conversion = clicks_per_hour.join(orders_per_hour, "hour").withColumn(
+        "conversion_rate", f.col("orders") / f.col("clicks"))
+    ```
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "If a price column contains nulls, what does f.sum('price') return?"
+  AnswerChoices: "Sum of non-null values — nulls are ignored;Null;Zero;Error"
+  CorrectAnswer: "Sum of non-null values — nulls are ignored"
+  Hint: "SQL aggregates skip null. sum(1, 2, null, 3) = 6."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write a groupBy that aggregates orders by date and category: sum of
+    amount as revenue, count as order_count. Use f.to_date for date.
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+
+    gold = (orders
+        .groupBy(f.to_date("created_at").alias("date"), "category")
+        .agg(f.sum("amount").alias("revenue"), f.count("*").alias("order_count")))
+  Hint: "groupBy with to_date and category. agg with sum and count. Use alias for clarity."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Granularity Trade-offs
+
+    Daily revenue by category: 365 * 10 = 3,650 rows per year. Small.
+    Hourly revenue by product: 8760 * 1000 = 8.7M rows. Larger.
+    Event-level: don't aggregate — that's silver.
+
+    Choose granularity based on: dashboard needs, storage, refresh time.
+    Can have multiple gold tables at different granularities for
+    different use cases.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Build Gold Tables for ShopStream
+
+    Implement two functions:
+
+    1. `gold_daily_revenue_by_category(orders_df)` — orders have
+       created_at, category, amount. Group by date (to_date(created_at))
+       and category. Sum amount as revenue, count as order_count.
+
+    2. `gold_hourly_conversion(clicks_df, orders_df)` — clicks have
+       timestamp, event_type; orders have created_at. For each hour,
+       count clicks (event_type='click') and orders. Compute
+       conversion_rate = orders / clicks. Handle division by zero (null
+       or 0 when clicks=0).
+
+    The test creates sample data and verifies row counts and column
+    presence.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "gold_daily: groupBy to_date, category. agg sum, count. gold_hourly: groupBy date_trunc hour for both, join, withColumn conversion_rate. Use when(clicks>0, orders/clicks).otherwise(None)."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    Gold business aggregations:
+
+    - **groupBy + agg** — sum, count, avg for KPIs
+    - **Pre-aggregate** — when queries are frequent and expensive
+    - **Design around questions** — daily revenue, conversion rate
+    - **Granularity** — balance detail vs size
+
+    In the next lesson, you will add **window functions** — rankings,
+    trends, period-over-period comparisons — for executive dashboards.

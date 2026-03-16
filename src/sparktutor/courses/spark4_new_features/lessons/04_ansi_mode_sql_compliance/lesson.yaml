@@ -1,0 +1,186 @@
+- Class: meta
+  Lesson: "ANSI Mode & SQL Compliance"
+  EstimatedMinutes: 40
+
+- Class: text
+  Depth: all
+  Output: |
+    ## When the Pipeline Breaks
+
+    Your e-commerce pipeline from Lessons 01–03 runs on Spark 4. Suddenly,
+    queries that worked in Spark 3 fail with overflow errors, division-by-zero
+    exceptions, or type mismatch errors. **ANSI mode** is the culprit — Spark 4
+    defaults to strict SQL compliance. This lesson teaches what breaks and how
+    to fix it with `try_*` functions.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What ANSI Mode Means
+
+    ANSI SQL compliance enforces:
+
+    1. **Strict type checking** — Implicit casts (e.g., string to int) fail.
+       Use `cast()` or `try_cast()` explicitly.
+
+    2. **Overflow errors** — Integer addition/multiplication that overflows
+       throws instead of wrapping. Use `try_add`, `try_multiply` for safe
+       fallback to null.
+
+    3. **Division by zero** — Throws instead of returning null. Use
+       `try_divide` to get null on divide-by-zero.
+
+    4. **Invalid datetime** — Malformed dates throw. Use `try_to_timestamp`
+       for null on parse failure.
+
+    The goal: surface data quality issues early rather than silently
+    corrupting results.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What Was Permissive in Spark 3
+
+    In Spark 3 with ANSI off (default):
+
+    ```python
+    # Spark 3 — silent overflow
+    f.col("a") + f.col("b")  # Overflow wraps to negative
+    f.col("x") / f.lit(0)    # Returns null
+    f.col("s").cast("int")   # "abc" might become 0 or null
+    ```
+
+    In Spark 4 with ANSI on (default):
+
+    ```python
+    # Spark 4 — throws
+    f.col("a") + f.col("b")  # OverflowException
+    f.col("x") / f.lit(0)    # DivideByZeroException
+    f.col("s").cast("int")   # NumberFormatException for "abc"
+    ```
+
+    Your e-commerce pipeline may have relied on these permissive behaviors.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## try_* Functions: Safe Alternatives
+
+    Spark provides `try_*` variants that return null on failure:
+
+    - `try_cast(expr, type)` — like cast, returns null on invalid input
+    - `try_divide(num, divisor)` — returns null when divisor is 0
+    - `try_add`, `try_subtract`, `try_multiply` — return null on overflow
+    - `try_to_timestamp(str, format)` — returns null on parse failure
+
+    ```python
+    from pyspark.sql import functions as f
+
+    df.withColumn("safe_ratio", f.try_divide(f.col("revenue"), f.col("orders")))
+    df.withColumn("safe_total", f.try_add(f.col("a"), f.col("b")))
+    df.withColumn("safe_int", f.try_cast(f.col("str_col"), "int"))
+    ```
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Migration Strategy
+
+    When a Spark 3 pipeline breaks under ANSI mode:
+
+    1. **Identify the failing operation** — overflow, divide-by-zero, cast
+    2. **Replace with try_*** — use try_divide, try_add, try_cast where
+       invalid data is possible
+    3. **Handle nulls downstream** — coalesce, fill, or filter as needed
+    4. **Optionally disable ANSI** — only for legacy compatibility; prefer
+       fixing with try_* for long-term data quality
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Example: Revenue Per Order
+
+    Spark 3 code that might overflow or divide by zero:
+
+    ```python
+    df.withColumn("avg_price", f.col("revenue") / f.col("order_count"))
+    ```
+
+    If order_count is 0, Spark 4 throws. Fix:
+
+    ```python
+    df.withColumn("avg_price", f.try_divide(f.col("revenue"), f.col("order_count")))
+    ```
+
+    If revenue * quantity overflows for large values:
+
+    ```python
+    df.withColumn("line_total", f.try_multiply(f.col("price"), f.col("quantity")))
+    ```
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## ANSI Config Options
+
+    You can disable ANSI for specific operations or the whole session:
+
+    ```python
+    spark.conf.set("spark.sql.ansi.enabled", "false")
+    ```
+
+    Or enable it on Spark 3 for migration testing:
+
+    ```python
+    spark.conf.set("spark.sql.ansi.enabled", "true")
+    ```
+
+    Best practice: fix with try_* and keep ANSI on. Disabling is a temporary
+    escape hatch.
+
+- Class: mult_question
+  Depth: all
+  Output: "Why does Spark 4 default to ANSI mode instead of Spark 3's permissive behavior?"
+  AnswerChoices: "For performance;To surface data quality issues early;To reduce memory;To enable Spark Connect"
+  CorrectAnswer: "To surface data quality issues early"
+  Hint: "Silent overflow and divide-by-zero can produce wrong results. ANSI mode throws so you fix the data or use try_*."
+
+- Class: mult_question
+  Depth: all
+  Output: "What does try_divide(x, 0) return in Spark 4?"
+  AnswerChoices: "0;Infinity;null;Throws DivideByZeroException"
+  CorrectAnswer: "null"
+  Hint: "try_divide returns null when the divisor is zero, avoiding the exception."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Given a DataFrame with columns "revenue" and "quantity", add a column
+    "unit_price" = revenue / quantity. Use try_divide to avoid divide-by-zero.
+    Handle null result with coalesce to 0.0.
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+
+    df = df.withColumn("unit_price", f.coalesce(f.try_divide(f.col("revenue"), f.col("quantity")), f.lit(0.0)))
+  Hint: "try_divide(revenue, quantity), coalesce(..., lit(0.0))"
+
+- Class: mult_question
+  Depth: all
+  Output: "When should you use try_cast instead of cast?"
+  AnswerChoices: "Always;When input may be invalid (e.g. non-numeric string);Never;Only for dates"
+  CorrectAnswer: "When input may be invalid (e.g. non-numeric string)"
+  Hint: "try_cast returns null on invalid input; cast throws. Use try_cast when data quality is uncertain."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Exercise: Fix ANSI Mode Failures
+
+    The e-commerce pipeline has a Spark 3-style aggregation that computes
+    average order value and revenue per product. Under ANSI mode it fails when
+    order_count is 0 or when overflow occurs. Implement `fix_ansi_safe_aggregates`
+    that uses try_divide for averages and try_multiply for line totals. The
+    starter provides the failing pipeline; you fix it.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Replace / with try_divide, * with try_multiply where overflow or divide-by-zero is possible."

@@ -1,0 +1,148 @@
+- Class: meta
+  Lesson: "Structured Streaming in Spark 4"
+  EstimatedMinutes: 35
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Real-Time Order Aggregation
+
+    Your e-commerce pipeline needs real-time metrics: revenue by product, order
+    counts, session analytics. Structured Streaming has been in Spark since 2.x,
+    but Spark 4 adds improvements: **async progress tracking**, **stateful
+    processing v2**, **RocksDB enhancements**, and **transformWithState** (replacing
+    flatMapGroupsWithState). This lesson migrates a streaming aggregation to the
+    new state management API.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Streaming Improvements in Spark 4
+
+    **Async progress tracking** — Streaming queries report progress
+    asynchronously, reducing latency for downstream consumers.
+
+    **Stateful processing v2** — A new state store implementation with better
+    fault tolerance and performance. RocksDB state store has improved
+    compaction and memory management.
+
+    **transformWithState** — Replaces flatMapGroupsWithState with a cleaner API.
+    You define state schema, update logic, and output. The API is more
+    explicit and easier to reason about.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## flatMapGroupsWithState (Spark 3)
+
+    In Spark 3, you used flatMapGroupsWithState for stateful streaming:
+
+    ```python
+    def update_state(key, values, state):
+        total = state.getOption(0).getOrElse(0) + sum(v for v in values)
+        state.update(total)
+        yield (key, total)
+
+    query = (df.groupByKey(lambda r: r.product_id)
+        .flatMapGroupsWithState(update_state, ...)
+        .writeStream...)
+    ```
+
+    The API was complex: GroupState, timeout handling, and output schema
+    required careful setup.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## transformWithState (Spark 4)
+
+    transformWithState provides a simpler model:
+
+    ```python
+    def state_func(key, values, state):
+        total = state.getOption(0).getOrElse(0) + sum(v for v in values)
+        state.update(total)
+        return [(key, total)]
+
+    df.transformWithState(state_func, state_schema, output_schema)
+    ```
+
+    State schema and output schema are explicit. The function returns a list
+    of output rows. Timeout and watermark handling are integrated.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## RocksDB State Store
+
+    The RocksDB state store persists state to disk. Spark 4 improvements:
+    - Better compaction to reduce disk usage
+    - Improved memory management for large state
+    - Configurable checkpoint intervals
+
+    For the e-commerce pipeline, product-level revenue state can grow large.
+    RocksDB handles it efficiently.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Migration Strategy
+
+    When migrating flatMapGroupsWithState to transformWithState:
+
+    1. Define state schema (e.g., total_revenue DOUBLE)
+    2. Define output schema (e.g., product_id, total_revenue)
+    3. Implement the state update function: (key, batch_values, state) -> output_rows
+    4. Replace flatMapGroupsWithState with transformWithState
+    5. Test with the same checkpoint location for compatibility (or use a new
+       checkpoint for a clean migration)
+
+- Class: mult_question
+  Depth: all
+  Output: "What does transformWithState replace in Spark 3?"
+  AnswerChoices: "mapGroups;flatMapGroupsWithState;groupBy;reduceByKey"
+  CorrectAnswer: "flatMapGroupsWithState"
+  Hint: "flatMapGroupsWithState was the stateful streaming API. transformWithState is its successor."
+
+- Class: mult_question
+  Depth: all
+  Output: "Why might RocksDB state store be preferred over in-memory state?"
+  AnswerChoices: "Faster;Handles large state that doesn't fit in memory;Smaller checkpoint;Enables broadcast"
+  CorrectAnswer: "Handles large state that doesn't fit in memory"
+  Hint: "RocksDB persists to disk. In-memory state is limited by executor memory."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    In batch mode (no streaming), simulate a stateful aggregation: given a
+    DataFrame with (product_id, revenue), group by product_id and sum revenue.
+    Return the aggregated DataFrame. This mimics what transformWithState
+    would do per micro-batch.
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+
+    result = df.groupBy("product_id").agg(f.sum("revenue").alias("total_revenue"))
+  Hint: "groupBy product_id, agg sum(revenue)."
+
+- Class: mult_question
+  Depth: all
+  Output: "What is the main benefit of async progress tracking in Spark 4 streaming?"
+  AnswerChoices: "Faster execution;Reduced latency for downstream consumers;Smaller state;Fewer shuffles"
+  CorrectAnswer: "Reduced latency for downstream consumers"
+  Hint: "Progress is reported without blocking. Downstream systems can react sooner."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Exercise: Migrate Streaming Aggregation
+
+    Simulate a streaming aggregation in batch mode. You will process "micro-batches"
+    of order data (each batch is a list of DataFrames), aggregate revenue by
+    product_id, and merge with prior state. Implement `streaming_revenue_by_product`
+    that: 1) takes a list of batch DataFrames (simulating micro-batches), 2)
+    unions and aggregates by product_id with sum(revenue), 3) returns the final
+    aggregated DataFrame. This models the output of transformWithState without
+    requiring a live stream. Use the same patterns: groupBy, agg, union.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Union all batches, then groupBy product_id, agg sum(revenue)."

@@ -1,0 +1,21 @@
+course:
+  id: spark4_new_features
+  title: "What's New in Spark 4: Migration & Modern Features"
+  description: "Master Spark 4's new capabilities by migrating a real e-commerce pipeline — Spark Connect, VARIANT type, ANSI mode, UDTFs, and more"
+  version: "1.0.0"
+  requires_lakehouse: false
+  prerequisites:
+    - "Python 3.10+"
+    - "pip install pyspark>=4.0.0"
+    - "Completed Spark 3 Fundamentals course (recommended)"
+  lessons:
+    - 01_spark4_overview
+    - 02_spark_connect
+    - 03_new_python_dataframe_api
+    - 04_ansi_mode_sql_compliance
+    - 05_variant_type_semi_structured
+    - 06_default_column_values_table_features
+    - 07_collation_support_string_handling
+    - 08_python_udtfs
+    - 09_structured_streaming_spark4
+    - 10_migration_capstone

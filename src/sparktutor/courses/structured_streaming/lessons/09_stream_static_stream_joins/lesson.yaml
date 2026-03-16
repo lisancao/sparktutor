@@ -1,0 +1,130 @@
+- Class: meta
+  Lesson: "Stream-Static & Stream-Stream Joins"
+  EstimatedMinutes: 45
+
+- Class: text
+  Depth: all
+  Output: |
+    ## PayGuard's Enrichment Needs
+
+    Raw transactions have user_id and merchant_id. For fraud detection,
+    you need: account tier (from account lookup), merchant category (from
+    merchant table), and whether the transaction matches a recent auth
+    event (from auth stream). **Stream-static** joins enrich with lookup
+    tables. **Stream-stream** joins match two event streams. Both are
+    critical for PayGuard's pipeline.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Stream-Static Joins
+
+    Join a streaming DataFrame with a **batch** (static) DataFrame. The
+    static side is broadcast or shuffled once per micro-batch. No
+    watermarks needed. The stream is the left side; the static table is
+    the right.
+
+    ```python
+    accounts_df = spark.read.parquet("/data/accounts/")
+    enriched = stream_df.join(accounts_df, "user_id", "left")
+    ```
+
+    PayGuard joins transactions with the account lookup (account_id,
+    tier, risk_level). Each micro-batch: stream rows + full accounts
+    table. Small static table → broadcast. Large → shuffle join.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Stream-Stream Joins
+
+    Both sides are streams. Spark matches rows from both sides. Without
+    bounds, you'd buffer forever. **Both sides need watermarks** and a
+    **time range condition** to limit how far back to look.
+
+    ```python
+    tx_stream = tx_stream.withWatermark("event_time", "10 minutes")
+    auth_stream = auth_stream.withWatermark("auth_time", "10 minutes")
+
+    matched = tx_stream.join(auth_stream,
+        f.expr("tx_stream.user_id = auth_stream.user_id AND "
+               "auth_time <= event_time AND event_time <= auth_time + interval 10 minutes"))
+    ```
+
+    The time range: "auth event must be within 10 minutes before the
+    transaction." Without it, Spark can't bound the join buffer.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Watermark Requirements for Stream-Stream
+
+    - Both streams must have withWatermark on their event time column.
+    - The join condition must include a time range (e.g., event_time
+      between auth_time and auth_time + 10 min). Otherwise Spark can't
+      decide when to drop old rows from the buffer.
+    - Watermark threshold determines how late data can arrive. Too tight
+      → dropped matches. Too loose → large buffer, memory pressure.
+
+    PayGuard matches transactions with merchant auth events: "did this
+    transaction occur within 5 minutes of a successful auth?" Both
+    streams need 5‑minute watermarks and the time range in the join.
+
+- Class: mult_question
+  Depth: all
+  Output: "What is required for a stream-stream join to work?"
+  AnswerChoices: "Only one stream needs a watermark;Both streams need watermarks and a time range condition;Stream-stream joins are not supported;Only the left stream needs a watermark"
+  CorrectAnswer: "Both streams need watermarks and a time range condition"
+  Hint: "Spark needs to bound the buffer on both sides. Watermarks + time range enable that."
+
+- Class: mult_question
+  Depth: all
+  Output: "For a stream-static join, does the static side need a watermark?"
+  AnswerChoices: "Yes, always;No, the static table is fully available each batch;Only if the static table is large;Only for left joins"
+  CorrectAnswer: "No, the static table is fully available each batch"
+  Hint: "Static = batch. It's read once per micro-batch. No streaming state."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write a stream-static join: stream_df (left) joins accounts_df (right)
+    on user_id, with a left join. Use the join() method.
+  CorrectAnswer: |
+    enriched = stream_df.join(accounts_df, "user_id", "left")
+  Hint: "join(accounts_df, 'user_id', 'left')"
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Time Range Condition for Stream-Stream
+
+    The condition must be an inequality on event time. Spark uses it to
+    prune the buffer: "don't keep auth events older than (tx_event_time
+    - 10 min)." Supported: `<=`, `>=`, `BETWEEN`, `AND` of time bounds.
+    Equi-join on keys (user_id) + time range. Example: `event_time
+    BETWEEN auth_time - 5 min AND auth_time + 5 min` for "auth within
+    ±5 min of transaction."
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Enrichment and Stream-Stream Simulation
+
+    Implement two functions:
+
+    1. `enrich_with_accounts`: Join transactions_df with accounts_df on
+       user_id (left join). Return transactions with account columns
+       (tier, risk_level) added. accounts_df is static.
+
+    2. `match_transactions_to_auth`: Simulate stream-stream join. Given
+       transactions_df and auth_events_df, both with event_time columns,
+       join on user_id where auth_time <= tx event_time and tx event_time
+       <= auth_time + 10 minutes. In batch we use a regular join with
+       the time condition. Return matched rows (tx_id, user_id, amount,
+       event_time, auth_time).
+
+    The test harness provides sample data. Same logic applies to
+    streaming with watermarks on both sides.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Stream-static: join on user_id. Stream-stream: join on user_id AND time range."

@@ -1,0 +1,179 @@
+- Class: meta
+  Lesson: "Bronze — Raw Ingestion Fundamentals"
+  EstimatedMinutes: 35
+
+- Class: text
+  Depth: all
+  Output: |
+    ## ShopStream Click Events
+
+    ShopStream's web analytics system emits click events: user_id,
+    session_id, product_id, event_type, timestamp, and sometimes extra
+    fields. Files arrive as CSV, one file per hour. Duplicates happen when
+    the collector retries. Schema changes when the frontend team adds
+    a new tracking dimension.
+
+    This lesson builds the bronze ingestion for these clicks. By the end,
+    you will have a function that reads the CSV, adds metadata, and
+    deduplicates — the foundation that silver and gold will consume.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    ## Schema-on-Read: Why Everything Is StringType
+
+    At bronze, we read with an **all-string schema**. Every column is
+    StringType. Why?
+
+    - **timestamp** might be "2024-01-15T10:30:00" or "invalid" or ""
+    - **product_id** might be "P-123" or "N/A"
+    - **event_type** might be "click" or "CLICK" or "click " (trailing space)
+
+    If we use inferSchema or cast to types at read time, bad values become
+    null or cause failures. We lose the original. Bronze's job: preserve
+    everything. Silver will cast, validate, and decide what to do with
+    "invalid" and "N/A".
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Metadata Columns
+
+    Every bronze row gets three metadata columns:
+
+    - **_ingested_at**: `f.current_timestamp()` — when this row was loaded
+    - **_source_file**: `f.input_file_name()` — which file it came from
+    - **_batch_id**: optional — a run identifier for reprocessing
+
+    These columns create an audit trail. "Where did this duplicate come
+    from?" Check _source_file. "When was this batch loaded?" Check
+    _ingested_at. "Which pipeline run produced this?" Check _batch_id.
+
+- Class: mult_question
+  Depth: all
+  Output: "Why does bronze use StringType for all columns instead of inferring types?"
+  AnswerChoices: "To preserve bad values — silver handles type casting;To save memory;Because CSV has no type information;To make reads faster"
+  CorrectAnswer: "To preserve bad values — silver handles type casting"
+  Hint: "If we cast at read and a value fails, we lose it. Bronze keeps everything; silver decides."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Deduplication Strategies
+
+    **dropDuplicates**: Removes rows that are identical across all
+    columns (or a subset). Fast, simple. Use when duplicates are exact
+    copies.
+
+    ```python
+    df.dropDuplicates(["event_id"])
+    ```
+
+    **Window-based**: When "duplicates" differ (e.g. same event_id,
+    different _ingested_at because of retries), keep the latest:
+
+    ```python
+    from pyspark.sql import Window
+    w = Window.partitionBy("event_id").orderBy(f.col("_ingested_at").desc())
+    df.withColumn("_rn", f.row_number().over(w)).filter(f.col("_rn") == 1).drop("_rn")
+    ```
+
+    For ShopStream clicks, event_id is the natural key. If no event_id,
+    use (user_id, session_id, product_id, timestamp) as composite key.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "When should you use window-based deduplication instead of dropDuplicates?"
+  AnswerChoices: "When duplicates have different metadata (e.g. _ingested_at) and you want to keep one;When the dataset is very large;When you have no primary key;Never — dropDuplicates is always better"
+  CorrectAnswer: "When duplicates have different metadata (e.g. _ingested_at) and you want to keep one"
+  Hint: "dropDuplicates keeps one arbitrary copy. Window lets you choose which one (e.g. latest by timestamp)."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Failure First: What Happens Without Dedup
+
+    Imagine ShopStream's collector sends the same click twice. Without
+    deduplication:
+    - Silver aggregates: 2 clicks instead of 1
+    - Gold conversion rate: inflated (same user counted twice)
+    - Revenue: could double-count if payment and click both duplicate
+
+    We will see this failure in the exercise: ingest without dedup, then
+    with dedup. The difference in downstream counts is the lesson.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write code to read a CSV from path with an all-StringType schema
+    (event_id, user_id, product_id, event_type, timestamp) and add
+    _ingested_at and _source_file columns.
+  CorrectAnswer: |
+    from pyspark.sql.types import StructType, StructField, StringType
+    from pyspark.sql import functions as f
+
+    schema = StructType([
+        StructField("event_id", StringType()),
+        StructField("user_id", StringType()),
+        StructField("product_id", StringType()),
+        StructField("event_type", StringType()),
+        StructField("timestamp", StringType()),
+    ])
+    df = (spark.read.csv(path, header=True, schema=schema)
+        .withColumn("_ingested_at", f.current_timestamp())
+        .withColumn("_source_file", f.input_file_name()))
+  Hint: "StructType with StructField for each column, all StringType. spark.read.csv with schema=, then withColumn for metadata."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## input_file_name() and Multiple Files
+
+    When you read with a glob (`/data/clicks/*.csv`), each partition may
+    have rows from different files. `input_file_name()` returns the file
+    path for each row. Useful for:
+    - Debugging: "Which file had the bad data?"
+    - Incremental processing: track which files are already in bronze
+    - Data lineage: attach file path to every row for compliance
+
+    Note: input_file_name() can be null for DataFrames created from
+    createDataFrame or other non-file sources. In tests, you may need to
+    mock or accept null.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Ingest ShopStream Click Events
+
+    Implement `bronze_clicks(spark, csv_path)` that:
+
+    1. Defines an all-StringType schema: event_id, user_id, product_id,
+       event_type, timestamp
+    2. Reads the CSV with header=True and that schema
+    3. Adds _ingested_at (current_timestamp) and _source_file
+       (input_file_name) metadata columns
+    4. Deduplicates by event_id using dropDuplicates
+    5. Returns the bronze DataFrame
+
+    The test harness creates a CSV with a duplicate event_id and
+    verifies your function returns 2 rows (not 3). It also checks that
+    price-like columns remain as StringType.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "StructType with StringType for each column. spark.read.csv(..., schema=schema). withColumn for metadata. dropDuplicates(['event_id'])."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    Bronze ingestion for ShopStream clicks is complete:
+
+    - **Schema-on-read** — all StringType to preserve bad values
+    - **Metadata** — _ingested_at, _source_file for audit trail
+    - **Deduplication** — dropDuplicates by event_id
+
+    This bronze_clicks function will be used in lesson 10's pipeline
+    orchestration. In the next lesson, you will extend bronze to handle
+    **multiple sources** — clicks, payments, and inventory — with
+    different formats and schemas.

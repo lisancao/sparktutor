@@ -1,0 +1,22 @@
+course:
+  id: spark3_fundamentals
+  title: "Spark 3 Fundamentals: Building a Ride-Sharing Analytics Platform"
+  description: "Master Apache Spark 3 from first principles by building a complete ride-sharing analytics platform — from raw data ingestion to real-time dashboards"
+  version: "1.0.0"
+  requires_lakehouse: false
+  prerequisites:
+    - "Python 3.10+"
+    - "pip install pyspark"
+  lessons:
+    - 01_your_first_spark_program
+    - 02_dataframes_core_abstraction
+    - 03_schemas_type_safety
+    - 04_column_expressions_transformations
+    - 05_reading_writing_data
+    - 06_aggregations_groupby
+    - 07_joins_combining_datasets
+    - 08_window_functions
+    - 09_spark_sql_catalog
+    - 10_understanding_query_plan
+    - 11_performance_tuning
+    - 12_capstone_ride_sharing_analytics
