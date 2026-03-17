@@ -107,14 +107,16 @@
     query = (summary.writeStream
         .outputMode("append")
         .format("console")
-        .start("/tmp/checkpoint"))
+        .option("checkpointLocation", "/tmp/checkpoint")
+        .start())
 
     query.awaitTermination()
     ```
 
     We use `select` (stateless) so `append` mode works. The checkpoint
-    location (optional but recommended) enables fault tolerance — we will
-    cover this in Lesson 10.
+    location (set via `.option("checkpointLocation", ...)`, not as an
+    argument to `.start()`) enables fault tolerance — we will cover
+    this in Lesson 10.
 
 - Class: mult_question
   Depth: all

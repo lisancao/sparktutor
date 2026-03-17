@@ -13,7 +13,7 @@ def optimize_pipeline(spark, trips_df, drivers_df, ratings_df):
     city_stats and driver_stats, unpersist, return (city_stats, driver_stats).
     """
     joined = (
-        trips_df.join(f.broadcast(drivers_df), "driver_id", "inner")
+        trips_df.join(f.broadcast(drivers_df.drop("city")), "driver_id", "inner")
         .join(ratings_df, "trip_id", "left")
     )
     joined.cache()

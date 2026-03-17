@@ -52,8 +52,8 @@
     ## Alert Output with Severity
 
     Each alert should have: tx_id, user_id, rule_name, severity, evidence.
-    Severity: "high" (velocity, amount), "medium" (single high amount),
-    "low" (blocklist). Evidence: e.g., "count=6 in window" or "amount=1500".
+    Severity: "high" (velocity, amount threshold), "medium" (blocklist).
+    Evidence: e.g., "count=6 in window" or "amount=1500".
 
     ```python
     alerts = alerts.withColumn("severity", f.when(...).otherwise(...))

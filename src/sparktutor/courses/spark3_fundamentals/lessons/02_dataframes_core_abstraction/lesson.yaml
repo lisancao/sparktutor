@@ -171,8 +171,8 @@
 
     Implement `filter_and_enrich_trips` that takes a trips DataFrame (with
     city, rider_id, fare, distance_miles, pickup_time) and:
-    1. Filters for trips where pickup_time is between "2024-01-15" and
-       "2024-01-16" (inclusive start, exclusive end)
+    1. Filters for trips where pickup_time is on "2024-01-15" or
+       "2024-01-16" (i.e., >= "2024-01-15" and < "2024-01-17")
     2. Adds `trip_duration` as a placeholder 0 (we will compute real duration
        in Lesson 4 when we have proper timestamps)
     3. Adds `fare_per_mile` as fare / distance_miles

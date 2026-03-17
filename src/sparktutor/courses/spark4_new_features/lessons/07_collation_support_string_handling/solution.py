@@ -24,7 +24,7 @@ def match_products_case_insensitive(spark, name: str) -> DataFrame:
     df = spark.createDataFrame(PRODUCTS_DATA, PRODUCTS_COLUMNS)
 
     try:
-        return df.filter(f.col("name").collate("utf8mb4_0900_ai_ci") == name)
+        return df.filter(f.col("name").collate("UTF8_LCASE") == name)
     except (AttributeError, TypeError):
         return df.filter(f.lower(f.col("name")) == f.lower(f.lit(name)))
 

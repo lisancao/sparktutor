@@ -85,12 +85,14 @@
 
     ```python
     if is_spark4:
-        df = df.withColumn("amount", f.col("price") * f.col("qty"))
+        df = df.withColumn("amount", f.try_multiply("price", "qty"))
     else:
         df = df.withColumn("amount", f.col("price") * f.col("qty"))
     ```
 
-    For most cases, Spark 4 code runs on Spark 3 if you avoid Spark 4-only APIs.
+    In Spark 4, `try_multiply` returns null on overflow instead of raising
+    an error (ANSI mode default). The Spark 3 branch uses the classic
+    operator which silently wraps on overflow.
 
     **Pattern 2: Config at session creation** — ANSI mode, timezone, etc. are
     configured when building the SparkSession. A version-aware factory can set

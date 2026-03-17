@@ -19,12 +19,12 @@ PRODUCTS_COLUMNS = ["product_id", "name"]
 def match_products_case_insensitive(spark, name: str) -> DataFrame:
     """
     Return products whose name matches the given name, case-insensitively.
-    Use collate("utf8mb4_0900_ai_ci") if available, else lower(name) == lower(input).
+    Use collate("UTF8_LCASE") if available, else lower(name) == lower(input).
     """
     df = spark.createDataFrame(PRODUCTS_DATA, PRODUCTS_COLUMNS)
 
     # TODO: Filter by name case-insensitively
-    # Try: f.col("name").collate("utf8mb4_0900_ai_ci") == name
+    # Try: f.col("name").collate("UTF8_LCASE") == name
     # Fallback: f.lower(f.col("name")) == f.lower(f.lit(name))
 
     pass

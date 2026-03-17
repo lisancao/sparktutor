@@ -24,24 +24,39 @@ ORDERS_SCHEMA = StructType([
 def explode_order_lines(spark) -> DataFrame:
     """
     Explode order line items. Skip items with quantity <= 0.
-    Use UDTF if available, else explode + filter.
+    Try Spark 4 UDTF first; fall back to explode + filter on Spark 3.
     """
     df = spark.createDataFrame(ORDERS_DATA, ORDERS_SCHEMA)
 
-    exploded = df.withColumn("item", f.explode("line_items"))
-    result = (
-        exploded
-        .filter(f.col("item.quantity") > 0)
-        .select(
-            "order_id",
-            f.col("item.product_id").alias("product_id"),
-            f.col("item.quantity").alias("quantity"),
-            f.col("item.price").alias("price"),
-            (f.col("item.quantity") * f.col("item.price")).alias("line_total"),
-        )
-    )
+    try:
+        from pyspark.sql.functions import udtf
 
-    return result
+        @udtf(returnType="order_id: string, product_id: string, quantity: int, price: double, line_total: double")
+        class ExplodeLines:
+            def eval(self, order_id: str, line_items):
+                for item in line_items:
+                    if item["quantity"] > 0:
+                        yield (order_id, item["product_id"], item["quantity"],
+                               item["price"], item["quantity"] * item["price"])
+
+        df.createOrReplaceTempView("orders_raw")
+        return spark.sql("""
+            SELECT t.* FROM orders_raw,
+            LATERAL ExplodeLines(order_id, line_items) t
+        """)
+    except (ImportError, AttributeError, Exception):
+        exploded = df.withColumn("item", f.explode("line_items"))
+        return (
+            exploded
+            .filter(f.col("item.quantity") > 0)
+            .select(
+                "order_id",
+                f.col("item.product_id").alias("product_id"),
+                f.col("item.quantity").alias("quantity"),
+                f.col("item.price").alias("price"),
+                (f.col("item.quantity") * f.col("item.price")).alias("line_total"),
+            )
+        )
 
 
 # ---- Test harness ----
