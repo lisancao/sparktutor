@@ -70,6 +70,7 @@ export interface LoadLessonResult {
   lessonId: string;
   restoredCode: string;
   starterCode: string;
+  isStarterFile?: boolean;
   firstStarterCode?: string;
   coursePrerequisites?: string[];
 }
@@ -79,6 +80,7 @@ export interface StepResult {
   currentIndex: number;
   totalSteps: number;
   starterCode: string;
+  isStarterFile?: boolean;
 }
 
 export interface AdvanceResult {
@@ -87,6 +89,7 @@ export interface AdvanceResult {
   currentIndex?: number;
   totalSteps?: number;
   starterCode?: string;
+  isStarterFile?: boolean;
 }
 
 export interface GoBackResult {
@@ -95,4 +98,5 @@ export interface GoBackResult {
   currentIndex?: number;
   totalSteps?: number;
   starterCode?: string;
+  isStarterFile?: boolean;
 }

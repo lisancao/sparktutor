@@ -260,15 +260,40 @@ class LessonRunner:
         step = self.current_step()
         if step is None:
             return ""
+        if step.cls not in ("cmd_question", "script"):
+            return ""
+        if step.starter_code and self.state:
+            starter_path = self.state.lesson.base_path / step.starter_code
+            if starter_path.exists():
+                return starter_path.read_text()
+        from sparktutor.engine.scaffolding import generate_scaffold
+        return generate_scaffold(
+            step_output=step.output,
+            step_cls=step.cls,
+            depth=self.profile.depth.value,
+            correct_answer=step.correct_answer or "",
+            hint=step.hint or "",
+            lesson_title=self.state.lesson.title if self.state else "",
+        )
+
+    def current_step_has_starter_file(self) -> bool:
+        """Check if the current step has an explicit StarterFile on disk."""
+        step = self.current_step()
+        if step is None or not step.starter_code or self.state is None:
+            return False
+        return (self.state.lesson.base_path / step.starter_code).exists()
 
     def get_first_starter_code(self) -> str:
-        """Scan ahead for the first code step's starter code.
+        """Get starter code to pre-populate the exercise file on lesson open.
 
-        Used to pre-populate exercise.py when a lesson starts on a text step,
-        so the editor isn't empty.
+        Prefers a StarterFile from any step (the lesson's main exercise) over
+        scaffolding from the first cmd_question, so the user always sees the
+        most meaningful starting point.
         """
         if self.state is None:
             return ""
+
+        # First pass: look for any step with a StarterFile on disk
         for step in self.state.filtered_steps:
             if step.cls not in ("cmd_question", "script"):
                 continue
@@ -276,6 +301,11 @@ class LessonRunner:
                 starter_path = self.state.lesson.base_path / step.starter_code
                 if starter_path.exists():
                     return starter_path.read_text()
+
+        # Second pass: generate scaffolding from the first code step
+        for step in self.state.filtered_steps:
+            if step.cls not in ("cmd_question", "script"):
+                continue
             from sparktutor.engine.scaffolding import generate_scaffold
             return generate_scaffold(
                 step_output=step.output,
@@ -285,25 +315,4 @@ class LessonRunner:
                 hint=step.hint or "",
                 lesson_title=self.state.lesson.title,
             )
-        return ""
-
-        # Use explicit starter file if available
-        if step.starter_code and self.state:
-            starter_path = self.state.lesson.base_path / step.starter_code
-            if starter_path.exists():
-                return starter_path.read_text()
-
-        # Generate scaffolding for code steps without an explicit starter
-        if step.cls in ("cmd_question", "script"):
-            from sparktutor.engine.scaffolding import generate_scaffold
-
-            return generate_scaffold(
-                step_output=step.output,
-                step_cls=step.cls,
-                depth=self.profile.depth.value,
-                correct_answer=step.correct_answer or "",
-                hint=step.hint or "",
-                lesson_title=self.state.lesson.title if self.state else "",
-            )
-
         return ""

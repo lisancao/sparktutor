@@ -429,13 +429,14 @@ async function openLesson(
 
     // Open exercise file FIRST (in Column One)
     if (result.step.cls === "script" || result.step.cls === "cmd_question") {
-      // Code steps: create/append starter code
+      // Code steps: create/write starter code
       await workspace.openExercise(
         courseId,
         result.lessonId,
         result.currentIndex,
         result.starterCode || "",
-        result.restoredCode || undefined
+        result.restoredCode || undefined,
+        result.isStarterFile
       );
     } else {
       // Non-code steps: open exercise file (pre-populated with first starter code if missing)
@@ -560,7 +561,8 @@ async function loadStepUI(
   workspace: WorkspaceManager,
   diagnostics: DiagnosticsManager,
   outputChannel: SparkOutputChannel,
-  statusBar: StatusBarManager
+  statusBar: StatusBarManager,
+  isStarterFile?: boolean
 ): Promise<void> {
   currentIndex = stepIndex;
   totalSteps = stepTotal;
@@ -581,7 +583,9 @@ async function loadStepUI(
       currentCourseId,
       currentLessonId,
       stepIndex,
-      starterCode
+      starterCode,
+      undefined,
+      isStarterFile
     );
   } else if (currentCourseId && currentLessonId) {
     await workspace.openExerciseIfExists(currentCourseId, currentLessonId, currentLessonTitle);
@@ -625,7 +629,8 @@ async function nextStep(
       workspace,
       diagnostics,
       outputChannel,
-      statusBar
+      statusBar,
+      result.isStarterFile
     );
   } catch (err) {
     vscode.window.showErrorMessage(
@@ -663,7 +668,8 @@ async function prevStep(
       workspace,
       diagnostics,
       outputChannel,
-      statusBar
+      statusBar,
+      result.isStarterFile
     );
   } catch (err) {
     vscode.window.showErrorMessage(

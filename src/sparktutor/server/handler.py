@@ -164,6 +164,7 @@ class ServerHandler:
             "lessonId": state.lesson.id,
             "restoredCode": restored_code,
             "starterCode": starter_code,
+            "isStarterFile": self._runner.current_step_has_starter_file(),
             "firstStarterCode": self._runner.get_first_starter_code(),
         }
         if lesson_idx == 0 and course.prerequisites:
@@ -183,6 +184,7 @@ class ServerHandler:
             "currentIndex": state.current_index,
             "totalSteps": len(state.filtered_steps),
             "starterCode": starter_code,
+            "isStarterFile": self._runner.current_step_has_starter_file(),
         }
 
     async def _run(self, params: dict) -> dict:
@@ -229,6 +231,7 @@ class ServerHandler:
             "currentIndex": self._runner.state.current_index if self._runner.state else 0,
             "totalSteps": len(self._runner.state.filtered_steps) if self._runner.state else 0,
             "starterCode": starter_code,
+            "isStarterFile": self._runner.current_step_has_starter_file(),
         }
 
     async def _go_back(self, params: dict) -> dict:
@@ -246,6 +249,7 @@ class ServerHandler:
             "currentIndex": self._runner.state.current_index if self._runner.state else 0,
             "totalSteps": len(self._runner.state.filtered_steps) if self._runner.state else 0,
             "starterCode": starter_code,
+            "isStarterFile": self._runner.current_step_has_starter_file(),
         }
 
     async def _get_hint(self, params: dict) -> dict:
