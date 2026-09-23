@@ -1,99 +1,94 @@
 - Class: meta
-  Lesson: DataFrames & Schemas
+  Lesson: DataFrame 与 Schema
   EstimatedMinutes: 25
 
 - Class: text
   Depth: all
   Output: |
-    ## What You'll Learn
+    ## 你将学到什么
 
-    In the previous lesson you created a SparkSession and performed your
-    first aggregation. Now you will understand the **DataFrame** — Spark's
-    core data abstraction — and the **schema system** that gives it
-    structure.
+    在上一课中，你创建了 SparkSession 并完成了第一次聚合。现在你将深入理解
+    **DataFrame** —— Spark 的核心数据抽象 —— 以及赋予其结构的
+    **schema 系统**。
 
-    By the end of this lesson you will be able to:
+    学完本课后，你将能够：
 
-    - Explain what a DataFrame is and why it is immutable
-    - Use `select`, `filter`, `withColumn`, `drop`, and `withColumnRenamed`
-    - Write column expressions with `col()`, bracket notation, and `expr()`
-    - Define explicit schemas with `StructType` and `StructField`
-    - Create DataFrames from Python data
-    - Work with complex types: arrays, maps, and nested structs
+    - 解释什么是 DataFrame 以及它为什么不可变
+    - 使用 `select`、`filter`、`withColumn`、`drop` 和 `withColumnRenamed`
+    - 用 `col()`、方括号语法和 `expr()` 编写列表达式
+    - 用 `StructType` 和 `StructField` 定义显式 schema
+    - 从 Python 数据创建 DataFrame
+    - 处理复杂类型：数组、映射和嵌套结构体
 
 - Class: text
   Depth: all
   Output: |
-    ## DataFrames: Distributed Tables
+    ## DataFrame：分布式表
 
-    A DataFrame is a distributed collection of data organized into named,
-    typed columns — like a table in a relational database. Two critical
-    properties:
+    DataFrame 是组织成具名、类型化列的分布式数据集合 —— 就像关系数据库中的表。
+    两个关键属性：
 
-    1. **Immutable** — every transformation returns a *new* DataFrame. The
-       original is never modified. This makes Spark programs safe to
-       parallelize.
-    2. **Lazy** — transformations build up a logical plan. Nothing executes
-       until you call an action like `show()`, `count()`, or `collect()`.
+    1. **不可变（Immutable）** —— 每次转换都返回一个*新的* DataFrame。
+       原始 DataFrame 永不修改。这使得 Spark 程序可以安全地并行化。
+    2. **惰性（Lazy）** —— 转换会构建一个逻辑计划。在你调用
+       `show()`、`count()` 或 `collect()` 等 action 之前，什么都不会执行。
 
-    Under the hood, a DataFrame tracks a **schema** (column names and types)
-    and a **logical plan** (the chain of transformations that produces it).
+    在底层，DataFrame 跟踪一个 **schema**（列名和类型）和一个
+    **逻辑计划**（产生它的转换链）。
 
 - Class: text
   Depth: beginner
   Output: |
-    ## Analogy: DataFrames as Spreadsheets
+    ## 类比：把 DataFrame 想象成电子表格
 
-    Think of a DataFrame like a spreadsheet. Each column has a name and a
-    type (text, number, date). You cannot change cells in place — instead,
-    you create a new sheet with your changes applied.
+    把 DataFrame 想象成电子表格。每列有名称和类型（文本、数字、日期）。
+    你不能原地修改单元格 —— 而是创建一个应用了更改的新工作表。
 
-    - `filter()` — highlight rows matching a condition, copy them to a new
-      sheet
-    - `withColumn()` — add a new column computed from existing ones
-    - `select()` — pick only the columns you need
-    - `drop()` — remove a column
+    - `filter()` —— 高亮匹配条件的行，复制到新工作表
+    - `withColumn()` —— 添加一列由已有列计算出的新列
+    - `select()` —— 只选取你需要的列
+    - `drop()` —— 移除一列
 
-    The original sheet is never touched. This "copy-on-write" approach is
-    what makes Spark safe to run across hundreds of machines simultaneously.
+    原始工作表从不被触碰。这种"写时复制"（copy-on-write）方法正是
+    Spark 能同时在数百台机器上安全运行的原因。
 
 - Class: text
   Depth: all
   Output: |
-    ## Common DataFrame Operations
+    ## 常用 DataFrame 操作
 
-    These are the transformations you will use most often:
+    以下是你最常用的转换：
 
-    **Selecting columns:**
+    **选取列：**
     ```python
     df.select("First", "Last", "Hits")
     ```
 
-    **Filtering rows:**
+    **过滤行：**
     ```python
     from pyspark.sql.functions import col
     df.filter(col("Hits") > 10000)
     ```
 
-    **Adding or replacing a column:**
+    **添加或替换列：**
     ```python
     df.withColumn("Double_Hits", col("Hits") * 2)
     ```
 
-    **Removing a column:**
+    **移除列：**
     ```python
     df.drop("Url")
     ```
 
-    **Renaming a column:**
+    **重命名列：**
     ```python
     df.withColumnRenamed("First", "FirstName")
     ```
 
-    All of these return new DataFrames. They are transformations (lazy) —
-    nothing executes until you call an action.
+    所有这些都返回新的 DataFrame。它们是转换（惰性的）——
+    在你调用 action 之前什么都不会执行。
 
-    **Docs:**
+    **文档：**
     [select](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.select.html) |
     [filter](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.filter.html) |
     [withColumn](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.withColumn.html) |
@@ -101,27 +96,27 @@
 
 - Class: mult_question
   Depth: all
-  Output: "Which DataFrame method adds a new column or replaces an existing one?"
+  Output: "哪个 DataFrame 方法用于添加新列或替换已有列？"
   AnswerChoices: "withColumn();addColumn();setColumn();appendColumn()"
   CorrectAnswer: "withColumn()"
-  Hint: "It starts with 'with' and ends with 'Column'."
+  Hint: "它以 'with' 开头，以 'Column' 结尾。"
 
 - Class: text
   Depth: all
   Output: |
-    ## Column Expressions
+    ## 列表达式
 
-    There are three equivalent ways to reference a column:
+    有三种等价方式引用列：
 
     ```python
     from pyspark.sql.functions import col, expr
 
-    col("Hits")          # function-based (most common in PySpark)
-    df["Hits"]           # bracket notation
-    expr("Hits")         # SQL expression string
+    col("Hits")          # 函数式（PySpark 中最常见）
+    df["Hits"]           # 方括号语法
+    expr("Hits")         # SQL 表达式字符串
     ```
 
-    `expr()` is the most powerful because it accepts full SQL syntax:
+    `expr()` 最强大，因为它接受完整的 SQL 语法：
 
     ```python
     expr("Hits * 2")
@@ -129,23 +124,22 @@
     expr("CASE WHEN Hits > 10000 THEN 'big' ELSE 'small' END")
     ```
 
-    All three produce **Column objects** — lazy descriptions of computation.
-    They describe *what* to compute, not *when*. Spark evaluates them only
-    when an action triggers execution.
+    三者都产生 **Column 对象** —— 对计算的惰性描述。它们描述*计算什么*，
+    而不是*何时计算*。Spark 只在 action 触发执行时才对它们求值。
 
 - Class: text
   Depth: all
   Output: |
-    ## Schema Definition with StructType
+    ## 用 StructType 定义 Schema
 
-    A schema describes a DataFrame's structure: column names, data types,
-    and nullability. You define one with `StructType` and `StructField`:
+    schema 描述 DataFrame 的结构：列名、数据类型和可空性。
+    你用 `StructType` 和 `StructField` 来定义：
 
     ```python
     from pyspark.sql.types import *
 
     schema = StructType([
-        StructField("Id", IntegerType(), False),       # not nullable
+        StructField("Id", IntegerType(), False),       # 不可为空
         StructField("First", StringType(), False),
         StructField("Last", StringType(), False),
         StructField("Hits", IntegerType(), False),
@@ -153,25 +147,25 @@
     ])
     ```
 
-    Each `StructField` takes three arguments: **name**, **type**, **nullable**.
+    每个 `StructField` 接受三个参数：**名称**、**类型**、**是否可空**。
 
-    Common types: `StringType`, `IntegerType`, `LongType`, `DoubleType`,
-    `BooleanType`, `TimestampType`, `DateType`.
+    常用类型：`StringType`、`IntegerType`、`LongType`、`DoubleType`、
+    `BooleanType`、`TimestampType`、`DateType`。
 
-    Complex types: `ArrayType(elementType)`, `MapType(keyType, valueType)`,
-    and nested `StructType` for struct-within-struct.
+    复杂类型：`ArrayType(elementType)`、`MapType(keyType, valueType)`，
+    以及用于结构体嵌套结构体的嵌套 `StructType`。
 
-    **Docs:**
+    **文档：**
     [StructType](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.types.StructType.html) |
     [ArrayType](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.types.ArrayType.html) |
     [MapType](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.types.MapType.html)
-    — schema definition with `StructField(name, type, nullable)`.
+    —— 用 `StructField(name, type, nullable)` 定义 schema。
 
 - Class: cmd_question
   Depth: all
   Output: |
-    Define a StructType schema for a table with columns: `name` (string,
-    not nullable), `age` (integer, nullable), and `email` (string, nullable).
+    为一个包含以下列的表定义 StructType schema：`name`（字符串，
+    不可为空）、`age`（整数，可空）和 `email`（字符串，可空）。
   CorrectAnswer: |
     from pyspark.sql.types import StructType, StructField, StringType, IntegerType
 
@@ -180,38 +174,36 @@
         StructField("age", IntegerType(), True),
         StructField("email", StringType(), True),
     ])
-  Hint: "Use StructType with a list of StructField(name, type, nullable). False = not nullable, True = nullable."
+  Hint: "用 StructType 传入一个 StructField(name, type, nullable) 列表。False = 不可为空，True = 可空。"
 
 - Class: text
   Depth: intermediate
   Output: |
-    ## Schema Inference vs. Explicit Schemas
+    ## Schema 推断 vs. 显式 Schema
 
-    When reading CSV or JSON, Spark can infer the schema:
+    读取 CSV 或 JSON 时，Spark 可以推断 schema：
 
     ```python
     df = spark.read.option("inferSchema", "true").csv("data.csv")
     ```
 
-    However, **inferSchema reads the data twice** — once to sample rows and
-    determine types, once to actually load. For production workloads, always
-    define schemas explicitly:
+    然而，**inferSchema 会读取数据两次** —— 一次采样行并确定类型，
+    一次实际加载。对于生产工作负载，始终显式定义 schema：
 
-    - **Faster** — avoids the extra scan
-    - **More reliable** — you control the types, not Spark's guesses
-    - **Catches issues early** — malformed data raises errors at load time
-      instead of producing silent nulls
+    - **更快** —— 避免额外的扫描
+    - **更可靠** —— 类型由你控制，而非 Spark 的猜测
+    - **尽早发现问题** —— 格式错误的数据在加载时就报错，
+      而不是静默产生 null
 
-    Parquet and ORC embed schemas in their file metadata, so inference is
-    free for those formats. This is one reason Parquet is Spark's preferred
-    format.
+    Parquet 和 ORC 将 schema 嵌入文件元数据中，因此对这些格式而言
+    推断是免费的。这是 Parquet 成为 Spark 首选格式的原因之一。
 
 - Class: text
   Depth: intermediate
   Output: |
-    ## Creating DataFrames from Python Data
+    ## 从 Python 数据创建 DataFrame
 
-    You can build a DataFrame from Python lists:
+    你可以从 Python 列表构建 DataFrame：
 
     ```python
     data = [
@@ -221,7 +213,7 @@
     df = spark.createDataFrame(data, schema)
     ```
 
-    Or using **Row objects** (column names come from keyword arguments):
+    或者使用 **Row 对象**（列名来自关键字参数）：
 
     ```python
     from pyspark.sql import Row
@@ -233,94 +225,88 @@
     df = spark.createDataFrame(rows)
     ```
 
-    Row objects are convenient for quick prototyping. For production code,
-    prefer explicit schemas — they are unambiguous and self-documenting.
+    Row 对象适合快速原型开发。对于生产代码，优先使用显式 schema ——
+    它们没有歧义且自带文档。
 
 - Class: mult_question
   Depth: intermediate
-  Output: "What happens when you use inferSchema=True with CSV files?"
-  AnswerChoices: "Spark reads the data twice — once to infer types, once to load;Spark guesses types from column names alone;Schema inference is instant with no extra cost;Spark reads only the first row for type detection"
-  CorrectAnswer: "Spark reads the data twice — once to infer types, once to load"
-  Hint: "CSV stores everything as text, so Spark must sample the data to figure out which columns are numbers, dates, etc."
+  Output: "对 CSV 文件使用 inferSchema=True 时会发生什么？"
+  AnswerChoices: "Spark 读取数据两次 —— 一次推断类型，一次加载;Spark 仅凭列名猜测类型;Schema 推断即时完成且无额外开销;Spark 只读取第一行来检测类型"
+  CorrectAnswer: "Spark 读取数据两次 —— 一次推断类型，一次加载"
+  Hint: "CSV 把所有内容都存为文本，所以 Spark 必须采样数据来弄清楚哪些列是数字、日期等。"
 
 - Class: cmd_question
   Depth: intermediate
   Output: |
-    Given a DataFrame `blogs_df` with an integer column `Hits`, add a new
-    boolean column called `Big_Hitter` that is `True` when Hits > 10000.
+    给定一个包含整数列 `Hits` 的 DataFrame `blogs_df`，添加一个新的
+    布尔列 `Big_Hitter`，当 Hits > 10000 时为 `True`。
   CorrectAnswer: |
     from pyspark.sql import functions as f
 
     result = blogs_df.withColumn("Big_Hitter", f.col("Hits") > 10000)
-  Hint: "Use withColumn with a boolean expression: f.col('Hits') > 10000."
+  Hint: "用 withColumn 传入一个布尔表达式：f.col('Hits') > 10000。"
 
 - Class: text
   Depth: advanced
   Output: |
-    ## Column Expressions Under the Hood
+    ## 列表达式的底层原理
 
-    Both `col()` and `expr()` produce Column objects, but they take
-    different paths through Spark:
+    `col()` 和 `expr()` 都产生 Column 对象，但它们在 Spark 中走不同的路径：
 
-    - `col("name")` creates a direct **UnresolvedAttribute** reference.
-    - `expr("name * 2")` is fed through Spark's SQL parser, producing an
-      expression tree that supports arithmetic, function calls, CASE/WHEN,
-      and nested field access.
+    - `col("name")` 直接创建一个 **UnresolvedAttribute** 引用。
+    - `expr("name * 2")` 经过 Spark 的 SQL 解析器，生成一棵支持算术运算、
+      函数调用、CASE/WHEN 和嵌套字段访问的表达式树。
 
-    Because Column objects are lazy, chaining transformations like:
+    因为 Column 对象是惰性的，链式调用如下转换：
 
     ```python
     df.select(col("a") + col("b")).filter(col("c") > 10)
     ```
 
-    builds a **logical plan**. Spark's Catalyst optimizer then rewrites
-    this plan — pushing filters below projections, pruning unused columns,
-    folding constants — before generating the physical execution plan.
+    会构建一个 **逻辑计划**。Spark 的 Catalyst 优化器随后重写这个计划
+    —— 谓词下推、裁剪未使用的列、常量折叠 —— 然后才生成物理执行计划。
 
-    Defining schemas explicitly helps the optimizer: it knows exact types
-    and can choose more efficient operations (integer comparison vs. string
-    comparison).
+    显式定义 schema 有助于优化器：它知道精确的类型，
+    可以选择更高效的操作（整数比较 vs. 字符串比较）。
 
 - Class: script
   Depth: all
   Output: |
-    ## Exercise: Build a Blogs DataFrame
+    ## 练习：构建博客 DataFrame
 
-    Implement the `build_blogs_df` function, adapted from Example 3-6
-    in *Learning Spark*.
+    实现 `build_blogs_df` 函数，改编自《Learning Spark》中的示例 3-6。
 
-    Your function should:
-    1. Define a schema with columns: Id (int), First (string), Last (string),
-       Url (string), Published (string), Hits (int), Campaigns (array of strings)
-    2. Create a DataFrame from the provided DATA using that schema
-    3. Add a boolean column `Big_Hitter` where Hits > 10000
-    4. Return the resulting DataFrame
+    你的函数应该：
+    1. 定义一个包含以下列的 schema：Id（int）、First（string）、Last（string）、
+       Url（string）、Published（string）、Hits（int）、Campaigns（字符串数组）
+    2. 用该 schema 从提供的 DATA 创建一个 DataFrame
+    3. 添加一个布尔列 `Big_Hitter`，当 Hits > 10000 时为 True
+    4. 返回结果 DataFrame
 
-    This exercise practices schema definition, DataFrame creation, and
-    adding computed columns — skills you will use in every lesson going
-    forward.
+    这个练习练习了 schema 定义、DataFrame 创建和添加计算列 ——
+    这些技能在后续每一课中都会用到。
   StarterFile: starter.py
   SolutionFile: solution.py
-  Hint: "Campaigns is ArrayType(StringType()). Use spark.createDataFrame(DATA, schema), then withColumn for the boolean column."
+  Hint: "Campaigns 是 ArrayType(StringType())。用 spark.createDataFrame(DATA, schema)，然后用 withColumn 添加布尔列。"
 
 - Class: text
   Depth: all
   Output: |
-    ## Summary
+    ## 小结
 
-    In this lesson you learned:
+    本课你学到了：
 
-    - **DataFrames** are immutable, distributed tables with named, typed
-      columns — every transformation returns a new DataFrame
-    - **Core operations** — `select`, `filter`, `withColumn`, `drop`, and
-      `withColumnRenamed` are your daily tools
-    - **Column expressions** — `col()`, `df["col"]`, and `expr()` all
-      produce lazy Column objects; `expr()` supports full SQL syntax
-    - **Schemas** — `StructType` and `StructField` define structure;
-      explicit schemas beat inference for production
-    - **Complex types** — `ArrayType`, `MapType`, and nested `StructType`
-      handle real-world nested data
-    - **createDataFrame** — build DataFrames from Python lists or Row objects
+    - **DataFrame** 是不可变的、分布式的表，具有具名、类型化的列 ——
+      每次转换都返回新的 DataFrame
+    - **核心操作** —— `select`、`filter`、`withColumn`、`drop` 和
+      `withColumnRenamed` 是你的日常工具
+    - **列表达式** —— `col()`、`df["col"]` 和 `expr()` 都产生惰性
+      Column 对象；`expr()` 支持完整的 SQL 语法
+    - **Schema** —— `StructType` 和 `StructField` 定义结构；
+      生产环境中显式 schema 优于推断
+    - **复杂类型** —— `ArrayType`、`MapType` 和嵌套 `StructType`
+      处理现实中的嵌套数据
+    - **createDataFrame** —— 从 Python 列表或 Row 对象构建 DataFrame
 
-    Next, you will learn how to read and write data in multiple formats —
-    CSV, JSON, Parquet, and ORC — and understand when to use each.
+    接下来，你将学习如何以多种格式读写数据 —— CSV、JSON、Parquet 和
+    ORC —— 并理解何时使用每种格式。

@@ -1,8 +1,7 @@
 """
-Bronze Layer - Solution
+Bronze 层 - 参考答案
 
-Complete bronze ingestion with schema-on-read, metadata columns,
-and deduplication.
+完整的 bronze 摄取：schema-on-read、元数据列和去重。
 """
 
 from pyspark.sql import SparkSession, functions as f
@@ -10,7 +9,7 @@ from pyspark.sql.types import StructType, StructField, StringType
 
 
 def bronze_orders(spark, csv_path):
-    """Ingest raw orders CSV into a bronze DataFrame."""
+    """将原始订单 CSV 摄取到 bronze DataFrame。"""
 
     schema = StructType([
         StructField("order_id", StringType()),
@@ -31,7 +30,7 @@ def bronze_orders(spark, csv_path):
     return deduped
 
 
-# ---- Test harness ----
+# ---- 测试代码 ----
 if __name__ == "__main__":
     import tempfile, os
 
@@ -46,10 +45,10 @@ if __name__ == "__main__":
         fh.write("1,widget,9.99,2\n")
 
     df = bronze_orders(spark, csv_path)
-    assert df.count() == 2, f"Expected 2 rows after dedup, got {df.count()}"
-    assert "_ingested_at" in df.columns, "Missing _ingested_at column"
-    assert "_source_file" in df.columns, "Missing _source_file column"
-    assert df.schema["price"].dataType == StringType(), "price should be StringType"
-    print("All tests passed!")
+    assert df.count() == 2, f"去重后预期 2 行，实际得到 {df.count()}"
+    assert "_ingested_at" in df.columns, "缺少 _ingested_at 列"
+    assert "_source_file" in df.columns, "缺少 _source_file 列"
+    assert df.schema["price"].dataType == StringType(), "price 应为 StringType"
+    print("所有测试通过！")
     df.show(truncate=False)
     spark.stop()

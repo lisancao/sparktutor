@@ -1,31 +1,31 @@
 - Class: meta
-  Lesson: Join Strategies
+  Lesson: Join 策略
   EstimatedMinutes: 25
 
 - Class: text
   Depth: all
   Output: |
-    ## What You'll Learn
+    ## 你将学到什么
 
-    Joins combine data from multiple sources — and they are the most
-    expensive operation in distributed computing. The wrong join strategy
-    can turn a 10-second query into a 10-minute one.
+    Join 将来自多个数据源的数据合并 —— 它们是分布式计算中
+    最昂贵的操作。错误的 join 策略可以把一个 10 秒的查询
+    变成 10 分钟的查询。
 
-    In the previous lesson you learned to tune partitions and caching.
-    Now you will learn to choose and optimize joins:
+    在上一课中，你学习了调优分区和缓存。现在你将学习
+    如何选择和优化 join：
 
-    - The five join types (inner, outer, semi, anti, cross)
-    - Broadcast Hash Join — the fastest strategy for small-large joins
-    - Sort Merge Join — the default for large-large joins
-    - Bucketed tables — pre-partition data to skip shuffles
-    - Handling data skew in joins
+    - 五种 join 类型（inner、outer、semi、anti、cross）
+    - Broadcast Hash Join —— 小表与大表 join 的最快策略
+    - Sort Merge Join —— 大表与大表 join 的默认策略
+    - Bucket 表 —— 预分区数据以跳过 shuffle
+    - 处理 join 中的数据倾斜
 
 - Class: text
   Depth: all
   Output: |
-    ## Join Types
+    ## Join 类型
 
-    Spark supports five join types:
+    Spark 支持五种 join 类型：
 
     ```python
     # Inner — only matching rows from both sides
@@ -44,39 +44,37 @@
     df1.join(df2, "key", "left_anti")
     ```
 
-    `left_semi` and `left_anti` are powerful for filtering without actually
-    bringing in columns from the right side.
+    `left_semi` 和 `left_anti` 在不过实际引入右侧列的情况下
+    进行过滤，非常强大。
 
-    **Docs:** [DataFrame.join](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.join.html)
-    — `on` (column name or expression), `how` (`inner`, `left`, `full`, `left_semi`, `left_anti`, `cross`).
+    **文档：** [DataFrame.join](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.join.html)
+    —— `on`（列名或表达式）、`how`（`inner`、`left`、`full`、`left_semi`、`left_anti`、`cross`）。
 
 - Class: text
   Depth: beginner
   Output: |
-    Imagine you have a huge phone book (big table) and a short guest list
-    (small table). Instead of searching the phone book for each guest, you
-    photocopy the guest list and hand one to every worker. Each worker
-    matches their section of the phone book against the local guest list.
-    No one needs to move the phone book around — that is a **Broadcast
-    Hash Join**.
+    想象你有一本巨大的电话簿（大表）和一份简短的客人名单（小表）。
+    与其为每个客人翻遍电话簿，不如复印客人名单，给每个工人一份。
+    每个工人将自己负责的电话簿部分与本地客人名单进行匹配。
+    没有人需要移动电话簿 —— 这就是 **Broadcast Hash Join**。
 
-    If both tables are huge (two phone books), you have no choice but to
-    sort and merge them — that is a **Sort Merge Join**. It is slower
-    because both sides must be shuffled and sorted first.
+    如果两张表都很大（两本电话簿），你别无选择，只能排序和合并它们
+    —— 这就是 **Sort Merge Join**。它更慢，因为两侧都必须先
+    经过 shuffle 和排序。
 
 - Class: text
   Depth: all
   Output: |
-    ## Broadcast Hash Join (BHJ)
+    ## Broadcast Hash Join（BHJ）
 
-    When one table is small enough to fit in executor memory, Spark
-    **broadcasts** it to every executor. The large table stays put — no
-    shuffle needed for it. This is the fastest join strategy.
+    当一张表小到足以放入执行器内存时，Spark 会将其 **广播**
+    到每个执行器。大表保持不动 —— 不需要为它做 shuffle。
+    这是最快的 join 策略。
 
-    Spark automatically uses BHJ when one side is below
-    `spark.sql.autoBroadcastJoinThreshold` (default: **10MB**).
+    当一侧小于 `spark.sql.autoBroadcastJoinThreshold`
+    （默认：**10MB**）时，Spark 会自动使用 BHJ。
 
-    You can force a broadcast with a hint:
+    你可以用 hint 强制广播：
 
     ```python
     from pyspark.sql import functions as f
@@ -84,54 +82,52 @@
     result = large_df.join(f.broadcast(small_df), "key")
     ```
 
-    Check the plan with `explain()` — look for `BroadcastHashJoin`.
+    用 `explain()` 检查执行计划 —— 查找 `BroadcastHashJoin`。
 
-    **Docs:** [f.broadcast](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.broadcast.html)
-    — wrap the small DataFrame in `f.broadcast(df)` inside the join call.
+    **文档：** [f.broadcast](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.broadcast.html)
+    —— 在 join 调用中用 `f.broadcast(df)` 包装小 DataFrame。
 
 - Class: mult_question
   Depth: all
-  Output: "When does Spark automatically choose a Broadcast Hash Join?"
-  AnswerChoices: "When one table is smaller than autoBroadcastJoinThreshold (10MB default);When both tables are large;When the join key has an index;Always for inner joins"
-  CorrectAnswer: "When one table is smaller than autoBroadcastJoinThreshold (10MB default)"
-  Hint: "Which strategy avoids shuffling the large table by replicating the small one?"
+  Output: "Spark 什么时候自动选择 Broadcast Hash Join？"
+  AnswerChoices: "当一张表小于 autoBroadcastJoinThreshold（默认 10MB）时;当两张表都很大时;当 join 键有索引时;对 inner join 总是如此"
+  CorrectAnswer: "当一张表小于 autoBroadcastJoinThreshold（默认 10MB）时"
+  Hint: "哪种策略通过复制小表来避免 shuffle 大表？"
 
 - Class: cmd_question
   Depth: all
   Output: |
-    Join a large DataFrame `orders` with a small DataFrame `products` on
-    the column `'product_id'`, using a broadcast hint on `products`.
+    将大 DataFrame `orders` 与小 DataFrame `products` 在
+    列 `'product_id'` 上 join，对 `products` 使用 broadcast hint。
   CorrectAnswer: |
     from pyspark.sql import functions as f
 
     result = orders.join(f.broadcast(products), "product_id")
-  Hint: "Wrap the small DataFrame in f.broadcast() inside the join call."
+  Hint: "在 join 调用中用 f.broadcast() 包装小 DataFrame。"
 
 - Class: text
   Depth: all
   Output: |
-    ## Sort Merge Join (SMJ)
+    ## Sort Merge Join（SMJ）
 
-    When both tables are too large to broadcast, Spark falls back to
-    Sort Merge Join:
+    当两张表都太大无法广播时，Spark 回退到 Sort Merge Join：
 
-    1. **Shuffle** — both sides are partitioned by the join key
-    2. **Sort** — each partition is sorted by the join key
-    3. **Merge** — sorted partitions are merged (like merge sort)
+    1. **Shuffle** —— 两侧都按 join 键分区
+    2. **Sort** —— 每个分区按 join 键排序
+    3. **Merge** —— 排序后的分区被合并（类似归并排序）
 
-    The shuffle is the expensive part — every row must be sent across the
-    network to the partition that owns its key's hash. This is unavoidable
-    for large-large joins.
+    shuffle 是代价高昂的部分 —— 每一行都必须通过网络发送到
+    拥有其键哈希值的分区。对于大表与大表的 join，这是不可避免的。
 
-    You can verify the strategy with `explain()` — look for
-    `SortMergeJoin` in the physical plan.
+    你可以用 `explain()` 验证策略 —— 在物理计划中查找
+    `SortMergeJoin`。
 
 - Class: text
   Depth: intermediate
   Output: |
-    ## Forcing a Specific Join Strategy
+    ## 强制使用特定的 Join 策略
 
-    Sometimes you know better than the optimizer:
+    有时候你比优化器更懂行：
 
     ```python
     # Force broadcast (even if above threshold)
@@ -145,16 +141,16 @@
     spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "10485760")
     ```
 
-    Use `explain()` after the join to confirm the strategy Spark chose.
+    join 之后使用 `explain()` 确认 Spark 选择的策略。
 
 - Class: text
   Depth: intermediate
   Output: |
-    ## Bucketed Tables
+    ## Bucket 表
 
-    If two tables are frequently joined on the same key, save them as
-    **bucketed** tables. Bucketing pre-partitions and pre-sorts the data,
-    so joins between same-bucketed tables skip the shuffle entirely:
+    如果两张表经常在同一个键上 join，将它们保存为 **bucketed** 表。
+    Bucketing 会预分区并预排序数据，因此相同 bucketing 的表之间
+    的 join 完全跳过 shuffle：
 
     ```python
     # Write bucketed
@@ -174,96 +170,94 @@
     result = orders.join(users, "user_id")
     ```
 
-    Both tables must have the **same number of buckets** and the **same
-    bucket column** for the optimization to apply.
+    两张表必须有**相同数量的 bucket** 和**相同的 bucket 列**，
+    该优化才会生效。
 
 - Class: mult_question
   Depth: intermediate
-  Output: "What is the main advantage of bucketed tables for joins?"
-  AnswerChoices: "Joins skip the shuffle because data is already pre-partitioned by the join key;Data is compressed more efficiently;Queries run without a SparkSession;Bucketed tables use less disk space"
-  CorrectAnswer: "Joins skip the shuffle because data is already pre-partitioned by the join key"
-  Hint: "The most expensive part of a Sort Merge Join is the shuffle. How does bucketing help?"
+  Output: "Bucket 表对 join 的主要优势是什么？"
+  AnswerChoices: "Join 跳过 shuffle，因为数据已按 join 键预分区;数据压缩更高效;查询无需 SparkSession 即可运行;Bucket 表占用更少磁盘空间"
+  CorrectAnswer: "Join 跳过 shuffle，因为数据已按 join 键预分区"
+  Hint: "Sort Merge Join 中最昂贵的部分是 shuffle。Bucketing 如何帮助？"
 
 - Class: text
   Depth: advanced
   Output: |
-    ## Handling Data Skew in Joins
+    ## 处理 Join 中的数据倾斜
 
-    Data skew occurs when one join key has far more rows than others — a
-    single partition becomes a bottleneck while other partitions finish
-    quickly. Common causes: null keys, popular users, default categories.
+    当某个 join 键的行数远多于其他键时就会发生数据倾斜 ——
+    单个分区成为瓶颈，而其他分区很快完成。常见原因：null 键、
+    热门用户、默认类别。
 
-    **Solution 1: AQE Skew Join** (automatic in Spark 3.2+)
-    AQE detects skewed partitions at runtime and splits them into smaller
-    sub-partitions. Enable with:
+    **解决方案 1：AQE 倾斜 Join**（Spark 3.2+ 自动启用）
+    AQE 在运行时检测倾斜的分区，并将其拆分成更小的子分区。
+    用以下配置启用：
     ```python
     spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
     spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionFactor", "5")
     ```
 
-    **Solution 2: Salting** — add a random prefix to the skewed key to
-    spread it across partitions:
+    **解决方案 2：加盐（Salting）** —— 给倾斜的键添加随机前缀
+    以将其分散到多个分区：
     ```python
     from pyspark.sql import functions as f
     salted = df.withColumn("salted_key",
         f.concat(f.col("key"), f.lit("_"), (f.rand() * 10).cast("int")))
     ```
-    Then join on the salted key. This trades a slightly larger shuffle for
-    eliminating the bottleneck.
+    然后在加盐后的键上 join。这用略大的 shuffle 换来了
+    瓶颈的消除。
 
-    **Solution 3: Filter nulls** — if null keys cause the skew, filter
-    them out, handle them separately, then union the results.
+    **解决方案 3：过滤 null** —— 如果 null 键导致倾斜，
+    过滤掉它们，单独处理，然后 union 结果。
 
 - Class: cmd_question
   Depth: advanced
   Output: |
-    Disable broadcast joins by setting `autoBroadcastJoinThreshold` to -1,
-    join DataFrames `users` and `events` on `'user_id'`, then show the
-    physical plan to verify Sort Merge Join is used.
+    将 `autoBroadcastJoinThreshold` 设置为 -1 以禁用 broadcast join，
+    在 `'user_id'` 上 join DataFrame `users` 和 `events`，
+    然后展示物理计划以验证使用了 Sort Merge Join。
   CorrectAnswer: |
     spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
     result = users.join(events, "user_id")
     result.explain()
-  Hint: "Set the threshold to -1, join, then call explain() to see the plan."
+  Hint: "将阈值设为 -1，join，然后调用 explain() 查看计划。"
 
 - Class: script
   Depth: all
   Output: |
-    ## Exercise: Join Strategy Comparison
+    ## 练习：Join 策略对比
 
-    Implement `join_comparison(spark)` that demonstrates both join
-    strategies on the same data:
+    实现 `join_comparison(spark)`，在同一份数据上演示两种 join 策略：
 
-    1. Create a users DataFrame (small) and an events DataFrame (larger)
-    2. Perform a broadcast hash join (using f.broadcast hint)
-    3. Perform a sort merge join (by disabling broadcast threshold)
-    4. Capture the explain plans for both
-    5. Reset the broadcast threshold to default
-    6. Return both results and plans
+    1. 创建一个 users DataFrame（小）和一个 events DataFrame（较大）
+    2. 执行 broadcast hash join（使用 f.broadcast hint）
+    3. 执行 sort merge join（通过禁用 broadcast 阈值）
+    4. 捕获两者的 explain 计划
+    5. 将 broadcast 阈值重置为默认值
+    6. 返回两个结果和计划
 
-    This exercise gives you hands-on experience reading physical plans
-    and understanding the difference between join strategies.
+    本练习让你获得阅读物理计划和理解 join 策略之间差异的
+    动手经验。
   StarterFile: starter.py
   SolutionFile: solution.py
-  Hint: "Use f.broadcast(users_df) for BHJ, set threshold to -1 for SMJ, capture plans with explain(), and reset threshold to 10485760."
+  Hint: "BHJ 用 f.broadcast(users_df)，SMJ 将阈值设为 -1，用 explain() 捕获计划，然后将阈值重置为 10485760。"
 
 - Class: text
   Depth: all
   Output: |
-    ## Summary
+    ## 小结
 
-    In this lesson you learned:
+    本课你学到了：
 
-    - **Join types** — inner, left/right/full outer, left_semi (EXISTS),
-      left_anti (NOT EXISTS)
-    - **Broadcast Hash Join** — fastest for small-large joins; auto-selected
-      below 10MB threshold; force with `f.broadcast()`
-    - **Sort Merge Join** — default for large-large joins; shuffle + sort +
-      merge
-    - **Bucketed tables** — pre-partition data to skip shuffles on frequent
-      joins
-    - **Skew handling** — AQE skew join, salting, or null filtering
+    - **Join 类型** —— inner、left/right/full outer、left_semi（EXISTS）、
+      left_anti（NOT EXISTS）
+    - **Broadcast Hash Join** —— 小表与大表 join 最快；低于 10MB
+      阈值时自动选择；用 `f.broadcast()` 强制
+    - **Sort Merge Join** —— 大表与大表 join 的默认策略；
+      shuffle + sort + merge
+    - **Bucket 表** —— 预分区数据以在频繁 join 时跳过 shuffle
+    - **倾斜处理** —— AQE 倾斜 join、加盐或 null 过滤
 
-    You can now write efficient joins and diagnose join performance with
-    `explain()`. In the next lesson, you will shift from batch to
-    **streaming** — processing data continuously as it arrives.
+    你现在可以编写高效的 join 并用 `explain()` 诊断 join 性能。
+    在下一课中，你将从批处理转向**流处理** —— 在数据到达时
+    持续处理数据。

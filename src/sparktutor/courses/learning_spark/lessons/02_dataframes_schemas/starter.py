@@ -1,14 +1,14 @@
 """
-DataFrames and Schemas - Starter Code
+DataFrame 与 Schema - 起始代码
 
-Implement the `build_blogs_df` function that:
-1. Defines a schema with: Id (int), First (string), Last (string),
-   Url (string), Published (string), Hits (int), Campaigns (array of strings)
-2. Creates a DataFrame from the provided data using that schema
-3. Adds a boolean column "Big_Hitter" where Hits > 10000
-4. Returns the DataFrame
+实现 `build_blogs_df` 函数：
+1. 定义包含以下字段的 schema：Id (int), First (string), Last (string),
+   Url (string), Published (string), Hits (int), Campaigns (字符串数组)
+2. 使用该 schema 从提供的数据创建 DataFrame
+3. 添加布尔列 "Big_Hitter"，当 Hits > 10000 时为 True
+4. 返回 DataFrame
 
-Based on Example-3_6 from Learning Spark.
+本练习基于 Learning Spark 中的 Example-3_6。
 """
 
 from pyspark.sql import SparkSession, functions as f
@@ -17,7 +17,7 @@ from pyspark.sql.types import (
 )
 
 
-# Sample blog author data
+# 博客作者示例数据
 DATA = [
     [1, "Jules", "Damji", "https://tinyurl.1", "1/4/2016", 4535, ["twitter", "LinkedIn"]],
     [2, "Brooke", "Wenig", "https://tinyurl.2", "5/5/2018", 8908, ["twitter", "LinkedIn"]],
@@ -29,22 +29,22 @@ DATA = [
 
 
 def build_blogs_df(spark):
-    """Create a blogs DataFrame with schema, data, and computed column."""
+    """创建包含 schema、数据和计算列的博客 DataFrame。"""
 
-    # TODO: Define the schema using StructType with the columns listed above
-    #       Note: Campaigns should be ArrayType(StringType())
-    schema = None  # Replace with StructType(...)
+    # TODO: 使用 StructType 定义上述列的 schema
+    #       注意：Campaigns 应为 ArrayType(StringType())
+    schema = None  # 替换为 StructType(...)
 
-    # TODO: Create the DataFrame from DATA using the schema
-    blogs_df = None  # Replace with spark.createDataFrame(...)
+    # TODO: 使用 schema 从 DATA 创建 DataFrame
+    blogs_df = None  # 替换为 spark.createDataFrame(...)
 
-    # TODO: Add a boolean column "Big_Hitter" that is True when Hits > 10000
-    result = None  # Replace
+    # TODO: 添加布尔列 "Big_Hitter"，当 Hits > 10000 时为 True
+    result = None  # 替换
 
     return result
 
 
-# ---- Test harness (do not modify below this line) ----
+# ---- 测试代码（请勿修改此行以下内容）----
 if __name__ == "__main__":
     spark = (SparkSession.builder
         .appName("BlogsTest")
@@ -52,13 +52,13 @@ if __name__ == "__main__":
         .getOrCreate())
 
     df = build_blogs_df(spark)
-    assert df is not None, "Function returned None"
-    assert df.count() == 6, f"Expected 6 rows, got {df.count()}"
-    assert "Big_Hitter" in df.columns, "Missing Big_Hitter column"
-    assert "Campaigns" in df.columns, "Missing Campaigns column"
+    assert df is not None, "函数返回了 None"
+    assert df.count() == 6, f"预期 6 行，实际得到 {df.count()}"
+    assert "Big_Hitter" in df.columns, "缺少 Big_Hitter 列"
+    assert "Campaigns" in df.columns, "缺少 Campaigns 列"
 
     big_hitters = df.filter(f.col("Big_Hitter") == True).count()
-    assert big_hitters == 3, f"Expected 3 big hitters, got {big_hitters}"
-    print("All tests passed!")
+    assert big_hitters == 3, f"预期 3 个高访问量博客，实际得到 {big_hitters}"
+    print("所有测试通过！")
     df.show(truncate=False)
     spark.stop()

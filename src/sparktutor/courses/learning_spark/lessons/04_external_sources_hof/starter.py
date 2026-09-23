@@ -1,14 +1,14 @@
 """
-External Data Sources & Higher-Order Functions - Starter Code
+外部数据源与高阶函数 - 起始代码
 
-Implement the `analyze_orders` function that:
-1. Creates a DataFrame of orders with an array column "items"
-2. Uses transform() to uppercase all items in each order
-3. Uses filter() to keep only items starting with "p"
-4. Adds a window-based rank by total (descending) within each region
-5. Returns the result DataFrame
+实现 `analyze_orders` 函数：
+1. 创建包含数组列 "items" 的订单 DataFrame
+2. 使用 transform() 将每个订单中的所有商品转为大写
+3. 使用 filter() 仅保留以 "p" 开头的商品
+4. 在每个区域内按总额（降序）添加排名
+5. 返回结果 DataFrame
 
-This exercise covers higher-order functions and window functions.
+本练习涵盖高阶函数和窗口函数。
 """
 
 from pyspark.sql import SparkSession, functions as f, Window
@@ -35,27 +35,27 @@ SCHEMA = StructType([
 
 
 def analyze_orders(spark):
-    """Analyze orders using higher-order functions and windows."""
+    """使用高阶函数和窗口函数分析订单。"""
 
     orders_df = spark.createDataFrame(ORDER_DATA, SCHEMA)
 
-    # TODO: Use transform() to uppercase all items in the "items" array
-    #       Add as a new column called "items_upper"
-    with_upper = None  # Replace
+    # TODO: 使用 transform() 将 "items" 数组中的所有商品转为大写
+    #       作为新列 "items_upper" 添加
+    with_upper = None  # 替换
 
-    # TODO: Use filter() on "items" to keep only items starting with "p"
-    #       Add as a new column called "p_items"
-    with_p_items = None  # Replace
+    # TODO: 对 "items" 使用 filter() 仅保留以 "p" 开头的商品
+    #       作为新列 "p_items" 添加
+    with_p_items = None  # 替换
 
-    # TODO: Add a rank column "region_rank" that ranks orders by total
-    #       (descending) within each region using a window function
-    w = None  # Define the window spec
-    result = None  # Add the rank column
+    # TODO: 添加排名列 "region_rank"，使用窗口函数在每个区域内
+    #       按总额（降序）对订单排名
+    w = None  # 定义窗口规范
+    result = None  # 添加排名列
 
     return result
 
 
-# ---- Test harness (do not modify below this line) ----
+# ---- 测试代码（请勿修改此行以下内容）----
 if __name__ == "__main__":
     spark = (SparkSession.builder
         .appName("HOFTest")
@@ -63,16 +63,16 @@ if __name__ == "__main__":
         .getOrCreate())
 
     df = analyze_orders(spark)
-    assert df is not None, "Function returned None"
-    assert "items_upper" in df.columns, "Missing items_upper column"
-    assert "p_items" in df.columns, "Missing p_items column"
-    assert "region_rank" in df.columns, "Missing region_rank column"
-    assert df.count() == 6, f"Expected 6 rows, got {df.count()}"
+    assert df is not None, "函数返回了 None"
+    assert "items_upper" in df.columns, "缺少 items_upper 列"
+    assert "p_items" in df.columns, "缺少 p_items 列"
+    assert "region_rank" in df.columns, "缺少 region_rank 列"
+    assert df.count() == 6, f"预期 6 行，实际得到 {df.count()}"
 
-    # Check uppercase transform worked
+    # 验证大写转换是否生效
     first_upper = df.filter(f.col("order_id") == 1).select("items_upper").collect()[0][0]
-    assert first_upper == ["PEN", "PAPER", "PENCIL"], f"items_upper wrong: {first_upper}"
+    assert first_upper == ["PEN", "PAPER", "PENCIL"], f"items_upper 错误：{first_upper}"
 
-    print("All tests passed!")
+    print("所有测试通过！")
     df.show(truncate=False)
     spark.stop()

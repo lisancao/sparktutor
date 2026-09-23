@@ -1,17 +1,17 @@
 """
-Optimization & Tuning - Starter Code
+优化与调优 - 起始代码
 
-Implement the `optimize_pipeline` function that:
-1. Creates a large-ish sample DataFrame (10000 rows)
-2. Sets shuffle partitions to a reasonable number (e.g., 8)
-3. Performs a groupBy aggregation (simulating an expensive operation)
-4. Caches the aggregated result (it will be reused)
-5. Computes two different analyses from the cached DataFrame
-6. Unpersists the cache when done
-7. Coalesces the final result to 1 partition for output
-8. Returns a dict with the two analysis results and partition info
+实现 `optimize_pipeline` 函数：
+1. 创建一个稍大的示例 DataFrame（10000 行）
+2. 将 shuffle 分区数设置为合理值（如 8）
+3. 执行 groupBy 聚合（模拟耗时操作）
+4. 缓存聚合结果（后续会复用）
+5. 从缓存的 DataFrame 计算两种不同的分析
+6. 完成后解除缓存
+7. 将最终结果合并为 1 个分区用于输出
+8. 返回包含两种分析结果和分区信息的字典
 
-This exercise covers caching strategy and partition management.
+本练习涵盖缓存策略和分区管理。
 """
 
 from pyspark.sql import SparkSession, functions as f
@@ -22,7 +22,7 @@ import random
 
 
 def generate_data(n=10000):
-    """Generate sample sales data."""
+    """生成示例销售数据。"""
     departments = ["Engineering", "Marketing", "Sales", "Support", "HR"]
     regions = ["North", "South", "East", "West"]
     random.seed(42)
@@ -42,31 +42,31 @@ SCHEMA = StructType([
 
 
 def optimize_pipeline(spark):
-    """Demonstrate caching and partition optimization."""
+    """演示缓存和分区优化。"""
 
-    # TODO: Set shuffle partitions to 8
-    # Your code here
+    # TODO: 将 shuffle 分区数设置为 8
+    # 在此编写代码
 
     sales_df = spark.createDataFrame(generate_data(), SCHEMA)
 
-    # TODO: Aggregate by department and region — sum and avg of revenue
-    #       This simulates an expensive operation worth caching
-    agg_df = None  # Replace
+    # TODO: 按 department 和 region 聚合 — 对 revenue 求和和求平均值
+    #       这模拟了一个值得缓存的耗时操作
+    agg_df = None  # 替换
 
-    # TODO: Cache the aggregated DataFrame and trigger materialization
-    # Your code here
+    # TODO: 缓存聚合后的 DataFrame 并触发物化
+    # 在此编写代码
 
-    # TODO: Analysis 1 — from cached agg_df, find top department by total revenue
-    top_dept = None  # Replace
+    # TODO: 分析 1 — 从缓存的 agg_df 中，按总营收找出排名第一的部门
+    top_dept = None  # 替换
 
-    # TODO: Analysis 2 — from cached agg_df, find top region by avg revenue
-    top_region = None  # Replace
+    # TODO: 分析 2 — 从缓存的 agg_df 中，按平均营收找出排名第一的区域
+    top_region = None  # 替换
 
-    # TODO: Unpersist the cached DataFrame
-    # Your code here
+    # TODO: 解除缓存的 DataFrame
+    # 在此编写代码
 
-    # TODO: Coalesce top_dept to 1 partition
-    top_dept_single = None  # Replace
+    # TODO: 将 top_dept 合并为 1 个分区
+    top_dept_single = None  # 替换
 
     partitions_before = agg_df.rdd.getNumPartitions()
 
@@ -77,7 +77,7 @@ def optimize_pipeline(spark):
     }
 
 
-# ---- Test harness (do not modify below this line) ----
+# ---- 测试代码（请勿修改此行以下内容）----
 if __name__ == "__main__":
     spark = (SparkSession.builder
         .appName("OptimizationTest")
@@ -85,16 +85,16 @@ if __name__ == "__main__":
         .getOrCreate())
 
     result = optimize_pipeline(spark)
-    assert result is not None, "Function returned None"
-    assert result["top_dept"] is not None, "top_dept is None"
-    assert result["top_region"] is not None, "top_region is None"
-    assert result["top_dept"].count() > 0, "top_dept is empty"
-    assert result["top_region"].count() > 0, "top_region is empty"
-    assert result["top_dept"].rdd.getNumPartitions() == 1, "top_dept should be 1 partition"
-    print(f"Aggregation partitions: {result['agg_partitions']}")
-    print("Top departments by total revenue:")
+    assert result is not None, "函数返回了 None"
+    assert result["top_dept"] is not None, "top_dept 为 None"
+    assert result["top_region"] is not None, "top_region 为 None"
+    assert result["top_dept"].count() > 0, "top_dept 为空"
+    assert result["top_region"].count() > 0, "top_region 为空"
+    assert result["top_dept"].rdd.getNumPartitions() == 1, "top_dept 应为 1 个分区"
+    print(f"聚合分区数：{result['agg_partitions']}")
+    print("按总营收排名的部门：")
     result["top_dept"].show()
-    print("Top regions by avg revenue:")
+    print("按平均营收排名的区域：")
     result["top_region"].show()
-    print("All tests passed!")
+    print("所有测试通过！")
     spark.stop()

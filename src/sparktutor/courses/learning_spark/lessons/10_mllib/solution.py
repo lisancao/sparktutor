@@ -1,7 +1,7 @@
 """
-Machine Learning with MLlib - Solution
+使用 MLlib 进行机器学习 - 参考答案
 
-Complete ML pipeline for housing price prediction.
+完整的房价预测 ML Pipeline。
 """
 
 from pyspark.sql import SparkSession
@@ -16,7 +16,7 @@ import random
 
 
 def generate_housing_data(n=500):
-    """Generate synthetic housing data for ML training."""
+    """生成用于 ML 训练的合成房屋数据。"""
     neighborhoods = ["Downtown", "Suburbs", "Rural", "Midtown", "Waterfront"]
     conditions = ["Excellent", "Good", "Fair", "Poor"]
     random.seed(42)
@@ -49,7 +49,7 @@ SCHEMA = StructType([
 
 
 def build_pipeline(spark):
-    """Build and evaluate an ML pipeline for housing price prediction."""
+    """构建并评估用于房价预测的 ML Pipeline。"""
 
     housing_df = spark.createDataFrame(generate_housing_data(), SCHEMA)
 
@@ -92,7 +92,7 @@ def build_pipeline(spark):
     }
 
 
-# ---- Test harness ----
+# ---- 测试代码 ----
 if __name__ == "__main__":
     spark = (SparkSession.builder
         .appName("MLlibTest")
@@ -100,19 +100,19 @@ if __name__ == "__main__":
         .getOrCreate())
 
     result = build_pipeline(spark)
-    assert result is not None, "Function returned None"
-    assert result["model"] is not None, "Model is None"
-    assert result["predictions"] is not None, "Predictions is None"
-    assert result["rmse"] is not None, "RMSE is None"
-    assert result["r2"] is not None, "R2 is None"
-    assert result["rmse"] > 0, f"RMSE should be positive, got {result['rmse']}"
-    assert 0 < result["r2"] <= 1, f"R2 should be between 0 and 1, got {result['r2']}"
-    print(f"Training samples: {result['train_count']}")
-    print(f"Test samples: {result['test_count']}")
-    print(f"RMSE: {result['rmse']:.2f}")
-    print(f"R2: {result['r2']:.4f}")
-    print("\nSample predictions:")
+    assert result is not None, "函数返回了 None"
+    assert result["model"] is not None, "模型为 None"
+    assert result["predictions"] is not None, "预测为 None"
+    assert result["rmse"] is not None, "RMSE 为 None"
+    assert result["r2"] is not None, "R2 为 None"
+    assert result["rmse"] > 0, f"RMSE 应为正数，实际得到 {result['rmse']}"
+    assert 0 < result["r2"] <= 1, f"R2 应在 0 到 1 之间，实际得到 {result['r2']}"
+    print(f"训练样本数：{result['train_count']}")
+    print(f"测试样本数：{result['test_count']}")
+    print(f"RMSE：{result['rmse']:.2f}")
+    print(f"R2：{result['r2']:.4f}")
+    print("\n预测示例：")
     result["predictions"].select("neighborhood", "condition", "bedrooms",
                                   "sqft", "age", "price", "prediction").show(10)
-    print("All tests passed!")
+    print("所有测试通过！")
     spark.stop()

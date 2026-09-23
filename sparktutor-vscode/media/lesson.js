@@ -76,7 +76,7 @@ function setLoading(show, label) {
   if (!overlay) return;
   if (show) {
     var text = overlay.querySelector('.loading-text');
-    if (text) text.textContent = label || 'Processing...';
+    if (text) text.textContent = label || '处理中...';
     overlay.classList.remove('hidden');
   } else {
     overlay.classList.add('hidden');
@@ -90,9 +90,9 @@ function setLoading(show, label) {
  */
 function send(type) {
   if (type === 'submit') {
-    setLoading(true, 'Evaluating...');
+    setLoading(true, '评估中...');
   } else if (type === 'run') {
-    setLoading(true, 'Running...');
+    setLoading(true, '运行中...');
   }
   vscode.postMessage({ type });
 }
@@ -177,9 +177,9 @@ function showFeedback(data) {
 
   // Clear pass/fail banner
   if (data.passed) {
-    html += '<div class="feedback-verdict feedback-verdict-pass">&#10004; Passed</div>';
+    html += '<div class="feedback-verdict feedback-verdict-pass">&#10004; 通过</div>';
   } else {
-    html += '<div class="feedback-verdict feedback-verdict-fail">&#10008; Not Passed</div>';
+    html += '<div class="feedback-verdict feedback-verdict-fail">&#10008; 未通过</div>';
   }
 
   if (data.feedback && data.feedback.length > 0) {
@@ -203,7 +203,7 @@ function showFeedback(data) {
       out += '<div class="feedback-group-label ' + cssClass + '">' + label + '</div>';
       for (var j = 0; j < items.length; j++) {
         var item = items[j];
-        var lineInfo = item.line ? 'Line ' + item.line + ': ' : '';
+        var lineInfo = item.line ? '第 ' + item.line + ' 行：' : '';
         out += '<div class="feedback-item feedback-' + item.severity + '">';
         out += '<strong>' + lineInfo + markdownToHtml(item.message) + '</strong>';
         if (item.suggestion) {
@@ -215,9 +215,9 @@ function showFeedback(data) {
       return out;
     }
 
-    html += renderGroup(bugs, 'Bugs', 'label-bug');
-    html += renderGroup(conventions, 'Convention', 'label-convention');
-    html += renderGroup(bestPractices, 'Best Practice (optional)', 'label-best-practice');
+    html += renderGroup(bugs, '错误', 'label-bug');
+    html += renderGroup(conventions, '代码规范', 'label-convention');
+    html += renderGroup(bestPractices, '最佳实践（可选）', 'label-best-practice');
     html += renderGroup(other, '', 'label-other');
   }
 
@@ -240,8 +240,8 @@ function showFinished() {
   if (content) {
     content.innerHTML =
       '<div class="finished-banner">' +
-      '<h2>Lesson Complete!</h2>' +
-      '<p>Great job! Select another lesson from the sidebar to continue learning.</p>' +
+      '<h2>课程完成！</h2>' +
+      '<p>做得好！从侧边栏选择另一节课继续学习。</p>' +
       '</div>';
   }
   const actions = document.querySelector('.actions');

@@ -1,47 +1,47 @@
 - Class: meta
-  Lesson: "Gold Layer"
+  Lesson: "Gold 层"
   EstimatedMinutes: 20
 
 - Class: text
   Depth: all
   Output: |
-    ## What You'll Learn
+    ## 你将学到什么
 
-    Bronze preserved raw data. Silver cleaned and enriched it. Now the
-    **gold layer** transforms that trusted data into business-ready
-    aggregations that answer specific questions.
+    Bronze 保留了原始数据。Silver 清洗并丰富了它。现在
+    **gold 层**把这些可信数据转换成可直接用于业务的聚合，
+    以回答具体问题。
 
-    By the end of this lesson you will be able to:
+    学完本课后，你将能够：
 
-    - Use `groupBy().agg()` to compute summaries (count, sum, avg, min, max)
-    - Name aggregated columns clearly with `alias()`
-    - Build hourly/daily summaries from time-extracted columns
-    - Use window functions for running totals and rankings (intermediate)
-    - Handle data skew with two-phase salted aggregation (advanced)
+    - 使用 `groupBy().agg()` 计算汇总（count、sum、avg、min、max）
+    - 用 `alias()` 清晰地命名聚合列
+    - 从时间提取列构建按小时/按天的汇总
+    - 使用窗口函数做累计求和和排名（中级）
+    - 用两阶段加盐聚合处理数据倾斜（高级）
 
-    Gold tables are the ones your stakeholders actually see — in
-    dashboards, reports, and ML feature stores.
+    Gold 表是你的利益相关者真正能看到的表 —— 出现在仪表盘、
+    报表和 ML 特征存储中。
 
 - Class: text
   Depth: all
   Output: |
-    ## From Silver to Gold
+    ## 从 Silver 到 Gold
 
-    The silver layer you built in the previous lesson produces a DataFrame
-    with clean types, a computed `total` column, and an `order_hour`
-    extracted from the timestamp. Gold reads that silver output and
-    answers business questions like:
+    你在上一课构建的 silver 层产出一个 DataFrame，带有干净的
+    类型、一个计算好的 `total` 列，以及从时间戳提取出的
+    `order_hour`。Gold 读取 silver 的输出，回答类似这样的
+    业务问题：
 
-    - "What is the total revenue per product?"
-    - "How many orders per hour?"
-    - "Which product generates the most revenue?"
+    - "每个产品的总收入是多少？"
+    - "每小时有多少订单？"
+    - "哪个产品贡献的收入最多？"
 
-    The pattern is always: **group → aggregate → (optionally) rank or sort**.
+    模式永远是：**group → aggregate → （可选）rank 或 sort**。
 
 - Class: text
   Depth: beginner
   Output: |
-    The workhorse of the gold layer is `groupBy().agg()`:
+    gold 层的主力是 `groupBy().agg()`：
 
     ```python
     from pyspark.sql import functions as f
@@ -56,32 +56,31 @@
     )
     ```
 
-    `groupBy("product")` creates one group per unique product value.
-    `agg()` then computes one or more aggregate expressions within each
-    group. `alias()` gives each result column a meaningful name — without
-    it, Spark generates names like `sum(total)` which are hard to work
-    with downstream.
+    `groupBy("product")` 为每个唯一的 product 值创建一个组。
+    然后 `agg()` 在每个组内计算一个或多个聚合表达式。
+    `alias()` 给每个结果列一个有意义的名字 —— 没有它，
+    Spark 会生成像 `sum(total)` 这样的名字，下游很难使用。
 
 - Class: text
   Depth: all
   Output: |
-    ## Common Aggregate Functions
+    ## 常用聚合函数
 
-    These are the functions you will use most often inside `agg()`:
+    这些是你在 `agg()` 中最常用的函数：
 
-    | Function              | Description                    |
-    |-----------------------|--------------------------------|
-    | `f.count("*")`        | Number of rows                 |
-    | `f.sum("col")`        | Sum of values                  |
-    | `f.avg("col")`        | Average (mean)                 |
-    | `f.min("col")`        | Minimum value                  |
-    | `f.max("col")`        | Maximum value                  |
-    | `f.countDistinct("c")`| Number of unique values        |
+    | 函数                    | 说明                  |
+    |-------------------------|-----------------------|
+    | `f.count("*")`          | 行数                  |
+    | `f.sum("col")`          | 值的求和              |
+    | `f.avg("col")`          | 平均值                |
+    | `f.min("col")`          | 最小值                |
+    | `f.max("col")`          | 最大值                |
+    | `f.countDistinct("c")`  | 唯一值的数量          |
 
-    You can pass multiple expressions to `agg()` — Spark computes them
-    all in a single pass over the data.
+    你可以把多个表达式传给 `agg()` —— Spark 在一次数据扫描中
+    把它们全部算出来。
 
-    **Docs:**
+    **文档：**
     [f.sum](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.functions.sum.html) |
     [f.avg](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.functions.avg.html) |
     [f.count](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.functions.count.html) |
@@ -90,17 +89,18 @@
 
 - Class: mult_question
   Depth: all
-  Output: "Which method do you call after groupBy() to compute aggregations?"
+  Output: "在 groupBy() 之后调用哪个方法来计算聚合？"
   AnswerChoices: "agg();compute();reduce();aggregate()"
   CorrectAnswer: "agg()"
-  Hint: "It is a short three-letter method that accepts one or more aggregate expressions."
+  Hint: "它是一个三个字母的短方法，接受一个或多个聚合表达式。"
 
 - Class: cmd_question
   Depth: all
   Output: |
-    Given a silver DataFrame `silver_df` with columns `product`, `quantity`,
-    and `total`, write a groupBy that computes the total `quantity` sold
-    and total `revenue` (sum of `total`) per `product`.
+    给定一个包含 `product`、`quantity` 和 `total` 列的
+    silver DataFrame `silver_df`，编写一个 groupBy，按
+    `product` 计算总 `quantity` 销量和总 `revenue`
+    （`total` 的和）。
   CorrectAnswer: |
     from pyspark.sql import functions as f
     gold_df = (silver_df
@@ -110,21 +110,22 @@
             f.sum("total").alias("revenue"),
         )
     )
-  Hint: "Use groupBy('product').agg(f.sum(...).alias(...), f.sum(...).alias(...))"
+  Hint: "使用 groupBy('product').agg(f.sum(...).alias(...), f.sum(...).alias(...))"
 
 - Class: mult_question
   Depth: all
-  Output: "Which function counts the number of unique values in a column?"
+  Output: "哪个函数计算一列中唯一值的数量？"
   AnswerChoices: "f.countDistinct();f.count();f.uniqueCount();f.distinct()"
   CorrectAnswer: "f.countDistinct()"
-  Hint: "It combines 'count' and 'distinct' into one function name."
+  Hint: "它把 'count' 和 'distinct' 合到了一个函数名里。"
 
 - Class: cmd_question
   Depth: intermediate
   Output: |
-    Compute an hourly summary from `silver_df`: group by `order_hour` and
-    calculate `order_count` (count of rows), `total_revenue` (sum of total),
-    and `unique_products` (count distinct of product). Sort by `order_hour`.
+    从 `silver_df` 计算每小时汇总：按 `order_hour` 分组，
+    计算 `order_count`（行数）、`total_revenue`（total 的和）
+    和 `unique_products`（product 的 count distinct）。
+    按 `order_hour` 排序。
   CorrectAnswer: |
     from pyspark.sql import functions as f
     hourly = (silver_df
@@ -136,20 +137,20 @@
         )
         .orderBy("order_hour")
     )
-  Hint: "groupBy order_hour, agg with count, sum, countDistinct, then orderBy."
+  Hint: "groupBy order_hour，agg 用 count、sum、countDistinct，然后 orderBy。"
 
 - Class: text
   Depth: intermediate
   Output: |
-    ## Window Functions: Aggregation Without Collapse
+    ## 窗口函数：不坍缩行的聚合
 
-    `groupBy` collapses rows — one output row per group. **Window
-    functions** compute values across related rows while keeping every
-    row in the output. This makes them perfect for:
+    `groupBy` 会坍缩行 —— 每个组输出一行。**窗口函数**
+    在相关行之间计算值，同时保留每一行在输出中。这使它们
+    非常适合：
 
-    - **Running totals** — cumulative sum up to the current row
-    - **Rankings** — rank products by revenue
-    - **Moving averages** — average over a sliding window of rows
+    - **累计求和** —— 到当前行为止的累计总和
+    - **排名** —— 按收入给产品排名
+    - **移动平均** —— 在滑动行窗口上取平均
 
     ```python
     from pyspark.sql import Window
@@ -161,13 +162,12 @@
     df = df.withColumn("running_revenue", f.sum("total").over(w))
     ```
 
-    `partitionBy` defines the groups (like groupBy, but rows are not
-    collapsed). `orderBy` defines the row ordering within each group.
-    `rowsBetween` defines which rows to include in the computation
-    relative to the current row.
+    `partitionBy` 定义分组（像 groupBy，但行不坍缩）。
+    `orderBy` 定义组内行的排序。`rowsBetween` 定义相对于
+    当前行在计算中包含哪些行。
 
-    **Docs:**
-    [Window](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.Window.html) — `partitionBy()`, `orderBy()`, `rowsBetween()`, `rangeBetween()` |
+    **文档：**
+    [Window](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.Window.html) —— `partitionBy()`、`orderBy()`、`rowsBetween()`、`rangeBetween()` |
     [f.rank](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.functions.rank.html) |
     [f.dense_rank](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.functions.dense_rank.html) |
     [f.row_number](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.functions.row_number.html)
@@ -175,8 +175,8 @@
 - Class: cmd_question
   Depth: intermediate
   Output: |
-    Add a `running_total` column to `silver_df` that is the cumulative sum
-    of `total` partitioned by `product` and ordered by `order_ts`.
+    给 `silver_df` 添加一个 `running_total` 列，它是 `total`
+    按 `product` 分区、按 `order_ts` 排序后的累计求和。
   CorrectAnswer: |
     from pyspark.sql import functions as f
     from pyspark.sql import Window
@@ -185,74 +185,73 @@
         Window.unboundedPreceding, Window.currentRow
     )
     result = silver_df.withColumn("running_total", f.sum("total").over(w))
-  Hint: "Define a Window with partitionBy, orderBy, and rowsBetween. Use f.sum().over(window)."
+  Hint: "用 partitionBy、orderBy 和 rowsBetween 定义 Window。用 f.sum().over(window)。"
 
 - Class: text
   Depth: intermediate
   Output: |
-    ## Rankings with Window Functions
+    ## 用窗口函数做排名
 
-    A common gold-layer pattern is ranking — "which product has the
-    highest revenue?" Use `f.rank()` or `f.dense_rank()` over a window
-    ordered by the metric:
+    gold 层的一个常见模式是排名 —— "哪个产品收入最高？"
+    在按指标排序的窗口上使用 `f.rank()` 或 `f.dense_rank()`：
 
     ```python
     rank_window = Window.orderBy(f.col("revenue").desc())
     gold = gold.withColumn("revenue_rank", f.rank().over(rank_window))
     ```
 
-    - `f.rank()` — ties get the same rank, next rank is skipped (1, 2, 2, 4)
-    - `f.dense_rank()` — ties get the same rank, no gap (1, 2, 2, 3)
-    - `f.row_number()` — no ties, arbitrary tiebreaking (1, 2, 3, 4)
+    - `f.rank()` —— 并列得到相同名次，跳过下一个名次（1, 2, 2, 4）
+    - `f.dense_rank()` —— 并列得到相同名次，不跳号（1, 2, 2, 3）
+    - `f.row_number()` —— 不允许并列，任意打破平局（1, 2, 3, 4）
 
-    Rankings are especially useful for "top N" queries — filter to
-    `revenue_rank <= 10` to get the top 10 products.
+    排名对 "top N" 查询特别有用 —— 过滤 `revenue_rank <= 10`
+    就能得到前 10 个产品。
 
 - Class: mult_question
   Depth: intermediate
-  Output: "What is the difference between f.rank() and f.dense_rank()?"
-  AnswerChoices: "rank() skips numbers after ties while dense_rank() does not;They are identical;rank() is faster;dense_rank() only works with partitions"
-  CorrectAnswer: "rank() skips numbers after ties while dense_rank() does not"
-  Hint: "With values 100, 90, 90, 80: rank gives 1,2,2,4 while dense_rank gives 1,2,2,3."
+  Output: "f.rank() 和 f.dense_rank() 之间的区别是什么？"
+  AnswerChoices: "rank() 在并列后会跳号，而 dense_rank() 不会;它们完全相同;rank() 更快;dense_rank() 只能配合分区使用"
+  CorrectAnswer: "rank() 在并列后会跳号，而 dense_rank() 不会"
+  Hint: "对于值 100, 90, 90, 80：rank 给出 1,2,2,4，而 dense_rank 给出 1,2,2,3。"
 
 - Class: text
   Depth: advanced
   Output: |
-    ## Performance Tuning for Gold Aggregations
+    ## Gold 聚合的性能调优
 
-    Gold-layer aggregations involve shuffles — Spark must redistribute
-    data so all rows with the same key end up on the same partition.
-    Three techniques to make this faster:
+    gold 层的聚合涉及 shuffle —— Spark 必须重新分布数据，
+    让相同键的所有行落到同一个分区上。三种让它更快的技巧：
 
-    **1. Tune shuffle partitions.** The default `spark.sql.shuffle.partitions`
-    is 200, which is too many for small to medium datasets. For datasets
-    under a few GB, try 8-32 partitions.
+    **1. 调整 shuffle 分区数。** 默认的
+    `spark.sql.shuffle.partitions` 是 200，对中小型数据集
+    来说太多了。对于几 GB 以下的数据集，试试 8-32 个分区。
 
-    **2. Cache the silver input.** If multiple gold tables read from the
-    same silver DataFrame, cache it to avoid recomputation:
+    **2. 缓存 silver 输入。** 如果多个 gold 表从同一个
+    silver DataFrame 读取，缓存它以避免重复计算：
     ```python
     silver_df.cache()
     silver_df.count()  # materialize the cache
     ```
 
-    **3. Two-phase (salted) aggregation.** When a single key dominates
-    the data (e.g., 80% of orders are for one product), that key's
-    partition becomes a bottleneck. The solution: add a random salt,
-    aggregate partially, then aggregate again without the salt.
+    **3. 两阶段（加盐）聚合。** 当单个键在数据中占主导
+    （例如 80% 的订单都是同一个产品），该键的分区就会成为
+    瓶颈。解决方案：加一个随机盐，先部分聚合，然后去掉盐
+    再聚合一次。
 
 - Class: mult_question
   Depth: advanced
-  Output: "What is the purpose of two-phase (salted) aggregation?"
-  AnswerChoices: "To handle data skew by distributing hot keys across partitions;To speed up I/O;To reduce memory usage;To improve join performance"
-  CorrectAnswer: "To handle data skew by distributing hot keys across partitions"
-  Hint: "Adding a random salt breaks up a single hot key into multiple sub-keys for the first phase."
+  Output: "两阶段（加盐）聚合的目的是什么？"
+  AnswerChoices: "通过把热点键分散到多个分区来处理数据倾斜;为了加速 I/O;为了减少内存使用;为了提升 join 性能"
+  CorrectAnswer: "通过把热点键分散到多个分区来处理数据倾斜"
+  Hint: "加随机盐把单个热点键拆成多个子键，用于第一阶段。"
 
 - Class: cmd_question
   Depth: advanced
   Output: |
-    Implement a two-phase aggregation for summing `total` by `product`.
-    Phase 1: add a salt column (random int 0-9), groupBy product + salt,
-    sum total. Phase 2: drop salt, groupBy product, sum again.
+    实现一个两阶段聚合，按 `product` 对 `total` 求和。
+    第一阶段：加一个盐列（随机整数 0-9），按 product + salt
+    分组，对 total 求和。第二阶段：去掉 salt，按 product
+    分组，再求和一次。
   CorrectAnswer: |
     from pyspark.sql import functions as f
 
@@ -268,42 +267,42 @@
         .groupBy("product")
         .agg(f.sum("partial_revenue").alias("revenue"))
     )
-  Hint: "Add a random _salt column, groupBy(product, _salt) for phase 1, then groupBy(product) for phase 2."
+  Hint: "添加一个随机 _salt 列，第一阶段 groupBy(product, _salt)，第二阶段 groupBy(product)。"
 
 - Class: script
   Depth: all
   Output: |
-    ## Exercise: Build a Gold Aggregation
+    ## 练习：构建 Gold 聚合
 
-    Open the starter file and implement `gold_product_summary(spark)`:
+    打开 starter 文件，实现 `gold_product_summary(spark)`：
 
-    1. Read from the `silver_orders` temp view
-    2. Group by `product`
-    3. Compute `order_count` (count), `total_revenue` (sum of total),
-       and `avg_order_value` (avg of total)
-    4. Add a `revenue_rank` column using a window function
-       (rank by total_revenue descending)
-    5. Return the gold DataFrame
+    1. 从 `silver_orders` 临时视图读取
+    2. 按 `product` 分组
+    3. 计算 `order_count`（count）、`total_revenue`（total 的和）
+       和 `avg_order_value`（total 的 avg）
+    4. 用窗口函数添加 `revenue_rank` 列
+       （按 total_revenue 降序排名）
+    5. 返回 gold DataFrame
 
-    The test harness creates silver data with multiple products and
-    verifies your aggregation and ranking are correct.
+    测试框架会创建包含多个产品的 silver 数据，并验证你的
+    聚合和排名是否正确。
   StarterFile: starter.py
   SolutionFile: solution.py
-  Hint: "groupBy product, agg for counts and sums, then use Window with f.rank().over(w)."
+  Hint: "groupBy product，agg 计算 count 和 sum，然后用 Window 配合 f.rank().over(w)。"
 
 - Class: text
   Depth: all
   Output: |
-    ## Summary
+    ## 小结
 
-    Your gold layer produces clean, aggregated, business-ready data:
+    你的 gold 层产出干净、经过聚合、可直接用于业务的数据：
 
-    - **groupBy + agg** — the core pattern for summaries
-    - **Aggregate functions** — count, sum, avg, min, max, countDistinct
-    - **alias()** — give computed columns meaningful names
-    - **Window functions** — running totals, rankings, moving averages
-    - **Two-phase aggregation** — handle data skew for hot keys
+    - **groupBy + agg** —— 汇总的核心模式
+    - **聚合函数** —— count、sum、avg、min、max、countDistinct
+    - **alias()** —— 给计算出的列起有意义的名字
+    - **窗口函数** —— 累计求和、排名、移动平均
+    - **两阶段聚合** —— 处理热点键的数据倾斜
 
-    You now have all three layers of the medallion architecture. In the
-    final lesson, you will connect them into a **single end-to-end
-    pipeline** with error handling and deployment patterns.
+    你现在已经拥有 medallion 架构的全部三层。在最后一课中，
+    你将把它们连接成一条**端到端的完整管道**，并加上错误
+    处理和部署模式。

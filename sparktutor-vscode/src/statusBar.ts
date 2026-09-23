@@ -17,7 +17,7 @@ export class StatusBarManager {
     );
     this.modeItem.name = "SparkTutor Mode";
     this.modeItem.command = "sparktutor.changeMode";
-    this.modeItem.tooltip = "Click to change execution mode";
+    this.modeItem.tooltip = "点击切换执行模式";
 
     this.stepItem = vscode.window.createStatusBarItem(
       vscode.StatusBarAlignment.Left,
@@ -31,7 +31,7 @@ export class StatusBarManager {
     );
     this.depthItem.name = "SparkTutor Depth";
     this.depthItem.command = "sparktutor.changeDepth";
-    this.depthItem.tooltip = "Click to change difficulty level";
+    this.depthItem.tooltip = "点击切换难度级别";
 
     this.aiProviderItem = vscode.window.createStatusBarItem(
       vscode.StatusBarAlignment.Left,
@@ -61,13 +61,17 @@ export class StatusBarManager {
   }
 
   setStep(currentIndex: number, totalSteps: number): void {
-    this.stepItem.text = `Step ${currentIndex + 1}/${totalSteps}`;
+    this.stepItem.text = `第 ${currentIndex + 1}/${totalSteps} 步`;
     this.stepItem.show();
   }
 
   setDepth(depth: string): void {
-    const label = depth.charAt(0).toUpperCase() + depth.slice(1);
-    this.depthItem.text = label;
+    const labels: Record<string, string> = {
+      beginner: "入门",
+      intermediate: "中级",
+      advanced: "高级",
+    };
+    this.depthItem.text = labels[depth] || depth;
     this.depthItem.show();
   }
 
@@ -75,6 +79,7 @@ export class StatusBarManager {
     const labels: Record<string, string> = {
       anthropic: "$(sparkle) AI: Claude",
       copilot: "$(copilot) AI: Copilot",
+      "openai-compatible": "$(cloud) AI: OpenAI-compat",
       none: "$(circle-slash) AI: Local",
     };
     this.aiProviderItem.text = labels[provider] || `AI: ${provider}`;

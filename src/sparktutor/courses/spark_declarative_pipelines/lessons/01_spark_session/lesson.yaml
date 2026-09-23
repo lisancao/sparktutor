@@ -1,18 +1,17 @@
 - Class: meta
-  Lesson: "SparkSession & Pipeline Setup"
+  Lesson: "SparkSession 与管道搭建"
   EstimatedMinutes: 15
 
 - Class: text
   Depth: all
   Output: |
-    ## Welcome to Spark Declarative Pipelines
+    ## 欢迎来到 Spark 声明式管道
 
-    In this course you will build a complete **bronze-silver-gold data
-    pipeline** using Apache Spark 4.1. By the end, you will have a
-    production-ready framework that ingests raw data, cleans it, and
-    produces business-ready aggregations.
+    在本课程中，你将使用 Apache Spark 4.1 构建一条完整的 **bronze-silver-gold
+    数据管道**。学完后，你将拥有一个生产级框架：摄入原始数据、清洗数据，
+    并产出可直接用于业务的聚合结果。
 
-    **What you'll build across the 8 lessons:**
+    **8 节课中你将构建的内容：**
 
     ```
     Raw CSV → [Bronze] → [Silver] → [Gold] → Business Reports
@@ -21,28 +20,27 @@
                dedup      enrich     summarize
     ```
 
-    This first lesson covers the **SparkSession** — the ignition key for
-    everything that follows. Every transformation, every query, every
-    table read starts with a SparkSession.
+    第一课讲解 **SparkSession** —— 后续一切内容的点火钥匙。
+    每一次转换、每一条查询、每一张表的读取，都从 SparkSession 开始。
 
 - Class: text
   Depth: all
   Output: |
-    ## What You'll Learn
+    ## 你将学到什么
 
-    - Create a SparkSession with the builder pattern
-    - Configure key settings for pipeline workloads
-    - Understand what the SparkSession provides (DataFrames, SQL, Catalog)
-    - Set up an Iceberg catalog for lakehouse tables (advanced)
+    - 用建造者模式创建 SparkSession
+    - 配置管道工作负载的关键设置
+    - 理解 SparkSession 提供了什么（DataFrame、SQL、Catalog）
+    - 为湖仓表设置 Iceberg catalog（高级）
 
-    **Prerequisites**: Basic Python. If you have taken the Learning Spark
-    course, this will be quick review with a pipeline-specific focus.
+    **前置要求**：基础 Python 知识。如果你学过 Learning Spark
+    课程，本节将是一次快速回顾，重点放在管道场景。
 
 - Class: text
   Depth: beginner
   Output: |
-    Think of SparkSession as the ignition key for a car. Without it,
-    nothing moves. You create one with a simple builder pattern:
+    把 SparkSession 想象成汽车的点火钥匙。没有它，什么都动不了。
+    用简单的建造者模式创建它：
 
     ```python
     from pyspark.sql import SparkSession
@@ -50,60 +48,59 @@
     spark = SparkSession.builder.appName("MyPipeline").getOrCreate()
     ```
 
-    `getOrCreate()` either creates a brand-new session or returns one that
-    already exists. This means you can safely call it multiple times without
-    creating duplicate sessions.
+    `getOrCreate()` 要么创建一个全新的会话，要么返回已存在的会话。
+    这意味着你可以安全地多次调用它，而不会创建重复的会话。
 
-    **Docs:** [SparkSession](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.SparkSession.html)
-    — `builder.appName()`, `builder.config()`, `builder.master()`, `getOrCreate()`.
+    **文档：** [SparkSession](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.SparkSession.html)
+    —— `builder.appName()`、`builder.config()`、`builder.master()`、`getOrCreate()`。
 
 - Class: text
   Depth: intermediate
   Output: |
-    SparkSession replaced the older SQLContext and HiveContext from Spark
-    1.x. It is the single entry point for:
+    SparkSession 取代了 Spark 1.x 时代的旧版 SQLContext 和 HiveContext。
+    它是以下操作的唯一入口：
 
-    - Creating DataFrames: `spark.createDataFrame(data, schema)`
-    - Running SQL queries: `spark.sql("SELECT ...")`
-    - Accessing the catalog: `spark.catalog.listTables()`
-    - Reading data: `spark.read.csv(...)`, `spark.read.parquet(...)`
+    - 创建 DataFrame：`spark.createDataFrame(data, schema)`
+    - 运行 SQL 查询：`spark.sql("SELECT ...")`
+    - 访问 catalog：`spark.catalog.listTables()`
+    - 读取数据：`spark.read.csv(...)`、`spark.read.parquet(...)`
 
-    For pipeline workloads, two configurations matter most:
+    对于管道工作负载，两个配置最为重要：
 
-    - `spark.sql.shuffle.partitions` — controls partitions after shuffles
-      like `groupBy`. Default is 200, but for development and small
-      datasets, set it to 8-16.
-    - `spark.driver.memory` — how much RAM the driver gets. Increase for
-      pipelines that collect large results.
+    - `spark.sql.shuffle.partitions` —— 控制 `groupBy` 等 shuffle
+      操作之后的分区数。默认是 200，但对于开发和小数据集，
+      建议设为 8-16。
+    - `spark.driver.memory` —— 驱动程序分配多少内存。对于需要
+      收集大量结果的管道，应调大。
 
 - Class: mult_question
   Depth: all
-  Output: "Which method on SparkSession.builder creates a new session or returns the existing one?"
+  Output: "SparkSession.builder 上哪个方法会创建新会话或返回已存在的会话？"
   AnswerChoices: "getOrCreate();create();start();initialize()"
   CorrectAnswer: "getOrCreate()"
-  Hint: "The name describes exactly what it does — get an existing one, or create a new one."
+  Hint: "名字本身就说明了它的作用 —— 获取一个已存在的，或者创建一个新的。"
 
 - Class: cmd_question
   Depth: all
   Output: |
-    Create a SparkSession with the app name `'OrdersPipeline'`.
+    创建一个 SparkSession，应用名称设为 `'OrdersPipeline'`。
   CorrectAnswer: |
     from pyspark.sql import SparkSession
     spark = SparkSession.builder.appName("OrdersPipeline").getOrCreate()
-  Hint: "Use SparkSession.builder, chain .appName(), then .getOrCreate()."
+  Hint: "用 SparkSession.builder，链式调用 .appName()，然后 .getOrCreate()。"
 
 - Class: mult_question
   Depth: intermediate
-  Output: "Which config controls the number of partitions produced by shuffle operations like groupBy?"
+  Output: "哪个配置控制 groupBy 等 shuffle 操作产生的分区数量？"
   AnswerChoices: "spark.sql.shuffle.partitions;spark.default.parallelism;spark.executor.cores;spark.shuffle.count"
   CorrectAnswer: "spark.sql.shuffle.partitions"
-  Hint: "It is an SQL-level config with a default of 200."
+  Hint: "它是一个 SQL 级别的配置，默认值为 200。"
 
 - Class: cmd_question
   Depth: intermediate
   Output: |
-    Create a SparkSession named `'PipelineApp'` with shuffle partitions
-    set to 8 and driver memory set to `'2g'`.
+    创建一个名为 `'PipelineApp'` 的 SparkSession，shuffle 分区数
+    设为 8，driver 内存设为 `'2g'`。
   CorrectAnswer: |
     from pyspark.sql import SparkSession
     spark = (SparkSession.builder
@@ -111,24 +108,22 @@
         .config("spark.sql.shuffle.partitions", "8")
         .config("spark.driver.memory", "2g")
         .getOrCreate())
-  Hint: "Chain multiple .config(key, value) calls before .getOrCreate()."
+  Hint: "在 .getOrCreate() 之前链式调用多个 .config(key, value)。"
 
 - Class: text
   Depth: advanced
   Output: |
-    Under the hood, SparkSession wraps a `SparkContext` (the cluster
-    connection) and a `SessionState` that holds the Catalyst optimizer,
-    analyzer, and physical planner.
+    在底层，SparkSession 封装了一个 `SparkContext`（集群连接）和一个
+    `SessionState`，后者持有 Catalyst 优化器、分析器和物理计划生成器。
 
-    When you call `spark.sql("SELECT ...")`, the query travels through:
-    1. **Parser** — SQL string to unresolved logical plan
-    2. **Analyzer** — resolves column/table names via the Catalog
-    3. **Optimizer** — applies Catalyst rules (predicate pushdown, etc.)
-    4. **Planner** — converts to a physical plan with concrete operators
+    当你调用 `spark.sql("SELECT ...")` 时，查询会依次经过：
+    1. **解析器（Parser）** —— 将 SQL 字符串转换为未解析的逻辑计划
+    2. **分析器（Analyzer）** —— 通过 Catalog 解析列名/表名
+    3. **优化器（Optimizer）** —— 应用 Catalyst 规则（谓词下推等）
+    4. **计划器（Planner）** —— 转换为带有具体算子的物理计划
 
-    For pipeline workloads, you can attach an **Iceberg catalog** at
-    session creation. This gives your pipeline ACID transactions, schema
-    evolution, and time travel:
+    对于管道工作负载，你可以在创建会话时挂载一个 **Iceberg catalog**。
+    这会为你的管道提供 ACID 事务、schema 演进和时间旅行能力：
 
     ```python
     spark = (SparkSession.builder
@@ -141,16 +136,16 @@
 
 - Class: mult_question
   Depth: advanced
-  Output: "In the Catalyst optimizer pipeline, what happens immediately after parsing?"
-  AnswerChoices: "Analysis — resolve names via the Catalog;Physical planning;Code generation;Partition pruning"
-  CorrectAnswer: "Analysis — resolve names via the Catalog"
-  Hint: "The parser produces an *unresolved* plan. The next stage resolves column and table names."
+  Output: "在 Catalyst 优化器管道中，解析之后紧接着发生什么？"
+  AnswerChoices: "分析 —— 通过 Catalog 解析名称;物理计划生成;代码生成;分区裁剪"
+  CorrectAnswer: "分析 —— 通过 Catalog 解析名称"
+  Hint: "解析器产生的是*未解析*的计划。下一阶段会解析列名和表名。"
 
 - Class: cmd_question
   Depth: advanced
   Output: |
-    Create a SparkSession with an Iceberg catalog named `'lakehouse'`
-    using the hadoop catalog type and warehouse path `'/warehouse/iceberg'`.
+    创建一个 SparkSession，挂载一个名为 `'lakehouse'` 的 Iceberg catalog，
+    使用 hadoop catalog 类型，warehouse 路径为 `'/warehouse/iceberg'`。
   CorrectAnswer: |
     from pyspark.sql import SparkSession
     spark = (SparkSession.builder
@@ -159,20 +154,19 @@
         .config("spark.sql.catalog.lakehouse.type", "hadoop")
         .config("spark.sql.catalog.lakehouse.warehouse", "/warehouse/iceberg")
         .getOrCreate())
-  Hint: "Iceberg catalog configs follow the pattern spark.sql.catalog.<name>.<property>."
+  Hint: "Iceberg catalog 配置遵循 spark.sql.catalog.<name>.<property> 的模式。"
 
 - Class: text
   Depth: all
   Output: |
-    ## Summary
+    ## 小结
 
-    You now know how to create and configure a SparkSession — the
-    foundation that every pipeline layer will use. Key takeaways:
+    你现在知道如何创建和配置 SparkSession 了 —— 它是每一层管道
+    都会使用的基础。要点回顾：
 
-    - `SparkSession.builder.appName(...).getOrCreate()` is the entry point
-    - Configure `shuffle.partitions` for your data size
-    - Advanced: attach an Iceberg catalog for ACID-compliant table storage
+    - `SparkSession.builder.appName(...).getOrCreate()` 是入口
+    - 根据数据规模配置 `shuffle.partitions`
+    - 高级：挂载 Iceberg catalog 以获得符合 ACID 规范的表存储
 
-    In the next lesson, you will learn the **DataFrame transformations**
-    that power every pipeline stage: select, filter, withColumn, and
-    conditional logic.
+    下一课中，你将学习驱动每个管道阶段的 **DataFrame 转换**：
+    select、filter、withColumn 以及条件逻辑。

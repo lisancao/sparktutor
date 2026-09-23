@@ -1,7 +1,7 @@
 """
-Spark SQL Deep Dive - Solution
+Spark SQL 深入探索 - 参考答案
 
-Compare DataFrame API and SQL execution plans.
+比较 DataFrame API 和 SQL 的执行计划。
 """
 
 from pyspark.sql import SparkSession, functions as f
@@ -30,7 +30,7 @@ SCHEMA = StructType([
 
 
 def compare_plans(spark):
-    """Compare DataFrame API and SQL execution plans."""
+    """比较 DataFrame API 和 SQL 的执行计划。"""
 
     emp_df = spark.createDataFrame(EMPLOYEE_DATA, SCHEMA)
 
@@ -61,7 +61,7 @@ def compare_plans(spark):
     }
 
 
-# ---- Test harness ----
+# ---- 测试代码 ----
 if __name__ == "__main__":
     spark = (SparkSession.builder
         .appName("SQLDeepDiveTest")
@@ -69,14 +69,14 @@ if __name__ == "__main__":
         .getOrCreate())
 
     result = compare_plans(spark)
-    assert result is not None, "Function returned None"
-    assert result["df_result"].count() == 3, "DataFrame API should return 3 departments"
-    assert result["sql_result"].count() == 3, "SQL should return 3 departments"
-    assert len(result["df_plan"]) > 0, "df_plan should not be empty"
-    assert len(result["sql_plan"]) > 0, "sql_plan should not be empty"
-    print("DataFrame API result:")
+    assert result is not None, "函数返回了 None"
+    assert result["df_result"].count() == 3, "DataFrame API 应返回 3 个部门"
+    assert result["sql_result"].count() == 3, "SQL 应返回 3 个部门"
+    assert len(result["df_plan"]) > 0, "df_plan 不应为空"
+    assert len(result["sql_plan"]) > 0, "sql_plan 不应为空"
+    print("DataFrame API 结果：")
     result["df_result"].show()
-    print("SQL result:")
+    print("SQL 结果：")
     result["sql_result"].show()
-    print("All tests passed!")
+    print("所有测试通过！")
     spark.stop()

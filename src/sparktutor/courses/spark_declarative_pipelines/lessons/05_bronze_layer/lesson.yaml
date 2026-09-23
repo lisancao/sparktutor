@@ -1,45 +1,44 @@
 - Class: meta
-  Lesson: "Bronze Layer"
+  Lesson: "Bronze 层"
   EstimatedMinutes: 20
 
 - Class: text
   Depth: all
   Output: |
-    ## What You'll Learn
+    ## 你将学到什么
 
-    With the Pipeline framework built, it is time to create the first
-    layer. The **bronze layer** is the foundation of every medallion
-    architecture pipeline. It has one job: get raw data in safely.
+    Pipeline 框架已经搭建完成，现在是创建第一层的时候了。
+    **Bronze 层**是每一个 medallion 架构管道的基础。它只有
+    一项任务：安全地把原始数据接入进来。
 
-    By the end of this lesson you will be able to:
+    学完本课后，你将能够：
 
-    - Explain the role of bronze in the medallion architecture
-    - Ingest raw CSV/JSON data with all-string schemas (schema-on-read)
-    - Add lineage metadata columns (`_ingested_at`, `_source_file`)
-    - Deduplicate records using `dropDuplicates` and window functions
-    - Understand incremental ingestion patterns (advanced)
+    - 解释 bronze 在 medallion 架构中的角色
+    - 用全字符串 schema（schema-on-read）接入原始 CSV/JSON 数据
+    - 添加血缘元数据列（`_ingested_at`、`_source_file`）
+    - 使用 `dropDuplicates` 和窗口函数对记录去重
+    - 理解增量接入模式（高级）
 
 - Class: text
   Depth: all
   Output: |
-    ## The Bronze Layer's Role
+    ## Bronze 层的职责
 
-    Bronze does four things:
+    Bronze 做四件事：
 
-    1. **Ingest** — read raw data from external sources (CSV, JSON, APIs)
-    2. **Preserve** — keep the original data as-is (no transformations)
-    3. **Annotate** — add metadata columns for tracking and auditing
-    4. **Deduplicate** — remove obvious exact duplicates
+    1. **接入（Ingest）** —— 从外部数据源（CSV、JSON、API）读取原始数据
+    2. **保留（Preserve）** —— 原样保留原始数据（不做任何转换）
+    3. **标注（Annotate）** —— 添加元数据列用于追踪和审计
+    4. **去重（Deduplicate）** —— 去除明显的完全重复记录
 
-    Bronze tables are your safety net. If anything goes wrong in silver or
-    gold, you can always re-process from bronze. This is why you preserve
-    the raw data without transforming it.
+    Bronze 表是你的安全网。如果 silver 或 gold 出了问题，
+    你总能从 bronze 重新处理。这就是为什么要保留原始数据而
+    不做转换。
 
 - Class: text
   Depth: beginner
   Output: |
-    A minimal bronze ingestion reads a raw file and adds two metadata
-    columns:
+    一个最小化的 bronze 接入逻辑读取原始文件并添加两个元数据列：
 
     ```python
     from pyspark.sql import functions as f
@@ -52,31 +51,30 @@
         )
     ```
 
-    - `_ingested_at` records **when** the row was loaded
-    - `_source_file` records **where** it came from
+    - `_ingested_at` 记录行是**何时**加载的
+    - `_source_file` 记录它来自**哪里**
 
-    These columns create an audit trail — you can always trace a row back
-    to its source.
+    这些列构成了一条审计追踪链 —— 你总能把一行数据追溯到它
+    的源头。
 
-    **Docs:**
+    **文档：**
     [f.current_timestamp](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.functions.current_timestamp.html) |
     [f.input_file_name](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.functions.input_file_name.html) |
     [dropDuplicates](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.dropDuplicates.html)
-    — `subset` parameter for dedup by specific columns.
+    —— `subset` 参数用于按指定列去重。
 
 - Class: mult_question
   Depth: all
-  Output: "What is the primary purpose of the bronze layer?"
-  AnswerChoices: "Ingest and preserve raw data with metadata;Aggregate data for dashboards;Clean and normalize data types;Train machine learning models"
-  CorrectAnswer: "Ingest and preserve raw data with metadata"
-  Hint: "Bronze is about raw ingestion and preservation, not transformation."
+  Output: "bronze 层的主要用途是什么？"
+  AnswerChoices: "接入并带元数据地保留原始数据;为仪表盘聚合数据;清洗并规范化数据类型;训练机器学习模型"
+  CorrectAnswer: "接入并带元数据地保留原始数据"
+  Hint: "Bronze 关注的是原始数据的接入与保留，而不是转换。"
 
 - Class: cmd_question
   Depth: all
   Output: |
-    Write a function `bronze_events` that reads JSON from
-    `'/data/raw/events.json'` and adds an `_ingested_at` column with the
-    current timestamp.
+    编写一个函数 `bronze_events`，从 `'/data/raw/events.json'`
+    读取 JSON，并添加一个 `_ingested_at` 列，值为当前时间戳。
   CorrectAnswer: |
     from pyspark.sql import functions as f
 
@@ -84,16 +82,15 @@
         return (spark.read.json("/data/raw/events.json")
             .withColumn("_ingested_at", f.current_timestamp())
         )
-  Hint: "Use spark.read.json() and .withColumn with f.current_timestamp()."
+  Hint: "使用 spark.read.json()，并用 .withColumn 配合 f.current_timestamp()。"
 
 - Class: text
   Depth: intermediate
   Output: |
-    ## Schema-on-Read
+    ## Schema-on-Read（读取时定义 Schema）
 
-    **Schema-on-read** means you do not enforce strict types at the
-    bronze layer. Instead, read everything as strings and let the silver
-    layer handle type casting.
+    **Schema-on-read** 意味着你不在 bronze 层强制严格类型。
+    相反，把所有内容都读成字符串，让 silver 层来做类型转换。
 
     ```python
     from pyspark.sql.types import StructType, StructField, StringType
@@ -106,32 +103,32 @@
     ])
     ```
 
-    Why? If a price column contains "N/A" or "pending", casting to double
-    would lose that row. Keeping it as a string preserves the original
-    data. The silver layer decides how to handle these cases.
+    为什么？如果 price 列包含 "N/A" 或 "pending"，转成 double
+    会丢掉这一行。保留为字符串就能保住原始数据。由 silver 层
+    来决定如何处理这些情况。
 
 - Class: mult_question
   Depth: intermediate
-  Output: "Why does the bronze layer read columns as strings instead of their actual types?"
-  AnswerChoices: "To avoid losing data from parse errors — type casting happens in silver;To save memory;Because Spark cannot infer types from CSV;To make queries faster"
-  CorrectAnswer: "To avoid losing data from parse errors — type casting happens in silver"
-  Hint: "If a price column contains 'N/A', casting to double would produce null and lose the original value."
+  Output: "为什么 bronze 层把列读成字符串而不是它们的实际类型？"
+  AnswerChoices: "避免因解析错误丢数据 —— 类型转换放在 silver 层完成;为了节省内存;因为 Spark 无法从 CSV 推断类型;为了让查询更快"
+  CorrectAnswer: "避免因解析错误丢数据 —— 类型转换放在 silver 层完成"
+  Hint: "如果 price 列包含 'N/A'，转成 double 会变成 null，丢失原始值。"
 
 - Class: text
   Depth: intermediate
   Output: |
-    ## Deduplication
+    ## 去重
 
-    Raw data often contains duplicates — files re-delivered, events
-    replayed, API responses cached. Bronze handles the simple case:
+    原始数据经常包含重复 —— 文件被重复投递、事件被重放、
+    API 响应被缓存。Bronze 处理简单的情况：
 
-    **Exact duplicates** — use `dropDuplicates`:
+    **完全重复** —— 使用 `dropDuplicates`：
     ```python
     df = df.dropDuplicates(["order_id"])
     ```
 
-    **Keep the latest** — when duplicates exist but you want the most
-    recent, use a window function:
+    **保留最新** —— 当存在重复但你想要最新的一条时，
+    使用窗口函数：
     ```python
     from pyspark.sql import Window
 
@@ -145,10 +142,10 @@
 - Class: cmd_question
   Depth: intermediate
   Output: |
-    Given a DataFrame `raw_df` with columns `event_id`, `user_id`,
-    `action`, and `_ingested_at`, deduplicate by `event_id` keeping only
-    the latest ingestion (highest `_ingested_at`). Use a window function
-    with `row_number`.
+    给定一个包含 `event_id`、`user_id`、`action` 和
+    `_ingested_at` 列的 DataFrame `raw_df`，按 `event_id`
+    去重，只保留最新一次接入（`_ingested_at` 最大的那条）。
+    使用带 `row_number` 的窗口函数。
   CorrectAnswer: |
     from pyspark.sql import functions as f
     from pyspark.sql import Window
@@ -158,75 +155,74 @@
         .withColumn("_rn", f.row_number().over(w))
         .filter(f.col("_rn") == 1)
         .drop("_rn"))
-  Hint: "Partition by event_id, order by _ingested_at desc, take row_number == 1."
+  Hint: "按 event_id 分区，按 _ingested_at 降序排列，取 row_number == 1。"
 
 - Class: text
   Depth: advanced
   Output: |
-    ## Incremental Ingestion
+    ## 增量接入
 
-    Re-reading the entire source every run is wasteful. Three approaches
-    for incremental ingestion:
+    每次运行都重新读取整个源是浪费的。增量接入有三种方式：
 
-    **1. File-based watermark** — track which files have been processed
-    using the `_source_file` metadata:
+    **1. 基于文件的水位线（watermark）** —— 利用
+    `_source_file` 元数据追踪哪些文件已经处理过：
     ```python
     processed = spark.table("bronze_orders").select("_source_file").distinct()
     new_files = all_files.subtract(processed)
     ```
 
-    **2. Timestamp-based watermark** — store the max `updated_at` from the
-    previous run and filter the source to only newer rows.
+    **2. 基于时间戳的水位线** —— 保存上一次运行的最大
+    `updated_at`，只筛选源中更新的行。
 
-    **3. Structured Streaming** — use `spark.readStream` with a file
-    source to automatically detect new files as they appear:
+    **3. Structured Streaming** —— 使用 `spark.readStream`
+    配合文件源，自动检测新出现的文件：
     ```python
     stream = (spark.readStream
         .schema(raw_schema)
         .csv("/data/incoming/"))
     ```
 
-    For this course we use batch mode, but the Pipeline framework you
-    built could easily wrap streaming sources.
+    本课程使用批处理模式，但你搭建的 Pipeline 框架可以
+    很容易地包装流式数据源。
 
 - Class: mult_question
   Depth: advanced
-  Output: "Which approach lets Spark automatically detect new files without manual watermark tracking?"
-  AnswerChoices: "spark.readStream with a file source;spark.read with glob patterns;A cron job that lists files;Manual timestamp comparison"
-  CorrectAnswer: "spark.readStream with a file source"
-  Hint: "Structured Streaming's file source maintains internal state of which files have been processed."
+  Output: "哪种方式可以让 Spark 自动检测新文件，而无需手动追踪水位线？"
+  AnswerChoices: "spark.readStream 配合文件源;spark.read 配合 glob 通配模式;列出文件的 cron 定时任务;手动比较时间戳"
+  CorrectAnswer: "spark.readStream 配合文件源"
+  Hint: "Structured Streaming 的文件源会维护已处理文件的内部状态。"
 
 - Class: script
   Depth: all
   Output: |
-    ## Exercise: Build a Bronze Ingestion
+    ## 练习：构建 Bronze 接入
 
-    Open the starter file and implement `bronze_orders(spark, csv_path)`:
+    打开 starter 文件，实现 `bronze_orders(spark, csv_path)`：
 
-    1. Define an all-StringType schema: order_id, product, price, quantity
-    2. Read the CSV with that schema (header=True)
-    3. Add `_ingested_at` (current_timestamp) and `_source_file`
-       (input_file_name) metadata columns
-    4. Deduplicate by `order_id`
-    5. Return the bronze DataFrame
+    1. 定义一个全 StringType 的 schema：order_id、product、
+       price、quantity
+    2. 用该 schema 读取 CSV（header=True）
+    3. 添加 `_ingested_at`（current_timestamp）和 `_source_file`
+       （input_file_name）元数据列
+    4. 按 `order_id` 去重
+    5. 返回 bronze DataFrame
 
-    The test harness feeds in a CSV with a duplicate row and verifies
-    your function handles it correctly.
+    测试框架会喂入一个包含重复行的 CSV，并验证你的函数
+    是否正确处理。
   StarterFile: starter.py
   SolutionFile: solution.py
-  Hint: "Read CSV with a StringType schema, add metadata columns with withColumn, then dropDuplicates."
+  Hint: "用 StringType schema 读取 CSV，用 withColumn 添加元数据列，然后 dropDuplicates。"
 
 - Class: text
   Depth: all
   Output: |
-    ## Summary
+    ## 小结
 
-    Your bronze layer is ready. It:
+    你的 bronze 层已经准备好了。它：
 
-    - **Ingests** raw data preserving original values (schema-on-read)
-    - **Annotates** every row with ingestion timestamp and source file
-    - **Deduplicates** by primary key
+    - **接入** 原始数据并保留原始值（schema-on-read）
+    - **标注** 每一行的接入时间戳和源文件
+    - 按主键**去重**
 
-    These three steps give you a reliable, auditable foundation. In the
-    next lesson, you will build the **silver layer** to clean, type-cast,
-    and enrich this data.
+    这三步为你提供了一个可靠、可审计的基础。在下一课中，
+    你将构建 **silver 层**来清洗、类型转换并丰富这些数据。

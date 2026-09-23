@@ -1,43 +1,42 @@
 - Class: meta
-  Lesson: Complex Types & Higher-Order Functions
+  Lesson: 复杂类型与高阶函数
   EstimatedMinutes: 25
 
 - Class: text
   Depth: all
   Output: |
-    ## What You'll Learn
+    ## 你将学到什么
 
-    Real-world data is rarely flat. JSON from APIs contains nested objects
-    and arrays. Event logs carry lists of tags. User profiles have maps of
-    preferences. Spark handles all of this natively.
+    现实世界的数据很少是扁平的。来自 API 的 JSON 包含嵌套对象和数组。
+    事件日志携带标签列表。用户画像有偏好的映射。Spark 原生处理所有这些。
 
-    In the previous lesson you read flat CSV and Parquet files. Now you
-    will learn to work with the **complex types** that appear in real data:
+    在上一课中，你读取了扁平的 CSV 和 Parquet 文件。现在你将学习处理
+    真实数据中出现的**复杂类型**：
 
-    - Arrays, maps, and nested structs
-    - `explode` to flatten arrays into rows
-    - Higher-order functions (`transform`, `filter`, `exists`, `aggregate`)
-      that operate on arrays *without* exploding them
-    - `collect_list` and `collect_set` to reassemble arrays from rows
+    - 数组、映射和嵌套结构体
+    - 用 `explode` 将数组展开为多行
+    - **高阶函数**（`transform`、`filter`、`exists`、`aggregate`），
+      它们*不*展开数组就能操作数组
+    - 用 `collect_list` 和 `collect_set` 将行重新组装为数组
 
 - Class: text
   Depth: all
   Output: |
-    ## Complex Type Schemas
+    ## 复杂类型 Schema
 
-    Spark supports three complex types within `StructType` schemas:
+    Spark 在 `StructType` schema 中支持三种复杂类型：
 
-    **ArrayType** — an ordered list of elements (all same type):
+    **ArrayType** —— 有序元素列表（所有元素同类型）：
     ```python
     StructField("tags", ArrayType(StringType()))
     ```
 
-    **MapType** — key-value pairs:
+    **MapType** —— 键值对：
     ```python
     StructField("preferences", MapType(StringType(), StringType()))
     ```
 
-    **Nested StructType** — a struct within a struct:
+    **嵌套 StructType** —— 结构体中的结构体：
     ```python
     StructField("address", StructType([
         StructField("city", StringType()),
@@ -46,107 +45,104 @@
     ]))
     ```
 
-    You access nested fields with dot notation: `col("address.city")`.
+    你用点号语法访问嵌套字段：`col("address.city")`。
 
 - Class: text
   Depth: beginner
   Output: |
-    Think of complex types in terms of everyday data:
+    用日常数据来理解复杂类型：
 
-    - An **array** is like a shopping list — ordered items:
+    - **数组（array）** 就像购物清单 —— 有序的条目：
       `["milk", "eggs", "bread"]`
-    - A **map** is like a settings page — keys and values:
+    - **映射（map）** 就像设置页面 —— 键和值：
       `{"theme": "dark", "language": "en"}`
-    - A **nested struct** is like a mailing label — a group of related
-      fields bundled together: `{city: "SF", state: "CA", zip: "94102"}`
+    - **嵌套结构体（nested struct）** 就像邮寄标签 —— 一组相关字段
+      捆绑在一起：`{city: "SF", state: "CA", zip: "94102"}`
 
-    Spark can read, filter, and transform all of these without you having
-    to flatten them first.
+    Spark 可以读取、过滤和转换所有这些，而不需要你先将它们扁平化。
 
 - Class: text
   Depth: all
   Output: |
-    ## Explode: Arrays to Rows
+    ## Explode：数组转多行
 
-    `explode()` turns each element of an array into its own row. This is a
-    one-to-many operation:
+    `explode()` 将数组的每个元素变成自己的一行。这是一对多操作：
 
     ```python
     from pyspark.sql import functions as f
 
-    # Before: id=1, tags=["spark", "python", "data"]
-    # After:  three rows — (1, "spark"), (1, "python"), (1, "data")
+    # 之前：id=1, tags=["spark", "python", "data"]
+    # 之后： 三行 —— (1, "spark"), (1, "python"), (1, "data")
 
     df.select("id", f.explode("tags").alias("tag"))
     ```
 
-    `posexplode()` also returns the position index:
+    `posexplode()` 还会返回位置索引：
     ```python
     df.select("id", f.posexplode("tags").alias("pos", "tag"))
     # (1, 0, "spark"), (1, 1, "python"), (1, 2, "data")
     ```
 
-    Use explode when you need to analyze individual array elements as rows.
+    当你需要将数组元素逐行分析时，使用 explode。
 
 - Class: cmd_question
   Depth: all
   Output: |
-    Given a DataFrame `df` with columns `id` and `tags` (an array of
-    strings), use `explode` to create one row per tag. Keep the `id`
-    column and alias the exploded column as `"tag"`.
+    给定一个包含 `id` 和 `tags`（字符串数组）列的 DataFrame `df`，
+    用 `explode` 为每个标签创建一行。保留 `id` 列，将展开后的列
+    别名为 `"tag"`。
   CorrectAnswer: |
     from pyspark.sql import functions as f
 
     result = df.select("id", f.explode("tags").alias("tag"))
-  Hint: "Use f.explode('tags') inside select(), with .alias('tag') to name the output column."
+  Hint: "在 select() 中用 f.explode('tags')，配合 .alias('tag') 命名输出列。"
 
 - Class: text
   Depth: all
   Output: |
-    ## Collect: Rows Back to Arrays
+    ## Collect：行转回数组
 
-    The reverse of explode — `collect_list()` and `collect_set()` gather
-    rows back into arrays during aggregation:
+    explode 的反向操作 —— `collect_list()` 和 `collect_set()`
+    在聚合时将行重新收集为数组：
 
     ```python
-    # Collect all tags per user into an array
+    # 将每个用户的所有标签收集到一个数组中
     df.groupBy("user_id").agg(
         f.collect_list("tag").alias("all_tags"),
         f.collect_set("tag").alias("unique_tags")
     )
     ```
 
-    `collect_list` preserves duplicates and order. `collect_set` removes
-    duplicates (order is not guaranteed).
+    `collect_list` 保留重复项和顺序。`collect_set` 去除重复项
+    （顺序不保证）。
 
 - Class: text
   Depth: all
   Output: |
-    ## Higher-Order Functions
+    ## 高阶函数
 
-    Exploding an array creates many rows, which is expensive. For
-    transformations that should stay within the array, Spark provides
-    **higher-order functions** that operate element-by-element:
+    展开数组会创建很多行，这代价高昂。对于应在数组内部完成的转换，
+    Spark 提供**高阶函数**，它们逐元素操作：
 
-    **`transform()`** — apply a function to every element (like Python's
-    `map()`):
+    **`transform()`** —— 对每个元素应用一个函数（类似 Python 的
+    `map()`）：
     ```python
     df.select(f.transform("prices", lambda x: x * 1.1).alias("with_tax"))
     ```
 
-    **`filter()`** — keep elements matching a condition:
+    **`filter()`** —— 保留匹配条件的元素：
     ```python
     df.select(f.filter("scores", lambda x: x > 80).alias("passing"))
     ```
 
-    **`exists()`** — true if any element matches:
+    **`exists()`** —— 任一元素匹配则为 true：
     ```python
     df.select(f.exists("tags", lambda x: x == "urgent").alias("is_urgent"))
     ```
 
-    These keep your DataFrame structure intact — no explosion of rows.
+    这些保持你的 DataFrame 结构完整 —— 不会产生行的爆炸式增长。
 
-    **Docs:**
+    **文档：**
     [transform](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.transform.html) |
     [filter (HOF)](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.filter.html) |
     [exists](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.exists.html) |
@@ -156,46 +152,45 @@
 
 - Class: mult_question
   Depth: all
-  Output: "Which higher-order function applies a transformation to every element of an array without creating new rows?"
+  Output: "哪个高阶函数对数组的每个元素应用转换，而不创建新行？"
   AnswerChoices: "transform();explode();map();foreach()"
   CorrectAnswer: "transform()"
-  Hint: "This function works like Python's map() but operates directly on array columns."
+  Hint: "这个函数像 Python 的 map() 一样工作，但直接操作数组列。"
 
 - Class: cmd_question
   Depth: all
   Output: |
-    Given a DataFrame `df` with an array column `items` (strings), use
-    `transform` to create a new column `items_upper` that contains
-    the uppercased version of every item.
+    给定一个包含数组列 `items`（字符串）的 DataFrame `df`，用
+    `transform` 创建一个新列 `items_upper`，包含每个条目的大写版本。
   CorrectAnswer: |
     from pyspark.sql import functions as f
 
     result = df.withColumn("items_upper", f.transform("items", lambda x: f.upper(x)))
-  Hint: "Use f.transform('items', lambda x: f.upper(x)) inside withColumn."
+  Hint: "在 withColumn 中用 f.transform('items', lambda x: f.upper(x))。"
 
 - Class: text
   Depth: intermediate
   Output: |
-    ## Aggregate: Folding an Array
+    ## Aggregate：折叠数组
 
-    `aggregate()` folds an array into a single value, like Python's
-    `functools.reduce()`. It takes four arguments:
+    `aggregate()` 将数组折叠为单个值，类似 Python 的
+    `functools.reduce()`。它接受四个参数：
 
     ```python
     f.aggregate(
-        "column",          # the array column
-        f.lit(0),          # initial accumulator value (zero)
-        lambda acc, x: acc + x,   # merge function
-        lambda acc: acc           # finish function (optional)
+        "column",          # 数组列
+        f.lit(0),          # 初始累加器值（零）
+        lambda acc, x: acc + x,   # 合并函数
+        lambda acc: acc           # 完成函数（可选）
     )
     ```
 
-    **Example — sum all elements in an array:**
+    **示例 —— 对数组中所有元素求和：**
     ```python
     df.select(f.aggregate("scores", f.lit(0), lambda acc, x: acc + x).alias("total"))
     ```
 
-    **Example — concatenate strings with a separator:**
+    **示例 —— 用分隔符连接字符串：**
     ```python
     df.select(f.aggregate(
         "words",
@@ -207,33 +202,32 @@
 
 - Class: mult_question
   Depth: intermediate
-  Output: "What does aggregate() do with an array column?"
-  AnswerChoices: "Folds the array into a single value using an accumulator function;Splits the array into multiple rows;Sorts the array elements;Counts the number of elements"
-  CorrectAnswer: "Folds the array into a single value using an accumulator function"
-  Hint: "Think of Python's functools.reduce() — it takes an initial value and combines elements one by one."
+  Output: "aggregate() 对数组列做什么？"
+  AnswerChoices: "用累加器函数将数组折叠为单个值;将数组拆分为多行;对数组元素排序;统计元素个数"
+  CorrectAnswer: "用累加器函数将数组折叠为单个值"
+  Hint: "想想 Python 的 functools.reduce() —— 它取一个初始值，逐个组合元素。"
 
 - Class: text
   Depth: intermediate
   Output: |
-    ## Working with Maps
+    ## 操作映射
 
-    Map columns store key-value pairs. Access values with bracket notation
-    or `element_at()`:
+    映射列存储键值对。用方括号语法或 `element_at()` 访问值：
 
     ```python
-    # Access a specific key
-    df.select(df["preferences"]["theme"])      # bracket notation
-    df.select(f.element_at("preferences", "theme"))  # function
+    # 访问特定键
+    df.select(df["preferences"]["theme"])      # 方括号语法
+    df.select(f.element_at("preferences", "theme"))  # 函数
 
-    # Get all keys or values
+    # 获取所有键或值
     df.select(f.map_keys("preferences"))
     df.select(f.map_values("preferences"))
 
-    # Explode a map into key-value rows
+    # 将映射展开为键值对行
     df.select(f.explode("preferences").alias("key", "value"))
     ```
 
-    You can also create maps:
+    你也可以创建映射：
     ```python
     df.withColumn("meta", f.create_map(
         f.lit("source"), f.col("source_name"),
@@ -244,74 +238,66 @@
 - Class: text
   Depth: advanced
   Output: |
-    ## Performance: Explode vs. Higher-Order Functions
+    ## 性能：Explode vs. 高阶函数
 
-    `explode()` is convenient but has a cost: it multiplies the number of
-    rows, which increases shuffle sizes and memory usage. If an array
-    column averages 10 elements, exploding it makes your DataFrame 10x
-    larger.
+    `explode()` 很方便但有代价：它使行数成倍增加，从而增大 shuffle
+    大小和内存使用。如果一个数组列平均有 10 个元素，展开它会让你的
+    DataFrame 大 10 倍。
 
-    Higher-order functions (`transform`, `filter`, `aggregate`) avoid this
-    by operating within each row. They are:
-    - More memory-efficient (no row multiplication)
-    - Faster for large arrays (no shuffle expansion)
-    - Easier to reason about (output has same row count as input)
+    高阶函数（`transform`、`filter`、`aggregate`）通过在每行内部操作
+    来避免这个问题。它们：
+    - 更节省内存（没有行倍增）
+    - 对大数组更快（没有 shuffle 扩展）
+    - 更容易推理（输出行数与输入相同）
 
-    **When to explode**: you need to join or group by individual array
-    elements. **When to use HOFs**: you need to transform, filter, or
-    reduce array contents while keeping the row structure intact.
+    **何时用 explode**：你需要按数组中的单个元素做 join 或 group by。
+    **何时用 HOF**：你需要在保持行结构不变的同时转换、过滤或归约数组内容。
 
 - Class: cmd_question
   Depth: intermediate
   Output: |
-    Given a DataFrame `df` with an array column `items` (strings), use
-    `filter` to create a new column `p_items` containing only items that
-    start with the letter "p".
+    给定一个包含数组列 `items`（字符串）的 DataFrame `df`，用
+    `filter` 创建一个新列 `p_items`，只包含以字母 "p" 开头的条目。
   CorrectAnswer: |
     from pyspark.sql import functions as f
 
     result = df.withColumn("p_items", f.filter("items", lambda x: x.startswith("p")))
-  Hint: "Use f.filter('items', lambda x: x.startswith('p')) to keep only elements starting with 'p'."
+  Hint: "用 f.filter('items', lambda x: x.startswith('p')) 只保留以 'p' 开头的元素。"
 
 - Class: script
   Depth: all
   Output: |
-    ## Exercise: Order Analysis with HOFs
+    ## 练习：用 HOF 进行订单分析
 
-    Implement `analyze_orders(spark)` that creates order data with array
-    columns and demonstrates higher-order functions:
+    实现 `analyze_orders(spark)`，创建带数组列的订单数据并演示高阶函数：
 
-    1. Create a DataFrame with columns: order_id, region, total, items (array)
-    2. Use `transform()` to uppercase all items → new column `items_upper`
-    3. Use `filter()` to keep only items starting with "p" → new column `p_items`
-    4. Add a window-based rank by total (descending) within each region
-    5. Return the result
+    1. 创建一个包含列 order_id、region、total、items（数组）的 DataFrame
+    2. 用 `transform()` 将所有 items 转为大写 → 新列 `items_upper`
+    3. 用 `filter()` 只保留以 "p" 开头的条目 → 新列 `p_items`
+    4. 在每个 region 内按 total 添加基于窗口函数的排名（降序）
+    5. 返回结果
 
-    This exercise combines complex type operations with window functions —
-    a common pattern in real analytics.
+    这个练习将复杂类型操作与窗口函数结合 —— 这是真实分析中常见的模式。
   StarterFile: starter.py
   SolutionFile: solution.py
-  Hint: "Use f.transform with f.upper(), f.filter with startswith(), and Window.partitionBy().orderBy() with f.rank()."
+  Hint: "用 f.transform 配合 f.upper()，f.filter 配合 startswith()，以及 Window.partitionBy().orderBy() 配合 f.rank()。"
 
 - Class: text
   Depth: all
   Output: |
-    ## Summary
+    ## 小结
 
-    In this lesson you learned:
+    本课你学到了：
 
-    - **Complex types** — `ArrayType`, `MapType`, and nested `StructType`
-      model real-world nested data
-    - **explode / posexplode** — flatten arrays into rows for per-element
-      analysis
-    - **collect_list / collect_set** — reassemble rows into arrays during
-      aggregation
-    - **Higher-order functions** — `transform`, `filter`, `exists`, and
-      `aggregate` operate on arrays without creating extra rows
-    - **Map operations** — `element_at`, `map_keys`, `map_values`, and
+    - **复杂类型** —— `ArrayType`、`MapType` 和嵌套 `StructType`
+      建模现实中的嵌套数据
+    - **explode / posexplode** —— 将数组扁平化为多行以进行逐元素分析
+    - **collect_list / collect_set** —— 在聚合时将行重新组装为数组
+    - **高阶函数** —— `transform`、`filter`、`exists` 和
+      `aggregate` 操作数组而不创建额外行
+    - **映射操作** —— `element_at`、`map_keys`、`map_values` 和
       `create_map`
 
-    You can now handle any data shape Spark throws at you. In the next
-    lesson, you will dive into Spark SQL — the query engine that powers
-    both the DataFrame API and SQL queries — and learn to read execution
-    plans and write user-defined functions.
+    你现在可以处理 Spark 抛给你的任何数据形状。在下一课中，你将深入
+    Spark SQL —— 为 DataFrame API 和 SQL 查询提供动力的查询引擎 ——
+    学习阅读执行计划和编写用户自定义函数。

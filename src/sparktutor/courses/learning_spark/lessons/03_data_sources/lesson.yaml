@@ -1,45 +1,44 @@
 - Class: meta
-  Lesson: Data Sources & Formats
+  Lesson: 数据源与格式
   EstimatedMinutes: 25
 
 - Class: text
   Depth: all
   Output: |
-    ## What You'll Learn
+    ## 你将学到什么
 
-    In the previous lesson you defined schemas and created DataFrames from
-    Python data. Real Spark applications read from files — CSV, JSON,
-    Parquet, ORC — and write results back for downstream consumers.
+    在上一课中，你定义了 schema 并从 Python 数据创建了 DataFrame。
+    真实的 Spark 应用从文件读取数据 —— CSV、JSON、Parquet、ORC ——
+    并将结果写回供下游使用。
 
-    By the end of this lesson you will be able to:
+    学完本课后，你将能够：
 
-    - Use the DataFrameReader and DataFrameWriter APIs
-    - Read and write CSV, JSON, Parquet, and ORC formats
-    - Explain why Parquet is Spark's preferred format
-    - Choose the right write mode (append, overwrite, ignore, error)
-    - Create SQL views from DataFrames and query them with `spark.sql()`
-    - Partition output files by column values
+    - 使用 DataFrameReader 和 DataFrameWriter API
+    - 读写 CSV、JSON、Parquet 和 ORC 格式
+    - 解释为什么 Parquet 是 Spark 的首选格式
+    - 选择正确的写入模式（append、overwrite、ignore、error）
+    - 从 DataFrame 创建 SQL 视图并用 `spark.sql()` 查询
+    - 按列值对输出文件进行分区
 
 - Class: text
   Depth: all
   Output: |
-    ## The DataFrameReader API
+    ## DataFrameReader API
 
-    Every data read in Spark follows the same pattern:
+    Spark 中每次数据读取都遵循相同模式：
 
     ```python
     df = (spark.read
-        .format("csv")            # what format
-        .option("header", "true") # format-specific settings
-        .schema(my_schema)        # explicit schema (recommended)
-        .load("/path/to/data"))   # where to read from
+        .format("csv")            # 什么格式
+        .option("header", "true") # 格式特定的设置
+        .schema(my_schema)        # 显式 schema（推荐）
+        .load("/path/to/data"))   # 从哪里读取
     ```
 
-    The chain is always: **format → options → schema → load**. Spark also
-    provides shorthand methods: `spark.read.csv()`, `spark.read.json()`,
-    `spark.read.parquet()`.
+    链式调用顺序始终是：**format → options → schema → load**。Spark 还提供
+    简写方法：`spark.read.csv()`、`spark.read.json()`、`spark.read.parquet()`。
 
-    **Docs:**
+    **文档：**
     [DataFrameReader.csv](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrameReader.csv.html) |
     [.json](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrameReader.json.html) |
     [.parquet](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrameReader.parquet.html) |
@@ -49,146 +48,139 @@
 - Class: text
   Depth: beginner
   Output: |
-    Think of DataFrameReader as a universal file opener. You tell it the
-    format (CSV, JSON, Parquet), pass any options it needs (like "this file
-    has a header row"), and it hands you back a DataFrame. No matter what
-    format the data starts in, you get the same DataFrame API to work with.
+    把 DataFrameReader 想象成一个通用的文件打开器。你告诉它格式
+    （CSV、JSON、Parquet），传入它需要的选项（比如"这个文件有表头行"），
+    它就把一个 DataFrame 交还给你。无论数据最初是什么格式，
+    你都用同一个 DataFrame API 来处理。
 
-    DataFrameWriter is the reverse — it takes your DataFrame and saves it
-    in whatever format you choose.
+    DataFrameWriter 则相反 —— 它接收你的 DataFrame 并以你选择的
+    任意格式保存。
 
 - Class: text
   Depth: all
   Output: |
-    ## Parquet: Spark's Preferred Format
+    ## Parquet：Spark 的首选格式
 
-    **Parquet** is a columnar storage format. Instead of storing rows
-    together (like CSV), it stores each column together. This gives three
-    advantages:
+    **Parquet** 是一种列式存储格式。它不像 CSV 那样把行存在一起，
+    而是把每一列存在一起。这带来三个优势：
 
-    1. **Column pruning** — if your query only needs 3 of 50 columns, Spark
-       reads only those 3. CSV would read all 50.
-    2. **Efficient compression** — similar values in a column compress
-       better than mixed values in a row.
-    3. **Schema embedded** — the column names and types are stored in the
-       file, so no schema inference or header parsing is needed.
+    1. **列裁剪（Column pruning）** —— 如果你的查询只需要 50 列中的 3 列，
+       Spark 只读那 3 列。CSV 则会读取全部 50 列。
+    2. **高效压缩** —— 同一列中的相似值比一行中混合的值压缩得更好。
+    3. **内嵌 schema** —— 列名和类型存储在文件中，因此不需要 schema
+       推断或表头解析。
 
-    Parquet also supports **predicate pushdown**: if you filter on a column,
-    Spark can skip entire row groups whose metadata shows they cannot match
-    the filter.
+    Parquet 还支持**谓词下推（predicate pushdown）**：如果你对某列做过滤，
+    Spark 可以跳过元数据显示不可能匹配过滤条件的整个行组。
 
     ```python
-    # Reading Parquet — no options needed, schema is in the file
+    # 读取 Parquet —— 不需要选项，schema 在文件中
     df = spark.read.parquet("/data/flights.parquet")
 
-    # Writing Parquet
+    # 写入 Parquet
     df.write.parquet("/output/flights")
     ```
 
 - Class: text
   Depth: all
   Output: |
-    ## CSV: Human-Readable but Inefficient
+    ## CSV：人类可读但效率低
 
-    CSV is the most common interchange format, but it has drawbacks: no
-    type information, no compression by default, and Spark must read every
-    column even if you only need one.
+    CSV 是最常见的交换格式，但它有缺点：没有类型信息、默认不压缩，
+    而且即使你只需要一列，Spark 也必须读取所有列。
 
-    Key options when reading CSV:
+    读取 CSV 时的关键选项：
 
     ```python
     df = (spark.read
-        .option("header", "true")       # first row has column names
-        .option("inferSchema", "true")   # auto-detect types (slow!)
-        .option("sep", ",")              # field delimiter
-        .option("nullValue", "NA")       # treat "NA" as null
-        .option("quote", '"')            # quote character
+        .option("header", "true")       # 第一行是列名
+        .option("inferSchema", "true")   # 自动检测类型（慢！）
+        .option("sep", ",")              # 字段分隔符
+        .option("nullValue", "NA")       # 将 "NA" 视为 null
+        .option("quote", '"')            # 引号字符
         .csv("/data/orders.csv"))
     ```
 
-    For production, replace `inferSchema` with an explicit schema you
-    defined with `StructType` (from the previous lesson).
+    对于生产环境，用你用 `StructType` 定义的显式 schema 替换
+    `inferSchema`（来自上一课）。
 
 - Class: text
   Depth: all
   Output: |
-    ## JSON: Semi-Structured Data
+    ## JSON：半结构化数据
 
-    Spark reads **single-line JSON** by default — one JSON object per line
-    (also called JSON Lines or NDJSON):
+    Spark 默认读取**单行 JSON** —— 每行一个 JSON 对象
+    （也称为 JSON Lines 或 NDJSON）：
 
     ```json
     {"name": "Alice", "age": 30}
     {"name": "Bob", "age": 25}
     ```
 
-    For multi-line JSON (one big array), set `multiLine=True`:
+    对于多行 JSON（一个大数组），设置 `multiLine=True`：
 
     ```python
     df = spark.read.option("multiLine", "true").json("/data/users.json")
     ```
 
-    JSON handles nested data naturally — Spark maps nested objects to
-    `StructType` and arrays to `ArrayType`.
+    JSON 自然地处理嵌套数据 —— Spark 将嵌套对象映射为
+    `StructType`，将数组映射为 `ArrayType`。
 
 - Class: mult_question
   Depth: all
-  Output: "Which file format is Spark's default and recommended format, offering columnar storage with built-in compression?"
+  Output: "哪个文件格式是 Spark 的默认推荐格式，提供列式存储和内置压缩？"
   AnswerChoices: "Parquet;CSV;JSON;ORC"
   CorrectAnswer: "Parquet"
-  Hint: "This format stores data by column, embeds the schema, and supports predicate pushdown."
+  Hint: "这种格式按列存储数据，内嵌 schema，并支持谓词下推。"
 
 - Class: text
   Depth: intermediate
   Output: |
-    ## ORC and Avro
+    ## ORC 与 Avro
 
-    **ORC** (Optimized Row Columnar) is similar to Parquet — columnar,
-    compressed, with embedded schema. It is historically preferred in the
-    Hive ecosystem. For most Spark workloads, Parquet and ORC perform
-    comparably.
+    **ORC**（Optimized Row Columnar）与 Parquet 类似 —— 列式、压缩、
+    内嵌 schema。它在 Hive 生态中历史上更受青睐。对于大多数 Spark
+    工作负载，Parquet 和 ORC 性能相当。
 
-    **Avro** is a **row-based** format, better suited for write-heavy
-    workloads and schema evolution. It is commonly used as a serialization
-    format with Kafka. Read with:
+    **Avro** 是一种**行式**格式，更适合写密集型工作负载和 schema 演进。
+    它通常用作 Kafka 的序列化格式。用以下方式读取：
 
     ```python
     df = spark.read.format("avro").load("/data/events.avro")
     ```
 
-    **Rule of thumb**: use Parquet for analytics (read-heavy), Avro for
-    streaming and messaging (write-heavy with schema evolution).
+    **经验法则**：分析（读密集）用 Parquet，流式和消息（写密集且需
+    schema 演进）用 Avro。
 
 - Class: text
   Depth: all
   Output: |
-    ## The DataFrameWriter API
+    ## DataFrameWriter API
 
-    Writing follows a similar pattern to reading:
+    写入遵循与读取类似的模式：
 
     ```python
     df.write.format("parquet").mode("overwrite").save("/output/data")
     ```
 
-    Or using shorthand: `df.write.parquet("/output/data")`.
+    或者使用简写：`df.write.parquet("/output/data")`。
 
-    **Write modes** control what happens when the output path already exists:
+    **写入模式**控制输出路径已存在时的行为：
 
-    | Mode | Behavior |
-    |------|----------|
-    | `error` (default) | Raise an error if data exists |
-    | `overwrite` | Delete existing data, write new |
-    | `append` | Add new data alongside existing |
-    | `ignore` | Silently skip if data exists |
+    | 模式 | 行为 |
+    |------|------|
+    | `error`（默认） | 如果数据已存在则报错 |
+    | `overwrite` | 删除已有数据，写入新数据 |
+    | `append` | 在已有数据旁追加新数据 |
+    | `ignore` | 如果数据已存在则静默跳过 |
 
-    Use `mode("overwrite")` for development and `mode("append")` for
-    incremental production pipelines.
+    开发时用 `mode("overwrite")`，增量生产管道用 `mode("append")`。
 
 - Class: cmd_question
   Depth: all
   Output: |
-    Read a CSV file at `'/data/flights.csv'` with `header=true` and
-    `inferSchema=true`, then create a temporary view called `'flights'`.
+    读取 `'/data/flights.csv'` 处的 CSV 文件，设置 `header=true` 和
+    `inferSchema=true`，然后创建一个名为 `'flights'` 的临时视图。
   CorrectAnswer: |
     flights_df = (spark.read
         .option("header", "true")
@@ -196,14 +188,14 @@
         .csv("/data/flights.csv"))
 
     flights_df.createOrReplaceTempView("flights")
-  Hint: "Use spark.read with csv and options, then createOrReplaceTempView on the result."
+  Hint: "用 spark.read 配合 csv 和选项，然后对结果调用 createOrReplaceTempView。"
 
 - Class: text
   Depth: all
   Output: |
-    ## SQL Views: Querying DataFrames with SQL
+    ## SQL 视图：用 SQL 查询 DataFrame
 
-    Once you create a view, you can query it with standard SQL:
+    一旦创建了视图，就可以用标准 SQL 查询它：
 
     ```python
     df.createOrReplaceTempView("flights")
@@ -216,118 +208,107 @@
     """)
     ```
 
-    Session-scoped views (`createOrReplaceTempView`) are visible only within
-    the current SparkSession. For application-wide visibility, use
-    `createOrReplaceGlobalTempView` and access via `global_temp.view_name`.
+    会话级视图（`createOrReplaceTempView`）仅在当前 SparkSession 内可见。
+    如需应用级可见性，使用 `createOrReplaceGlobalTempView` 并通过
+    `global_temp.view_name` 访问。
 
-    SQL and the DataFrame API produce the **same execution plan** — the
-    Catalyst optimizer treats them identically. Choose whichever is more
-    readable for your use case.
+    SQL 和 DataFrame API 产生**相同的执行计划** —— Catalyst 优化器
+    对它们一视同仁。根据你的用例选择更易读的那个。
 
 - Class: mult_question
   Depth: intermediate
-  Output: "What is the main advantage of Parquet over CSV for analytical workloads?"
-  AnswerChoices: "Columnar storage enables column pruning and predicate pushdown;Parquet files are human-readable;CSV files cannot store numbers;Parquet is always smaller"
-  CorrectAnswer: "Columnar storage enables column pruning and predicate pushdown"
-  Hint: "Think about what happens when you SELECT only 3 of 50 columns, or WHERE a column matches a value."
+  Output: "对于分析型工作负载，Parquet 相比 CSV 的主要优势是什么？"
+  AnswerChoices: "列式存储支持列裁剪和谓词下推;Parquet 文件人类可读;CSV 文件不能存储数字;Parquet 总是更小"
+  CorrectAnswer: "列式存储支持列裁剪和谓词下推"
+  Hint: "想想当你只 SELECT 50 列中的 3 列，或 WHERE 某列匹配某个值时会发生什么。"
 
 - Class: text
   Depth: intermediate
   Output: |
-    ## Write Partitioning
+    ## 写入分区
 
-    Partitioning organizes output files into subdirectories by column
-    values:
+    分区按列值将输出文件组织到子目录中：
 
     ```python
     df.write.partitionBy("year", "month").parquet("/output/data")
     ```
 
-    This creates a directory structure like:
+    这会创建如下目录结构：
     ```
     /output/data/year=2025/month=01/part-00000.parquet
     /output/data/year=2025/month=02/part-00000.parquet
     /output/data/year=2024/month=12/part-00000.parquet
     ```
 
-    **Partition pruning** — when you filter on a partitioned column, Spark
-    skips entire directories that cannot match. A query for `year = 2025`
-    never touches the `year=2024` directory.
+    **分区裁剪（Partition pruning）** —— 当你对分区列做过滤时，
+    Spark 会跳过不可能匹配的整个目录。查询 `year = 2025` 永远不会
+    触碰 `year=2024` 目录。
 
-    **Warning**: do not partition by high-cardinality columns (e.g., user
-    IDs). You will create millions of tiny files, which hurts performance
-    more than it helps.
+    **警告**：不要按高基数列（例如用户 ID）分区。你会创建数百万个
+    小文件，这对性能的伤害大于帮助。
 
 - Class: cmd_question
   Depth: intermediate
   Output: |
-    Write a DataFrame `df` to Parquet at `'/output/data'`, partitioned by
-    the `'country'` column, using overwrite mode.
+    将 DataFrame `df` 以 overwrite 模式写入 `'/output/data'` 处的
+    Parquet，按 `'country'` 列分区。
   CorrectAnswer: |
     df.write.mode("overwrite").partitionBy("country").parquet("/output/data")
-  Hint: "Chain .mode(), .partitionBy(), and .parquet() on df.write."
+  Hint: "在 df.write 上链式调用 .mode()、.partitionBy() 和 .parquet()。"
 
 - Class: text
   Depth: advanced
   Output: |
-    ## Format Comparison: When to Use What
+    ## 格式对比：何时用什么
 
-    | Format | Storage | Schema | Compression | Best For |
+    | 格式 | 存储 | Schema | 压缩 | 最适合 |
     |--------|---------|--------|-------------|----------|
-    | Parquet | Columnar | Embedded | Excellent | Analytics, data lakes |
-    | ORC | Columnar | Embedded | Excellent | Hive ecosystem |
-    | CSV | Row | External | None by default | Interchange, debugging |
-    | JSON | Row | Self-describing | Moderate | APIs, semi-structured |
-    | Avro | Row | Embedded | Good | Streaming, Kafka |
+    | Parquet | 列式 | 内嵌 | 极佳 | 分析、数据湖 |
+    | ORC | 列式 | 内嵌 | 极佳 | Hive 生态 |
+    | CSV | 行式 | 外部 | 默认无 | 交换、调试 |
+    | JSON | 行式 | 自描述 | 中等 | API、半结构化 |
+    | Avro | 行式 | 内嵌 | 良好 | 流式、Kafka |
 
-    For Spark workloads, default to **Parquet**. Use CSV/JSON only for
-    ingestion from external systems. Use Avro when integrating with Kafka
-    or when schema evolution is critical.
+    对于 Spark 工作负载，默认用 **Parquet**。CSV/JSON 仅用于从外部系统
+    摄入数据。与 Kafka 集成或 schema 演进很关键时用 Avro。
 
-    **Predicate pushdown support**: Parquet and ORC push filters into the
-    file reader (skip row groups). CSV and JSON cannot — Spark must read
-    and filter all rows.
+    **谓词下推支持**：Parquet 和 ORC 将过滤下推到文件读取器中
+    （跳过行组）。CSV 和 JSON 做不到 —— Spark 必须读取并过滤所有行。
 
 - Class: script
   Depth: all
   Output: |
-    ## Exercise: Multi-Format Data Pipeline
+    ## 练习：多格式数据管道
 
-    Implement `data_pipeline(spark, output_path)` that demonstrates the
-    full read-write-query cycle:
+    实现 `data_pipeline(spark, output_path)`，演示完整的读-写-查询循环：
 
-    1. Create a sample DataFrame of flight delay data
-    2. Write it to Parquet at the given path (overwrite mode)
-    3. Read the Parquet back into a new DataFrame
-    4. Create a temporary SQL view called `"flights"`
-    5. Run a SQL query to find the top 3 destinations by total delay
-    6. Return the query result DataFrame
+    1. 创建一个航班延误数据的示例 DataFrame
+    2. 以 overwrite 模式将其写入给定路径的 Parquet
+    3. 将 Parquet 读回为新的 DataFrame
+    4. 创建一个名为 `"flights"` 的临时 SQL 视图
+    5. 运行 SQL 查询找出总延误排名前 3 的目的地
+    6. 返回查询结果 DataFrame
 
-    This exercise ties together everything from the lesson: reading,
-    writing, format conversion, SQL views, and queries.
+    这个练习综合了本课的所有内容：读取、写入、格式转换、SQL 视图和查询。
   StarterFile: starter.py
   SolutionFile: solution.py
-  Hint: "Use spark.createDataFrame with SCHEMA, df.write.mode('overwrite').parquet(), spark.read.parquet(), createOrReplaceTempView, and spark.sql()."
+  Hint: "用 spark.createDataFrame 配合 SCHEMA，df.write.mode('overwrite').parquet()，spark.read.parquet()，createOrReplaceTempView 和 spark.sql()。"
 
 - Class: text
   Depth: all
   Output: |
-    ## Summary
+    ## 小结
 
-    In this lesson you learned:
+    本课你学到了：
 
-    - **DataFrameReader** — the universal API for reading any format
-    - **Parquet** — Spark's preferred columnar format with column pruning,
-      compression, and embedded schemas
-    - **CSV** and **JSON** — common interchange formats with more options
-      to configure
-    - **DataFrameWriter** — write modes (error, overwrite, append, ignore)
-    - **SQL views** — `createOrReplaceTempView` lets you query DataFrames
-      with standard SQL
-    - **Partitioning** — organize output by column values for efficient
-      filtering
+    - **DataFrameReader** —— 读取任意格式的通用 API
+    - **Parquet** —— Spark 的首选列式格式，支持列裁剪、压缩和内嵌 schema
+    - **CSV** 和 **JSON** —— 常见的交换格式，有更多选项可配置
+    - **DataFrameWriter** —— 写入模式（error、overwrite、append、ignore）
+    - **SQL 视图** —— `createOrReplaceTempView` 让你用标准 SQL
+      查询 DataFrame
+    - **分区** —— 按列值组织输出以实现高效过滤
 
-    You can now read data from any common format, transform it, and write
-    results. In the next lesson, you will work with complex data types —
-    arrays, maps, and nested structs — and the higher-order functions that
-    manipulate them.
+    你现在可以从任何常见格式读取数据、转换并写入结果。在下一课中，
+    你将处理复杂数据类型 —— 数组、映射和嵌套结构体 —— 以及操作它们的
+    高阶函数。

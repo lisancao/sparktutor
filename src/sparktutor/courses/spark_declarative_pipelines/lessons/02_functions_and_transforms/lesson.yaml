@@ -1,49 +1,48 @@
 - Class: meta
-  Lesson: "Functions & Transforms"
+  Lesson: "函数与转换"
   EstimatedMinutes: 15
 
 - Class: text
   Depth: all
   Output: |
-    ## What You'll Learn
+    ## 你将学到什么
 
-    With a SparkSession ready, it is time to learn the transformations
-    that power every pipeline stage. The bronze layer uses them to add
-    metadata columns. The silver layer uses them to cast types and filter
-    bad data. The gold layer uses them to compute aggregations.
+    有了 SparkSession，是时候学习驱动每个管道阶段的转换了。
+    bronze 层用它们来添加元数据列。silver 层用它们来做类型转换
+    并过滤脏数据。gold 层用它们来计算聚合。
 
-    By the end of this lesson you will be able to:
+    学完本课后，你将能够：
 
-    - Use `select()`, `filter()`, and `withColumn()` to transform data
-    - Reference columns with `f.col()` and create constants with `f.lit()`
-    - Write conditional logic with `f.when().otherwise()`
-    - Chain transformations into readable pipelines
-    - Write Arrow-optimized UDFs for custom logic (advanced)
+    - 使用 `select()`、`filter()` 和 `withColumn()` 转换数据
+    - 用 `f.col()` 引用列，用 `f.lit()` 创建常量
+    - 用 `f.when().otherwise()` 编写条件逻辑
+    - 将转换链式组合成可读的管道
+    - 编写 Arrow 优化的 UDF 实现自定义逻辑（高级）
 
 - Class: text
   Depth: all
   Output: |
-    Spark ships hundreds of built-in functions in `pyspark.sql.functions`.
-    The convention is to import it as `f`:
+    Spark 在 `pyspark.sql.functions` 中内置了数百个函数。
+    惯例是将其导入为 `f`：
 
     ```python
     from pyspark.sql import functions as f
     ```
 
-    The three transformations you will use in nearly every pipeline step:
+    你几乎在每个管道步骤中都会用到的三个转换：
 
-    - `select()` — choose which columns to keep
-    - `filter()` (or `where()`) — keep only rows matching a condition
-    - `withColumn()` — add or replace a column
+    - `select()` —— 选择要保留哪些列
+    - `filter()`（或 `where()`）—— 只保留满足条件的行
+    - `withColumn()` —— 添加或替换一列
 
-    All transformations are **lazy**. Nothing executes until you call an
-    **action** like `.show()`, `.count()`, or `.write`.
+    所有转换都是**惰性的**。在调用 `.show()`、`.count()` 或 `.write`
+    等**动作**之前，什么都不会执行。
 
 - Class: text
   Depth: beginner
   Output: |
-    Here is a quick example. Given a DataFrame `df` with columns `name`,
-    `age`, and `city`:
+    下面是一个简单示例。假设有一个 DataFrame `df`，包含列
+    `name`、`age` 和 `city`：
 
     ```python
     # Keep only name and age
@@ -56,12 +55,12 @@
     df.withColumn("birth_year", f.lit(2026) - f.col("age"))
     ```
 
-    Key helpers:
-    - `f.col("name")` — reference a column by name
-    - `f.lit(42)` — create a constant (literal) column
-    - `f.when(condition, value).otherwise(default)` — conditional logic
+    关键辅助函数：
+    - `f.col("name")` —— 按名称引用一列
+    - `f.lit(42)` —— 创建一个常量（字面量）列
+    - `f.when(condition, value).otherwise(default)` —— 条件逻辑
 
-    **Docs:**
+    **文档：**
     [select](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.select.html) |
     [filter](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.filter.html) |
     [withColumn](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.withColumn.html) |
@@ -71,52 +70,51 @@
 
 - Class: mult_question
   Depth: all
-  Output: "Which function creates a reference to a DataFrame column by name?"
+  Output: "哪个函数按名称创建对 DataFrame 列的引用？"
   AnswerChoices: "f.col();f.ref();f.column();f.field()"
   CorrectAnswer: "f.col()"
-  Hint: "It is a three-letter function in pyspark.sql.functions."
+  Hint: "它是 pyspark.sql.functions 中一个三个字母的函数。"
 
 - Class: cmd_question
   Depth: all
   Output: |
-    Given a DataFrame `df` with columns `product`, `price`, and `quantity`,
-    write a select that returns only `product` and `price`.
+    给定一个包含列 `product`、`price` 和 `quantity` 的 DataFrame `df`，
+    编写一个 select，只返回 `product` 和 `price`。
   CorrectAnswer: |
     df.select("product", "price")
-  Hint: "Pass column names as strings to df.select()."
+  Hint: "将列名作为字符串传给 df.select()。"
 
 - Class: cmd_question
   Depth: all
   Output: |
-    Filter DataFrame `df` to keep only rows where `price` is greater
-    than 10.0.
+    过滤 DataFrame `df`，只保留 `price` 大于 10.0 的行。
   CorrectAnswer: |
     df.filter(f.col("price") > 10.0)
-  Hint: "Use f.col('price') to reference the column, then compare with >."
+  Hint: "用 f.col('price') 引用列，然后用 > 比较。"
 
 - Class: mult_question
   Depth: all
-  Output: "What does f.lit(value) do?"
-  AnswerChoices: "Creates a column with a constant value;Converts a column to lowercase;Limits the number of rows;Lights up the Spark UI"
-  CorrectAnswer: "Creates a column with a constant value"
-  Hint: "'lit' is short for 'literal' — it wraps a Python value as a Spark column expression."
+  Output: "f.lit(value) 做什么？"
+  AnswerChoices: "创建一个带有常量值的列;将列转换为小写;限制行数;点亮 Spark UI"
+  CorrectAnswer: "创建一个带有常量值的列"
+  Hint: "'lit' 是 'literal' 的缩写 —— 它将一个 Python 值包装成 Spark 列表达式。"
 
 - Class: cmd_question
   Depth: intermediate
   Output: |
-    Add a new column called `total` to DataFrame `df` that equals
-    `price * quantity`.
+    向 DataFrame `df` 添加一个名为 `total` 的新列，其值等于
+    `price * quantity`。
   CorrectAnswer: |
     df.withColumn("total", f.col("price") * f.col("quantity"))
-  Hint: "Use withColumn with an arithmetic expression on f.col columns."
+  Hint: "用 withColumn，并对 f.col 列做算术表达式。"
 
 - Class: text
   Depth: intermediate
   Output: |
-    ## Chaining Transformations
+    ## 链式组合转换
 
-    Real pipeline code chains multiple transformations together. Spark
-    builds a logical plan and only executes when an action triggers it:
+    真实的管道代码会将多个转换链式组合在一起。Spark
+    构建一个逻辑计划，只有当动作触发时才执行：
 
     ```python
     result = (df
@@ -127,30 +125,30 @@
     result.show()  # action triggers execution
     ```
 
-    This pattern — filter bad data, compute derived columns, select the
-    final output — is exactly what the silver layer of our pipeline will
-    do. You are building the vocabulary for it now.
+    这种模式 —— 过滤脏数据、计算派生列、选择最终输出 ——
+    正是我们管道的 silver 层将要做的事情。你现在正在为它
+    积累词汇。
 
 - Class: cmd_question
   Depth: intermediate
   Output: |
-    Using `f.when`, add a column called `tier` to `df` that is `'premium'`
-    when `price >= 100`, and `'standard'` otherwise.
+    使用 `f.when`，向 `df` 添加一个名为 `tier` 的列：当
+    `price >= 100` 时为 `'premium'`，否则为 `'standard'`。
   CorrectAnswer: |
     df.withColumn("tier", f.when(f.col("price") >= 100, "premium").otherwise("standard"))
-  Hint: "f.when(condition, value).otherwise(default_value) returns a Column expression."
+  Hint: "f.when(condition, value).otherwise(default_value) 返回一个 Column 表达式。"
 
 - Class: text
   Depth: advanced
   Output: |
-    ## Arrow-Optimized UDFs
+    ## Arrow 优化的 UDF
 
-    When built-in functions are not enough, you can write custom logic
-    with UDFs. Classic Python UDFs serialize data row-by-row between the
-    JVM and Python, which is slow.
+    当内置函数不够用时，你可以用 UDF 编写自定义逻辑。
+    经典 Python UDF 在 JVM 和 Python 之间逐行序列化数据，
+    速度很慢。
 
-    Spark 4.x encourages **Arrow-optimized UDFs** (also called pandas
-    UDFs) that operate on batches using Apache Arrow:
+    Spark 4.x 推荐使用 **Arrow 优化的 UDF**（也叫 pandas
+    UDF），它基于 Apache Arrow 批量处理：
 
     ```python
     import pandas as pd
@@ -163,24 +161,23 @@
     df.withColumn("sale_price", discount(f.col("price")))
     ```
 
-    Arrow UDFs are typically 3-100x faster because they avoid per-row
-    serialization. In our pipeline, we will use built-in functions
-    whenever possible, but Arrow UDFs are your escape hatch for custom
-    business logic.
+    Arrow UDF 通常快 3-100 倍，因为它避免了逐行序列化。
+    在我们的管道中，会尽可能使用内置函数，但 Arrow UDF
+    是你处理自定义业务逻辑的逃生舱。
 
 - Class: mult_question
   Depth: advanced
-  Output: "Why are Arrow (pandas) UDFs faster than classic Python UDFs?"
-  AnswerChoices: "They process batches via Arrow, avoiding per-row serialization;They run on the GPU;They skip the Catalyst optimizer;They use less memory"
-  CorrectAnswer: "They process batches via Arrow, avoiding per-row serialization"
-  Hint: "The key advantage is batch processing with the zero-copy Arrow format."
+  Output: "为什么 Arrow（pandas）UDF 比经典 Python UDF 更快？"
+  AnswerChoices: "它们通过 Arrow 批量处理，避免逐行序列化;它们在 GPU 上运行;它们跳过了 Catalyst 优化器;它们占用更少内存"
+  CorrectAnswer: "它们通过 Arrow 批量处理，避免逐行序列化"
+  Hint: "关键优势是用零拷贝的 Arrow 格式做批处理。"
 
 - Class: cmd_question
   Depth: advanced
   Output: |
-    Write a pandas UDF called `normalize` that takes a pandas Series of
-    doubles and returns each value divided by the series maximum. Declare
-    the return type as `'double'`.
+    编写一个名为 `normalize` 的 pandas UDF，接收一个 double 类型的
+    pandas Series，返回每个值除以该 Series 的最大值。将返回类型
+    声明为 `'double'`。
   CorrectAnswer: |
     import pandas as pd
     from pyspark.sql.functions import pandas_udf
@@ -188,21 +185,20 @@
     @pandas_udf("double")
     def normalize(s: pd.Series) -> pd.Series:
         return s / s.max()
-  Hint: "Use @pandas_udf('double') decorator. Divide the series by s.max()."
+  Hint: "使用 @pandas_udf('double') 装饰器。将 Series 除以 s.max()。"
 
 - Class: text
   Depth: all
   Output: |
-    ## Summary
+    ## 小结
 
-    You now have the core transformation vocabulary:
+    你现在掌握了核心的转换词汇：
 
-    - `select()` — choose columns
-    - `filter()` — choose rows
-    - `withColumn()` — add or replace columns
-    - `f.col()`, `f.lit()`, `f.when().otherwise()` — column expressions
-    - Arrow UDFs for custom logic (advanced)
+    - `select()` —— 选择列
+    - `filter()` —— 选择行
+    - `withColumn()` —— 添加或替换列
+    - `f.col()`、`f.lit()`、`f.when().otherwise()` —— 列表达式
+    - Arrow UDF 用于自定义逻辑（高级）
 
-    These transformations are the building blocks for every pipeline layer.
-    In the next lesson, you will learn to **read and write data** — the I/O
-    layer that connects your transformations to the outside world.
+    这些转换是每一层管道的构建块。下一课中，你将学习
+    **读写数据** —— 将你的转换与外部世界连接起来的 I/O 层。

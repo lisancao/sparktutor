@@ -1,31 +1,31 @@
 - Class: meta
-  Lesson: "Full Pipeline"
+  Lesson: "完整管道"
   EstimatedMinutes: 25
 
 - Class: text
   Depth: all
   Output: |
-    ## What You'll Learn
+    ## 你将学到什么
 
-    This is the capstone lesson. You have built every piece individually:
-    a SparkSession, transformations, I/O, a Pipeline framework, and
-    three medallion layers. Now you will **connect them into a single
-    end-to-end pipeline** and learn how to make it production-ready.
+    这是结业课。你已经分别构建了每一个部件：一个
+    SparkSession、各种转换、I/O、一个 Pipeline 框架，以及
+    三层 medallion 架构。现在你要把它们**连接成一条端到端的
+    完整管道**，并学习如何让它达到生产可用。
 
-    By the end of this lesson you will be able to:
+    学完本课后，你将能够：
 
-    - Wire bronze, silver, and gold functions into one Pipeline
-    - Trace data flow through all three layers
-    - Add error handling and logging to the Pipeline runner
-    - Understand idempotency and why it matters for batch pipelines
-    - Choose a deployment pattern for production (advanced)
+    - 把 bronze、silver、gold 函数接入同一个 Pipeline
+    - 追踪数据在三层之间的流动
+    - 给 Pipeline 运行器添加错误处理和日志
+    - 理解幂等性以及它对批处理管道为何重要
+    - 为生产环境选择部署模式（高级）
 
 - Class: text
   Depth: all
   Output: |
-    ## The Complete Picture
+    ## 完整图景
 
-    Here is the architecture you have built across this course:
+    这是你在本课程中构建的架构：
 
     ```
     Raw CSV  ──>  [Bronze]  ──>  [Silver]  ──>  [Gold]
@@ -39,16 +39,14 @@
                   orders"        orders"          summary"
     ```
 
-    Each layer reads from the previous layer's temp view using
-    `spark.table()`. The Pipeline framework detects these dependencies
-    and runs everything in the correct order.
+    每一层都用 `spark.table()` 读取上一层的临时视图。
+    Pipeline 框架会检测这些依赖，并按正确顺序运行所有内容。
 
 - Class: text
   Depth: beginner
   Output: |
-    Connecting the layers is straightforward. Register each function
-    with the pipeline decorator, and dependency detection handles the
-    rest:
+    连接各层很简单。用管道装饰器注册每个函数，依赖检测会
+    处理剩下的事：
 
     ```python
     pipe = Pipeline(spark)
@@ -73,52 +71,50 @@
     pipe.run()  # Executes: bronze → silver → gold
     ```
 
-    The `pipe.run()` call builds the dependency graph, topologically
-    sorts it, and executes each function in order. You declare **what**
-    each step does; the framework handles **when** to run it.
+    `pipe.run()` 调用会构建依赖图、对其做拓扑排序，并按顺序
+    执行每个函数。你声明每一步**做什么**；框架负责**何时**
+    运行它。
 
 - Class: mult_question
   Depth: all
-  Output: "In a medallion architecture, what is the correct execution order?"
-  AnswerChoices: "Bronze, then Silver, then Gold;Gold, then Silver, then Bronze;All layers in parallel;Silver first, then Bronze and Gold in parallel"
-  CorrectAnswer: "Bronze, then Silver, then Gold"
-  Hint: "Each layer depends on the output of the previous one."
+  Output: "在 medallion 架构中，正确的执行顺序是什么？"
+  AnswerChoices: "先 Bronze，再 Silver，最后 Gold;先 Gold，再 Silver，最后 Bronze;所有层并行;先 Silver，再 Bronze 和 Gold 并行"
+  CorrectAnswer: "先 Bronze，再 Silver，最后 Gold"
+  Hint: "每一层都依赖上一层的输出。"
 
 - Class: text
   Depth: all
   Output: |
-    ## Why This Design Works
+    ## 为什么这个设计有效
 
-    The medallion architecture gives you several important properties:
+    medallion 架构给你带来几个重要特性：
 
-    **Reprocessability.** If the silver logic changes (e.g., a new type
-    cast), you re-run silver and gold from the unchanged bronze data.
-    You never need to re-ingest from the original source.
+    **可重处理性。** 如果 silver 逻辑变了（例如新增了一种
+    类型转换），你可以从未改动的 bronze 数据重新运行 silver
+    和 gold。你永远不需要从原始数据源重新接入。
 
-    **Debuggability.** When gold numbers look wrong, you can inspect
-    the silver temp view to see if cleaning was correct, or the bronze
-    view to see the raw input. Each layer is independently queryable.
+    **可调试性。** 当 gold 的数字看起来不对时，你可以检查
+    silver 临时视图看清洗是否正确，或检查 bronze 视图看
+    原始输入。每一层都可以独立查询。
 
-    **Separation of concerns.** Bronze engineers worry about ingestion
-    reliability. Silver engineers worry about data quality. Gold
-    engineers worry about business logic. Each layer has a clear owner
-    and contract.
+    **关注点分离。** Bronze 工程师关心接入可靠性。Silver
+    工程师关心数据质量。Gold 工程师关心业务逻辑。每一层
+    都有明确的负责人和契约。
 
 - Class: mult_question
   Depth: all
-  Output: "If the gold layer produces unexpected results, what should you check first?"
-  AnswerChoices: "The silver temp view to verify the cleaned data is correct;The raw CSV file on disk;The Spark driver logs;The gold layer's write mode"
-  CorrectAnswer: "The silver temp view to verify the cleaned data is correct"
-  Hint: "Gold reads from silver. If silver data is wrong, gold will be wrong too. Debug layer by layer."
+  Output: "如果 gold 层产出了意外结果，你应该先检查什么？"
+  AnswerChoices: "检查 silver 临时视图，确认清洗后的数据是否正确;磁盘上的原始 CSV 文件;Spark driver 日志;gold 层的写入模式"
+  CorrectAnswer: "检查 silver 临时视图，确认清洗后的数据是否正确"
+  Hint: "Gold 从 silver 读取。如果 silver 数据错了，gold 也会错。逐层调试。"
 
 - Class: text
   Depth: intermediate
   Output: |
-    ## Error Handling and Logging
+    ## 错误处理与日志
 
-    Production pipelines need to report what happened — which steps
-    succeeded, how many rows were processed, and what went wrong.
-    Enhance the `run()` method with logging and error tracking:
+    生产管道需要报告发生了什么 —— 哪些步骤成功了、处理了
+    多少行、哪里出了问题。用日志和错误追踪增强 `run()` 方法：
 
     ```python
     import logging
@@ -146,24 +142,24 @@
         return results
     ```
 
-    The `results` dictionary becomes a pipeline run report. In
-    production, you would persist this to a monitoring system.
+    `results` 字典变成一份管道运行报告。在生产环境中，你会
+    把它持久化到监控系统。
 
 - Class: mult_question
   Depth: intermediate
-  Output: "If the silver layer fails, should the gold layer still run?"
-  AnswerChoices: "No — gold depends on silver, so it should be skipped or the pipeline should stop;Yes — each layer is independent;Yes — gold can use stale data;It depends on the file format"
-  CorrectAnswer: "No — gold depends on silver, so it should be skipped or the pipeline should stop"
-  Hint: "Gold reads from silver. If silver failed, there is no valid data for gold to consume."
+  Output: "如果 silver 层失败了，gold 层还应该运行吗？"
+  AnswerChoices: "不应该 —— gold 依赖 silver，所以应该跳过它或停止整个管道;应该 —— 每一层都是独立的;应该 —— gold 可以用旧数据;取决于文件格式"
+  CorrectAnswer: "不应该 —— gold 依赖 silver，所以应该跳过它或停止整个管道"
+  Hint: "Gold 从 silver 读取。如果 silver 失败了，gold 就没有有效数据可消费。"
 
 - Class: cmd_question
   Depth: intermediate
   Output: |
-    Write a `run_with_logging` method for a Pipeline class that iterates
-    through sorted flows, executes each one inside a try/except, and
-    collects results in a dictionary with keys 'status' and 'rows' (or
-    'error'). Use Python's `logging` module. Re-raise the exception so
-    downstream steps do not run.
+    为一个 Pipeline 类编写一个 `run_with_logging` 方法，
+    遍历排序后的 flows，在 try/except 中执行每一个，并把
+    结果收集到一个字典中，键为 'status' 和 'rows'（或
+    'error'）。使用 Python 的 `logging` 模块。重新抛出异常，
+    使下游步骤不被执行。
   CorrectAnswer: |
     import logging
 
@@ -186,125 +182,124 @@
                 logger.error(f"Failed to materialize {name}: {e}")
                 raise
         return results
-  Hint: "Loop through sorted flows, wrap each in try/except, collect status in a dict."
+  Hint: "遍历排序后的 flows，每个包在 try/except 中，把状态收集到字典里。"
 
 - Class: text
   Depth: advanced
   Output: |
-    ## Idempotency: Run It Twice, Get the Same Result
+    ## 幂等性：跑两次，得到相同结果
 
-    A pipeline is **idempotent** if running it twice with the same input
-    produces the same output without side effects. This is critical for
-    production because pipelines will be retried after failures.
+    如果用相同输入运行两次管道产生相同输出且没有副作用，
+    那么这个管道是**幂等的**。这对生产环境至关重要，因为
+    管道在失败后会被重试。
 
-    Your pipeline is already idempotent because:
+    你的管道已经是幂等的，因为：
 
-    1. **Bronze deduplicates** by `order_id` — re-ingesting the same
-       CSV produces the same set of rows
-    2. **Silver uses deterministic transforms** — casts, filters, and
-       arithmetic produce the same output for the same input
-    3. **Temp views are replaced** — `createOrReplaceTempView` overwrites
-       the previous result, not appends to it
+    1. **Bronze 按 `order_id` 去重** —— 重复接入同一个
+       CSV 会产生相同的行集合
+    2. **Silver 使用确定性转换** —— 转换、过滤和算术对
+       相同输入产生相同输出
+    3. **临时视图是替换的** —— `createOrReplaceTempView`
+       会覆盖之前的结果，而不是追加
 
-    If you persist results to storage, use `mode("overwrite")` or
-    Iceberg's `createOrReplace` — never `mode("append")` for batch
-    pipelines, as re-running would create duplicate rows.
+    如果你把结果持久化到存储，使用 `mode("overwrite")` 或
+    Iceberg 的 `createOrReplace` —— 批处理管道永远不要用
+    `mode("append")`，因为重跑会产生重复行。
 
 - Class: mult_question
   Depth: advanced
-  Output: "Why should batch pipelines avoid using mode('append') for writes?"
-  AnswerChoices: "Because re-running the pipeline creates duplicate rows;Because append is slower than overwrite;Because append does not support Parquet;Because append locks the table"
-  CorrectAnswer: "Because re-running the pipeline creates duplicate rows"
-  Hint: "If you run the pipeline twice, append writes the same data twice."
+  Output: "为什么批处理管道写数据时应避免使用 mode('append')？"
+  AnswerChoices: "因为重跑管道会产生重复行;因为 append 比 overwrite 慢;因为 append 不支持 Parquet;因为 append 会锁定表"
+  CorrectAnswer: "因为重跑管道会产生重复行"
+  Hint: "如果你把管道跑两次，append 会把相同数据写两遍。"
 
 - Class: text
   Depth: advanced
   Output: |
-    ## Deployment Patterns
+    ## 部署模式
 
-    Your Pipeline class runs locally in this course, but the same code
-    runs in production with different submission methods:
+    你的 Pipeline 类在本课程中本地运行，但同样的代码可以用
+    不同的提交方式在生产环境运行：
 
-    **1. spark-submit** — the standard way to run Spark jobs:
+    **1. spark-submit** —— 运行 Spark 作业的标准方式：
     ```bash
     spark-submit --master spark://master:7077 pipeline.py
     ```
 
-    **2. Orchestration (Airflow/Dagster)** — schedule pipeline runs,
-    handle retries, and manage dependencies between multiple pipelines.
-    Each pipeline becomes a task in a DAG.
+    **2. 编排（Airflow/Dagster）** —— 调度管道运行、处理
+    重试，并管理多条管道之间的依赖。每条管道成为 DAG 中
+    的一个任务。
 
-    **3. Containerized (Kubernetes)** — package Spark + your code in a
-    Docker image and submit via `spark-submit --master k8s://...`.
-    Executor pods are created and destroyed per job.
+    **3. 容器化（Kubernetes）** —— 把 Spark + 你的代码打包
+    进 Docker 镜像，通过 `spark-submit --master k8s://...`
+    提交。Executor pod 按作业创建和销毁。
 
-    **4. Monitoring** — expose pipeline metrics (rows processed,
-    duration, errors) to Prometheus/Grafana. The `results` dictionary
-    from `run_with_logging` is a natural starting point.
+    **4. 监控** —— 把管道指标（处理行数、耗时、错误）暴露
+    给 Prometheus/Grafana。`run_with_logging` 返回的
+    `results` 字典是一个天然的起点。
 
 - Class: mult_question
   Depth: advanced
-  Output: "Which deployment approach packages Spark and application code together for cloud-native orchestration?"
-  AnswerChoices: "Containerized with Kubernetes;spark-submit to a standalone cluster;A cron job on the driver node;SSH into each executor"
-  CorrectAnswer: "Containerized with Kubernetes"
-  Hint: "Kubernetes orchestrates containers. Spark on K8s launches executor pods from a Docker image."
+  Output: "哪种部署方式把 Spark 和应用代码打包在一起，用于云原生编排？"
+  AnswerChoices: "用 Kubernetes 容器化;用 spark-submit 提交到 standalone 集群;在 driver 节点上跑 cron 定时任务;SSH 登录每个 executor"
+  CorrectAnswer: "用 Kubernetes 容器化"
+  Hint: "Kubernetes 编排容器。Spark on K8s 从 Docker 镜像启动 executor pod。"
 
 - Class: script
   Depth: all
   Output: |
-    ## Capstone Exercise: End-to-End Pipeline
+    ## 结业练习：端到端管道
 
-    This is the final exercise. Open the starter file and build a
-    complete pipeline that connects all three layers:
+    这是最后一个练习。打开 starter 文件，构建一条连接全部
+    三层的完整管道：
 
-    1. **Bronze** (`bronze_orders`): read raw CSV with an all-string
-       schema, add `_ingested_at` and `_source_file` metadata,
-       deduplicate by `order_id`
-    2. **Silver** (`silver_orders`): read from `bronze_orders` temp
-       view, cast `price` to double and `quantity` to int, compute
-       `total` (price * quantity), filter out null prices, extract
-       `order_hour` from the timestamp
-    3. **Gold** (`gold_product_summary`): read from `silver_orders`
-       temp view, group by `product`, compute `order_count`,
-       `total_revenue`, `avg_order_value`, and add `revenue_rank`
-    4. Register all three with `@pipe.materialized_view()` and
-       call `pipe.run()`
+    1. **Bronze**（`bronze_orders`）：用全字符串 schema 读取
+       原始 CSV，添加 `_ingested_at` 和 `_source_file` 元数据，
+       按 `order_id` 去重
+    2. **Silver**（`silver_orders`）：从 `bronze_orders`
+       临时视图读取，把 `price` 转成 double、`quantity` 转成
+       int，计算 `total`（price * quantity），过滤掉 null
+       price，从时间戳提取 `order_hour`
+    3. **Gold**（`gold_product_summary`）：从 `silver_orders`
+       临时视图读取，按 `product` 分组，计算 `order_count`、
+       `total_revenue`、`avg_order_value`，并添加 `revenue_rank`
+    4. 用 `@pipe.materialized_view()` 注册全部三个函数，
+       然后调用 `pipe.run()`
 
-    The test harness feeds in a CSV with clean and dirty rows, then
-    verifies all three layers produce correct output.
+    测试框架会喂入一个同时包含干净行和脏行的 CSV，然后
+    验证三层是否都产出正确输出。
   StarterFile: starter.py
   SolutionFile: solution.py
-  Hint: "Combine everything from lessons 04-07. Register three functions with the pipeline decorator."
+  Hint: "综合第 04-07 课的所有内容。用管道装饰器注册三个函数。"
 
 - Class: text
   Depth: all
   Output: |
-    ## Course Complete!
+    ## 课程完成！
 
-    You have built a production-style data pipeline from scratch.
-    Here is what you learned across all eight lessons:
+    你已经从零构建了一条生产级的数据管道。以下是你在全部
+    八课中学到的内容：
 
-    | Lesson | What You Built |
-    |--------|---------------|
-    | 1. SparkSession | The entry point — configured for local development |
-    | 2. Functions & Transforms | select, filter, withColumn, f.col, f.when |
-    | 3. Reading & Writing Data | DataFrameReader/Writer, schemas, Parquet, write modes |
-    | 4. Pipeline Framework | Decorator registration, dependency detection, topo sort |
-    | 5. Bronze Layer | Raw ingestion, metadata columns, deduplication |
-    | 6. Silver Layer | Type casting, null handling, enrichment joins, JSON parsing |
-    | 7. Gold Layer | Aggregations, window functions, rankings |
-    | 8. Full Pipeline | End-to-end wiring, error handling, idempotency |
+    | 课程 | 你构建了什么 |
+    |------|-------------|
+    | 1. SparkSession | 入口点 —— 为本地开发配置 |
+    | 2. 函数与转换 | select、filter、withColumn、f.col、f.when |
+    | 3. 读写数据 | DataFrameReader/Writer、schema、Parquet、写入模式 |
+    | 4. Pipeline 框架 | 装饰器注册、依赖检测、拓扑排序 |
+    | 5. Bronze 层 | 原始数据接入、元数据列、去重 |
+    | 6. Silver 层 | 类型转换、null 处理、丰富性 join、JSON 解析 |
+    | 7. Gold 层 | 聚合、窗口函数、排名 |
+    | 8. 完整管道 | 端到端接线、错误处理、幂等性 |
 
-    The first three lessons gave you the Spark vocabulary. Lesson 4
-    gave you the orchestration framework. Lessons 5-7 used both to
-    build the three medallion layers. And this lesson connected
-    everything into a working pipeline.
+    前三课给了你 Spark 的词汇。第 4 课给了你编排框架。
+    第 5-7 课用这两者构建了三层 medallion 架构。而这一课
+    把一切连接成一条可运行的管道。
 
-    **Where to go from here:**
-    - Add persistent storage with Parquet or Iceberg tables
-    - Replace the CSV source with a Kafka stream
-    - Deploy with spark-submit or an orchestrator like Airflow
-    - Add data quality checks between layers
+    **接下来去哪里：**
+    - 用 Parquet 或 Iceberg 表添加持久化存储
+    - 把 CSV 源替换成 Kafka 流
+    - 用 spark-submit 或 Airflow 之类的编排器部署
+    - 在层与层之间添加数据质量检查
 
-    You are now equipped to build production-grade data pipelines with
-    Apache Spark. Happy engineering!
+    现在你已经具备了用 Apache Spark 构建生产级数据管道的
+    能力。工程愉快！

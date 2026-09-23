@@ -1,15 +1,15 @@
 """
-Machine Learning with MLlib - Starter Code
+使用 MLlib 进行机器学习 - 起始代码
 
-Implement the `build_pipeline` function that:
-1. Creates a sample housing dataset with categorical and numeric features
-2. Splits into train/test sets (80/20)
-3. Builds a Pipeline with StringIndexer, VectorAssembler, RandomForestRegressor
-4. Trains the pipeline on training data
-5. Evaluates RMSE and R2 on test predictions
-6. Returns a dict with the model, predictions, and metrics
+实现 `build_pipeline` 函数：
+1. 创建包含类别特征和数值特征的房屋示例数据集
+2. 拆分为训练集/测试集（80/20）
+3. 构建包含 StringIndexer、VectorAssembler、RandomForestRegressor 的 Pipeline
+4. 在训练数据上拟合 Pipeline
+5. 在测试预测上评估 RMSE 和 R2
+6. 返回包含模型、预测和指标的字典
 
-Adapted from the Learning Spark MLflow train.py example.
+改编自 Learning Spark 的 MLflow train.py 示例。
 """
 
 from pyspark.sql import SparkSession
@@ -24,7 +24,7 @@ import random
 
 
 def generate_housing_data(n=500):
-    """Generate synthetic housing data for ML training."""
+    """生成用于 ML 训练的合成房屋数据。"""
     neighborhoods = ["Downtown", "Suburbs", "Rural", "Midtown", "Waterfront"]
     conditions = ["Excellent", "Good", "Fair", "Poor"]
     random.seed(42)
@@ -36,7 +36,7 @@ def generate_housing_data(n=500):
         sqft = random.randint(500, 4000)
         age = random.randint(0, 80)
 
-        # Price based on features (with some noise)
+        # 基于特征计算价格（含一些噪声）
         base = {"Downtown": 300000, "Suburbs": 200000, "Rural": 100000,
                 "Midtown": 250000, "Waterfront": 400000}
         cond = {"Excellent": 1.3, "Good": 1.1, "Fair": 0.9, "Poor": 0.7}
@@ -58,42 +58,42 @@ SCHEMA = StructType([
 
 
 def build_pipeline(spark):
-    """Build and evaluate an ML pipeline for housing price prediction."""
+    """构建并评估用于房价预测的 ML Pipeline。"""
 
     housing_df = spark.createDataFrame(generate_housing_data(), SCHEMA)
 
-    # TODO: Split into train (80%) and test (20%) with seed=42
-    trainDF, testDF = None, None  # Replace
+    # TODO: 拆分为训练集（80%）和测试集（20%），seed=42
+    trainDF, testDF = None, None  # 替换
 
-    # TODO: Create StringIndexers for categorical columns
+    # TODO: 为类别列创建 StringIndexer
     #       "neighborhood" -> "neighborhoodIndex"
     #       "condition" -> "conditionIndex"
-    neighborhood_indexer = None  # Replace
-    condition_indexer = None  # Replace
+    neighborhood_indexer = None  # 替换
+    condition_indexer = None  # 替换
 
-    # TODO: Create VectorAssembler combining:
+    # TODO: 创建 VectorAssembler，合并以下列：
     #       ["neighborhoodIndex", "conditionIndex", "bedrooms", "sqft", "age"]
-    #       into a column called "features"
-    assembler = None  # Replace
+    #       到名为 "features" 的列中
+    assembler = None  # 替换
 
-    # TODO: Create RandomForestRegressor with labelCol="price",
+    # TODO: 创建 RandomForestRegressor，labelCol="price"，
     #       numTrees=20, maxDepth=5, seed=42
-    rf = None  # Replace
+    rf = None  # 替换
 
-    # TODO: Create a Pipeline with stages:
+    # TODO: 创建 Pipeline，stages 为：
     #       [neighborhood_indexer, condition_indexer, assembler, rf]
-    pipeline = None  # Replace
+    pipeline = None  # 替换
 
-    # TODO: Fit the pipeline on trainDF
-    model = None  # Replace
+    # TODO: 在 trainDF 上拟合 Pipeline
+    model = None  # 替换
 
-    # TODO: Transform testDF to get predictions
-    predictions = None  # Replace
+    # TODO: 对 testDF 进行变换以获取预测
+    predictions = None  # 替换
 
-    # TODO: Evaluate RMSE and R2
+    # TODO: 评估 RMSE 和 R2
     evaluator = RegressionEvaluator(labelCol="price", predictionCol="prediction")
-    rmse = None  # Replace — use setMetricName("rmse").evaluate()
-    r2 = None  # Replace — use setMetricName("r2").evaluate()
+    rmse = None  # 替换 — 使用 setMetricName("rmse").evaluate()
+    r2 = None  # 替换 — 使用 setMetricName("r2").evaluate()
 
     return {
         "model": model,
@@ -105,7 +105,7 @@ def build_pipeline(spark):
     }
 
 
-# ---- Test harness (do not modify below this line) ----
+# ---- 测试代码（请勿修改此行以下内容）----
 if __name__ == "__main__":
     spark = (SparkSession.builder
         .appName("MLlibTest")
@@ -113,19 +113,19 @@ if __name__ == "__main__":
         .getOrCreate())
 
     result = build_pipeline(spark)
-    assert result is not None, "Function returned None"
-    assert result["model"] is not None, "Model is None"
-    assert result["predictions"] is not None, "Predictions is None"
-    assert result["rmse"] is not None, "RMSE is None"
-    assert result["r2"] is not None, "R2 is None"
-    assert result["rmse"] > 0, f"RMSE should be positive, got {result['rmse']}"
-    assert 0 < result["r2"] <= 1, f"R2 should be between 0 and 1, got {result['r2']}"
-    print(f"Training samples: {result['train_count']}")
-    print(f"Test samples: {result['test_count']}")
-    print(f"RMSE: {result['rmse']:.2f}")
-    print(f"R2: {result['r2']:.4f}")
-    print("\nSample predictions:")
+    assert result is not None, "函数返回了 None"
+    assert result["model"] is not None, "模型为 None"
+    assert result["predictions"] is not None, "预测为 None"
+    assert result["rmse"] is not None, "RMSE 为 None"
+    assert result["r2"] is not None, "R2 为 None"
+    assert result["rmse"] > 0, f"RMSE 应为正数，实际得到 {result['rmse']}"
+    assert 0 < result["r2"] <= 1, f"R2 应在 0 到 1 之间，实际得到 {result['r2']}"
+    print(f"训练样本数：{result['train_count']}")
+    print(f"测试样本数：{result['test_count']}")
+    print(f"RMSE：{result['rmse']:.2f}")
+    print(f"R2：{result['r2']:.4f}")
+    print("\n预测示例：")
     result["predictions"].select("neighborhood", "condition", "bedrooms",
                                   "sqft", "age", "price", "prediction").show(10)
-    print("All tests passed!")
+    print("所有测试通过！")
     spark.stop()

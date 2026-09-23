@@ -1,16 +1,16 @@
 """
-Data Lakes & Lakehouses - Starter Code
+数据湖与湖仓一体 - 起始代码
 
-Implement the `lakehouse_simulation` function that simulates
-lakehouse concepts using Parquet + versioned directories:
-1. Creates initial employee data and writes as "version 0"
-2. Adds new employees and writes as "version 1"
-3. Reads both versions to demonstrate "time travel"
-4. Verifies schema consistency between versions
-5. Returns a dict with both versions and schema info
+实现 `lakehouse_simulation` 函数，使用 Parquet + 版本化目录
+模拟湖仓概念：
+1. 创建初始员工数据并写为 "版本 0"
+2. 添加新员工并写为 "版本 1"
+3. 读取两个版本以演示 "时间旅行"
+4. 验证版本之间的 schema 一致性
+5. 返回包含两个版本和 schema 信息的字典
 
-This is dry-run compatible — no Delta/Iceberg JARs required.
-In production, you would use Delta or Iceberg for real ACID support.
+兼容 dry-run — 无需 Delta/Iceberg JAR。
+在生产环境中，你可以使用 Delta 或 Iceberg 获得真正的 ACID 支持。
 """
 
 from pyspark.sql import SparkSession, functions as f
@@ -40,27 +40,27 @@ SCHEMA = StructType([
 
 
 def lakehouse_simulation(spark, base_path):
-    """Simulate lakehouse versioning with Parquet directories."""
+    """使用 Parquet 目录模拟湖仓版本管理。"""
 
     v0_path = os.path.join(base_path, "v0")
     v1_path = os.path.join(base_path, "v1")
 
-    # TODO: Create initial DataFrame and write to v0_path as Parquet
-    initial_df = None  # Replace
-    # Write to v0_path here
+    # TODO: 创建初始 DataFrame 并以 Parquet 格式写入 v0_path
+    initial_df = None  # 替换
+    # 在此写入 v0_path
 
-    # TODO: Create new employees DataFrame, union with initial,
-    #       and write to v1_path as Parquet
-    new_df = None  # Replace
-    combined_df = None  # Replace (union of initial_df and new_df)
-    # Write to v1_path here
+    # TODO: 创建新员工 DataFrame，与初始数据 union，
+    #       并以 Parquet 格式写入 v1_path
+    new_df = None  # 替换
+    combined_df = None  # 替换（initial_df 和 new_df 的 union）
+    # 在此写入 v1_path
 
-    # TODO: Read back both versions (simulating time travel)
-    version_0 = None  # Replace — read from v0_path
-    version_1 = None  # Replace — read from v1_path
+    # TODO: 读取两个版本（模拟时间旅行）
+    version_0 = None  # 替换 — 从 v0_path 读取
+    version_1 = None  # 替换 — 从 v1_path 读取
 
-    # TODO: Verify schema consistency
-    schemas_match = None  # Replace — compare version_0.schema == version_1.schema
+    # TODO: 验证 schema 一致性
+    schemas_match = None  # 替换 — 比较 version_0.schema == version_1.schema
 
     return {
         "version_0": version_0,
@@ -71,7 +71,7 @@ def lakehouse_simulation(spark, base_path):
     }
 
 
-# ---- Test harness (do not modify below this line) ----
+# ---- 测试代码（请勿修改此行以下内容）----
 if __name__ == "__main__":
     import tempfile, shutil
 
@@ -85,16 +85,16 @@ if __name__ == "__main__":
 
     try:
         result = lakehouse_simulation(spark, base)
-        assert result is not None, "Function returned None"
-        assert result["v0_count"] == 3, f"Version 0 should have 3 rows, got {result['v0_count']}"
-        assert result["v1_count"] == 5, f"Version 1 should have 5 rows, got {result['v1_count']}"
-        assert result["schemas_match"] == True, "Schemas should match between versions"
-        print("Version 0 (initial):")
+        assert result is not None, "函数返回了 None"
+        assert result["v0_count"] == 3, f"版本 0 应有 3 行，实际得到 {result['v0_count']}"
+        assert result["v1_count"] == 5, f"版本 1 应有 5 行，实际得到 {result['v1_count']}"
+        assert result["schemas_match"] == True, "各版本之间的 schema 应一致"
+        print("版本 0（初始）：")
         result["version_0"].show()
-        print("Version 1 (with new employees):")
+        print("版本 1（含新员工）：")
         result["version_1"].show()
-        print(f"Schemas match: {result['schemas_match']}")
-        print("All tests passed!")
+        print(f"Schema 是否一致：{result['schemas_match']}")
+        print("所有测试通过！")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
         spark.stop()

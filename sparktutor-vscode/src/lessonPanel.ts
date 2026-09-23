@@ -34,7 +34,7 @@ export class LessonPanel {
       vscode.ViewColumn.Two,
       {
         enableScripts: true,
-        retainContextWhenHidden: true,
+        retainContextWhenHidden: false,
         localResourceRoots: [
           vscode.Uri.joinPath(this.extensionUri, "media"),
         ],
@@ -147,16 +147,16 @@ export class LessonPanel {
 
     if (step.cls === "text") {
       // Read-only content step — just Next
-      instructionHtml = `<div class="instruction-banner info">Read the content above, then click <strong>Next</strong> to continue.</div>`;
+      instructionHtml = `<div class="instruction-banner info">阅读以上内容，然后点击<strong>下一步</strong>继续。</div>`;
       actionButtonsHtml = `<div class="actions">
-        <button class="btn btn-primary" onclick="send('next')">Next &rarr;</button>
+        <button class="btn btn-primary" onclick="send('next')">下一步 &rarr;</button>
       </div>`;
     } else if (step.cls === "mult_question") {
       // Multiple choice — pick an answer, then Submit
       const choices = step.answerChoices
         ? step.answerChoices.split(";").map((c) => c.trim())
         : [];
-      instructionHtml = `<div class="instruction-banner prompt">Select an answer below, then click <strong>Submit</strong>.</div>`;
+      instructionHtml = `<div class="instruction-banner prompt">在下方选择一个答案，然后点击<strong>提交</strong>。</div>`;
       choicesHtml = `<div class="choices">${choices
         .map(
           (c) =>
@@ -164,18 +164,18 @@ export class LessonPanel {
         )
         .join("")}</div>`;
       actionButtonsHtml = `<div class="actions">
-        <button class="btn btn-success" onclick="send('submit')">&check; Submit</button>
+        <button class="btn btn-success" onclick="send('submit')">&check; 提交</button>
       </div>`;
     } else if (step.cls === "cmd_question" || step.cls === "script") {
       // Code step — write code in editor, Run/Submit
       const label =
         step.cls === "script"
-          ? "Write your solution in the <strong>editor tab on the left</strong>, then Run or Submit."
-          : "Write your code in the <strong>editor tab on the left</strong>, then click Submit.";
+          ? "在<strong>左侧编辑器标签页</strong>中编写你的解决方案，然后运行或提交。"
+          : "在<strong>左侧编辑器标签页</strong>中编写代码，然后点击提交。";
       instructionHtml = `<div class="instruction-banner prompt">${label}</div>`;
       actionButtonsHtml = `<div class="actions">
-        <button class="btn btn-primary" onclick="send('run')">&#9654; Run</button>
-        <button class="btn btn-success" onclick="send('submit')">&check; Submit</button>
+        <button class="btn btn-primary" onclick="send('run')">&#9654; 运行</button>
+        <button class="btn btn-success" onclick="send('submit')">&check; 提交</button>
       </div>`;
     }
 
@@ -194,8 +194,8 @@ export class LessonPanel {
       <div class="progress-fill" style="width: ${progressPercent}%"></div>
     </div>
     <div class="step-meta">
-      <span class="step-label">Step ${currentIndex + 1} of ${totalSteps}</span>
-      <span class="depth-badge depth-${depth}">${depth.charAt(0).toUpperCase() + depth.slice(1)}</span>
+      <span class="step-label">第 ${currentIndex + 1} 步 / 共 ${totalSteps} 步</span>
+      <span class="depth-badge depth-${depth}">${depthLabel(depth)}</span>
     </div>
   </div>
 
@@ -208,7 +208,7 @@ export class LessonPanel {
 
   <div id="loading-overlay" class="loading-overlay hidden">
     <div class="loading-spinner"></div>
-    <span class="loading-text">Processing...</span>
+    <span class="loading-text">处理中...</span>
   </div>
 
   <div id="feedback-section" class="feedback-section hidden"></div>
@@ -216,20 +216,20 @@ export class LessonPanel {
   ${actionButtonsHtml}
 
   <div class="nav-buttons">
-    <button class="btn btn-secondary" onclick="send('back')">&larr; Back</button>
-    <button class="btn btn-secondary" onclick="send('hint')">Hint</button>
-    <button class="btn btn-secondary" onclick="send('next')">Next &rarr;</button>
+    <button class="btn btn-secondary" onclick="send('back')">&larr; 上一步</button>
+    <button class="btn btn-secondary" onclick="send('hint')">提示</button>
+    <button class="btn btn-secondary" onclick="send('next')">下一步 &rarr;</button>
   </div>
 
   <div id="hint-section" class="hint-section hidden"></div>
 
   <hr>
   <div class="chat-section">
-    <h3>Ask the Tutor</h3>
+    <h3>向导师提问</h3>
     <div id="chat-messages" class="chat-messages"></div>
     <div class="chat-input-row">
-      <input type="text" id="chat-input" placeholder="Ask a question about this step..." onkeydown="if(event.key==='Enter')sendChat()">
-      <button class="btn btn-primary" onclick="sendChat()">Send</button>
+      <input type="text" id="chat-input" placeholder="就本步骤提问..." onkeydown="if(event.key==='Enter')sendChat()">
+      <button class="btn btn-primary" onclick="sendChat()">发送</button>
     </div>
   </div>
 
@@ -250,6 +250,20 @@ function escapeHtml(text: string): string {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+/** Map internal depth level to a Chinese label for the badge. */
+function depthLabel(depth: string): string {
+  switch (depth) {
+    case "beginner":
+      return "入门";
+    case "intermediate":
+      return "中级";
+    case "advanced":
+      return "高级";
+    default:
+      return depth;
+  }
 }
 
 /** Markdown-to-HTML: code blocks, inline code, bold, italic, lists, links, paragraphs. */

@@ -1,13 +1,13 @@
 """
-Pipeline Framework - Starter Code
+Pipeline 框架 - 起始代码
 
-Complete the Pipeline class below. You need to implement:
-1. materialized_view() -- decorator that registers functions
-2. _detect_deps()      -- inspect function source for spark.table() calls
-3. _topo_sort()        -- topological sort using Kahn's algorithm
-4. run()               -- build graph, sort, execute in order
+完成下面的 Pipeline 类。你需要实现：
+1. materialized_view() -- 注册函数的装饰器
+2. _detect_deps()      -- 检查函数源码中的 spark.table() 调用
+3. _topo_sort()        -- 使用 Kahn 算法进行拓扑排序
+4. run()               -- 构建图、排序、按序执行
 
-Test your implementation by running this file. The expected output is:
+运行此文件来测试你的实现。预期输出为：
   Materialized: bronze_orders (... rows)
   Materialized: silver_orders (... rows)
 """
@@ -23,32 +23,32 @@ class Pipeline:
         self._flows = {}
 
     def materialized_view(self):
-        """Return a decorator that registers the wrapped function in self._flows."""
-        # TODO: implement
+        """返回一个装饰器，将被装饰的函数注册到 self._flows 中。"""
+        # TODO: 实现
         pass
 
     def _detect_deps(self, func):
-        """Return a list of table names referenced via spark.table('...') in func."""
-        # TODO: implement
+        """返回函数中通过 spark.table('...') 引用的表名列表。"""
+        # TODO: 实现
         pass
 
     def _topo_sort(self, graph):
         """
-        Topological sort using Kahn's algorithm.
-        graph: dict mapping node_name -> list of dependency names
-        Returns: list of node names in execution order
-        Raises ValueError if a cycle is detected.
+        使用 Kahn 算法进行拓扑排序。
+        graph: 字典，映射 节点名 -> 依赖名列表
+        返回：按执行顺序排列的节点名列表
+        如果检测到循环则抛出 ValueError。
         """
-        # TODO: implement
+        # TODO: 实现
         pass
 
     def run(self):
-        """Build the dependency graph, sort, and execute each flow in order."""
-        # TODO: implement
+        """构建依赖图、排序，并按顺序执行每个 flow。"""
+        # TODO: 实现
         pass
 
 
-# ---- Test harness (do not modify below this line) ----
+# ---- 测试代码（请勿修改此行以下内容）----
 if __name__ == "__main__":
     from pyspark.sql import SparkSession
 

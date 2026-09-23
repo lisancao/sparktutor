@@ -1,4 +1,4 @@
-"""Configuration model for SparkTutor."""
+﻿"""Configuration model for SparkTutor."""
 
 from __future__ import annotations
 
@@ -62,7 +62,7 @@ class Settings(BaseModel):
     def load(cls) -> "Settings":
         config_path = Path.home() / ".sparktutor" / "config.yaml"
         if config_path.exists():
-            with open(config_path) as f:
+            with open(config_path, encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
         else:
             data = {}

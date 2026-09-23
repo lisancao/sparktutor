@@ -161,7 +161,7 @@ export function registerCommands(
         !currentCourseId ||
         !currentLessonId
       ) {
-        vscode.window.showWarningMessage("No lesson is currently open.");
+        vscode.window.showWarningMessage("当前没有打开的课程。");
         return;
       }
 
@@ -169,7 +169,7 @@ export function registerCommands(
       const solutionCode = currentStep.solutionCode;
       if (!solutionCode) {
         vscode.window.showInformationMessage(
-          "No solution available for this step."
+          "本步骤暂无参考答案。"
         );
         return;
       }
@@ -179,7 +179,7 @@ export function registerCommands(
         const result = await bridge.call<{ solution: string }>("getSolution");
         if (!result.solution) {
           vscode.window.showInformationMessage(
-            "No solution available for this step."
+            "本步骤暂无参考答案。"
           );
           return;
         }
@@ -197,7 +197,7 @@ export function registerCommands(
             "vscode.diff",
             exerciseUri,
             solutionUri,
-            `Your Code ↔ Solution (Step ${currentIndex + 1})`
+            `你的代码 ↔ 参考答案（第 ${currentIndex + 1} 步）`
           );
         } else {
           // No exercise file open, just show the solution
@@ -206,7 +206,7 @@ export function registerCommands(
         }
       } catch (err) {
         vscode.window.showErrorMessage(
-          `Failed to load solution: ${err instanceof Error ? err.message : err}`
+          `加载参考答案失败：${err instanceof Error ? err.message : err}`
         );
       }
     }),
@@ -235,16 +235,16 @@ export function registerCommands(
 
     vscode.commands.registerCommand("sparktutor.resetLesson", async () => {
       if (!currentCourseId || !currentLessonId || currentLessonIdx === undefined) {
-        vscode.window.showWarningMessage("No lesson is currently open.");
+        vscode.window.showWarningMessage("当前没有打开的课程。");
         return;
       }
 
       const confirm = await vscode.window.showWarningMessage(
-        `Reset "${currentLessonTitle || currentLessonId}"? This will clear all progress and saved code for this lesson.`,
+        `重置「${currentLessonTitle || currentLessonId}」？这将清除本课程的所有进度和已保存的代码。`,
         { modal: true },
-        "Reset"
+        "重置"
       );
-      if (confirm !== "Reset") {
+      if (confirm !== "重置") {
         return;
       }
 
@@ -272,13 +272,41 @@ export function registerCommands(
           true // skipResumePrompt — we just reset
         );
 
-        vscode.window.showInformationMessage("Lesson reset successfully.");
+        vscode.window.showInformationMessage("课程已成功重置。");
       } catch (err) {
         vscode.window.showErrorMessage(
-          `Reset failed: ${err instanceof Error ? err.message : err}`
+          `重置失败：${err instanceof Error ? err.message : err}`
         );
       }
-    })
+    }),
+
+    vscode.commands.registerCommand(
+      "sparktutor.checkAiConnection",
+      async () => {
+        await checkAiConnection(aiRouter, outputChannel);
+      }
+    )
+  );
+}
+
+async function checkAiConnection(
+  aiRouter: AiRouter,
+  outputChannel: SparkOutputChannel
+): Promise<void> {
+  await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: "SparkTutor: Checking AI connection…",
+    },
+    async () => {
+      const result = await aiRouter.checkConnection();
+      outputChannel.appendLine(`[ai] ${result.message}`);
+      if (result.ok) {
+        vscode.window.showInformationMessage(`SparkTutor: ${result.message}`);
+      } else {
+        vscode.window.showErrorMessage(`SparkTutor: ${result.message}`);
+      }
+    }
   );
 }
 
@@ -286,28 +314,28 @@ async function pickExecutionMode(): Promise<string | undefined> {
   const items: vscode.QuickPickItem[] = [
     {
       label: "Local",
-      description: "pip install pyspark — no Docker needed",
-      detail: "Run Spark in the same Python environment",
+      description: "pip install pyspark —— 无需 Docker",
+      detail: "在同一 Python 环境中运行 Spark",
     },
     {
       label: "Lakehouse",
-      description: "Docker containers with Kafka, Iceberg, etc.",
-      detail: "Requires lakehouse-stack and Docker Desktop",
+      description: "带 Kafka、Iceberg 等的 Docker 容器",
+      detail: "需要 lakehouse-stack 和 Docker Desktop",
     },
     {
       label: "Databricks",
-      description: "Remote Databricks cluster via Spark Connect",
-      detail: "Requires databricks-connect and cluster access",
+      description: "通过 Spark Connect 连接远程 Databricks 集群",
+      detail: "需要 databricks-connect 和集群访问权限",
     },
     {
       label: "Auto",
-      description: "Detect automatically",
-      detail: "Uses lakehouse if containers are running, otherwise local",
+      description: "自动检测",
+      detail: "容器运行时使用 Lakehouse，否则使用 Local",
     },
   ];
   const pick = await vscode.window.showQuickPick(items, {
-    placeHolder: "How should SparkTutor run Spark code?",
-    title: "SparkTutor — Execution Mode",
+    placeHolder: "SparkTutor 应如何运行 Spark 代码？",
+    title: "SparkTutor —— 执行模式",
   });
   if (!pick) {
     return undefined;
@@ -323,23 +351,23 @@ async function pickDepth(): Promise<string | undefined> {
   const items: vscode.QuickPickItem[] = [
     {
       label: "Beginner",
-      description: "Core concepts, guided examples, encouraging feedback",
-      detail: "Best if you're new to Spark or PySpark",
+      description: "核心概念、引导式示例、鼓励性反馈",
+      detail: "适合 Spark 或 PySpark 新手",
     },
     {
       label: "Intermediate",
-      description: "Patterns, trade-offs, configuration tuning",
-      detail: "You know DataFrames but want to go deeper",
+      description: "设计模式、权衡分析、配置调优",
+      detail: "已了解 DataFrame，希望深入学习",
     },
     {
       label: "Advanced",
-      description: "Internals, performance, production readiness",
-      detail: "You've run Spark in production and want mastery",
+      description: "内部原理、性能优化、生产就绪",
+      detail: "已有生产环境 Spark 经验，追求精通",
     },
   ];
   const pick = await vscode.window.showQuickPick(items, {
-    placeHolder: "Choose your experience level",
-    title: "SparkTutor — Set Your Level",
+    placeHolder: "选择你的经验水平",
+    title: "SparkTutor —— 设置你的水平",
   });
   return pick?.label.toLowerCase();
 }
@@ -384,11 +412,11 @@ async function openLesson(
     // If there's saved progress, ask whether to resume or start fresh
     if (result.currentIndex > 0 && !skipResumePrompt) {
       const choice = await vscode.window.showInformationMessage(
-        `"${result.lessonTitle}" — resume at step ${result.currentIndex + 1}/${result.totalSteps}?`,
-        "Resume",
-        "Start from Beginning"
+        `「${result.lessonTitle}」—— 从第 ${result.currentIndex + 1}/${result.totalSteps} 步继续？`,
+        "继续",
+        "从头开始"
       );
-      if (choice === "Start from Beginning") {
+      if (choice === "从头开始") {
         await bridge.call("resetLesson", {
           courseId,
           lessonId: result.lessonId,
@@ -402,7 +430,7 @@ async function openLesson(
 
     // Prepend prerequisites banner to the first lesson's first step
     if (result.coursePrerequisites?.length) {
-      const prereqMd = "## Prerequisites\n\n" +
+      const prereqMd = "## 前置要求\n\n" +
         result.coursePrerequisites.map(p => `- ${p}`).join("\n") +
         "\n\n---\n\n";
       result.step.output = prereqMd + result.step.output;
@@ -456,7 +484,7 @@ async function openLesson(
     saveSession();
   } catch (err) {
     vscode.window.showErrorMessage(
-      `Failed to load lesson: ${err instanceof Error ? err.message : err}`
+      `加载课程失败：${err instanceof Error ? err.message : err}`
     );
   }
 }
@@ -470,7 +498,7 @@ async function runCode(
   const code = workspace.getCurrentCode();
   if (!code.trim()) {
     vscode.window.showWarningMessage(
-      "No code to run. Write your code in the editor tab on the left."
+      "没有可运行的代码。请在左侧编辑器标签页中编写代码。"
     );
     lessonPanel.notifyExecDone();
     return;
@@ -478,7 +506,7 @@ async function runCode(
 
   outputChannel.clear();
   outputChannel.show();
-  outputChannel.appendLine("--- Running code ---\n");
+  outputChannel.appendLine("--- 运行代码 ---\n");
 
   try {
     const result = await bridge.call<ExecResult>("run", { code });
@@ -503,11 +531,11 @@ async function submitCode(
   if (!code.trim()) {
     if (currentStep?.cls === "mult_question") {
       vscode.window.showWarningMessage(
-        "Select an answer choice first, then click Submit."
+        "请先选择一个答案选项，然后点击提交。"
       );
     } else {
       vscode.window.showWarningMessage(
-        "No code to submit. Write your code in the editor tab on the left, then click Submit."
+        "没有可提交的代码。请在左侧编辑器标签页中编写代码，然后点击提交。"
       );
     }
     return;
@@ -516,7 +544,7 @@ async function submitCode(
   // Show progress
   outputChannel.clear();
   outputChannel.show();
-  outputChannel.appendLine("--- Submitting... ---\n");
+  outputChannel.appendLine("--- 提交中... ---\n");
 
   try {
     const result = await aiRouter.submitCode({ code });
@@ -529,25 +557,25 @@ async function submitCode(
     }
 
     if (result.passed) {
-      outputChannel.appendLine("--- PASSED ---");
+      outputChannel.appendLine("--- 已通过 ---");
       vscode.window.showInformationMessage(
-        result.encouragement || "Correct! Click Next to continue."
+        result.encouragement || "回答正确！点击下一步继续。"
       );
     } else {
-      outputChannel.appendLine("--- NOT PASSED --- check feedback in the lesson panel");
+      outputChannel.appendLine("--- 未通过 --- 请在课程面板中查看反馈");
       // Log feedback to output too
       for (const fb of result.feedback) {
-        const lineInfo = fb.line ? `Line ${fb.line}: ` : "";
+        const lineInfo = fb.line ? `第 ${fb.line} 行：` : "";
         outputChannel.appendLine(`[${fb.severity}] ${lineInfo}${fb.message}`);
         if (fb.suggestion) {
-          outputChannel.appendLine(`  suggestion: ${fb.suggestion}`);
+          outputChannel.appendLine(`  建议：${fb.suggestion}`);
         }
       }
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    outputChannel.appendLine(`\n--- Error: ${msg} ---`);
-    vscode.window.showErrorMessage(`Submit failed: ${msg}`);
+    outputChannel.appendLine(`\n--- 错误：${msg} ---`);
+    vscode.window.showErrorMessage(`提交失败：${msg}`);
   }
 }
 
@@ -611,7 +639,7 @@ async function nextStep(
       lessonPanel.showFinished();
       treeProvider.refresh();
       vscode.window.showInformationMessage(
-        "Congratulations! You completed the lesson!"
+        "恭喜！你已完成本课程！"
       );
       return;
     }
@@ -629,7 +657,7 @@ async function nextStep(
     );
   } catch (err) {
     vscode.window.showErrorMessage(
-      `Navigation failed: ${err instanceof Error ? err.message : err}`
+      `导航失败：${err instanceof Error ? err.message : err}`
     );
   }
 }
@@ -649,7 +677,7 @@ async function prevStep(
 
     if (result.atStart) {
       vscode.window.showInformationMessage(
-        "You're at the beginning of the lesson."
+        "你已经在课程的开头了。"
       );
       return;
     }
@@ -667,7 +695,7 @@ async function prevStep(
     );
   } catch (err) {
     vscode.window.showErrorMessage(
-      `Navigation failed: ${err instanceof Error ? err.message : err}`
+      `导航失败：${err instanceof Error ? err.message : err}`
     );
   }
 }
@@ -681,7 +709,7 @@ async function showHint(
     lessonPanel.showHint(result.hint);
   } catch (err) {
     vscode.window.showErrorMessage(
-      `Hint failed: ${err instanceof Error ? err.message : err}`
+      `获取提示失败：${err instanceof Error ? err.message : err}`
     );
   }
 }
@@ -698,7 +726,7 @@ async function handleChat(
     lessonPanel.showChatResponse(result.answer);
   } catch (err) {
     lessonPanel.showChatResponse(
-      `Error: ${err instanceof Error ? err.message : err}`
+      `错误：${err instanceof Error ? err.message : err}`
     );
   }
 }

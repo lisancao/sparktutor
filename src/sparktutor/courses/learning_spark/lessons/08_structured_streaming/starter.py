@@ -1,18 +1,18 @@
 """
-Structured Streaming - Starter Code
+Structured Streaming - 起始代码
 
-Implement the `streaming_word_count` function that:
-1. Creates a batch DataFrame simulating streaming text data
-2. Splits lines into individual words using split + explode
-3. Groups by word and counts occurrences
-4. Orders by count descending
-5. Returns the word count DataFrame
+实现 `streaming_word_count` 函数：
+1. 创建模拟流式文本数据的批量 DataFrame
+2. 使用 split + explode 将每行拆分为单个单词
+3. 按单词分组并计数
+4. 按计数降序排列
+5. 返回单词计数 DataFrame
 
-This exercise simulates a streaming word count in batch mode
-(dry-run compatible — no actual stream needed).
+本练习以批处理模式模拟流式单词计数
+（兼容 dry-run — 无需实际流）。
 
-In a real streaming scenario, you would replace spark.createDataFrame
-with spark.readStream.format("socket") or .format("kafka").
+在真实流式场景中，你可以将 spark.createDataFrame
+替换为 spark.readStream.format("socket") 或 .format("kafka")。
 """
 
 from pyspark.sql import SparkSession, functions as f
@@ -34,28 +34,28 @@ SCHEMA = StructType([
 
 
 def streaming_word_count(spark):
-    """Simulate a streaming word count in batch mode."""
+    """以批处理模式模拟流式单词计数。"""
 
     lines_df = spark.createDataFrame(TEXT_DATA, SCHEMA)
 
-    # TODO: Split each line into words using split() and explode()
-    #       Create a column called "word"
-    words_df = None  # Replace
+    # TODO: 使用 split() 和 explode() 将每行拆分为单词
+    #       创建名为 "word" 的列
+    words_df = None  # 替换
 
-    # TODO: Group by word and count occurrences
-    counts_df = None  # Replace
+    # TODO: 按单词分组并计数
+    counts_df = None  # 替换
 
-    # TODO: Order by count descending
-    result = None  # Replace
+    # TODO: 按计数降序排列
+    result = None  # 替换
 
     return result
 
 
 def streaming_windowed_count(spark):
-    """Demonstrate windowed aggregation concepts in batch mode.
+    """以批处理模式演示窗口聚合概念。
 
-    Creates timestamped word data, applies a time-based window,
-    and counts words per window.
+    创建带时间戳的单词数据，应用基于时间的窗口，
+    并统计每个窗口内的单词数。
     """
     from pyspark.sql.types import TimestampType
     from datetime import datetime, timedelta
@@ -77,38 +77,38 @@ def streaming_windowed_count(spark):
 
     ts_df = spark.createDataFrame(timestamped_data, ts_schema)
 
-    # TODO: Split lines into words with timestamps preserved
-    words_df = None  # Replace
+    # TODO: 将行拆分为单词，保留时间戳
+    words_df = None  # 替换
 
-    # TODO: Group by 10-minute tumbling window on event_time and word,
-    #       count occurrences
-    #       Use: f.window("event_time", "10 minutes")
-    windowed_counts = None  # Replace
+    # TODO: 按 event_time 上 10 分钟的滚动窗口和单词分组，
+    #       统计出现次数
+    #       使用：f.window("event_time", "10 minutes")
+    windowed_counts = None  # 替换
 
     return windowed_counts
 
 
-# ---- Test harness (do not modify below this line) ----
+# ---- 测试代码（请勿修改此行以下内容）----
 if __name__ == "__main__":
     spark = (SparkSession.builder
         .appName("StreamingTest")
         .master("local[*]")
         .getOrCreate())
 
-    # Test 1: Basic word count
+    # 测试 1：基础单词计数
     wc = streaming_word_count(spark)
-    assert wc is not None, "streaming_word_count returned None"
+    assert wc is not None, "streaming_word_count 返回了 None"
     top_word = wc.collect()[0]
-    assert top_word["word"] in ("spark", "hello", "world"), f"Unexpected top word: {top_word}"
-    print("Word counts:")
+    assert top_word["word"] in ("spark", "hello", "world"), f"意外的排名第一的单词：{top_word}"
+    print("单词计数：")
     wc.show(truncate=False)
 
-    # Test 2: Windowed count
+    # 测试 2：窗口计数
     ww = streaming_windowed_count(spark)
-    assert ww is not None, "streaming_windowed_count returned None"
-    assert "window" in ww.columns, "Missing window column"
-    print("\nWindowed word counts:")
+    assert ww is not None, "streaming_windowed_count 返回了 None"
+    assert "window" in ww.columns, "缺少 window 列"
+    print("\n窗口单词计数：")
     ww.show(truncate=False)
 
-    print("All tests passed!")
+    print("所有测试通过！")
     spark.stop()

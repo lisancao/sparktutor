@@ -1,8 +1,8 @@
 """
-Built-in Data Sources - Solution
+内置数据源 - 参考答案
 
-Complete data pipeline: create, write to Parquet, read back,
-create SQL view, and query.
+完整数据管道：创建、写入 Parquet、重新读取、
+创建 SQL 视图并查询。
 """
 
 from pyspark.sql import SparkSession, functions as f
@@ -25,7 +25,7 @@ SCHEMA = StructType([
 
 
 def data_pipeline(spark, output_path):
-    """Read, write, and query flight data."""
+    """读取、写入并查询航班数据。"""
 
     flights_df = spark.createDataFrame(FLIGHT_DATA, SCHEMA)
 
@@ -46,7 +46,7 @@ def data_pipeline(spark, output_path):
     return result
 
 
-# ---- Test harness ----
+# ---- 测试代码 ----
 if __name__ == "__main__":
     import tempfile, os, shutil
 
@@ -60,14 +60,14 @@ if __name__ == "__main__":
 
     try:
         df = data_pipeline(spark, out_path)
-        assert df is not None, "Function returned None"
-        assert df.count() == 3, f"Expected 3 rows, got {df.count()}"
+        assert df is not None, "函数返回了 None"
+        assert df.count() == 3, f"预期 3 行，实际得到 {df.count()}"
         cols = [c.lower() for c in df.columns]
-        assert "destination" in cols, f"Missing destination column, got {cols}"
-        assert "total_delay" in cols, f"Missing total_delay column, got {cols}"
+        assert "destination" in cols, f"缺少 destination 列，实际得到 {cols}"
+        assert "total_delay" in cols, f"缺少 total_delay 列，实际得到 {cols}"
         top = df.collect()[0]
-        assert top.destination == "ORD", f"Expected ORD as top destination, got {top.destination}"
-        print("All tests passed!")
+        assert top.destination == "ORD", f"预期 ORD 为排名第一的目的地，实际得到 {top.destination}"
+        print("所有测试通过！")
         df.show(truncate=False)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

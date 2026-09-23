@@ -1,7 +1,7 @@
 """
-Data Lakes & Lakehouses - Solution
+数据湖与湖仓一体 - 参考答案
 
-Simulate lakehouse versioning with Parquet directories.
+使用 Parquet 目录模拟湖仓版本管理。
 """
 
 from pyspark.sql import SparkSession, functions as f
@@ -31,7 +31,7 @@ SCHEMA = StructType([
 
 
 def lakehouse_simulation(spark, base_path):
-    """Simulate lakehouse versioning with Parquet directories."""
+    """使用 Parquet 目录模拟湖仓版本管理。"""
 
     v0_path = os.path.join(base_path, "v0")
     v1_path = os.path.join(base_path, "v1")
@@ -57,7 +57,7 @@ def lakehouse_simulation(spark, base_path):
     }
 
 
-# ---- Test harness ----
+# ---- 测试代码 ----
 if __name__ == "__main__":
     import tempfile, shutil
 
@@ -71,16 +71,16 @@ if __name__ == "__main__":
 
     try:
         result = lakehouse_simulation(spark, base)
-        assert result is not None, "Function returned None"
-        assert result["v0_count"] == 3, f"Version 0 should have 3 rows, got {result['v0_count']}"
-        assert result["v1_count"] == 5, f"Version 1 should have 5 rows, got {result['v1_count']}"
-        assert result["schemas_match"] == True, "Schemas should match between versions"
-        print("Version 0 (initial):")
+        assert result is not None, "函数返回了 None"
+        assert result["v0_count"] == 3, f"版本 0 应有 3 行，实际得到 {result['v0_count']}"
+        assert result["v1_count"] == 5, f"版本 1 应有 5 行，实际得到 {result['v1_count']}"
+        assert result["schemas_match"] == True, "各版本之间的 schema 应一致"
+        print("版本 0（初始）：")
         result["version_0"].show()
-        print("Version 1 (with new employees):")
+        print("版本 1（含新员工）：")
         result["version_1"].show()
-        print(f"Schemas match: {result['schemas_match']}")
-        print("All tests passed!")
+        print(f"Schema 是否一致：{result['schemas_match']}")
+        print("所有测试通过！")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
         spark.stop()

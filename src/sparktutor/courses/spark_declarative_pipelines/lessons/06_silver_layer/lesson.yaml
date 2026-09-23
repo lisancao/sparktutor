@@ -1,44 +1,42 @@
 - Class: meta
-  Lesson: "Silver Layer"
+  Lesson: "Silver 层"
   EstimatedMinutes: 20
 
 - Class: text
   Depth: all
   Output: |
-    ## What You'll Learn
+    ## 你将学到什么
 
-    Bronze preserved raw data faithfully. Now the **silver layer**
-    transforms it into clean, typed, enriched data that downstream
-    consumers can trust.
+    Bronze 忠实地保留了原始数据。现在 **silver 层**将其
+    转换为干净、类型化、经过丰富的数据，供下游使用者信任。
 
-    By the end of this lesson you will be able to:
+    学完本课后，你将能够：
 
-    - Cast bronze string columns to proper types (double, int, timestamp)
-    - Handle null values from failed casts
-    - Compute derived columns (totals, time extractions)
-    - Enrich records by joining with reference tables
-    - Parse embedded JSON columns (intermediate)
-    - Implement SCD Type 2 joins for historical dimensions (advanced)
+    - 把 bronze 字符串列转换为正确类型（double、int、timestamp）
+    - 处理转换失败产生的 null 值
+    - 计算派生列（合计、时间提取）
+    - 通过关联维表来丰富记录
+    - 解析内嵌的 JSON 列（中级）
+    - 为历史维度实现 SCD Type 2 关联（高级）
 
 - Class: text
   Depth: all
   Output: |
-    ## Silver Layer Responsibilities
+    ## Silver 层的职责
 
-    The silver layer performs four kinds of transformations:
+    silver 层执行四类转换：
 
-    1. **Type casting** — convert strings to proper types
-    2. **Data cleaning** — handle nulls, trim whitespace, standardize
-    3. **Enrichment** — join with reference/dimension tables
-    4. **Feature extraction** — parse nested fields, extract time components
+    1. **类型转换** —— 把字符串转成正确类型
+    2. **数据清洗** —— 处理 null、去除空格、标准化
+    3. **丰富（Enrichment）** —— 与维表/维度表关联
+    4. **特征提取** —— 解析嵌套字段、提取时间分量
 
-    Each of these makes the data more useful for gold-layer aggregations
-    and analytics.
+    每一步都让数据对 gold 层的聚合和分析更有用。
 
 - Class: text
   Depth: beginner
   Output: |
-    The most common silver operation is casting bronze string columns:
+    最常见的 silver 操作是转换 bronze 字符串列：
 
     ```python
     from pyspark.sql import functions as f
@@ -54,42 +52,42 @@
         )
     ```
 
-    If a value cannot be cast (e.g., "N/A" to double), Spark produces
-    `null`. Those rows can be filtered out or sent to a quarantine table.
+    如果某个值无法转换（例如把 "N/A" 转成 double），Spark
+    会产生 `null`。这些行可以被过滤掉，或发送到隔离表。
 
-    **Docs:**
-    [Column.cast](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.Column.cast.html) — `cast("double")`, `cast("int")`, `cast(TimestampType())` |
-    [f.to_date](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.functions.to_date.html) — `format` parameter for date patterns |
-    [f.from_json](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.functions.from_json.html) — `schema` parameter for parsing JSON strings
+    **文档：**
+    [Column.cast](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.Column.cast.html) —— `cast("double")`、`cast("int")`、`cast(TimestampType())` |
+    [f.to_date](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.functions.to_date.html) —— 日期模式的 `format` 参数 |
+    [f.from_json](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.functions.from_json.html) —— 解析 JSON 字符串的 `schema` 参数
 
 - Class: mult_question
   Depth: all
-  Output: "What happens when you cast the string 'N/A' to DoubleType in Spark?"
-  AnswerChoices: "It becomes null;It throws an exception;It becomes 0.0;It stays as the string 'N/A'"
-  CorrectAnswer: "It becomes null"
-  Hint: "Spark's cast is lenient — unparseable values become null, not errors."
+  Output: "在 Spark 中把字符串 'N/A' 转成 DoubleType 会发生什么？"
+  AnswerChoices: "它变成 null;它抛出异常;它变成 0.0;它保持为字符串 'N/A'"
+  CorrectAnswer: "它变成 null"
+  Hint: "Spark 的 cast 是宽容的 —— 无法解析的值变成 null，而不是报错。"
 
 - Class: cmd_question
   Depth: all
   Output: |
-    Given a bronze DataFrame `bronze_df` with string columns `price` and
-    `quantity`, cast `price` to double and `quantity` to integer.
+    给定一个包含字符串列 `price` 和 `quantity` 的 bronze
+    DataFrame `bronze_df`，把 `price` 转成 double，把
+    `quantity` 转成 integer。
   CorrectAnswer: |
     from pyspark.sql import functions as f
     silver_df = (bronze_df
         .withColumn("price", f.col("price").cast("double"))
         .withColumn("quantity", f.col("quantity").cast("int"))
     )
-  Hint: "Use .withColumn with f.col(...).cast('double') and .cast('int')."
+  Hint: "用 .withColumn 配合 f.col(...).cast('double') 和 .cast('int')。"
 
 - Class: text
   Depth: intermediate
   Output: |
-    ## Enrichment with Joins
+    ## 用关联做数据丰富
 
-    Silver is where you join transactional data with reference data.
-    Use `f.broadcast()` for small lookup tables to avoid expensive
-    shuffles:
+    Silver 是把事务数据与参考数据关联的地方。对小的查找表
+    使用 `f.broadcast()`，以避免代价高昂的 shuffle：
 
     ```python
     products = spark.table("dim_products")  # small reference table
@@ -101,37 +99,36 @@
     )
     ```
 
-    `f.broadcast()` sends the small table to every executor, so the
-    large orders table stays in place. This is significantly faster than
-    a shuffle join.
+    `f.broadcast()` 把小表发送到每个 executor，因此大的
+    orders 表保持原地不动。这比 shuffle join 快得多。
 
-    **Docs:** [f.broadcast](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.functions.broadcast.html) — wrap the small DataFrame |
-    [DataFrame.join](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.join.html) — `on`, `how` parameters
+    **文档：** [f.broadcast](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.functions.broadcast.html) —— 包装小 DataFrame |
+    [DataFrame.join](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.join.html) —— `on`、`how` 参数
 
 - Class: mult_question
   Depth: intermediate
-  Output: "When should you use a broadcast join?"
-  AnswerChoices: "When one side is small enough to fit in executor memory;When both tables are large;When you want to remove duplicates;When joining on multiple columns"
-  CorrectAnswer: "When one side is small enough to fit in executor memory"
-  Hint: "Broadcasting sends the entire small table to each executor, eliminating the shuffle."
+  Output: "什么时候应该使用 broadcast join？"
+  AnswerChoices: "当一侧小到能放进 executor 内存时;当两张表都很大时;当你想去除重复时;当按多列关联时"
+  CorrectAnswer: "当一侧小到能放进 executor 内存时"
+  Hint: "广播会把整张小表发送到每个 executor，消除了 shuffle。"
 
 - Class: cmd_question
   Depth: intermediate
   Output: |
-    Join `orders_df` with a small reference DataFrame `products_df` on
-    `product_id` using a left broadcast join.
+    把 `orders_df` 与一个小的参考 DataFrame `products_df`
+    在 `product_id` 上做 left broadcast join 关联。
   CorrectAnswer: |
     from pyspark.sql import functions as f
     enriched = orders_df.join(f.broadcast(products_df), on="product_id", how="left")
-  Hint: "Wrap the small DataFrame in f.broadcast() inside the join call."
+  Hint: "在 join 调用内部用 f.broadcast() 包装小 DataFrame。"
 
 - Class: text
   Depth: intermediate
   Output: |
-    ## Parsing JSON Columns
+    ## 解析 JSON 列
 
-    Bronze data from APIs or Kafka often contains raw JSON strings. The
-    silver layer parses them into structured columns:
+    来自 API 或 Kafka 的 bronze 数据通常包含原始 JSON 字符串。
+    silver 层把它们解析成结构化列：
 
     ```python
     from pyspark.sql.types import StructType, StructField, StringType
@@ -147,15 +144,16 @@
         .drop("parsed", "payload"))
     ```
 
-    `from_json` converts a JSON string column into a struct column. You
-    then access individual fields with dot notation (`parsed.action`).
+    `from_json` 把一个 JSON 字符串列转成 struct 列。然后你
+    用点号访问各个字段（`parsed.action`）。
 
 - Class: cmd_question
   Depth: intermediate
   Output: |
-    Given a DataFrame `events_df` with a string column `metadata`
-    containing JSON like `{"browser": "Chrome", "os": "Linux"}`, parse it
-    into separate `browser` and `os` columns. Drop the original `metadata`.
+    给定一个 DataFrame `events_df`，其中有一个字符串列
+    `metadata`，内容是类似 `{"browser": "Chrome", "os": "Linux"}`
+    的 JSON，把它解析成独立的 `browser` 和 `os` 列。
+    并删除原始的 `metadata` 列。
   CorrectAnswer: |
     from pyspark.sql import functions as f
     from pyspark.sql.types import StructType, StructField, StringType
@@ -169,19 +167,17 @@
         .withColumn("parsed", f.from_json(f.col("metadata"), meta_schema))
         .select("*", "parsed.browser", "parsed.os")
         .drop("parsed", "metadata"))
-  Hint: "Define a StructType for the JSON, use f.from_json, then select the nested fields."
+  Hint: "为 JSON 定义一个 StructType，用 f.from_json，然后 select 嵌套字段。"
 
 - Class: text
   Depth: advanced
   Output: |
-    ## SCD Type 2 Joins
+    ## SCD Type 2 关联
 
-    **Slowly Changing Dimensions (SCD Type 2)** track historical changes
-    to reference data. Each dimension row has `valid_from` and `valid_to`
-    timestamps.
+    **缓慢变化维（SCD Type 2）**追踪参考数据的历史变化。
+    每个维度行都有 `valid_from` 和 `valid_to` 时间戳。
 
-    To join a fact table against an SCD-2 dimension, match on key AND
-    time range:
+    要把事实表与 SCD-2 维度关联，需要同时匹配键**和**时间范围：
 
     ```python
     enriched = facts.join(dim,
@@ -191,8 +187,8 @@
         how="left")
     ```
 
-    **Data quality flags** can also be added in silver to catch suspicious
-    records before they reach gold:
+    **数据质量标志**也可以在 silver 层添加，在可疑记录到达
+    gold 之前捕获它们：
 
     ```python
     df = df.withColumn("_dq_price_valid",
@@ -201,44 +197,43 @@
 
 - Class: mult_question
   Depth: advanced
-  Output: "In an SCD Type 2 join, what additional condition beyond the key match is required?"
-  AnswerChoices: "The fact date must fall within the dimension's valid_from and valid_to range;The dimension must be broadcast;Both tables must be partitioned by date;The fact table must be sorted"
-  CorrectAnswer: "The fact date must fall within the dimension's valid_from and valid_to range"
-  Hint: "SCD-2 rows have validity windows. You match facts to the dimension version that was active at the time."
+  Output: "在 SCD Type 2 关联中，除了键匹配之外还需要什么额外条件？"
+  AnswerChoices: "事实日期必须落在维度的 valid_from 和 valid_to 范围内;维度表必须被广播;两张表都必须按日期分区;事实表必须排序"
+  CorrectAnswer: "事实日期必须落在维度的 valid_from 和 valid_to 范围内"
+  Hint: "SCD-2 行有生效时间窗口。你把事实匹配到当时生效的维度版本。"
 
 - Class: script
   Depth: all
   Output: |
-    ## Exercise: Build a Silver Transformation
+    ## 练习：构建 Silver 转换
 
-    Open the starter file and implement `silver_orders(spark)`:
+    打开 starter 文件，实现 `silver_orders(spark)`：
 
-    1. Read from the `bronze_orders` temp view
-    2. Cast `price` to double and `quantity` to int
-    3. Add a `total` column (price * quantity)
-    4. Filter out rows where price is null (failed casts from bad data)
-    5. Add an `order_hour` column extracted from `order_ts`
-    6. Return the clean silver DataFrame
+    1. 从 `bronze_orders` 临时视图读取
+    2. 把 `price` 转成 double，`quantity` 转成 int
+    3. 添加 `total` 列（price * quantity）
+    4. 过滤掉 price 为 null 的行（坏数据导致的转换失败）
+    5. 从 `order_ts` 提取出 `order_hour` 列
+    6. 返回干净的 silver DataFrame
 
-    The test harness creates bronze data with one bad row ("N/A" price)
-    and verifies your function handles it correctly.
+    测试框架会创建包含一行坏数据（price 为 "N/A"）的
+    bronze 数据，并验证你的函数是否正确处理。
   StarterFile: starter.py
   SolutionFile: solution.py
-  Hint: "Cast columns, compute total with multiplication, filter where price is not null, extract hour with f.hour(f.to_timestamp(...))."
+  Hint: "转换列类型，用乘法计算 total，过滤 price 不为 null 的行，用 f.hour(f.to_timestamp(...)) 提取小时。"
 
 - Class: text
   Depth: all
   Output: |
-    ## Summary
+    ## 小结
 
-    Your silver layer now produces clean, typed, enriched data:
+    你的 silver 层现在产出干净、类型化、经过丰富的数据：
 
-    - **Type casting** — strings to doubles, ints, timestamps
-    - **Null handling** — filter or quarantine unparseable values
-    - **Derived columns** — compute totals, extract time components
-    - **Enrichment** — broadcast joins with reference tables
-    - **JSON parsing** — structured columns from raw JSON strings
+    - **类型转换** —— 字符串转 double、int、timestamp
+    - **Null 处理** —— 过滤或隔离无法解析的值
+    - **派生列** —— 计算合计、提取时间分量
+    - **数据丰富** —— 与维表做 broadcast join
+    - **JSON 解析** —— 从原始 JSON 字符串生成结构化列
 
-    Silver data is trustworthy and analytics-ready. In the next lesson,
-    you will build the **gold layer** — aggregations and rankings that
-    answer specific business questions.
+    Silver 数据值得信赖、可直接用于分析。在下一课中，
+    你将构建 **gold 层** —— 回答具体业务问题的聚合和排名。

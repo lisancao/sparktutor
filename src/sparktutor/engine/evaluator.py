@@ -63,19 +63,19 @@ class Evaluator:
     def check_mult_choice(self, guess: str, correct: str) -> EvalResult:
         """Evaluate a multiple-choice answer."""
         if choices_match(guess, correct):
-            return EvalResult(passed=True, encouragement="Correct!")
+            return EvalResult(passed=True, encouragement="回答正确！")
         return EvalResult(
             passed=False,
             feedback=[FeedbackItem(
                 line=None, severity="warning",
-                message=f"Not quite. The correct answer is: {correct}",
+                message=f"不太对。正确答案是：{correct}",
             )],
         )
 
     def check_code_exact(self, guess: str, correct: str) -> EvalResult:
         """Exact code match (with normalization)."""
         if code_match(guess, correct):
-            return EvalResult(passed=True, encouragement="Well done!")
+            return EvalResult(passed=True, encouragement="做得好！")
         return EvalResult(passed=False)
 
     def check_ast_contains(self, code: str, checks: list[dict]) -> EvalResult:
@@ -151,8 +151,8 @@ class Evaluator:
                     all_passed = False
                     feedback.append(FeedbackItem(
                         line=None, severity="warning",
-                        message=f"Missing required element: {key}='{value}'",
-                        suggestion=f"Make sure your code includes a {key} named '{value}'",
+                        message=f"缺少必需元素：{key}='{value}'",
+                        suggestion=f"确保你的代码中包含名为 '{value}' 的 {key}",
                     ))
 
         return EvalResult(passed=all_passed, feedback=feedback)
@@ -185,6 +185,7 @@ Student code:
 {f'Execution stderr:\\n{stderr}' if stderr else ''}
 
 Respond in JSON. Be concise — 1-2 sentences per feedback item max.
+CRITICAL: All text fields below ("message", "suggestion", "encouragement", "skill_signals") MUST be written in Simplified Chinese (简体中文). Keep code identifiers, API names, and config keys in English.
 {{
   "passed": true/false,
   "feedback": [
@@ -192,12 +193,12 @@ Respond in JSON. Be concise — 1-2 sentences per feedback item max.
       "line": <int or null>,
       "severity": "error|warning|info",
       "category": "bug|convention|best_practice",
-      "message": "<text — use `backticks` for inline code>",
-      "suggestion": "<fix hint or null — use `backticks` for inline code>"
+      "message": "<中文说明 — 行内代码用 `反引号` 包裹>",
+      "suggestion": "<中文修改建议或 null — 行内代码用 `反引号` 包裹>"
     }}
   ],
-  "encouragement": "<one sentence calibrated to their depth level>",
-  "skill_signals": ["<observed competency or gap>"]
+  "encouragement": "<一句中文鼓励，根据学生水平调整语气>",
+  "skill_signals": ["<观察到的能力或不足，用中文>"]
 }}
 
 Category meanings:
@@ -264,7 +265,7 @@ Rules:
                 passed=False,
                 feedback=[FeedbackItem(
                     line=None, severity="info",
-                    message="Claude API not configured — using local checks only.",
+                    message="未配置 Claude API —— 仅使用本地检查。",
                 )],
             )
 
@@ -291,7 +292,7 @@ Rules:
                 passed=False,
                 feedback=[FeedbackItem(
                     line=None, severity="warning",
-                    message=f"Claude review failed: {e}",
+                    message=f"Claude 评审失败：{e}",
                 )],
             )
 
@@ -321,7 +322,7 @@ Rules:
         if step.correct_answer:
             exact = self.check_code_exact(code, step.correct_answer)
             if exact.passed:
-                return EvalResult(passed=True, encouragement="Correct!")
+                return EvalResult(passed=True, encouragement="回答正确！")
 
         # AST structural checks
         ast_checks = [v.params for v in step.validation if v.type == "ast_contains"]
@@ -356,19 +357,19 @@ Rules:
                 if exec_result and exec_result.stderr:
                     fb.append(FeedbackItem(
                         line=None, severity="error",
-                        message=f"Code execution failed (exit code {exec_result.exit_code}).",
-                        suggestion="Check the Output panel for error details.",
+                        message=f"代码执行失败（退出码 {exec_result.exit_code}）。",
+                        suggestion="请查看输出面板了解错误详情。",
                         category="bug",
                     ))
                 elif exec_result is None:
                     fb.append(FeedbackItem(
                         line=None, severity="error",
-                        message="Code requires execution but was not run.",
-                        suggestion="Make sure your code can be executed successfully.",
+                        message="代码需要运行但尚未执行。",
+                        suggestion="请确保你的代码能够成功运行。",
                         category="bug",
                     ))
                 return EvalResult(passed=False, feedback=fb)
-            return EvalResult(passed=True, encouragement="Well done!")
+            return EvalResult(passed=True, encouragement="做得好！")
 
         # If we got past exact match without passing, do Claude review as fallback
         if step.correct_answer:
@@ -411,7 +412,7 @@ Rules:
         if step.correct_answer:
             exact = self.check_code_exact(code, step.correct_answer)
             if exact.passed:
-                return EvalResult(passed=True, encouragement="Correct!"), False, {}
+                return EvalResult(passed=True, encouragement="回答正确！"), False, {}
 
         # AST structural checks
         ast_checks = [v.params for v in step.validation if v.type == "ast_contains"]
@@ -446,19 +447,19 @@ Rules:
                 if exec_result and exec_result.stderr:
                     fb.append(FeedbackItem(
                         line=None, severity="error",
-                        message=f"Code execution failed (exit code {exec_result.exit_code}).",
-                        suggestion="Check the Output panel for error details.",
+                        message=f"代码执行失败（退出码 {exec_result.exit_code}）。",
+                        suggestion="请查看输出面板了解错误详情。",
                         category="bug",
                     ))
                 elif exec_result is None:
                     fb.append(FeedbackItem(
                         line=None, severity="error",
-                        message="Code requires execution but was not run.",
-                        suggestion="Make sure your code can be executed successfully.",
+                        message="代码需要运行但尚未执行。",
+                        suggestion="请确保你的代码能够成功运行。",
                         category="bug",
                     ))
                 return EvalResult(passed=False, feedback=fb), False, {}
-            return EvalResult(passed=True, encouragement="Well done!"), False, {}
+            return EvalResult(passed=True, encouragement="做得好！"), False, {}
 
         # If we got past exact match without passing, do Claude review as fallback
         if step.correct_answer:
@@ -474,7 +475,7 @@ Rules:
             return None, True, kwargs
 
         # No validation rules — pass if syntax is OK
-        return EvalResult(passed=True, encouragement="Code looks good!"), False, {}
+        return EvalResult(passed=True, encouragement="代码看起来不错！"), False, {}
 
     # --- Chat: freeform Q&A ---
 
@@ -490,14 +491,16 @@ Rules:
         """Build chat messages. Returns [{"role": "system", ...}, {"role": "user", ...}]."""
         from sparktutor.engine.spark_knowledge import get_system_prompt
 
-        user_msg = f"""The student is working on: "{lesson_title}"
-Current exercise: {step_context}
-Student depth level: {depth}
+        user_msg = f"""学生正在学习：「{lesson_title}」
+当前练习内容：{step_context}
+学生水平：{depth}
 
-{f'Their current code:\n```python\n{code_context}\n```' if code_context else '(no code yet)'}
+{f'学生当前代码：\n```python\n{code_context}\n```' if code_context else '（暂无代码）'}
 {extra_context}
 
-Student question: {question}"""
+学生问题：{question}
+
+请用简体中文回答。"""
 
         return [
             {"role": "system", "content": get_system_prompt()},
@@ -516,7 +519,7 @@ Student question: {question}"""
         """Answer a freeform question about the current lesson/code using Claude."""
         client = self._get_client()
         if client is None:
-            return "Claude API not configured. Set ANTHROPIC_API_KEY to enable chat."
+            return "未配置 Claude API。请设置 ANTHROPIC_API_KEY 以启用对话功能。"
 
         messages = self.build_chat_messages(
             question=question,
@@ -538,4 +541,19 @@ Student question: {question}"""
             )
             return response.content[0].text
         except Exception as e:
-            return f"Chat error: {e}"
+            return f"对话出错：{e}"
+
+    async def ping(self) -> tuple[bool, str]:
+        """Send a minimal request to verify the AI client is configured and reachable."""
+        client = self._get_client()
+        if client is None:
+            return False, "Anthropic API key not configured."
+        try:
+            client.messages.create(
+                model=self.settings.claude.get_model(),
+                max_tokens=1,
+                messages=[{"role": "user", "content": "ping"}],
+            )
+            return True, "Anthropic API OK."
+        except Exception as e:
+            return False, f"Anthropic check failed: {e}"

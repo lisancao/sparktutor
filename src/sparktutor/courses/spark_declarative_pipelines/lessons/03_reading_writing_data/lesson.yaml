@@ -1,47 +1,47 @@
 - Class: meta
-  Lesson: "Reading & Writing Data"
+  Lesson: "读写数据"
   EstimatedMinutes: 15
 
 - Class: text
   Depth: all
   Output: |
-    ## What You'll Learn
+    ## 你将学到什么
 
-    A pipeline is only useful if it can **ingest** data from the outside
-    world and **persist** results. In this lesson you will learn Spark's
-    I/O layer — the DataFrameReader and DataFrameWriter APIs.
+    一条管道只有在能够从外部世界**摄入**数据并**持久化**结果时才有用。
+    本课你将学习 Spark 的 I/O 层 —— DataFrameReader 和
+    DataFrameWriter API。
 
-    By the end of this lesson you will be able to:
+    学完本课后，你将能够：
 
-    - Read CSV and JSON files with explicit schemas
-    - Write data in Parquet format (Spark's preferred format)
-    - Choose the right write mode (overwrite, append, error, ignore)
-    - Explain why explicit schemas are required for production pipelines
-    - Write to Iceberg tables for ACID-compliant storage (advanced)
+    - 用显式 schema 读取 CSV 和 JSON 文件
+    - 以 Parquet 格式写入数据（Spark 首选格式）
+    - 选择正确的写入模式（overwrite、append、error、ignore）
+    - 解释为什么生产管道必须使用显式 schema
+    - 写入 Iceberg 表以实现符合 ACID 规范的存储（高级）
 
-    These skills directly power the **bronze layer** — reading raw files
-    is the first step of every pipeline.
+    这些技能直接支撑 **bronze 层** —— 读取原始文件是每条管道
+    的第一步。
 
 - Class: text
   Depth: beginner
   Output: |
-    The simplest way to read a CSV file:
+    读取 CSV 文件最简单的方式：
 
     ```python
     df = spark.read.csv("/data/orders.csv", header=True, inferSchema=True)
     ```
 
-    `header=True` means the first row contains column names.
-    `inferSchema=True` makes Spark scan the file to guess column types.
-    This is convenient for exploration but slow on large files — Spark
-    reads the data twice (once to infer, once to load).
+    `header=True` 表示第一行包含列名。
+    `inferSchema=True` 让 Spark 扫描文件来猜测列类型。
+    这对探索数据很方便，但在大文件上很慢 —— Spark 会读两遍数据
+    （一遍推断类型，一遍加载数据）。
 
 - Class: text
   Depth: all
   Output: |
-    ## The DataFrameReader Pattern
+    ## DataFrameReader 模式
 
-    Every data read follows the same structure:
+    每次数据读取都遵循相同的结构：
 
     ```python
     df = (spark.read
@@ -51,16 +51,16 @@
         .load("/data/input"))      # where to read from
     ```
 
-    The chain is always: **format → options → schema → load**.
+    链式调用的顺序总是：**format → options → schema → load**。
 
-    Shorthand methods are also available:
+    也有简写方法可用：
     ```python
     spark.read.csv(path, header=True, schema=schema)
     spark.read.json(path, schema=schema)
     spark.read.parquet(path)  # schema embedded, no options needed
     ```
 
-    **Docs:**
+    **文档：**
     [DataFrameReader.csv](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrameReader.csv.html) |
     [.json](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrameReader.json.html) |
     [.parquet](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrameReader.parquet.html) |
@@ -69,16 +69,16 @@
 
 - Class: mult_question
   Depth: all
-  Output: "What does inferSchema=True do when reading a CSV?"
-  AnswerChoices: "Scans the data to guess column types automatically;Enforces a user-provided schema;Skips rows with bad data;Infers the file encoding"
-  CorrectAnswer: "Scans the data to guess column types automatically"
-  Hint: "Spark needs an extra pass over the data to figure out types."
+  Output: "读取 CSV 时 inferSchema=True 做什么？"
+  AnswerChoices: "扫描数据自动猜测列类型;强制使用用户提供的 schema;跳过包含脏数据的行;推断文件编码"
+  CorrectAnswer: "扫描数据自动猜测列类型"
+  Hint: "Spark 需要额外扫一遍数据来确定类型。"
 
 - Class: cmd_question
   Depth: all
   Output: |
-    Read a CSV file at `'/data/orders.csv'` with headers and inferred
-    schema into a DataFrame called `orders`.
+    读取 `'/data/orders.csv'` 处的 CSV 文件，带表头并推断 schema，
+    存入名为 `orders` 的 DataFrame。
   CorrectAnswer: |
     orders = spark.read.csv("/data/orders.csv", header=True, inferSchema=True)
   Hint: "spark.read.csv(path, header=True, inferSchema=True)"
@@ -86,10 +86,10 @@
 - Class: text
   Depth: intermediate
   Output: |
-    ## Explicit Schemas: The Production Standard
+    ## 显式 schema：生产环境标准
 
-    For production pipelines, **never** rely on `inferSchema`. Define the
-    schema explicitly with `StructType`:
+    对于生产管道，**绝不**依赖 `inferSchema`。用 `StructType`
+    显式定义 schema：
 
     ```python
     from pyspark.sql.types import (
@@ -106,25 +106,25 @@
     df = spark.read.csv("/data/orders.csv", header=True, schema=schema)
     ```
 
-    Benefits:
-    - **Faster** — no extra scan to detect types
-    - **Safer** — bad data becomes `null` instead of being silently mistyped
-    - **Self-documenting** — the schema is your contract
+    好处：
+    - **更快** —— 无需额外扫描来检测类型
+    - **更安全** —— 脏数据变成 `null`，而不是被静默地错误类型化
+    - **自文档化** —— schema 就是你的契约
 
-    In our pipeline, the **bronze layer** will read with all-string schemas
-    (schema-on-read), and the **silver layer** will cast to proper types.
+    在我们的管道中，**bronze 层**会用全字符串 schema 读取
+    （schema-on-read），**silver 层**再转换为正确的类型。
 
-    **Docs:**
+    **文档：**
     [StructType](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.types.StructType.html) |
     [StructField](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.types.StructField.html)
-    — `StructField(name, dataType, nullable)` and all type classes.
+    —— `StructField(name, dataType, nullable)` 及所有类型类。
 
 - Class: cmd_question
   Depth: intermediate
   Output: |
-    Define a schema for a `users` CSV with columns: `user_id` (StringType),
-    `name` (StringType), and `age` (IntegerType). Then read
-    `'/data/users.csv'` using that schema.
+    为一个 `users` CSV 定义 schema，包含列：`user_id`（StringType）、
+    `name`（StringType）和 `age`（IntegerType）。然后用该 schema
+    读取 `'/data/users.csv'`。
   CorrectAnswer: |
     from pyspark.sql.types import StructType, StructField, StringType, IntegerType
 
@@ -135,41 +135,41 @@
     ])
 
     users = spark.read.csv("/data/users.csv", header=True, schema=schema)
-  Hint: "Build a StructType with three StructField entries, then pass schema=schema to spark.read.csv."
+  Hint: "用三个 StructField 条目构建一个 StructType，然后将 schema=schema 传给 spark.read.csv。"
 
 - Class: text
   Depth: all
   Output: |
-    ## Write Modes
+    ## 写入模式
 
-    The DataFrameWriter controls how data is persisted:
+    DataFrameWriter 控制数据如何持久化：
 
     ```python
     df.write.format("parquet").mode("overwrite").save("/output/data")
     ```
 
-    | Mode | Behavior |
+    | 模式 | 行为 |
     |------|----------|
-    | `error` (default) | Fail if data already exists |
-    | `overwrite` | Delete existing data, write new |
-    | `append` | Add new data alongside existing |
-    | `ignore` | Silently skip if data exists |
+    | `error`（默认）| 数据已存在则失败 |
+    | `overwrite` | 删除已有数据，写入新数据 |
+    | `append` | 在已有数据旁追加新数据 |
+    | `ignore` | 数据已存在则静默跳过 |
 
-    For our pipeline: use `overwrite` for batch runs (ensures
-    idempotency), `append` only for incremental/streaming pipelines.
+    对于我们的管道：批量运行用 `overwrite`（保证幂等性），
+    只有增量/流处理管道才用 `append`。
 
 - Class: mult_question
   Depth: all
-  Output: "What is the default write mode if you do not specify one?"
+  Output: "如果不指定写入模式，默认模式是什么？"
   AnswerChoices: "error;overwrite;append;ignore"
   CorrectAnswer: "error"
-  Hint: "Spark is cautious by default — it will not overwrite existing data unless you tell it to."
+  Hint: "Spark 默认很谨慎 —— 除非你告诉它，否则不会覆盖已有数据。"
 
 - Class: cmd_question
   Depth: all
   Output: |
-    Write DataFrame `orders` to Parquet format at `'/output/orders_parquet'`
-    using overwrite mode.
+    将 DataFrame `orders` 以 overwrite 模式写入 Parquet 格式，
+    路径为 `'/output/orders_parquet'`。
   CorrectAnswer: |
     orders.write.mode("overwrite").parquet("/output/orders_parquet")
   Hint: "df.write.mode('overwrite').parquet(path)"
@@ -177,46 +177,43 @@
 - Class: text
   Depth: intermediate
   Output: |
-    ## Parquet: The Preferred Pipeline Format
+    ## Parquet：首选的管道格式
 
-    **Parquet** is the recommended format for pipeline intermediate and
-    output data because:
+    **Parquet** 是管道中间数据和输出数据的推荐格式，因为：
 
-    - **Columnar** — reads only the columns your query needs
-    - **Compressed** — Snappy compression by default, excellent ratios
-    - **Schema embedded** — no inference needed when reading back
-    - **Predicate pushdown** — Spark can skip row groups that do not match
-      your filters
+    - **列式存储** —— 只读取查询所需的列
+    - **压缩** —— 默认 Snappy 压缩，压缩比优秀
+    - **内嵌 schema** —— 读回时无需推断
+    - **谓词下推** —— Spark 可以跳过不匹配过滤条件的行组
 
-    Reading Parquet is the simplest read in Spark:
+    读取 Parquet 是 Spark 中最简单的读取方式：
     ```python
     df = spark.read.parquet("/data/orders.parquet")
     ```
 
-    In our pipeline, bronze writes intermediate data as temp views (in
-    memory). For persistent storage between pipeline runs, Parquet or
-    Iceberg tables are the standard choice.
+    在我们的管道中，bronze 将中间数据写为临时视图（内存中）。
+    对于管道运行之间的持久化存储，Parquet 或 Iceberg 表是标准选择。
 
 - Class: cmd_question
   Depth: intermediate
   Output: |
-    Read a Parquet file at `'/data/events.parquet'`, filter to rows where
-    `event_type` equals `'purchase'`, and write the result to
-    `'/output/purchases'` in overwrite mode.
+    读取 `'/data/events.parquet'` 处的 Parquet 文件，过滤出
+    `event_type` 等于 `'purchase'` 的行，并将结果以 overwrite 模式
+    写入 `'/output/purchases'`。
   CorrectAnswer: |
     from pyspark.sql import functions as f
     events = spark.read.parquet("/data/events.parquet")
     purchases = events.filter(f.col("event_type") == "purchase")
     purchases.write.mode("overwrite").parquet("/output/purchases")
-  Hint: "Chain read → filter → write. Use f.col() for the filter condition."
+  Hint: "链式调用 read → filter → write。过滤条件用 f.col()。"
 
 - Class: text
   Depth: advanced
   Output: |
-    ## Iceberg Tables: ACID for Pipelines
+    ## Iceberg 表：管道级 ACID
 
-    For production pipelines, **Iceberg** adds ACID transactions, time
-    travel, and schema evolution on top of Parquet:
+    对于生产管道，**Iceberg** 在 Parquet 之上增加了 ACID 事务、
+    时间旅行和 schema 演进：
 
     ```python
     # Write to an Iceberg table
@@ -229,42 +226,41 @@
     spark.read.option("snapshot-id", 12345).table("lakehouse.db.orders")
     ```
 
-    Key benefits for pipelines:
-    - **Atomicity** — partial writes never corrupt the table
-    - **Schema evolution** — add columns without rewriting data
-    - **Partition evolution** — change partitioning without rewriting data
-    - **Time travel** — query any previous version for debugging
+    对管道的关键好处：
+    - **原子性** —— 部分写入绝不会损坏表
+    - **Schema 演进** —— 添加列无需重写数据
+    - **分区演进** —— 更改分区方式无需重写数据
+    - **时间旅行** —— 可查询任意历史版本用于调试
 
 - Class: mult_question
   Depth: advanced
-  Output: "Which Iceberg feature lets you query a table as it looked at a previous point in time?"
-  AnswerChoices: "Time travel via snapshot IDs;Schema evolution;Partition pruning;Compaction"
-  CorrectAnswer: "Time travel via snapshot IDs"
-  Hint: "Iceberg stores immutable snapshots. You can read any historical snapshot."
+  Output: "Iceberg 的哪个功能让你能以表在过去某个时间点的状态进行查询？"
+  AnswerChoices: "通过快照 ID 时间旅行;Schema 演进;分区裁剪;合并（Compaction）"
+  CorrectAnswer: "通过快照 ID 时间旅行"
+  Hint: "Iceberg 存储不可变的快照。你可以读取任意历史快照。"
 
 - Class: cmd_question
   Depth: advanced
   Output: |
-    Write DataFrame `orders` to an Iceberg table called
-    `'lakehouse.bronze.orders'` using `createOrReplace`.
+    将 DataFrame `orders` 用 `createOrReplace` 写入一个名为
+    `'lakehouse.bronze.orders'` 的 Iceberg 表。
   CorrectAnswer: |
     orders.writeTo("lakehouse.bronze.orders").using("iceberg").createOrReplace()
-  Hint: "Use df.writeTo(table_name).using('iceberg').createOrReplace()."
+  Hint: "用 df.writeTo(table_name).using('iceberg').createOrReplace()。"
 
 - Class: text
   Depth: all
   Output: |
-    ## Summary
+    ## 小结
 
-    You now know how to read and write data in Spark:
+    你现在知道如何在 Spark 中读写数据了：
 
-    - **DataFrameReader** — format, options, schema, load
-    - **Explicit schemas** — always use them in production (no inferSchema)
-    - **Parquet** — the default format for analytics and pipelines
-    - **Write modes** — overwrite for idempotent batch pipelines
-    - **Iceberg** — ACID transactions for production table storage
+    - **DataFrameReader** —— format、options、schema、load
+    - **显式 schema** —— 生产环境始终使用（不要用 inferSchema）
+    - **Parquet** —— 分析和管道的默认格式
+    - **写入模式** —— 幂等批量管道用 overwrite
+    - **Iceberg** —— 生产级表存储的 ACID 事务
 
-    You have all the building blocks: a SparkSession, transformations, and
-    I/O. In the next lesson, you will build the **Pipeline Framework** —
-    a reusable class that ties transformations together with automatic
-    dependency resolution.
+    你已经掌握了所有构建块：SparkSession、转换和 I/O。
+    下一课中，你将构建 **Pipeline Framework** —— 一个可复用的类，
+    通过自动依赖解析将各种转换串联起来。

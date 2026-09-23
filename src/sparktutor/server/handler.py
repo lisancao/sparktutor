@@ -1,8 +1,9 @@
-"""Server handler: dispatches JSON-lines requests to engine components."""
+﻿"""Server handler: dispatches JSON-lines requests to engine components."""
 
 from __future__ import annotations
 
 import sys
+
 from dataclasses import asdict
 from pathlib import Path
 from typing import Callable, Optional
@@ -76,6 +77,7 @@ class ServerHandler:
         """Route a request message to the appropriate handler method."""
         method = msg.get("method", "")
         params = msg.get("params", {})
+        print(f"sparktutor-server: dispatch {method}", file=sys.stderr)
 
         handler_map = {
             "listCourses": self._list_courses,
@@ -94,6 +96,7 @@ class ServerHandler:
             "buildReviewPrompt": self._build_review_prompt,
             "buildChatPrompt": self._build_chat_prompt,
             "parseReviewResponse": self._parse_review_response,
+            "ping": self._ping,
         }
 
         handler = handler_map.get(method)
@@ -253,7 +256,7 @@ class ServerHandler:
             raise ValueError("No lesson loaded")
 
         hint = self._runner.get_hint()
-        return {"hint": hint or "No hint available for this step."}
+        return {"hint": hint or "本步骤暂无提示。"}
 
     async def _chat(self, params: dict) -> dict:
         question = params["question"]
@@ -422,3 +425,8 @@ class ServerHandler:
     async def _detect_mode(self, params: dict) -> dict:
         mode = await self.executor.detect_mode()
         return {"mode": mode.value}
+
+    async def _ping(self, params: dict) -> dict:
+        """Health check for the configured AI provider (Anthropic client)."""
+        ok, message = await self.evaluator.ping()
+        return {"ok": ok, "message": message}

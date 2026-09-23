@@ -1,7 +1,7 @@
 """
-External Data Sources & Higher-Order Functions - Solution
+外部数据源与高阶函数 - 参考答案
 
-Complete order analysis with higher-order functions and window ranking.
+使用高阶函数和窗口排名完成订单分析。
 """
 
 from pyspark.sql import SparkSession, functions as f, Window
@@ -28,7 +28,7 @@ SCHEMA = StructType([
 
 
 def analyze_orders(spark):
-    """Analyze orders using higher-order functions and windows."""
+    """使用高阶函数和窗口函数分析订单。"""
 
     orders_df = spark.createDataFrame(ORDER_DATA, SCHEMA)
 
@@ -46,7 +46,7 @@ def analyze_orders(spark):
     return result
 
 
-# ---- Test harness ----
+# ---- 测试代码 ----
 if __name__ == "__main__":
     spark = (SparkSession.builder
         .appName("HOFTest")
@@ -54,15 +54,15 @@ if __name__ == "__main__":
         .getOrCreate())
 
     df = analyze_orders(spark)
-    assert df is not None, "Function returned None"
-    assert "items_upper" in df.columns, "Missing items_upper column"
-    assert "p_items" in df.columns, "Missing p_items column"
-    assert "region_rank" in df.columns, "Missing region_rank column"
-    assert df.count() == 6, f"Expected 6 rows, got {df.count()}"
+    assert df is not None, "函数返回了 None"
+    assert "items_upper" in df.columns, "缺少 items_upper 列"
+    assert "p_items" in df.columns, "缺少 p_items 列"
+    assert "region_rank" in df.columns, "缺少 region_rank 列"
+    assert df.count() == 6, f"预期 6 行，实际得到 {df.count()}"
 
     first_upper = df.filter(f.col("order_id") == 1).select("items_upper").collect()[0][0]
-    assert first_upper == ["PEN", "PAPER", "PENCIL"], f"items_upper wrong: {first_upper}"
+    assert first_upper == ["PEN", "PAPER", "PENCIL"], f"items_upper 错误：{first_upper}"
 
-    print("All tests passed!")
+    print("所有测试通过！")
     df.show(truncate=False)
     spark.stop()

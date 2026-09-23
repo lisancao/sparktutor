@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Bridge: spawns the Python JSON-lines server as a subprocess
  * and provides typed RPC communication.
  */
@@ -62,6 +62,7 @@ export class Bridge extends EventEmitter {
 
       // Merge PYTHONPATH so sparktutor is importable
       const env = { ...process.env };
+      env.PYTHONUTF8 = "1";
       env.PYTHONPATH = env.PYTHONPATH
         ? `${srcDir}:${env.PYTHONPATH}`
         : srcDir;
@@ -157,9 +158,9 @@ export class Bridge extends EventEmitter {
       setTimeout(() => {
         if (!settled) {
           settled = true;
-          reject(new Error("Server startup timed out after 10s"));
+          reject(new Error("Server startup timed out after 30s"));
         }
-      }, 10000);
+      }, 30000);
     });
   }
 

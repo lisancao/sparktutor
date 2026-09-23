@@ -1,8 +1,8 @@
 """
-Pipeline Framework - Solution
+Pipeline 框架 - 参考答案
 
-A complete, working Pipeline class with decorator registration,
-dependency detection, topological sort, and execution.
+完整可用的 Pipeline 类：装饰器注册、依赖检测、
+拓扑排序和执行。
 """
 
 import inspect
@@ -16,23 +16,23 @@ class Pipeline:
         self._flows = {}
 
     def materialized_view(self):
-        """Return a decorator that registers the wrapped function in self._flows."""
+        """返回一个装饰器，将被装饰的函数注册到 self._flows 中。"""
         def decorator(func):
             self._flows[func.__name__] = func
             return func
         return decorator
 
     def _detect_deps(self, func):
-        """Return a list of table names referenced via spark.table('...') in func."""
+        """返回函数中通过 spark.table('...') 引用的表名列表。"""
         source = inspect.getsource(func)
         return re.findall(r'spark\.table\(["\'](\w+)["\']\)', source)
 
     def _topo_sort(self, graph):
         """
-        Topological sort using Kahn's algorithm.
-        graph: dict mapping node_name -> list of dependency names
-        Returns: list of node names in execution order
-        Raises ValueError if a cycle is detected.
+        使用 Kahn 算法进行拓扑排序。
+        graph: 字典，映射 节点名 -> 依赖名列表
+        返回：按执行顺序排列的节点名列表
+        如果检测到循环则抛出 ValueError。
         """
         in_degree = {n: 0 for n in graph}
         for node, deps in graph.items():
@@ -53,27 +53,27 @@ class Pipeline:
                         queue.append(candidate)
 
         if len(order) != len(graph):
-            raise ValueError("Cycle detected in pipeline dependencies")
+            raise ValueError("Pipeline 依赖中检测到循环")
         return order
 
     def run(self):
-        """Build the dependency graph, sort, and execute each flow in order."""
-        # Build dependency graph
+        """构建依赖图、排序，并按顺序执行每个 flow。"""
+        # 构建依赖图
         graph = {}
         for name, func in self._flows.items():
             graph[name] = self._detect_deps(func)
 
-        # Sort
+        # 排序
         order = self._topo_sort(graph)
 
-        # Execute
+        # 执行
         for name in order:
             df = self._flows[name](self.spark)
             df.createOrReplaceTempView(name)
-            print(f"Materialized: {name} ({df.count()} rows)")
+            print(f"已物化：{name}（{df.count()} 行）")
 
 
-# ---- Test harness ----
+# ---- 测试代码 ----
 if __name__ == "__main__":
     from pyspark.sql import SparkSession
 

@@ -1,87 +1,85 @@
 - Class: meta
-  Lesson: Optimization & Tuning
+  Lesson: 性能优化与调优
   EstimatedMinutes: 30
 
 - Class: text
   Depth: all
   Output: |
-    ## What You'll Learn
+    ## 你将学到什么
 
-    In the previous lesson you learned how the Catalyst optimizer works
-    and how to read execution plans. Now you will apply that knowledge
-    to **tune** Spark applications for real-world performance.
+    在上一课中，你学习了 Catalyst 优化器的工作原理以及如何阅读执行计划。
+    现在你将把这些知识应用到 **调优** Spark 应用上，以获得真实世界的性能表现。
 
-    By the end of this lesson you will be able to:
+    学完本课后，你将能够：
 
-    - Configure the most impactful Spark settings
-    - Manage partitions with `repartition` and `coalesce`
-    - Cache DataFrames strategically and know when NOT to cache
-    - Read execution plans to diagnose performance bottlenecks
-    - Apply a systematic approach to Spark tuning
+    - 配置影响最大的 Spark 设置
+    - 使用 `repartition` 和 `coalesce` 管理分区
+    - 有策略地缓存 DataFrame，并知道何时**不要**缓存
+    - 阅读执行计划以诊断性能瓶颈
+    - 运用系统化的 Spark 调优方法
 
 - Class: text
   Depth: beginner
   Output: |
-    Think of Spark partitions like lanes on a highway. More lanes
-    (partitions) let more cars (tasks) move in parallel, but too many
-    lanes waste space and create merge overhead. The goal is to match
-    the number of partitions to your cluster's capacity and your data size.
+    把 Spark 分区想象成高速公路上的车道。更多的车道（分区）
+    让更多的车辆（任务）并行行驶，但车道过多会浪费空间并产生合并开销。
+    目标是让分区数量与集群容量和数据规模相匹配。
 
-    Tuning Spark is about finding the right balance between parallelism,
-    memory usage, and shuffle overhead.
+    调优 Spark 就是在并行度、内存使用和 shuffle 开销之间
+    找到恰当的平衡。
 
 - Class: text
   Depth: all
   Output: |
-    ## The Most Impactful Configurations
+    ## 影响最大的配置项
 
-    Spark has hundreds of config knobs, but a handful dominate performance:
+    Spark 有数百个配置旋钮，但只有少数几个对性能起决定性作用：
 
-    **Parallelism:**
-    - `spark.sql.shuffle.partitions` — number of partitions after a shuffle
-      (default: 200). Set to 2-3x your total executor cores.
-    - `spark.default.parallelism` — default partitions for RDD operations
+    **并行度：**
+    - `spark.sql.shuffle.partitions` —— shuffle 之后的分区数
+      （默认：200）。设置为执行器总核心数的 2-3 倍。
+    - `spark.default.parallelism` —— RDD 操作的默认分区数
 
-    **Memory:**
-    - `spark.executor.memory` — memory per executor (e.g., `4g`)
-    - `spark.driver.memory` — memory for the driver
-    - `spark.memory.fraction` — fraction of executor memory for execution
-      and storage (default: 0.6)
+    **内存：**
+    - `spark.executor.memory` —— 每个执行器的内存（例如 `4g`）
+    - `spark.driver.memory` —— 驱动程序的内存
+    - `spark.memory.fraction` —— 用于执行和存储的执行器内存比例
+      （默认：0.6）
 
-    **File reading:**
-    - `spark.sql.files.maxPartitionBytes` — max size per partition when
-      reading files (default: 128MB)
+    **文件读取：**
+    - `spark.sql.files.maxPartitionBytes` —— 读取文件时每个分区的
+      最大大小（默认：128MB）
 
-    Set configs via the builder, conf file, or at runtime:
+    通过建造者、配置文件或运行时设置配置：
     ```python
     spark.conf.set("spark.sql.shuffle.partitions", "50")
     ```
 
-    **Docs:** [Spark Configuration](https://spark.apache.org/docs/3.5.0/configuration.html)
-    — searchable list of every config property including `spark.sql.shuffle.partitions`,
-    `spark.executor.memory`, `spark.memory.fraction`, and more.
+    **文档：** [Spark Configuration](https://spark.apache.org/docs/3.5.0/configuration.html)
+    —— 可搜索的全部配置属性列表，包括 `spark.sql.shuffle.partitions`、
+    `spark.executor.memory`、`spark.memory.fraction` 等。
 
 - Class: mult_question
   Depth: all
-  Output: "What does spark.sql.shuffle.partitions control?"
-  AnswerChoices: "Number of partitions created after a shuffle operation;Maximum memory per partition;Number of executor cores;Size of each data block"
-  CorrectAnswer: "Number of partitions created after a shuffle operation"
-  Hint: "After a groupBy or join, data is reshuffled. This setting controls how many partitions the result has."
+  Output: "spark.sql.shuffle.partitions 控制的是什么？"
+  AnswerChoices: "shuffle 操作后创建的分区数量;每个分区的最大内存;执行器核心数;每个数据块的大小"
+  CorrectAnswer: "shuffle 操作后创建的分区数量"
+  Hint: "在 groupBy 或 join 之后，数据会被重新 shuffle。这个设置控制结果有多少个分区。"
 
 - Class: text
   Depth: all
   Output: |
-    ## Repartition vs. Coalesce
+    ## Repartition 与 Coalesce 的对比
 
-    Two tools for changing the number of partitions:
+    两个用于改变分区数量的工具：
 
-    **`repartition(n)`** — shuffles data into exactly `n` partitions. This
-    is a full shuffle (expensive) but produces evenly-balanced partitions.
-    Use when you need to *increase* partitions or *rebalance* skewed data.
+    **`repartition(n)`** —— 将数据 shuffle 成恰好 `n` 个分区。
+    这是一次完整的 shuffle（代价高），但产生均衡的分区。
+    当你需要*增加*分区或*重新平衡*倾斜数据时使用。
 
-    **`coalesce(n)`** — reduces partitions by merging adjacent ones.
-    No shuffle — just reassignment. Use when *decreasing* partitions
-    (e.g., before writing small output files).
+    **`coalesce(n)`** —— 通过合并相邻分区来减少分区数。
+    没有 shuffle —— 只是重新分配。当*减少*分区时使用
+    （例如，在写入小输出文件之前）。
 
     ```python
     # Increase to 100 partitions (full shuffle)
@@ -91,25 +89,25 @@
     df = df.coalesce(10)
     ```
 
-    **Rule of thumb**: always use `coalesce` when reducing, `repartition`
-    when increasing or when you need balanced partitions.
+    **经验法则**：减少分区时始终用 `coalesce`，
+    增加分区或需要均衡分区时用 `repartition`。
 
 - Class: cmd_question
   Depth: all
   Output: |
-    A DataFrame has 1000 partitions and you want to write it as 10 output
-    files. What is the most efficient approach?
+    一个 DataFrame 有 1000 个分区，你想把它写成 10 个输出文件。
+    最高效的方法是什么？
   CorrectAnswer: |
     df.coalesce(10).write.parquet("/output/path")
-  Hint: "You're reducing partitions, so use coalesce (not repartition) to avoid an unnecessary shuffle."
+  Hint: "你在减少分区，所以用 coalesce（而不是 repartition）来避免不必要的 shuffle。"
 
 - Class: text
   Depth: all
   Output: |
-    ## Caching and Persistence
+    ## 缓存与持久化
 
-    When a DataFrame is used **multiple times** in your application,
-    caching avoids recomputing it from scratch each time:
+    当一个 DataFrame 在应用中被**多次使用**时，
+    缓存可以避免每次都从头重新计算：
 
     ```python
     df.cache()      # shorthand for persist(MEMORY_AND_DISK)
@@ -118,153 +116,146 @@
     df.unpersist()  # release memory when done
     ```
 
-    Caching is **lazy** — calling `cache()` only marks the DataFrame.
-    The actual data is materialized on the first action after cache().
+    缓存是**惰性的** —— 调用 `cache()` 只是标记 DataFrame。
+    实际数据在 cache() 之后的第一个 action 时才物化。
 
-    **Docs:**
+    **文档：**
     [cache](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.cache.html) |
     [persist](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.persist.html) |
     [unpersist](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.unpersist.html)
-    — `StorageLevel` parameter for `persist()`, lazy materialization behavior.
+    —— `persist()` 的 `StorageLevel` 参数、惰性物化行为。
 
 - Class: text
   Depth: intermediate
   Output: |
-    ## Storage Levels
+    ## 存储级别
 
-    `cache()` uses `MEMORY_AND_DISK` by default. `persist()` gives you
-    more control:
+    `cache()` 默认使用 `MEMORY_AND_DISK`。`persist()` 给你更多控制权：
 
-    | Level | Where | Tradeoff |
-    |-------|-------|----------|
-    | `MEMORY_ONLY` | RAM | Fastest, risks OOM |
-    | `MEMORY_AND_DISK` | RAM + disk | Safe default |
-    | `DISK_ONLY` | Disk | Slowest, memory-safe |
-    | `MEMORY_ONLY_SER` | RAM (serialized) | Less memory, CPU overhead |
-    | `OFF_HEAP` | Tungsten memory | Outside JVM GC |
+    | 级别 | 存储位置 | 权衡 |
+    |------|----------|------|
+    | `MEMORY_ONLY` | 内存 | 最快，有 OOM 风险 |
+    | `MEMORY_AND_DISK` | 内存 + 磁盘 | 安全的默认值 |
+    | `DISK_ONLY` | 磁盘 | 最慢，内存安全 |
+    | `MEMORY_ONLY_SER` | 内存（序列化） | 更省内存，有 CPU 开销 |
+    | `OFF_HEAP` | Tungsten 内存 | 不受 JVM GC 管理 |
 
     ```python
     from pyspark import StorageLevel
     df.persist(StorageLevel.MEMORY_ONLY_SER)
     ```
 
-    For most cases, `cache()` (MEMORY_AND_DISK) is the right choice. Use
-    `MEMORY_ONLY_SER` when you need to cache more data than fits in
-    deserialized form.
+    对大多数情况，`cache()`（MEMORY_AND_DISK）是正确选择。当需要缓存的
+    数据超过反序列化形式能容纳的大小时，使用 `MEMORY_ONLY_SER`。
 
 - Class: mult_question
   Depth: all
-  Output: "What is the difference between cache() and persist()?"
-  AnswerChoices: "cache() uses MEMORY_AND_DISK by default; persist() lets you choose the StorageLevel;cache() is faster than persist();persist() only uses disk storage;cache() works only with RDDs"
-  CorrectAnswer: "cache() uses MEMORY_AND_DISK by default; persist() lets you choose the StorageLevel"
-  Hint: "cache() is just a convenience method — what does it wrap?"
+  Output: "cache() 和 persist() 之间的区别是什么？"
+  AnswerChoices: "cache() 默认使用 MEMORY_AND_DISK；persist() 让你选择 StorageLevel;cache() 比 persist() 更快;persist() 只使用磁盘存储;cache() 只对 RDD 有效"
+  CorrectAnswer: "cache() 默认使用 MEMORY_AND_DISK；persist() 让你选择 StorageLevel"
+  Hint: "cache() 只是一个便捷方法 —— 它封装了什么？"
 
 - Class: text
   Depth: all
   Output: |
-    ## When to Cache (and When Not To)
+    ## 何时缓存（以及何时不要缓存）
 
-    **Cache when:**
-    - A DataFrame is used 2+ times AND is expensive to compute (joins,
-      aggregations, complex transformations)
-    - A DataFrame is the input to an iterative algorithm (ML training)
+    **在以下情况缓存：**
+    - 一个 DataFrame 被使用 2 次以上**且**计算代价高昂（join、
+      聚合、复杂转换）
+    - 一个 DataFrame 是迭代算法的输入（ML 训练）
 
-    **Do NOT cache when:**
-    - The DataFrame is used only once (caching adds overhead for no benefit)
-    - The DataFrame is too large to fit in cluster memory
-    - The DataFrame is cheap to recompute (simple file read without complex
-      transforms)
-    - You are writing output immediately (just write it, don't cache first)
+    **在以下情况不要缓存：**
+    - DataFrame 只被使用一次（缓存只会增加开销而无收益）
+    - DataFrame 太大，无法放入集群内存
+    - DataFrame 重新计算代价很低（没有复杂转换的简单文件读取）
+    - 你马上就要写输出（直接写就行，不要先缓存）
 
-    Always `unpersist()` when you are done. Forgotten caches consume cluster
-    memory and can cause OOM errors in later stages.
+    用完后始终调用 `unpersist()`。被遗忘的缓存会消耗集群内存，
+    并可能在后续 stage 中导致 OOM 错误。
 
 - Class: cmd_question
   Depth: intermediate
   Output: |
-    Cache a DataFrame `df`, trigger materialization with `count()`, print
-    the count, then release the cache with `unpersist()`.
+    缓存 DataFrame `df`，用 `count()` 触发物化，打印计数，
+    然后用 `unpersist()` 释放缓存。
   CorrectAnswer: |
     df.cache()
     count = df.count()
     print(count)
     df.unpersist()
-  Hint: "cache() marks it, count() materializes it, unpersist() releases it."
+  Hint: "cache() 标记它，count() 物化它，unpersist() 释放它。"
 
 - Class: text
   Depth: advanced
   Output: |
-    ## A Systematic Tuning Approach
+    ## 系统化的调优方法
 
-    When a Spark job is slow, follow this diagnostic process:
+    当 Spark 作业运行缓慢时，遵循以下诊断流程：
 
-    **1. Check the Spark UI** — look at stage timelines, task durations,
-    and shuffle sizes. The UI reveals bottlenecks that code cannot.
+    **1. 查看 Spark UI** —— 查看 stage 时间线、任务时长和 shuffle 大小。
+    UI 能揭示代码无法发现的瓶颈。
 
-    **2. Look for data skew** — one task taking 10x longer than others
-    means a partition has disproportionate data. Solutions: salting,
-    AQE skew join, or repartitioning by a better key.
+    **2. 查找数据倾斜** —— 某个任务比其他任务慢 10 倍意味着某个分区
+    拥有不成比例的数据。解决方案：加盐（salting）、AQE 倾斜 join，
+    或按更好的键重新分区。
 
-    **3. Check shuffle sizes** — large shuffles (>1GB per task) suggest
-    too few partitions or missing broadcast opportunities.
+    **3. 检查 shuffle 大小** —— 大的 shuffle（每个任务 >1GB）表明
+    分区太少或缺少 broadcast 机会。
 
-    **4. Check partition counts** — `df.rdd.getNumPartitions()`. Target
-    ~128MB per partition. Too few = underutilized cores. Too many =
-    scheduling overhead.
+    **4. 检查分区数量** —— `df.rdd.getNumPartitions()`。
+    目标是每个分区约 128MB。太少 = 核心利用不足。
+    太多 = 调度开销。
 
-    **5. Check for unnecessary computation** — is the same DataFrame
-    recomputed multiple times? Cache it. Are you reading columns you
-    don't need? Use `select()` early.
+    **5. 检查不必要的计算** —— 同一个 DataFrame 是否被多次重新计算？
+    缓存它。你是否在读取不需要的列？尽早使用 `select()`。
 
 - Class: text
   Depth: advanced
   Output: |
-    ## Monitoring Cache Usage
+    ## 监控缓存使用情况
 
-    The **Storage tab** in the Spark UI shows what is cached, memory used,
-    and the fraction cached. If a DataFrame shows < 100% cached, data is
-    spilling to disk — either the cluster is memory-constrained or you are
-    caching too much.
+    Spark UI 中的 **Storage 标签页**显示缓存了什么、使用了多少内存
+    以及缓存比例。如果一个 DataFrame 显示 < 100% 缓存，说明数据
+    正在溢写到磁盘 —— 要么是集群内存受限，要么是你缓存了太多数据。
 
-    **Practical tip**: cache the *filtered* DataFrame, not the raw read.
-    A 100GB raw read cached is wasteful; a 5GB filtered + aggregated
-    intermediate result is a good cache candidate.
+    **实用提示**：缓存*过滤后*的 DataFrame，而不是原始读取。
+    缓存 100GB 的原始读取是浪费；一个 5GB 的过滤+聚合中间结果
+    才是合适的缓存候选。
 
 - Class: script
   Depth: all
   Output: |
-    ## Exercise: Optimize a Pipeline
+    ## 练习：优化数据管道
 
-    Implement `optimize_pipeline(spark)` that demonstrates caching
-    strategy and partition management:
+    实现 `optimize_pipeline(spark)`，演示缓存策略和分区管理：
 
-    1. Set shuffle partitions to 10 (for local mode)
-    2. Create a sample sales DataFrame with 1000 rows
-    3. Cache an expensive aggregation (group by product, sum revenue)
-    4. Reuse the cached result for two separate analyses
-    5. Unpersist the cache
-    6. Coalesce the final output to 2 partitions
-    7. Return the results
+    1. 将 shuffle 分区数设置为 10（用于本地模式）
+    2. 创建一个包含 1000 行的示例销售 DataFrame
+    3. 缓存一个代价高昂的聚合（按产品分组，对收入求和）
+    4. 复用缓存的结果进行两次独立分析
+    5. 释放缓存
+    6. 将最终输出 coalesce 为 2 个分区
+    7. 返回结果
   StarterFile: starter.py
   SolutionFile: solution.py
-  Hint: "Use spark.conf.set for shuffle partitions, .cache() + .count() to materialize, and .coalesce() before returning."
+  Hint: "用 spark.conf.set 设置 shuffle 分区，.cache() + .count() 来物化，返回前用 .coalesce()。"
 
 - Class: text
   Depth: all
   Output: |
-    ## Summary
+    ## 小结
 
-    In this lesson you learned:
+    本课你学到了：
 
-    - **Key configs** — `shuffle.partitions`, executor/driver memory, and
-      file partition sizes are the most impactful settings
-    - **repartition vs. coalesce** — repartition for increasing or
-      balancing; coalesce for reducing without shuffle
-    - **Caching** — cache DataFrames reused 2+ times; always unpersist
-    - **Storage levels** — MEMORY_AND_DISK is the safe default; use SER
-      variants to fit more data
-    - **Tuning process** — Spark UI → skew → shuffles → partitions → caching
+    - **关键配置** —— `shuffle.partitions`、执行器/驱动程序内存和
+      文件分区大小是影响最大的设置
+    - **repartition 与 coalesce** —— repartition 用于增加或均衡分区；
+      coalesce 用于不 shuffle 地减少分区
+    - **缓存** —— 缓存被复用 2 次以上的 DataFrame；始终 unpersist
+    - **存储级别** —— MEMORY_AND_DISK 是安全的默认值；
+      使用 SER 变体以容纳更多数据
+    - **调优流程** —— Spark UI → 倾斜 → shuffle → 分区 → 缓存
 
-    You now have the tools to diagnose and fix performance problems. In
-    the next lesson, you will tackle **joins** — the most expensive and
-    most important operation in distributed data processing.
+    你现在拥有了诊断和修复性能问题的工具。在下一课中，你将攻克
+    **join** —— 分布式数据处理中最昂贵也最重要的操作。

@@ -1,36 +1,36 @@
 """
-Silver Layer - Solution
+Silver 层 - 参考答案
 
-Clean, type-cast, and enrich bronze data into silver.
+清洗、类型转换和丰富 bronze 数据为 silver 层。
 """
 
 from pyspark.sql import SparkSession, functions as f
 
 
 def silver_orders(spark):
-    """Transform bronze_orders into a clean silver DataFrame."""
+    """将 bronze_orders 转换为干净的 silver DataFrame。"""
 
     bronze = spark.table("bronze_orders")
 
-    # Cast string columns to proper types
+    # 将字符串列转为正确的类型
     typed = (bronze
         .withColumn("price", f.col("price").cast("double"))
         .withColumn("quantity", f.col("quantity").cast("int"))
     )
 
-    # Compute total
+    # 计算总额
     with_total = typed.withColumn("total", f.col("price") * f.col("quantity"))
 
-    # Filter out rows where price could not be parsed
+    # 过滤掉无法解析 price 的行
     clean = with_total.filter(f.col("price").isNotNull())
 
-    # Extract hour from the order timestamp string
+    # 从订单时间戳字符串中提取小时
     enriched = clean.withColumn("order_hour", f.hour(f.to_timestamp(f.col("order_ts"))))
 
     return enriched
 
 
-# ---- Test harness ----
+# ---- 测试代码 ----
 if __name__ == "__main__":
     spark = SparkSession.builder.appName("SilverTest").master("local[*]").getOrCreate()
 
@@ -44,14 +44,14 @@ if __name__ == "__main__":
     bronze.createOrReplaceTempView("bronze_orders")
 
     df = silver_orders(spark)
-    assert df.count() == 2, f"Expected 2 rows (1 filtered), got {df.count()}"
-    assert "total" in df.columns, "Missing 'total' column"
-    assert "order_hour" in df.columns, "Missing 'order_hour' column"
+    assert df.count() == 2, f"预期 2 行（过滤掉 1 行），实际得到 {df.count()}"
+    assert "total" in df.columns, "缺少 'total' 列"
+    assert "order_hour" in df.columns, "缺少 'order_hour' 列"
 
     row = df.filter(f.col("order_id") == "1").first()
-    assert abs(row["total"] - 19.98) < 0.01, f"Expected total ~19.98, got {row['total']}"
-    assert row["order_hour"] == 14, f"Expected order_hour 14, got {row['order_hour']}"
+    assert abs(row["total"] - 19.98) < 0.01, f"预期 total 约 19.98，实际得到 {row['total']}"
+    assert row["order_hour"] == 14, f"预期 order_hour 为 14，实际得到 {row['order_hour']}"
 
-    print("All tests passed!")
+    print("所有测试通过！")
     df.show(truncate=False)
     spark.stop()

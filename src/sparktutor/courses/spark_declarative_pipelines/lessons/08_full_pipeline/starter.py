@@ -1,14 +1,13 @@
 """
-Full Pipeline - Starter Code (Capstone)
+完整 Pipeline - 起始代码（毕业项目）
 
-Build a complete bronze -> silver -> gold pipeline using the Pipeline
-framework. Implement all three layer functions and register them with
-the pipeline decorator.
+使用 Pipeline 框架构建完整的 bronze -> silver -> gold 流水线。
+实现所有三层函数并用流水线装饰器注册。
 
-The pipeline should:
-  bronze_orders: Read CSV, add _ingested_at, deduplicate by order_id
-  silver_orders: Cast types, add total, filter null prices, add order_hour
-  gold_product_summary: groupBy product, agg count/sum/avg, rank by revenue
+流水线应：
+  bronze_orders: 读取 CSV，添加 _ingested_at，按 order_id 去重
+  silver_orders: 类型转换，添加 total，过滤 null price，添加 order_hour
+  gold_product_summary: 按 product 分组，聚合 count/sum/avg，按营收排名
 """
 
 import inspect
@@ -17,7 +16,7 @@ from collections import deque
 from pyspark.sql import SparkSession, functions as f, Window
 
 
-# ---- Pipeline Framework (provided) ----
+# ---- Pipeline 框架（已提供）----
 
 class Pipeline:
     def __init__(self, spark):
@@ -51,7 +50,7 @@ class Pipeline:
                     if in_degree[candidate] == 0:
                         queue.append(candidate)
         if len(order) != len(graph):
-            raise ValueError("Cycle detected")
+            raise ValueError("检测到循环")
         return order
 
     def run(self):
@@ -60,46 +59,46 @@ class Pipeline:
         for name in order:
             df = self._flows[name](self.spark)
             df.createOrReplaceTempView(name)
-            print(f"Materialized: {name} ({df.count()} rows)")
+            print(f"已物化：{name}（{df.count()} 行）")
 
 
-# ---- Your pipeline layers ----
+# ---- 你的流水线层 ----
 
 def build_pipeline(spark, csv_path):
-    """Build and return a Pipeline with bronze, silver, and gold layers."""
+    """构建并返回包含 bronze、silver 和 gold 层的 Pipeline。"""
 
     pipe = Pipeline(spark)
 
     @pipe.materialized_view()
     def bronze_orders(spark):
-        """Read raw CSV, add metadata columns, deduplicate by order_id."""
-        # TODO: implement
+        """读取原始 CSV，添加元数据列，按 order_id 去重。"""
+        # TODO: 实现
         pass
 
     @pipe.materialized_view()
     def silver_orders(spark):
-        """Cast types, compute total, filter nulls, extract order_hour."""
-        # TODO: implement
-        # Read from spark.table("bronze_orders")
+        """类型转换，计算 total，过滤 null，提取 order_hour。"""
+        # TODO: 实现
+        # 从 spark.table("bronze_orders") 读取
         pass
 
     @pipe.materialized_view()
     def gold_product_summary(spark):
-        """Aggregate by product: count, revenue, avg, rank."""
-        # TODO: implement
-        # Read from spark.table("silver_orders")
+        """按 product 聚合：count、revenue、avg、排名。"""
+        # TODO: 实现
+        # 从 spark.table("silver_orders") 读取
         pass
 
     return pipe
 
 
-# ---- Test harness (do not modify below this line) ----
+# ---- 测试代码（请勿修改此行以下内容）----
 if __name__ == "__main__":
     import tempfile, os
 
     spark = SparkSession.builder.appName("FullPipelineTest").master("local[*]").getOrCreate()
 
-    # Create test CSV
+    # 创建测试 CSV 文件
     tmp = tempfile.mkdtemp()
     csv_path = os.path.join(tmp, "orders.csv")
     with open(csv_path, "w") as fh:
@@ -108,28 +107,28 @@ if __name__ == "__main__":
         fh.write("2,gadget,24.99,1,2026-01-15 09:15:00\n")
         fh.write("3,widget,9.99,5,2026-01-15 16:00:00\n")
         fh.write("4,gizmo,4.99,10,2026-01-15 11:00:00\n")
-        fh.write("5,widget,N/A,1,2026-01-15 20:00:00\n")  # bad price
-        fh.write("1,widget,9.99,2,2026-01-15 14:30:00\n")  # duplicate
+        fh.write("5,widget,N/A,1,2026-01-15 20:00:00\n")  # 坏价格
+        fh.write("1,widget,9.99,2,2026-01-15 14:30:00\n")  # 重复行
 
     pipe = build_pipeline(spark, csv_path)
     pipe.run()
 
-    # Verify bronze
+    # 验证 bronze
     bronze = spark.table("bronze_orders")
-    assert bronze.count() == 5, f"Bronze: expected 5 rows, got {bronze.count()}"
-    assert "_ingested_at" in bronze.columns, "Bronze: missing _ingested_at"
+    assert bronze.count() == 5, f"Bronze：预期 5 行，实际得到 {bronze.count()}"
+    assert "_ingested_at" in bronze.columns, "Bronze：缺少 _ingested_at"
 
-    # Verify silver
+    # 验证 silver
     silver = spark.table("silver_orders")
-    assert silver.count() == 4, f"Silver: expected 4 rows (1 null filtered), got {silver.count()}"
-    assert "total" in silver.columns, "Silver: missing 'total'"
-    assert "order_hour" in silver.columns, "Silver: missing 'order_hour'"
+    assert silver.count() == 4, f"Silver：预期 4 行（过滤掉 1 个 null），实际得到 {silver.count()}"
+    assert "total" in silver.columns, "Silver：缺少 'total'"
+    assert "order_hour" in silver.columns, "Silver：缺少 'order_hour'"
 
-    # Verify gold
+    # 验证 gold
     gold = spark.table("gold_product_summary")
-    assert gold.count() == 3, f"Gold: expected 3 products, got {gold.count()}"
-    assert "revenue_rank" in gold.columns, "Gold: missing 'revenue_rank'"
+    assert gold.count() == 3, f"Gold：预期 3 个产品，实际得到 {gold.count()}"
+    assert "revenue_rank" in gold.columns, "Gold：缺少 'revenue_rank'"
 
-    print("\nAll tests passed! Full pipeline is working end-to-end.")
+    print("\n所有测试通过！完整流水线端到端运行正常。")
     gold.show(truncate=False)
     spark.stop()

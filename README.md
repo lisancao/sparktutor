@@ -1,4 +1,7 @@
-# SparkTutor
+# SparkTutor-CN
+
+> Based on [lisancao/sparktutor](https://github.com/lisancao/sparktutor), licensed under MIT. This is an enhanced derivative project focusing on **Chinese localization, open-source LLM integration, and learning diagnosis**.
+
 
 Interactive Apache Spark 4.1 learning environment — a VS Code extension with Claude-powered tutoring that turns your IDE into a hands-on Spark classroom.
 
@@ -83,8 +86,13 @@ Open VS Code settings (`Ctrl+,`) and search for "SparkTutor":
 
 | Setting | Description |
 |---------|-------------|
-| `sparktutor.aiProvider` | AI backend: `auto` (default), `anthropic`, or `copilot` |
+| `sparktutor.aiProvider` | AI backend: `auto` (default), `anthropic`, `copilot`, or `openai-compatible` |
 | `sparktutor.anthropicApiKey` | Anthropic API key (or set `ANTHROPIC_API_KEY` env var) |
+| `sparktutor.openaiBaseUrl` | OpenAI-compatible base URL (DeepSeek / GLM / Qwen / Kimi / Doubao / Ollama ...) |
+| `sparktutor.openaiApiKey` | API key for the OpenAI-compatible provider (or `SPARKTUTOR_OPENAI_API_KEY` / `OPENAI_API_KEY` env var) |
+| `sparktutor.openaiModel` | Model name for the OpenAI-compatible provider (e.g. `deepseek-chat`, `glm-4-plus`, `qwen-plus`) |
+| `sparktutor.openaiExtraHeaders` | Extra JSON headers for the OpenAI-compatible endpoint (e.g. `{"x-api-key": "..."}` for custom auth) |
+| `sparktutor.copilotModel` | Preferred Copilot model id/family (e.g. `gpt-4o`); leave empty to auto-select |
 | `sparktutor.claudeModel` | Claude model for review/chat (default: `claude-sonnet-4-6`) |
 | `sparktutor.pythonPath` | Python interpreter path (default: `python3`) |
 | `sparktutor.projectPath` | Path to sparktutor repo root (auto-detected if installed via VSIX) |
@@ -97,9 +105,23 @@ SparkTutor supports multiple AI backends for code review and chat:
 |----------|--------------|----------|
 | **Claude (Anthropic)** | Set `sparktutor.anthropicApiKey` or `ANTHROPIC_API_KEY` env var | Highest quality feedback |
 | **GitHub Copilot** | Install the [GitHub Copilot](https://marketplace.visualstudio.com/items?itemName=GitHub.copilot) extension | Codespaces, students with Copilot subscriptions |
+| **OpenAI-compatible** | Set `sparktutor.openaiBaseUrl` / `openaiApiKey` / `openaiModel` (or env vars) | DeepSeek, Zhipu GLM, Alibaba Qwen, Moonshot Kimi, Volcengine Doubao, Ollama — works with most Chinese model APIs |
 | **Local only** | No API key, no Copilot | Syntax/AST checks still work, no AI review |
 
-In `auto` mode (default), SparkTutor uses Claude if an API key is set, falls back to Copilot if available, and runs local-only checks otherwise. The active provider is shown in the status bar.
+Common OpenAI-compatible endpoints:
+
+| Provider | `openaiBaseUrl` | Example model |
+|----------|-----------------|---------------|
+| DeepSeek | `https://api.deepseek.com/v1` | `deepseek-chat` |
+| Zhipu GLM | `https://open.bigmodel.cn/api/paas/v4` | `glm-4-plus` |
+| Alibaba Qwen | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-plus` |
+| Moonshot Kimi | `https://api.moonshot.cn/v1` | `moonshot-v1-8k` |
+| Volcengine Doubao | `https://ark.cn-beijing.volces.com/api/v3` | `doubao-seed-1-6-250615` |
+| Ollama (local) | `http://localhost:11434/v1` | your local model |
+
+In `auto` mode (default), SparkTutor uses Claude if an API key is set, falls back to an OpenAI-compatible provider if configured, then Copilot if available, and runs local-only checks otherwise. The active provider is shown in the status bar.
+
+**Connection health check:** run `SparkTutor: Check AI Connection` from the command palette (`Ctrl+Shift+P`) to verify the active provider with a real request. On startup SparkTutor probes once automatically; if a probe fails, that provider is skipped for 60 seconds and the fallback (Copilot / local checks) is used instead of failing every submit.
 
 ## Usage
 

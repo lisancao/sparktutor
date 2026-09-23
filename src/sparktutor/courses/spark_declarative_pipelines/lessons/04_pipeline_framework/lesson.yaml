@@ -1,32 +1,31 @@
 - Class: meta
-  Lesson: "Pipeline Framework"
+  Lesson: "管道框架"
   EstimatedMinutes: 25
 
 - Class: text
   Depth: all
   Output: |
-    ## What You'll Learn
+    ## 你将学到什么
 
-    Over the last three lessons you learned to create a SparkSession,
-    transform data, and read/write files. But real-world pipelines have
-    **multiple steps that depend on each other**: you cannot build the
-    silver layer until bronze is ready, and gold depends on silver.
+    过去三课你学习了创建 SparkSession、转换数据以及读写文件。
+    但真实世界的管道有**多个相互依赖的步骤**：bronze 就绪之前
+    你无法构建 silver 层，而 gold 又依赖 silver。
 
-    In this lesson you will build a lightweight **Pipeline class** that:
-    1. Registers transformation functions with a decorator
-    2. Auto-detects dependencies between them
-    3. Runs them in the correct order using topological sort
+    本课你将构建一个轻量级的 **Pipeline 类**，它能：
+    1. 用装饰器注册转换函数
+    2. 自动检测函数之间的依赖
+    3. 使用拓扑排序按正确顺序运行它们
 
-    By the end you will have a reusable framework for the bronze, silver,
-    and gold layers you build in the next three lessons.
+    学完后，你将拥有一个可复用框架，用于接下来三课中构建的
+    bronze、silver 和 gold 层。
 
 - Class: text
   Depth: beginner
   Output: |
-    A Python **decorator** is a function that wraps another function to
-    add behavior. You have probably seen `@property` or `@staticmethod`.
-    We will create a `@pipeline.materialized_view()` decorator that
-    registers a function as a pipeline step:
+    Python **装饰器**是一个包装另一个函数以增加行为的函数。
+    你可能见过 `@property` 或 `@staticmethod`。
+    我们将创建一个 `@pipeline.materialized_view()` 装饰器，
+    把一个函数注册为管道步骤：
 
     ```python
     @pipeline.materialized_view()
@@ -34,16 +33,16 @@
         return spark.read.csv("/data/orders.csv", header=True)
     ```
 
-    When the pipeline runs, it calls `bronze_orders(spark)` and saves the
-    result as a temp view named `bronze_orders`. The function name becomes
-    the table name — this is the "declarative" part.
+    当管道运行时，它调用 `bronze_orders(spark)` 并将结果保存为
+    名为 `bronze_orders` 的临时视图。函数名即表名 —— 这就是
+    "声明式"的部分。
 
 - Class: text
   Depth: intermediate
   Output: |
-    ## The Decorator Pattern
+    ## 装饰器模式
 
-    The decorator stores each function in a registry dictionary:
+    装饰器将每个函数存到一个注册表字典中：
 
     ```python
     class Pipeline:
@@ -58,27 +57,25 @@
             return decorator
     ```
 
-    When you decorate a function, it gets added to `_flows` keyed by its
-    name. The function itself is unchanged — it still takes `spark` and
-    returns a DataFrame.
+    当你装饰一个函数时，它会以函数名为键加入 `_flows`。
+    函数本身不变 —— 它仍然接收 `spark` 并返回一个 DataFrame。
 
-    This pattern separates **declaration** (what each step does) from
-    **orchestration** (what order to run them in). You declare the steps;
-    the framework handles the ordering.
+    这种模式将**声明**（每一步做什么）与**编排**（按什么顺序运行）
+    分离开来。你声明步骤；框架负责排序。
 
 - Class: mult_question
   Depth: all
-  Output: "What does the @pipeline.materialized_view() decorator do?"
-  AnswerChoices: "Registers the function as a pipeline step;Materializes the DataFrame to memory;Creates a SQL view;Caches the result in Spark"
-  CorrectAnswer: "Registers the function as a pipeline step"
-  Hint: "The decorator adds the function to the pipeline's internal registry."
+  Output: "@pipeline.materialized_view() 装饰器做什么？"
+  AnswerChoices: "将函数注册为管道步骤;将 DataFrame 物化到内存;创建一个 SQL 视图;将结果缓存到 Spark 中"
+  CorrectAnswer: "将函数注册为管道步骤"
+  Hint: "装饰器将函数加入管道的内部注册表。"
 
 - Class: cmd_question
   Depth: all
   Output: |
-    Write a Pipeline class with an `__init__` that takes `spark` and
-    initializes an empty dictionary `_flows`. Add a `materialized_view`
-    method that returns a decorator which registers functions by name.
+    编写一个 Pipeline 类，`__init__` 接收 `spark` 并初始化一个空字典
+    `_flows`。添加一个 `materialized_view` 方法，返回一个装饰器，
+    按函数名注册函数。
   CorrectAnswer: |
     class Pipeline:
         def __init__(self, spark):
@@ -90,16 +87,15 @@
                 self._flows[func.__name__] = func
                 return func
             return decorator
-  Hint: "The decorator stores func in self._flows[func.__name__] and returns func."
+  Hint: "装饰器将 func 存入 self._flows[func.__name__] 并返回 func。"
 
 - Class: text
   Depth: intermediate
   Output: |
-    ## Dependency Detection
+    ## 依赖检测
 
-    How does the pipeline know that `silver_orders` depends on
-    `bronze_orders`? We inspect the function's source code for calls to
-    `spark.table("...")`:
+    管道怎么知道 `silver_orders` 依赖 `bronze_orders`？
+    我们检查函数源码中是否有对 `spark.table("...")` 的调用：
 
     ```python
     import inspect, re
@@ -109,32 +105,31 @@
         return re.findall(r'spark\.table\(["\'](\w+)["\']\)', source)
     ```
 
-    If `silver_orders` calls `spark.table("bronze_orders")`, the regex
-    finds `"bronze_orders"` as a dependency. This is a simple but
-    effective heuristic — it works because our convention is to use
-    `spark.table()` to read from pipeline steps.
+    如果 `silver_orders` 调用了 `spark.table("bronze_orders")`，
+    正则表达式就会找到 `"bronze_orders"` 作为依赖。这是一个简单
+    但有效的启发式方法 —— 它之所以有效，是因为我们约定用
+    `spark.table()` 从管道步骤中读取数据。
 
 - Class: mult_question
   Depth: intermediate
-  Output: "How does the pipeline auto-detect that silver_orders depends on bronze_orders?"
-  AnswerChoices: "By scanning the function source for spark.table() calls;By checking the Spark catalog;By running the function and catching errors;By analyzing the DataFrame lineage"
-  CorrectAnswer: "By scanning the function source for spark.table() calls"
-  Hint: "The pipeline uses inspect.getsource and a regex to find table references."
+  Output: "管道如何自动检测 silver_orders 依赖 bronze_orders？"
+  AnswerChoices: "通过扫描函数源码中的 spark.table() 调用;通过检查 Spark catalog;通过运行函数并捕获错误;通过分析 DataFrame 血缘"
+  CorrectAnswer: "通过扫描函数源码中的 spark.table() 调用"
+  Hint: "管道使用 inspect.getsource 和正则表达式来查找表引用。"
 
 - Class: text
   Depth: advanced
   Output: |
-    ## Topological Sort
+    ## 拓扑排序
 
-    Given a dependency graph, **topological sort** produces an ordering
-    where every function runs after its dependencies. We use Kahn's
-    algorithm:
+    给定一个依赖图，**拓扑排序**产生一个顺序，使每个函数都在其
+    依赖之后运行。我们使用 Kahn 算法：
 
-    1. Compute **in-degree** (number of dependencies) for each node
-    2. Start with nodes that have in-degree 0 (no dependencies)
-    3. Process each node, decrementing in-degree of its dependents
-    4. Repeat until all nodes are processed
-    5. If the queue empties before all nodes are processed → cycle detected
+    1. 计算每个节点的**入度**（依赖数量）
+    2. 从入度为 0 的节点（无依赖）开始
+    3. 处理每个节点，将其依赖者的入度减 1
+    4. 重复直到所有节点都被处理
+    5. 如果队列在所有节点处理完之前就空了 → 检测到环
 
     ```python
     from collections import deque
@@ -165,9 +160,9 @@
 - Class: cmd_question
   Depth: advanced
   Output: |
-    Write a `_detect_deps` method for the Pipeline class that takes a
-    function, reads its source with `inspect.getsource`, and returns a
-    list of table names found in `spark.table("...")` calls.
+    为 Pipeline 类编写一个 `_detect_deps` 方法，接收一个函数，
+    用 `inspect.getsource` 读取其源码，并返回在 `spark.table("...")`
+    调用中找到的表名列表。
   CorrectAnswer: |
     import inspect
     import re
@@ -175,14 +170,14 @@
     def _detect_deps(self, func):
         source = inspect.getsource(func)
         return re.findall(r'spark\.table\(["\'](\w+)["\']\)', source)
-  Hint: "Use inspect.getsource for the source, then re.findall with a pattern matching spark.table(...)."
+  Hint: "用 inspect.getsource 获取源码，然后用 re.findall 匹配 spark.table(...) 的模式。"
 
 - Class: text
   Depth: all
   Output: |
-    ## The run() Method
+    ## run() 方法
 
-    Finally, `run()` ties it all together:
+    最后，`run()` 将所有部分串在一起：
 
     ```python
     def run(self):
@@ -201,51 +196,47 @@
             print(f"Materialized: {name} ({df.count()} rows)")
     ```
 
-    Each step's result is registered as a **temp view** so downstream
-    steps can reference it with `spark.table("step_name")`. This is the
-    contract that makes dependency detection work.
+    每一步的结果都注册为一个**临时视图**，这样下游步骤就能用
+    `spark.table("step_name")` 引用它。这正是让依赖检测生效的契约。
 
 - Class: script
   Depth: all
   Output: |
-    ## Exercise: Build the Pipeline Framework
+    ## 练习：构建管道框架
 
-    Put it all together: complete the Pipeline class so that it can
-    register flows, detect dependencies, sort them, and execute in order.
+    把所有部分组合起来：补全 Pipeline 类，使其能够注册流程、
+    检测依赖、排序并按顺序执行。
 
-    Open the starter file and implement:
-    - `materialized_view()` — the decorator
-    - `_detect_deps(func)` — source inspection for dependencies
-    - `_topo_sort(graph)` — Kahn's algorithm
-    - `run()` — build graph, sort, execute
+    打开 starter 文件并实现：
+    - `materialized_view()` —— 装饰器
+    - `_detect_deps(func)` —— 源码检查以检测依赖
+    - `_topo_sort(graph)` —— Kahn 算法
+    - `run()` —— 构建图、排序、执行
 
-    The test harness registers three functions (bronze → silver → gold)
-    and verifies they execute in the correct order.
+    测试框架会注册三个函数（bronze → silver → gold），
+    并验证它们按正确顺序执行。
   StarterFile: starter.py
   SolutionFile: solution.py
-  Hint: "Implement all four methods. See the lesson text for reference code."
+  Hint: "实现全部四个方法。参考课程正文中的示例代码。"
 
 - Class: mult_question
   Depth: all
-  Output: "If step A depends on step B and step B depends on step A, what happens during topological sort?"
-  AnswerChoices: "A cycle is detected and an error is raised;Step A runs first;Step B runs first;Both run in parallel"
-  CorrectAnswer: "A cycle is detected and an error is raised"
-  Hint: "Circular dependencies cannot be resolved — the algorithm detects this when not all nodes get processed."
+  Output: "如果步骤 A 依赖步骤 B，而步骤 B 又依赖步骤 A，拓扑排序时会发生什么？"
+  AnswerChoices: "检测到环并抛出错误;步骤 A 先运行;步骤 B 先运行;两者并行运行"
+  CorrectAnswer: "检测到环并抛出错误"
+  Hint: "循环依赖无法解析 —— 当不是所有节点都被处理时，算法会检测到这一点。"
 
 - Class: text
   Depth: all
   Output: |
-    ## Summary
+    ## 小结
 
-    You now have a reusable Pipeline framework with:
+    你现在拥有了一个可复用的 Pipeline 框架，具备：
 
-    - **Declarative registration** — `@pipe.materialized_view()` registers
-      steps by function name
-    - **Automatic dependency detection** — regex inspection of
-      `spark.table()` calls
-    - **Topological execution** — Kahn's algorithm ensures correct ordering
-    - **Cycle detection** — circular dependencies raise clear errors
+    - **声明式注册** —— `@pipe.materialized_view()` 按函数名注册步骤
+    - **自动依赖检测** —— 正则表达式检查 `spark.table()` 调用
+    - **拓扑执行** —— Kahn 算法确保正确顺序
+    - **环检测** —— 循环依赖会抛出清晰的错误
 
-    This is the backbone of everything that follows. In the next three
-    lessons you will use this framework to build real **bronze**, **silver**,
-    and **gold** layers for a data pipeline.
+    这是后续所有内容的骨架。接下来三课中，你将使用这个框架
+    为一条数据管道构建真正的 **bronze**、**silver** 和 **gold** 层。

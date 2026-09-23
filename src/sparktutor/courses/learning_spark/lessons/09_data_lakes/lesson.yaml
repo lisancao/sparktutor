@@ -1,126 +1,121 @@
 - Class: meta
-  Lesson: Data Lakes & Lakehouses
+  Lesson: 数据湖与湖仓
   EstimatedMinutes: 25
 
 - Class: text
   Depth: all
   Output: |
-    ## What You'll Learn
+    ## 你将学到什么
 
-    You have learned to read Parquet files, run SQL queries, and even
-    process streaming data. But what happens when two jobs write to the
-    same table at once? What if a write fails halfway? How do you query
-    last week's version of your data?
+    你已经学会了读取 Parquet 文件、运行 SQL 查询，甚至处理流数据。
+    但当两个作业同时写入同一张表时会发生什么？如果写入中途失败呢？
+    如何查询上周版本的数据？
 
-    Plain files (Parquet, CSV) cannot answer these questions. **Lakehouse
-    table formats** add the reliability of a database to the scale of a
-    data lake.
+    普通文件（Parquet、CSV）无法回答这些问题。**湖仓表格式**
+    将数据库的可靠性与数据湖的规模结合起来。
 
-    By the end of this lesson you will be able to:
+    学完本课后，你将能够：
 
-    - Explain the evolution from data lakes to lakehouses
-    - Compare Delta Lake, Apache Iceberg, and Apache Hudi
-    - Describe ACID guarantees and why they matter
-    - Use schema enforcement and schema evolution
-    - Query historical data with time travel
-    - Understand when to choose which format
+    - 解释从数据湖到湖仓的演进
+    - 对比 Delta Lake、Apache Iceberg 和 Apache Hudi
+    - 描述 ACID 保证及其重要性
+    - 使用 schema 约束和 schema 演进
+    - 通过时间旅行查询历史数据
+    - 理解何时选择哪种格式
 
 - Class: text
   Depth: all
   Output: |
-    ## The Evolution of Data Architectures
+    ## 数据架构的演进
 
-    **Databases** (1970s-2000s) — structured, ACID-compliant, limited
-    scale. Great for transactions, expensive for large analytics.
+    **数据库**（1970s-2000s）—— 结构化、符合 ACID、规模有限。
+    适合事务，大规模分析成本高昂。
 
-    **Data warehouses** — optimized for analytics, structured data,
-    expensive to scale. Good for BI but rigid schemas.
+    **数据仓库** —— 为分析优化、结构化数据、扩展成本高昂。
+    适合 BI，但 schema 僵化。
 
-    **Data lakes** (2010s) — store everything cheaply on distributed
-    storage (HDFS, S3, ADLS). Schema-on-read means any format goes.
-    Problem: no transactions, no quality enforcement, data becomes a
-    "data swamp."
+    **数据湖**（2010s）—— 以低成本在分布式存储（HDFS、S3、ADLS）上
+    存储一切。Schema-on-read 意味着任何格式都行。
+    问题：没有事务、没有质量约束，数据变成"数据沼泽"。
 
-    **Lakehouses** (2020s) — combine lake storage with warehouse
-    reliability. You get cheap, scalable storage with ACID transactions,
-    schema enforcement, and time travel.
+    **湖仓**（2020s）—— 将湖存储与仓库可靠性结合。
+    你以低成本、可扩展的存储获得 ACID 事务、schema 约束
+    和时间旅行。
 
 - Class: text
   Depth: beginner
   Output: |
-    A data lake is like a massive warehouse where you dump everything —
-    boxes of documents, photos, recordings — in whatever format. It is
-    cheap and flexible, but things get messy fast. You cannot undo a
-    mistake, and two people dropping boxes at the same time can corrupt
-    each other's work.
+    数据湖就像一个巨大的仓库，你把所有东西都倒进去 ——
+    一箱箱文件、照片、录音 —— 不管什么格式。它便宜又灵活，
+    但很快就会变得一团糟。你无法撤销错误，两个人同时放箱子
+    还会互相损坏对方的工作。
 
-    A lakehouse adds organization: labeled shelves (schema enforcement),
-    an inventory system (transaction log), and the ability to undo
-    mistakes (time travel). You keep the flexibility of a lake with the
-    reliability of a database.
+    湖仓增加了组织性：带标签的货架（schema 约束）、
+    库存系统（事务日志）和撤销错误的能力（时间旅行）。
+    你保留了湖的灵活性，同时获得了数据库的可靠性。
 
 - Class: text
   Depth: all
   Output: |
-    ## Three Major Lakehouse Formats
+    ## 三大湖仓格式
 
-    **Delta Lake** — developed by Databricks. Uses a JSON-based
-    transaction log (`_delta_log/`). Deep Spark integration. Strong
-    community and tooling.
+    **Delta Lake** —— 由 Databricks 开发。使用基于 JSON 的
+    事务日志（`_delta_log/`）。与 Spark 深度集成。
+    强大的社区和工具生态。
 
-    **Apache Iceberg** — developed at Netflix. Uses metadata files with
-    manifest lists. Designed for multi-engine access (Spark, Trino, Flink,
-    Dremio). Supports hidden partitioning and partition evolution.
+    **Apache Iceberg** —— 在 Netflix 开发。使用带有 manifest 列表的
+    元数据文件。为多引擎访问设计（Spark、Trino、Flink、Dremio）。
+    支持隐藏分区和分区演进。
 
-    **Apache Hudi** — developed at Uber. Optimized for upserts and
-    incremental processing. Good for streaming + change data capture (CDC).
+    **Apache Hudi** —— 在 Uber 开发。针对 upsert 和增量处理优化。
+    适合流处理 + 变更数据捕获（CDC）。
 
-    All three provide ACID transactions, schema enforcement, time travel,
-    and merge (upsert) operations. The choice depends on your ecosystem.
+    三者都提供 ACID 事务、schema 约束、时间旅行和合并（upsert）操作。
+    选择取决于你的技术生态。
 
-    **Docs:**
+    **文档：**
     [Delta Lake Quickstart](https://docs.delta.io/latest/quick-start.html) |
     [Iceberg Spark Guide](https://iceberg.apache.org/docs/latest/spark-getting-started/) |
     [Hudi Spark Guide](https://hudi.apache.org/docs/quick-start-guide)
-    — setup, read/write, time travel, and schema evolution for each format.
+    —— 每种格式的安装、读写、时间旅行和 schema 演进。
 
 - Class: mult_question
   Depth: all
-  Output: "What key problem do lakehouse formats solve that plain data lake files (Parquet/CSV) cannot?"
-  AnswerChoices: "ACID transactions, schema enforcement, and reliable concurrent writes;Cheaper storage costs;Faster file I/O speeds;Better compression ratios"
-  CorrectAnswer: "ACID transactions, schema enforcement, and reliable concurrent writes"
-  Hint: "What guarantees are missing when two Spark jobs write to the same Parquet directory at once?"
+  Output: "湖仓格式解决了普通数据湖文件（Parquet/CSV）无法解决的什么关键问题？"
+  AnswerChoices: "ACID 事务、schema 约束和可靠的并发写入;更便宜的存储成本;更快的文件 I/O 速度;更好的压缩比"
+  CorrectAnswer: "ACID 事务、schema 约束和可靠的并发写入"
+  Hint: "当两个 Spark 作业同时写入同一个 Parquet 目录时，缺少什么保证？"
 
 - Class: text
   Depth: all
   Output: |
-    ## ACID Guarantees
+    ## ACID 保证
 
-    Lakehouses provide the same ACID properties as databases:
+    湖仓提供与数据库相同的 ACID 特性：
 
-    - **Atomicity** — a write either succeeds completely or not at all.
-      No partial writes that leave corrupt data.
-    - **Consistency** — schema enforcement ensures every row matches the
-      table schema. Bad data is rejected at write time.
-    - **Isolation** — concurrent readers see consistent snapshots. A reader
-      never sees a half-written batch.
-    - **Durability** — once a write is committed, it is permanent — stored
-      in the transaction log.
+    - **原子性（Atomicity）** —— 写入要么完全成功，要么完全不发生。
+      不会留下导致数据损坏的部分写入。
+    - **一致性（Consistency）** —— schema 约束确保每行都符合表 schema。
+      坏数据在写入时被拒绝。
+    - **隔离性（Isolation）** —— 并发读取者看到一致的快照。
+      读取者永远不会看到写了一半的批次。
+    - **持久性（Durability）** —— 一旦写入被提交，它就是永久的 ——
+      存储在事务日志中。
 
-    These guarantees mean you can run pipelines confidently without
-    worrying about data corruption from failures or concurrency.
+    这些保证意味着你可以放心地运行管道，无需担心故障或并发
+    导致的数据损坏。
 
 - Class: text
   Depth: all
   Output: |
-    ## Schema Enforcement and Evolution
+    ## Schema 约束与演进
 
-    **Schema enforcement** rejects writes that do not match the table
-    schema. If your pipeline accidentally produces a column with the wrong
-    type, the write fails immediately instead of silently corrupting data.
+    **Schema 约束**拒绝不符合表 schema 的写入。如果你的管道
+    意外产生了类型错误的列，写入会立即失败，而不是默默地
+    损坏数据。
 
-    **Schema evolution** lets you safely add columns or widen types without
-    rewriting existing data:
+    **Schema 演进**让你可以安全地添加列或拓宽类型，
+    而无需重写现有数据：
 
     ```python
     # Delta Lake — merge schema on append
@@ -134,15 +129,15 @@
     spark.sql("ALTER TABLE catalog.db.events ADD COLUMN browser STRING")
     ```
 
-    Existing data is unchanged — new columns appear as `null` in old rows.
+    现有数据不变 —— 新列在旧行中显示为 `null`。
 
 - Class: text
   Depth: intermediate
   Output: |
-    ## Time Travel: Querying Historical Data
+    ## 时间旅行：查询历史数据
 
-    Every write creates a new **version** (or **snapshot**). You can query
-    any previous version:
+    每次写入都会创建一个新的**版本**（或**快照**）。
+    你可以查询任何历史版本：
 
     ```python
     # Delta Lake — by version number
@@ -155,63 +150,59 @@
     spark.read.format("iceberg").option("snapshot-id", 12345).load("db.table")
     ```
 
-    Use cases for time travel:
-    - **Auditing** — prove what data looked like at a specific date
-    - **Debugging** — compare current vs. previous versions to find when
-      data went wrong
-    - **Reproducibility** — re-run an analysis on the exact data it
-      originally used
+    时间旅行的用例：
+    - **审计** —— 证明数据在特定日期的样子
+    - **调试** —— 对比当前版本与历史版本，找到数据出错的时间点
+    - **可复现性** —— 在最初使用的确切数据上重新运行分析
 
 - Class: mult_question
   Depth: all
-  Output: "What is time travel in the context of lakehouse tables?"
-  AnswerChoices: "Querying historical versions of data as they existed at a past point in time;Moving data between time zones;Scheduling writes for future execution;Compressing old data files"
-  CorrectAnswer: "Querying historical versions of data as they existed at a past point in time"
-  Hint: "Each write creates a new version. Time travel lets you look at any previous version."
+  Output: "在湖仓表的语境中，什么是时间旅行？"
+  AnswerChoices: "查询数据在过去某个时间点存在的历史版本;在时区之间移动数据;安排未来执行的写入;压缩旧数据文件"
+  CorrectAnswer: "查询数据在过去某个时间点存在的历史版本"
+  Hint: "每次写入创建一个新版本。时间旅行让你查看任何历史版本。"
 
 - Class: cmd_question
   Depth: intermediate
   Output: |
-    Write a DataFrame `df` to a Delta table at `'/data/events'`, then
-    read back version 0 (the original) into a variable called `df_v0`.
+    将 DataFrame `df` 写入 `'/data/events'` 的 Delta 表，
+    然后读回版本 0（原始版本）到名为 `df_v0` 的变量中。
   CorrectAnswer: |
     df.write.format("delta").mode("overwrite").save("/data/events")
 
     df_v0 = spark.read.format("delta").option("versionAsOf", 0).load("/data/events")
-  Hint: "Write with format('delta'), then read with option('versionAsOf', 0)."
+  Hint: "用 format('delta') 写入，然后用 option('versionAsOf', 0) 读取。"
 
 - Class: text
   Depth: advanced
   Output: |
-    ## Delta Lake vs. Iceberg: Choosing a Format
+    ## Delta Lake 与 Iceberg：选择格式
 
-    | Feature | Delta Lake | Apache Iceberg |
-    |---------|-----------|----------------|
-    | Transaction log | JSON + checkpoint Parquet | Metadata files + manifests |
-    | Multi-engine | Spark-centric (expanding) | Spark, Trino, Flink, Dremio |
-    | Partitioning | Explicit `PARTITIONED BY` | Hidden partitioning, partition evolution |
-    | Schema evolution | mergeSchema option | ALTER TABLE, full type promotion |
-    | Community | Databricks-led | Apache Foundation, multi-vendor |
+    | 特性 | Delta Lake | Apache Iceberg |
+    |------|-----------|----------------|
+    | 事务日志 | JSON + checkpoint Parquet | 元数据文件 + manifest |
+    | 多引擎 | 以 Spark 为中心（正在扩展） | Spark、Trino、Flink、Dremio |
+    | 分区 | 显式 `PARTITIONED BY` | 隐藏分区、分区演进 |
+    | Schema 演进 | mergeSchema 选项 | ALTER TABLE、完整类型提升 |
+    | 社区 | Databricks 主导 | Apache 基金会，多厂商 |
 
-    **Choose Delta** when working primarily with Spark and Databricks.
-    **Choose Iceberg** when you need multi-engine access or advanced
-    partition management.
+    **选择 Delta** 当主要使用 Spark 和 Databricks 时。
+    **选择 Iceberg** 当你需要多引擎访问或高级分区管理时。
 
-    Both support ACID, time travel, schema evolution, and merge operations.
+    两者都支持 ACID、时间旅行、schema 演进和合并操作。
 
 - Class: text
   Depth: advanced
   Output: |
-    ## Maintenance Operations
+    ## 维护操作
 
-    Lakehouse tables accumulate old data files over time. Regular
-    maintenance keeps them performant:
+    湖仓表会随时间积累旧数据文件。定期维护保持其高性能：
 
-    **Compaction** — merge small files into larger ones for better read
-    performance.
+    **Compaction（合并）** —— 将小文件合并成更大的文件，
+    以获得更好的读取性能。
 
-    **Vacuum / Expire snapshots** — remove old data files no longer
-    needed by any active version:
+    **Vacuum / 过期快照** —— 移除不再被任何活跃版本需要的
+    旧数据文件：
     ```python
     # Delta Lake
     spark.sql("VACUUM delta.`/data/events` RETAIN 168 HOURS")
@@ -220,64 +211,59 @@
     spark.sql("CALL catalog.system.expire_snapshots('db.events', TIMESTAMP '2025-01-01')")
     ```
 
-    **History** — view all operations:
+    **History（历史）** —— 查看所有操作：
     ```python
     spark.sql("DESCRIBE HISTORY delta.`/data/events`")
     ```
 
-    Never vacuum below the default retention (7 days for Delta) unless
-    you are certain no long-running queries need older versions.
+    除非你确定没有长时间运行的查询需要旧版本，否则不要
+    在低于默认保留期（Delta 为 7 天）的情况下执行 vacuum。
 
 - Class: mult_question
   Depth: advanced
-  Output: "Which lakehouse format is generally considered most portable across different query engines?"
+  Output: "哪种湖仓格式通常被认为在不同查询引擎间可移植性最好？"
   AnswerChoices: "Apache Iceberg;Delta Lake;Apache Hudi;Apache Parquet"
   CorrectAnswer: "Apache Iceberg"
-  Hint: "This format was designed with multi-engine support as a core goal."
+  Hint: "这种格式在设计时就将多引擎支持作为核心目标。"
 
 - Class: script
   Depth: all
   Output: |
-    ## Exercise: Lakehouse Simulation
+    ## 练习：湖仓模拟
 
-    Since this exercise runs in dry-run mode (no Delta/Iceberg JARs
-    required), you will simulate lakehouse concepts using versioned
-    Parquet directories.
+    由于本练习以 dry-run 模式运行（不需要 Delta/Iceberg JAR），
+    你将使用带版本的 Parquet 目录来模拟湖仓概念。
 
-    Implement `lakehouse_simulation(spark, base_path)`:
+    实现 `lakehouse_simulation(spark, base_path)`：
 
-    1. Create initial employee data and write as "version 0"
-    2. Add new employees and write combined data as "version 1"
-    3. Read both versions to demonstrate time travel
-    4. Verify schema consistency between versions
-    5. Return a dict with both versions and schema comparison
+    1. 创建初始员工数据并写为"版本 0"
+    2. 添加新员工并将合并数据写为"版本 1"
+    3. 读取两个版本以演示时间旅行
+    4. 验证版本之间的 schema 一致性
+    5. 返回一个包含两个版本和 schema 对比的字典
 
-    This simulates the core lakehouse workflow: write, evolve, query
-    historical versions.
+    这模拟了核心湖仓工作流：写入、演进、查询历史版本。
   StarterFile: starter.py
   SolutionFile: solution.py
-  Hint: "Use spark.createDataFrame with SCHEMA, write each version to a versioned subdirectory, read both back, and compare schemas."
+  Hint: "用 spark.createDataFrame 配合 SCHEMA，将每个版本写入带版本号的子目录，读回两者并比较 schema。"
 
 - Class: text
   Depth: all
   Output: |
-    ## Summary
+    ## 小结
 
-    In this lesson you learned:
+    本课你学到了：
 
-    - **Data architecture evolution** — databases → warehouses → lakes →
-      lakehouses
-    - **Three formats** — Delta Lake, Apache Iceberg, Apache Hudi provide
-      ACID transactions on data lake storage
-    - **ACID guarantees** — atomicity, consistency, isolation, durability
-      prevent corruption from failures and concurrency
-    - **Schema enforcement/evolution** — reject bad writes, safely add
-      columns
-    - **Time travel** — query any historical version for auditing,
-      debugging, or reproducibility
-    - **Maintenance** — vacuum/expire old snapshots, compact small files
+    - **数据架构演进** —— 数据库 → 仓库 → 数据湖 → 湖仓
+    - **三种格式** —— Delta Lake、Apache Iceberg、Apache Hudi
+      在数据湖存储上提供 ACID 事务
+    - **ACID 保证** —— 原子性、一致性、隔离性、持久性
+      防止故障和并发导致的损坏
+    - **Schema 约束/演进** —— 拒绝坏写入，安全添加列
+    - **时间旅行** —— 查询任何历史版本以用于审计、
+      调试或可复现性
+    - **维护** —— vacuum/过期旧快照、合并小文件
 
-    You now understand the storage layer that production data platforms
-    are built on. In the final lesson, you will use everything you have
-    learned as we explore **machine learning with MLlib** — Spark's
-    built-in library for training and deploying models at scale.
+    你现在理解了生产数据平台赖以构建的存储层。在最后一课中，
+    你将运用所学的一切，探索 **MLlib 机器学习** —— Spark 内置的
+    大规模模型训练和部署库。

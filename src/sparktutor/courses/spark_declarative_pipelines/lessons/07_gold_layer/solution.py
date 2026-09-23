@@ -1,18 +1,18 @@
 """
-Gold Layer - Solution
+Gold 层 - 参考答案
 
-Product-level aggregation with revenue ranking.
+产品级聚合与营收排名。
 """
 
 from pyspark.sql import SparkSession, functions as f, Window
 
 
 def gold_product_summary(spark):
-    """Produce a gold-level product summary with rankings."""
+    """生成带有排名的 gold 层产品汇总。"""
 
     silver = spark.table("silver_orders")
 
-    # Aggregate by product
+    # 按产品聚合
     agg_df = (silver
         .groupBy("product")
         .agg(
@@ -22,14 +22,14 @@ def gold_product_summary(spark):
         )
     )
 
-    # Rank products by revenue (highest first)
+    # 按营收排名（最高在前）
     w = Window.orderBy(f.col("total_revenue").desc())
     ranked = agg_df.withColumn("revenue_rank", f.rank().over(w))
 
     return ranked
 
 
-# ---- Test harness ----
+# ---- 测试代码 ----
 if __name__ == "__main__":
     spark = SparkSession.builder.appName("GoldTest").master("local[*]").getOrCreate()
 
@@ -46,13 +46,13 @@ if __name__ == "__main__":
 
     df = gold_product_summary(spark)
 
-    assert df.count() == 3, f"Expected 3 products, got {df.count()}"
-    assert "revenue_rank" in df.columns, "Missing 'revenue_rank' column"
-    assert "total_revenue" in df.columns, "Missing 'total_revenue' column"
+    assert df.count() == 3, f"预期 3 个产品，实际得到 {df.count()}"
+    assert "revenue_rank" in df.columns, "缺少 'revenue_rank' 列"
+    assert "total_revenue" in df.columns, "缺少 'total_revenue' 列"
 
     top = df.filter(f.col("revenue_rank") == 1).first()
-    assert top["product"] == "widget", f"Expected widget as #1, got {top['product']}"
+    assert top["product"] == "widget", f"预期 widget 排名第一，实际得到 {top['product']}"
 
-    print("All tests passed!")
+    print("所有测试通过！")
     df.show(truncate=False)
     spark.stop()

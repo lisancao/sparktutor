@@ -85,6 +85,10 @@ export async function activate(
       statusBar.setAiProvider("none");
     });
 
+  // Startup connectivity probe (non-blocking): cache the outcome so a failed
+  // provider is skipped for a short while instead of failing every submit.
+  aiRouter.runStartupHealthCheck().catch(() => {});
+
   context.subscriptions.push({
     dispose: () => {
       bridge.dispose();
@@ -108,22 +112,25 @@ export async function activate(
   // Check for a saved session and offer to resume
   const saved = getSavedSession();
   if (saved) {
-    const resume = await vscode.window.showInformationMessage(
-      `Resume "${saved.lessonTitle}" (${saved.depth})?`,
-      "Resume",
-      "Start Fresh"
-    );
-    if (resume === "Resume") {
-      vscode.commands.executeCommand(
-        "sparktutor.openLesson",
-        saved.courseId,
-        saved.lessonIdx,
-        saved.depth,
-        true, // skipResumePrompt — user already confirmed
-      );
-    } else if (resume === "Start Fresh") {
-      clearSavedSession();
-    }
+    vscode.window
+      .showInformationMessage(
+        `继续「${saved.lessonTitle}」（${saved.depth}）？`,
+        "继续",
+        "重新开始"
+      )
+      .then((resume) => {
+        if (resume === "继续") {
+          vscode.commands.executeCommand(
+            "sparktutor.openLesson",
+            saved.courseId,
+            saved.lessonIdx,
+            saved.depth,
+            true // skipResumePrompt — user already confirmed
+          );
+        } else if (resume === "重新开始") {
+          clearSavedSession();
+        }
+      });
   }
 }
 

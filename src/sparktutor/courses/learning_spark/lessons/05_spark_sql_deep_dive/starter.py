@@ -1,15 +1,15 @@
 """
-Spark SQL Deep Dive - Starter Code
+Spark SQL 深入探索 - 起始代码
 
-Implement the `compare_plans` function that:
-1. Creates a sample employee DataFrame
-2. Writes a query using the DataFrame API: filter salary > 50000,
-   group by department, compute average salary, order by avg desc
-3. Writes the same query using Spark SQL
-4. Returns a dict with keys "df_plan" and "sql_plan" containing
-   the string explain output for each approach
+实现 `compare_plans` 函数：
+1. 创建员工示例 DataFrame
+2. 使用 DataFrame API 编写查询：筛选 salary > 50000，
+   按 department 分组，计算平均薪资，按均值降序排列
+3. 使用 Spark SQL 编写相同的查询
+4. 返回包含 "df_plan" 和 "sql_plan" 键的字典，
+   值为两种方式的 explain 字符串输出
 
-This demonstrates that both APIs produce equivalent execution plans.
+本练习展示两种 API 产生相同的执行计划。
 """
 
 from pyspark.sql import SparkSession, functions as f
@@ -39,22 +39,22 @@ SCHEMA = StructType([
 
 
 def compare_plans(spark):
-    """Compare DataFrame API and SQL execution plans."""
+    """比较 DataFrame API 和 SQL 的执行计划。"""
 
     emp_df = spark.createDataFrame(EMPLOYEE_DATA, SCHEMA)
 
-    # TODO: Register as a temp view for SQL queries
-    # Your code here
+    # TODO: 注册为临时视图以便 SQL 查询
+    # 在此编写代码
 
-    # TODO: DataFrame API approach — filter salary > 50000,
-    #       group by department, avg salary, order by avg desc
-    df_result = None  # Replace
+    # TODO: DataFrame API 方式 — 筛选 salary > 50000，
+    #       按 department 分组，计算平均薪资，按均值降序
+    df_result = None  # 替换
 
-    # TODO: SQL approach — same logic as above using spark.sql()
-    sql_result = None  # Replace
+    # TODO: SQL 方式 — 使用 spark.sql() 实现与上面相同的逻辑
+    sql_result = None  # 替换
 
-    # Capture explain plans as strings
-    # (explain() prints to stdout; we capture it)
+    # 获取 explain 计划的字符串表示
+    # （explain() 输出到 stdout；我们在这里捕获它）
     df_plan = df_result._jdf.queryExecution().simpleString()
     sql_plan = sql_result._jdf.queryExecution().simpleString()
 
@@ -66,7 +66,7 @@ def compare_plans(spark):
     }
 
 
-# ---- Test harness (do not modify below this line) ----
+# ---- 测试代码（请勿修改此行以下内容）----
 if __name__ == "__main__":
     spark = (SparkSession.builder
         .appName("SQLDeepDiveTest")
@@ -74,14 +74,14 @@ if __name__ == "__main__":
         .getOrCreate())
 
     result = compare_plans(spark)
-    assert result is not None, "Function returned None"
-    assert result["df_result"].count() == 3, "DataFrame API should return 3 departments"
-    assert result["sql_result"].count() == 3, "SQL should return 3 departments"
-    assert len(result["df_plan"]) > 0, "df_plan should not be empty"
-    assert len(result["sql_plan"]) > 0, "sql_plan should not be empty"
-    print("DataFrame API result:")
+    assert result is not None, "函数返回了 None"
+    assert result["df_result"].count() == 3, "DataFrame API 应返回 3 个部门"
+    assert result["sql_result"].count() == 3, "SQL 应返回 3 个部门"
+    assert len(result["df_plan"]) > 0, "df_plan 不应为空"
+    assert len(result["sql_plan"]) > 0, "sql_plan 不应为空"
+    print("DataFrame API 结果：")
     result["df_result"].show()
-    print("SQL result:")
+    print("SQL 结果：")
     result["sql_result"].show()
-    print("All tests passed!")
+    print("所有测试通过！")
     spark.stop()

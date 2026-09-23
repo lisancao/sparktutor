@@ -1,93 +1,90 @@
 - Class: meta
-  Lesson: Introduction & Getting Started
+  Lesson: 简介与快速上手
   EstimatedMinutes: 25
 
 - Class: text
   Depth: all
   Output: |
-    ## What You'll Learn
+    ## 你将学到什么
 
-    By the end of this lesson you will be able to:
+    学完本课程后，你将能够：
 
-    - Explain what Apache Spark is and why it exists
-    - Describe the Driver-Executor architecture
-    - Create a SparkSession — the entry point to all Spark functionality
-    - Read a CSV file into a DataFrame
-    - Perform basic aggregations with `groupBy`, `agg`, and `orderBy`
-    - Filter results to answer specific questions about your data
+    - 解释什么是 Apache Spark 以及它为什么会出现
+    - 描述 Driver-Executor 架构
+    - 创建 SparkSession —— 所有 Spark 功能的入口
+    - 将 CSV 文件读取为 DataFrame
+    - 使用 `groupBy`、`agg` 和 `orderBy` 进行基本聚合
+    - 过滤结果以回答关于数据的具体问题
 
-    This lesson establishes the foundation everything else builds on. Every
-    Spark program starts with a SparkSession and works with DataFrames.
+    本课程是后续所有内容的基础。每个 Spark 程序都从
+    SparkSession 开始，并围绕 DataFrame 展开。
 
 - Class: text
   Depth: all
   Output: |
-    ## What Is Apache Spark?
+    ## 什么是 Apache Spark？
 
-    Apache Spark is a **unified analytics engine** for large-scale data
-    processing. It handles SQL queries, streaming data, machine learning, and
-    graph processing — all through a single framework.
+    Apache Spark 是一个面向大规模数据处理的**统一分析引擎**。
+    它通过单一框架处理 SQL 查询、流数据、机器学习和图计算。
 
-    Spark's key innovation is **in-memory processing**. The earlier MapReduce
-    model writes intermediate results to disk after every step. Spark keeps
-    data in memory across operations, which can make iterative workloads
-    (like ML training) 10-100x faster.
+    Spark 的核心创新是**内存计算**。早期的 MapReduce 模型在每一步
+    都将中间结果写入磁盘。Spark 在操作之间将数据保留在内存中，
+    这使得迭代式工作负载（如机器学习训练）速度提升 10-100 倍。
 
-    Spark provides APIs in Python, Scala, Java, and R. Throughout this course
-    we use PySpark — the Python API. Under the hood, PySpark communicates
-    with the same JVM-based engine, so you get full Spark performance while
-    writing Python.
+    Spark 提供 Python、Scala、Java 和 R 的 API。本课程全程使用
+    PySpark —— 即 Python API。在底层，PySpark 与同一个基于 JVM 的
+    引擎通信，因此你在编写 Python 的同时能获得完整的 Spark 性能。
 
 - Class: text
   Depth: beginner
   Output: |
-    ## Analogy: Spark as a Restaurant Kitchen
+    ## 类比：把 Spark 想象成餐厅后厨
 
-    Think of Spark like a busy restaurant kitchen:
+    把 Spark 想象成一个繁忙的餐厅后厨：
 
-    - The **Driver** is the **head chef** — it reads the order (your code),
-      plans the steps, and coordinates who does what. It does not cook
-      the food itself.
-    - **Executors** are the **line cooks** — they do the actual work on their
-      assigned portion of the data: slicing, grilling, plating.
-    - The **Cluster Manager** is the **restaurant manager** — it decides how
-      many cooks are available and assigns resources.
+    - **Driver（驱动程序）** 是**主厨** —— 它读取订单（你的代码），
+      规划步骤，并协调谁做什么。它自己不做菜。
+    - **Executor（执行器）** 是**后厨厨师** —— 它们在分配到的数据
+      分片上做实际工作：切配、烹饪、摆盘。
+    - **Cluster Manager（集群管理器）** 是**餐厅经理** —— 它决定
+      有多少厨师可用并分配资源。
 
-    When you submit a Spark job, the head chef (Driver) breaks it into tasks
-    and hands them to line cooks (Executors), who work in parallel to get
-    the result out fast. More cooks = more parallelism = faster results.
+    当你提交一个 Spark 作业时，主厨（Driver）将其拆分成多个任务，
+    交给后厨厨师（Executor），他们并行工作以快速产出结果。
+    厨师越多 = 并行度越高 = 结果越快。
 
 - Class: text
   Depth: all
   Output: |
-    ## Spark Architecture
+    ## Spark 架构
 
-    A Spark application has four core components:
+    一个 Spark 应用有四个核心组件：
 
-    - **Driver Program** — runs your `main()` function, creates the
-      SparkSession, and coordinates execution across the cluster.
-    - **Cluster Manager** — allocates resources. Options include Standalone,
-      YARN, Mesos, and Kubernetes.
-    - **Worker Nodes** — machines in the cluster that host Executors.
-    - **Executors** — JVM processes on workers that run tasks and cache data.
+    - **Driver Program（驱动程序）** —— 运行你的 `main()` 函数，
+      创建 SparkSession，并协调整个集群的执行。
+    - **Cluster Manager（集群管理器）** —— 分配资源。可选方案包括
+      Standalone、YARN、Mesos 和 Kubernetes。
+    - **Worker Nodes（工作节点）** —— 集群中托管 Executor 的机器。
+    - **Executors（执行器）** —— Worker 上运行任务并缓存数据的
+      JVM 进程。
 
-    The execution hierarchy:
+    执行层级：
 
     ```
     Application  →  Jobs  →  Stages  →  Tasks
     ```
 
-    A **job** is triggered by an action (e.g., `show()`, `count()`). Jobs are
-    divided into **stages** at shuffle boundaries. Stages contain **tasks** —
-    one per data partition — that run in parallel across executors.
+    一个 **job** 由一个 action 触发（例如 `show()`、`count()`）。
+    Job 在 shuffle 边界处被划分为多个 **stage**。Stage 包含多个
+    **task** —— 每个数据分区一个 —— 它们在各个 executor 上并行运行。
 
 - Class: text
   Depth: intermediate
   Output: |
-    ## SparkSession: The Unified Entry Point
+    ## SparkSession：统一的入口
 
-    Starting in Spark 2.0, `SparkSession` replaced the older SparkContext,
-    SQLContext, and HiveContext. You create one with the **builder pattern**:
+    从 Spark 2.0 开始，`SparkSession` 取代了旧的 SparkContext、
+    SQLContext 和 HiveContext。你通过**建造者模式**创建它：
 
     ```python
     from pyspark.sql import SparkSession
@@ -99,78 +96,74 @@
         .getOrCreate())
     ```
 
-    The `master` setting controls where Spark runs:
-    - `local[*]` — use all local CPU cores (great for development)
-    - `local[4]` — use exactly 4 cores
-    - `spark://host:7077` — connect to a Standalone cluster
-    - `k8s://...` — connect to a Kubernetes cluster
+    `master` 设置控制 Spark 在哪里运行：
+    - `local[*]` —— 使用所有本地 CPU 核心（适合开发）
+    - `local[4]` —— 恰好使用 4 个核心
+    - `spark://host:7077` —— 连接到 Standalone 集群
+    - `k8s://...` —— 连接到 Kubernetes 集群
 
-    `getOrCreate()` either creates a new session or returns the existing one,
-    so calling it multiple times is safe.
+    `getOrCreate()` 会创建新会话或返回已存在的会话，因此多次调用
+    是安全的。
 
-    **Docs:** [SparkSession](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.SparkSession.html)
-    — builder pattern, `appName()`, `master()`, `config()`, `getOrCreate()`.
+    **文档：** [SparkSession](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.SparkSession.html)
+    —— 建造者模式、`appName()`、`master()`、`config()`、`getOrCreate()`。
 
 - Class: mult_question
   Depth: all
-  Output: "What is the role of the Driver in a Spark application?"
-  AnswerChoices: "Coordinates execution and plans queries;Stores data on disk;Executes individual tasks on data partitions;Manages cluster resources"
-  CorrectAnswer: "Coordinates execution and plans queries"
-  Hint: "Think about the head chef analogy — who plans the work but doesn't do the cooking?"
+  Output: "Driver 在 Spark 应用中的作用是什么？"
+  AnswerChoices: "协调执行并规划查询;将数据存储在磁盘上;在数据分区上执行单个任务;管理集群资源"
+  CorrectAnswer: "协调执行并规划查询"
+  Hint: "想想主厨的类比 —— 谁规划工作但不亲自做菜？"
 
 - Class: text
   Depth: advanced
   Output: |
-    ## The Execution Model in Detail
+    ## 执行模型详解
 
-    When you call an action, Spark's execution engine kicks in:
+    当你调用一个 action 时，Spark 的执行引擎启动：
 
-    1. **DAG Scheduler** — analyzes the chain of transformations and builds a
-       Directed Acyclic Graph (DAG). It breaks the DAG into stages at
-       **shuffle boundaries** — points where data must be redistributed
-       across partitions.
+    1. **DAG 调度器** —— 分析转换链并构建有向无环图（DAG）。
+       它在 **shuffle 边界**处将 DAG 拆分为多个 stage —— 即数据必须
+       在分区之间重新分布的点。
 
-    2. **Task Scheduler** — takes each stage and creates tasks (one per
-       partition), then assigns them to available executors.
+    2. **任务调度器** —— 为每个 stage 创建任务（每个分区一个），
+       然后将它们分配给可用的 executor。
 
-    **Narrow vs. Wide Transformations:**
-    - **Narrow** (e.g., `map`, `filter`, `select`) — each input partition
-      contributes to exactly one output partition. No data movement.
-    - **Wide** (e.g., `groupBy`, `join`, `repartition`) — input partitions
-      contribute to multiple output partitions. Requires a **shuffle** —
-      expensive network I/O.
+    **窄依赖与宽依赖：**
+    - **窄依赖**（例如 `map`、`filter`、`select`）—— 每个输入分区
+      只贡献到一个输出分区。没有数据移动。
+    - **宽依赖**（例如 `groupBy`、`join`、`repartition`）—— 输入分区
+      贡献到多个输出分区。需要 **shuffle** —— 代价高昂的网络 I/O。
 
-    **Lazy Evaluation:**
-    Transformations build up a logical plan. Only actions trigger execution.
-    This lets Spark's Catalyst optimizer analyze the entire pipeline and
-    rewrite it before generating code — predicate pushdown, column pruning,
-    join reordering — all happen transparently.
+    **惰性求值：**
+    转换会累积成逻辑计划。只有 action 才会触发执行。
+    这让 Spark 的 Catalyst 优化器能在生成代码之前分析整个管道并
+    重写它 —— 谓词下推、列裁剪、join 重排序 —— 全部透明发生。
 
 - Class: cmd_question
   Depth: all
   Output: |
-    Create a SparkSession with the app name `'MnMCount'` and master set to
-    `'local[*]'`. Store it in a variable called `spark`.
+    创建一个 SparkSession，应用名称设为 `'MnMCount'`，master 设为
+    `'local[*]'`。将其存储在名为 `spark` 的变量中。
   CorrectAnswer: |
     from pyspark.sql import SparkSession
 
     spark = SparkSession.builder.appName("MnMCount").master("local[*]").getOrCreate()
-  Hint: "Use SparkSession.builder, chain .appName() and .master(), then call .getOrCreate()."
+  Hint: "使用 SparkSession.builder，链式调用 .appName() 和 .master()，然后调用 .getOrCreate()。"
 
 - Class: mult_question
   Depth: all
-  Output: "Which of these triggers actual computation in Spark (is an action, not a transformation)?"
+  Output: "以下哪个会在 Spark 中触发实际计算（是 action，而非 transformation）？"
   AnswerChoices: "show();select();filter();withColumn()"
   CorrectAnswer: "show()"
-  Hint: "Transformations are lazy — they build the plan. Actions trigger the plan to execute and produce results."
+  Hint: "Transformation 是惰性的 —— 它们只构建计划。Action 会触发计划执行并产生结果。"
 
 - Class: text
   Depth: all
   Output: |
-    ## Reading Data
+    ## 读取数据
 
-    Spark reads data through the **DataFrameReader** API. The most common
-    pattern:
+    Spark 通过 **DataFrameReader** API 读取数据。最常见的模式：
 
     ```python
     df = (spark.read
@@ -180,24 +173,24 @@
         .load("/path/to/file.csv"))
     ```
 
-    Or using the shorthand:
+    或者使用简写：
 
     ```python
     df = spark.read.csv("/path/to/file.csv", header=True, inferSchema=True)
     ```
 
-    This gives you a **DataFrame** — a distributed table with named, typed
-    columns. Think of it as a spreadsheet that can span thousands of machines.
+    这会得到一个 **DataFrame** —— 一张具有命名类型化列的分布式表。
+    可以把它想象成一张能横跨数千台机器的电子表格。
 
-    **Docs:** [DataFrameReader.csv](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrameReader.csv.html)
-    — all parameters for `header`, `inferSchema`, `schema`, `sep`, `nullValue`, etc.
+    **文档：** [DataFrameReader.csv](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrameReader.csv.html)
+    —— `header`、`inferSchema`、`schema`、`sep`、`nullValue` 等全部参数。
 
 - Class: text
   Depth: all
   Output: |
-    ## Aggregations and Filtering
+    ## 聚合与过滤
 
-    Once you have a DataFrame, you can analyze it with transformations:
+    一旦有了 DataFrame，就可以用转换来分析数据：
 
     ```python
     from pyspark.sql import functions as f
@@ -208,19 +201,19 @@
         .orderBy(f.col("Total").desc()))
     ```
 
-    Breaking this down:
-    - `groupBy("State", "Color")` — groups rows by unique combinations
-    - `agg(f.sum("Count").alias("Total"))` — sums the Count column, names
-      it "Total"
-    - `orderBy(f.col("Total").desc())` — sorts descending by Total
+    逐一拆解：
+    - `groupBy("State", "Color")` —— 按唯一组合对行分组
+    - `agg(f.sum("Count").alias("Total"))` —— 对 Count 列求和，
+      命名为 "Total"
+    - `orderBy(f.col("Total").desc())` —— 按 Total 降序排列
 
-    `filter()` and `where()` select rows matching a condition:
+    `filter()` 和 `where()` 选择满足条件的行：
 
     ```python
     ca_only = result.filter(f.col("State") == "CA")
     ```
 
-    **Docs:**
+    **文档：**
     [f.col](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.col.html) |
     [f.sum](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.sum.html) |
     [DataFrame.groupBy](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.groupBy.html) |
@@ -229,86 +222,85 @@
 - Class: cmd_question
   Depth: intermediate
   Output: |
-    Given a DataFrame `df` with columns `State`, `Color`, and `Count`,
-    write code to group by State and Color, sum the Count column (aliased
-    as "Total"), and order by the sum descending.
+    给定一个包含 `State`、`Color` 和 `Count` 列的 DataFrame `df`，
+    编写代码按 State 和 Color 分组，对 Count 列求和（别名为 "Total"），
+    并按总和降序排列。
   CorrectAnswer: |
     from pyspark.sql import functions as f
 
     result = (df.groupBy("State", "Color")
         .agg(f.sum("Count").alias("Total"))
         .orderBy(f.col("Total").desc()))
-  Hint: "Use groupBy with two columns, agg with f.sum() and alias(), then orderBy with desc()."
+  Hint: "groupBy 传两列，agg 用 f.sum() 和 alias()，然后 orderBy 用 desc()。"
 
 - Class: text
   Depth: intermediate
   Output: |
-    ## Reading Data: Options and Formats
+    ## 读取数据：选项与格式
 
-    The `option()` method configures how Spark reads files. For CSV:
+    `option()` 方法配置 Spark 如何读取文件。对于 CSV：
 
-    - `header` — first row contains column names (true/false)
-    - `inferSchema` — scan the file to detect types (true/false)
-    - `sep` — field delimiter (default: comma)
-    - `nullValue` — string to treat as null
+    - `header` —— 第一行是否为列名（true/false）
+    - `inferSchema` —— 是否扫描文件来检测类型（true/false）
+    - `sep` —— 字段分隔符（默认逗号）
+    - `nullValue` —— 视为 null 的字符串
 
-    Common formats beyond CSV: **JSON** (semi-structured), **Parquet**
-    (columnar, compressed — Spark's preferred format), and **ORC** (similar
-    to Parquet, popular in Hive ecosystems).
+    CSV 之外的常见格式：**JSON**（半结构化）、**Parquet**
+    （列式存储、压缩 —— Spark 首选格式）和 **ORC**（与 Parquet 类似，
+    在 Hive 生态中流行）。
 
-    We will explore all of these in depth in the next lesson on Data Sources.
+    我们将在下一节关于数据源的课程中深入探讨所有这些格式。
 
 - Class: text
   Depth: advanced
   Output: |
-    ## Why inferSchema Costs You
+    ## 为什么 inferSchema 有代价
 
-    When you set `inferSchema=true` on CSV or JSON, Spark makes **two passes**
-    over the data: one to sample rows and infer types, another to actually
-    load. For large files this doubles read time.
+    当你对 CSV 或 JSON 设置 `inferSchema=true` 时，Spark 会对数据
+    做**两遍**扫描：一遍采样行并推断类型，另一遍实际加载数据。
+    对于大文件，这会使读取时间翻倍。
 
-    In production, always define schemas explicitly with `StructType`. You
-    will learn how in the next lesson. For now, `inferSchema` is fine for
-    exploration and small datasets.
+    在生产环境中，始终用 `StructType` 显式定义 schema。你将在下一节
+    课程中学到如何做。目前，`inferSchema` 适合探索和小数据集。
 
 - Class: script
   Depth: all
   Output: |
-    ## Exercise: M&M Candy Count Analysis
+    ## 练习：M&M 糖果计数分析
 
-    Time to put it all together. Implement the `mnm_analysis` function,
-    adapted from the M&M count example in the book *Learning Spark*.
+    是时候将所有内容综合运用了。实现 `mnm_analysis` 函数，
+    改编自《Learning Spark》一书中的 M&M 计数示例。
 
-    Your function should:
-    1. Read a CSV file (with header and inferSchema) containing columns:
-       `State`, `Color`, `Count`
-    2. Group by State and Color, sum the Count column (alias as "Total")
-    3. Order by Total descending
-    4. Filter for California (`'CA'`) only
-    5. Return the California-only DataFrame
+    你的函数应该：
+    1. 读取一个 CSV 文件（带 header 和 inferSchema），包含列：
+       `State`、`Color`、`Count`
+    2. 按 State 和 Color 分组，对 Count 列求和（别名为 "Total"）
+    3. 按 Total 降序排列
+    4. 仅筛选加利福尼亚州（`'CA'`）
+    5. 返回仅包含加利福尼亚州的 DataFrame
 
-    This exercises every skill from the lesson: SparkSession, reading data,
-    groupBy, agg, orderBy, and filter.
+    这道练习综合运用了本课的所有技能：SparkSession、读取数据、
+    groupBy、agg、orderBy 和 filter。
   StarterFile: starter.py
   SolutionFile: solution.py
-  Hint: "Read with spark.read.csv() and options. groupBy two columns, agg with f.sum(), orderBy desc, then filter where State == 'CA'."
+  Hint: "用 spark.read.csv() 和选项读取。groupBy 两列，agg 用 f.sum()，orderBy desc，然后 filter State == 'CA'。"
 
 - Class: text
   Depth: all
   Output: |
-    ## Summary
+    ## 小结
 
-    In this lesson you learned:
+    本课你学到了：
 
-    - **What Spark is** — a unified analytics engine with in-memory processing
-    - **Spark architecture** — Driver coordinates, Executors do the work,
-      Cluster Manager assigns resources
-    - **SparkSession** — the entry point, created with the builder pattern
-    - **Reading data** — `spark.read.csv()` with options like header and
-      inferSchema
-    - **Aggregations** — `groupBy`, `agg`, `orderBy` for data analysis
-    - **Filtering** — `filter()` to narrow results
+    - **什么是 Spark** —— 一个具有内存计算能力的统一分析引擎
+    - **Spark 架构** —— Driver 负责协调，Executor 做实际工作，
+      Cluster Manager 分配资源
+    - **SparkSession** —— 入口点，通过建造者模式创建
+    - **读取数据** —— `spark.read.csv()` 以及 header、
+      inferSchema 等选项
+    - **聚合** —— `groupBy`、`agg`、`orderBy` 用于数据分析
+    - **过滤** —— `filter()` 缩小结果范围
 
-    You wrote your first complete Spark program. In the next lesson, you
-    will learn how DataFrames work under the hood — schemas, column
-    expressions, and the type system that makes Spark reliable at scale.
+    你编写了第一个完整的 Spark 程序。在下一课中，你将学习
+    DataFrame 在底层如何工作 —— schema、列表达式和让 Spark
+    在大规模下可靠运行的类型系统。

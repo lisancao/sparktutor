@@ -1,36 +1,36 @@
 """
-M&M Candy Count Analysis - Starter Code
+M&M 糖果数量分析 - 起始代码
 
-Implement the `mnm_analysis` function that:
-1. Reads a CSV file with columns: State, Color, Count
-2. Groups by State and Color, sums the Count column
-3. Orders by the sum in descending order
-4. Filters for California ('CA') only
-5. Returns the California-only DataFrame
+实现 `mnm_analysis` 函数：
+1. 读取包含以下列的 CSV 文件：State, Color, Count
+2. 按 State 和 Color 分组，对 Count 列求和
+3. 按求和结果降序排列
+4. 仅筛选加利福尼亚州（'CA'）的数据
+5. 返回仅包含加利福尼亚州的 DataFrame
 
-Based on the M&M count example from Learning Spark.
+本练习基于 Learning Spark 中的 M&M 糖果计数示例。
 """
 
 from pyspark.sql import SparkSession, functions as f
 
 
 def mnm_analysis(spark, file_path):
-    """Analyze M&M candy counts from CSV data."""
+    """从 CSV 数据中分析 M&M 糖果数量。"""
 
-    # TODO: Read the CSV file with header and inferSchema options
-    mnm_df = None  # Replace with spark.read...
+    # TODO: 使用 header 和 inferSchema 选项读取 CSV 文件
+    mnm_df = None  # 替换为 spark.read...
 
-    # TODO: Group by State and Color, sum the Count column,
-    #       and order by the sum descending
-    count_mnm_df = None  # Replace
+    # TODO: 按 State 和 Color 分组，对 Count 列求和，
+    #       并按求和结果降序排列
+    count_mnm_df = None  # 替换
 
-    # TODO: Filter for California ('CA') only
-    ca_count_mnm_df = None  # Replace
+    # TODO: 仅筛选加利福尼亚州（'CA'）的数据
+    ca_count_mnm_df = None  # 替换
 
     return ca_count_mnm_df
 
 
-# ---- Test harness (do not modify below this line) ----
+# ---- 测试代码（请勿修改此行以下内容）----
 if __name__ == "__main__":
     import tempfile, os
 
@@ -39,7 +39,7 @@ if __name__ == "__main__":
         .master("local[*]")
         .getOrCreate())
 
-    # Create test CSV
+    # 创建测试 CSV 文件
     tmp = tempfile.mkdtemp()
     csv_path = os.path.join(tmp, "mnm_dataset.csv")
     with open(csv_path, "w") as fh:
@@ -52,10 +52,10 @@ if __name__ == "__main__":
         fh.write("NY,Blue,900\n")
 
     df = mnm_analysis(spark, csv_path)
-    assert df is not None, "Function returned None"
+    assert df is not None, "函数返回了 None"
     states = [row.State for row in df.collect()]
-    assert all(s == "CA" for s in states), f"Expected only CA rows, got {states}"
-    assert df.count() == 2, f"Expected 2 CA color groups, got {df.count()}"
-    print("All tests passed!")
+    assert all(s == "CA" for s in states), f"预期仅包含 CA 行，实际得到 {states}"
+    assert df.count() == 2, f"预期 2 个 CA 颜色分组，实际得到 {df.count()}"
+    print("所有测试通过！")
     df.show(truncate=False)
     spark.stop()

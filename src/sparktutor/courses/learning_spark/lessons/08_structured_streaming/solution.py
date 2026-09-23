@@ -1,7 +1,7 @@
 """
-Structured Streaming - Solution
+Structured Streaming - 参考答案
 
-Streaming word count simulation in batch mode.
+以批处理模式模拟流式单词计数。
 """
 
 from pyspark.sql import SparkSession, functions as f
@@ -23,7 +23,7 @@ SCHEMA = StructType([
 
 
 def streaming_word_count(spark):
-    """Simulate a streaming word count in batch mode."""
+    """以批处理模式模拟流式单词计数。"""
 
     lines_df = spark.createDataFrame(TEXT_DATA, SCHEMA)
 
@@ -39,7 +39,7 @@ def streaming_word_count(spark):
 
 
 def streaming_windowed_count(spark):
-    """Demonstrate windowed aggregation concepts in batch mode."""
+    """以批处理模式演示窗口聚合概念。"""
     from pyspark.sql.types import TimestampType
     from datetime import datetime, timedelta
 
@@ -73,7 +73,7 @@ def streaming_windowed_count(spark):
     return windowed_counts
 
 
-# ---- Test harness ----
+# ---- 测试代码 ----
 if __name__ == "__main__":
     spark = (SparkSession.builder
         .appName("StreamingTest")
@@ -81,17 +81,17 @@ if __name__ == "__main__":
         .getOrCreate())
 
     wc = streaming_word_count(spark)
-    assert wc is not None, "streaming_word_count returned None"
+    assert wc is not None, "streaming_word_count 返回了 None"
     top_word = wc.collect()[0]
-    assert top_word["word"] in ("spark", "hello", "world"), f"Unexpected top word: {top_word}"
-    print("Word counts:")
+    assert top_word["word"] in ("spark", "hello", "world"), f"意外的排名第一的单词：{top_word}"
+    print("单词计数：")
     wc.show(truncate=False)
 
     ww = streaming_windowed_count(spark)
-    assert ww is not None, "streaming_windowed_count returned None"
-    assert "window" in ww.columns, "Missing window column"
-    print("\nWindowed word counts:")
+    assert ww is not None, "streaming_windowed_count 返回了 None"
+    assert "window" in ww.columns, "缺少 window 列"
+    print("\n窗口单词计数：")
     ww.show(truncate=False)
 
-    print("All tests passed!")
+    print("所有测试通过！")
     spark.stop()

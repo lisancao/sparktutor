@@ -1,7 +1,7 @@
 {
   "name": "sparktutor",
   "displayName": "SparkTutor",
-  "description": "Interactive Apache Spark 4.1 learning environment with Claude-powered tutoring",
+  "description": "交互式 Apache Spark 4.1 学习环境，由 AI 导师辅助教学",
   "version": "0.3.0",
   "publisher": "sparktutor",
   "engines": {
@@ -19,49 +19,53 @@
     "commands": [
       {
         "command": "sparktutor.run",
-        "title": "SparkTutor: Run Code",
+        "title": "SparkTutor：运行代码",
         "icon": "$(play)"
       },
       {
         "command": "sparktutor.submit",
-        "title": "SparkTutor: Submit Code",
+        "title": "SparkTutor：提交代码",
         "icon": "$(check)"
       },
       {
         "command": "sparktutor.next",
-        "title": "SparkTutor: Next Step",
+        "title": "SparkTutor：下一步",
         "icon": "$(arrow-right)"
       },
       {
         "command": "sparktutor.back",
-        "title": "SparkTutor: Previous Step",
+        "title": "SparkTutor：上一步",
         "icon": "$(arrow-left)"
       },
       {
         "command": "sparktutor.hint",
-        "title": "SparkTutor: Show Hint",
+        "title": "SparkTutor：显示提示",
         "icon": "$(lightbulb)"
       },
       {
         "command": "sparktutor.openLesson",
-        "title": "SparkTutor: Open Lesson"
+        "title": "SparkTutor：打开课程"
       },
       {
         "command": "sparktutor.showSolution",
-        "title": "SparkTutor: Show Solution Diff"
+        "title": "SparkTutor：查看参考答案对比"
       },
       {
         "command": "sparktutor.changeDepth",
-        "title": "SparkTutor: Change Depth Level"
+        "title": "SparkTutor：切换难度级别"
       },
       {
         "command": "sparktutor.resetLesson",
-        "title": "SparkTutor: Reset Current Lesson",
+        "title": "SparkTutor：重置当前课程",
         "icon": "$(trash)"
       },
       {
         "command": "sparktutor.changeMode",
         "title": "SparkTutor: Change Execution Mode"
+      },
+      {
+        "command": "sparktutor.checkAiConnection",
+        "title": "SparkTutor: Check AI Connection"
       }
     ],
     "keybindings": [
@@ -104,7 +108,7 @@
       "sparktutor": [
         {
           "id": "sparktutorCourses",
-          "name": "Courses"
+          "name": "课程"
         }
       ]
     },
@@ -150,13 +154,44 @@
         "sparktutor.aiProvider": {
           "type": "string",
           "default": "auto",
-          "enum": ["anthropic", "copilot", "auto"],
+          "enum": ["anthropic", "copilot", "openai-compatible", "auto"],
           "enumDescriptions": [
             "Use Anthropic API directly (requires API key)",
             "Use VS Code Copilot (GitHub Copilot subscription required)",
-            "Auto: Anthropic if API key set, else Copilot if available, else local-only"
+            "Use any OpenAI-compatible API (DeepSeek, Zhipu GLM, Alibaba Qwen, Moonshot Kimi, Volcengine Doubao, Ollama, ...)",
+            "Auto: Anthropic if API key set, else OpenAI-compatible if configured, else Copilot if available, else local-only"
           ],
           "description": "Which AI provider to use for code review and chat"
+        },
+        "sparktutor.openaiBaseUrl": {
+          "type": "string",
+          "default": "https://api.openai.com/v1",
+          "description": "Base URL of an OpenAI-compatible API. Examples: DeepSeek https://api.deepseek.com/v1, Zhipu GLM https://open.bigmodel.cn/api/paas/v4, Alibaba Qwen https://dashscope.aliyuncs.com/compatible-mode/v1, Moonshot Kimi https://api.moonshot.cn/v1, Volcengine Doubao https://ark.cn-beijing.volces.com/api/v3, Ollama http://localhost:11434/v1",
+          "order": 1
+        },
+        "sparktutor.openaiApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key for the OpenAI-compatible provider. Leave empty to use SPARKTUTOR_OPENAI_API_KEY or OPENAI_API_KEY environment variable.",
+          "order": 2
+        },
+        "sparktutor.openaiModel": {
+          "type": "string",
+          "default": "gpt-4o-mini",
+          "description": "Model name for the OpenAI-compatible provider. Examples: deepseek-chat, glm-4-plus, qwen-plus, moonshot-v1-8k, doubao-seed-1-6-250615, or an Ollama model name.",
+          "order": 3
+        },
+        "sparktutor.openaiExtraHeaders": {
+          "type": "object",
+          "default": {},
+          "description": "Extra HTTP headers (JSON object) sent to the OpenAI-compatible endpoint, e.g. for x-api-key authentication or a custom Authorization header. Overrides the default Bearer auth when present.",
+          "order": 4
+        },
+        "sparktutor.copilotModel": {
+          "type": "string",
+          "default": "",
+          "description": "Preferred GitHub Copilot model id or family (e.g. gpt-4o, claude-sonnet-4-6). Leave empty to auto-select.",
+          "order": 5
         },
         "sparktutor.executionMode": {
           "type": "string",

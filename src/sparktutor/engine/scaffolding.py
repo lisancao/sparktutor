@@ -63,10 +63,10 @@ def _beginner_scaffold(
 
     if structure.get("builder_pattern"):
         # SparkSession builder pattern
-        lines.append("# TODO: Create a SparkSession using the builder pattern")
-        lines.append("# Hint: SparkSession.builder.appName(...)")
+        lines.append("# TODO: 使用建造者模式创建 SparkSession")
+        lines.append("# 提示: SparkSession.builder.appName(...)")
         lines.append("spark = (SparkSession.builder")
-        lines.append("    # TODO: set your app name and any configs")
+        lines.append("    # TODO: 设置应用名称和配置")
         lines.append("    # .appName('...')")
         lines.append("    # .config('key', 'value')")
         lines.append("    .getOrCreate())")
@@ -74,7 +74,7 @@ def _beginner_scaffold(
         # Function definition scaffolding
         for func_name, func_args in structure["functions"]:
             lines.append(f"def {func_name}({', '.join(func_args)}):")
-            lines.append(f"    # TODO: implement {func_name}")
+            lines.append(f"    # TODO: 实现 {func_name}")
             lines.append("    pass")
             lines.append("")
     elif structure.get("has_class_def"):
@@ -84,16 +84,16 @@ def _beginner_scaffold(
             for method_name, method_args in methods:
                 args_str = ", ".join(method_args) if method_args else "self"
                 lines.append(f"    def {method_name}({args_str}):")
-                lines.append(f"        # TODO: implement {method_name}")
+                lines.append(f"        # TODO: 实现 {method_name}")
                 lines.append("        pass")
                 lines.append("")
     else:
         # Generic scaffolding — use the hint
-        lines.append(f"# Exercise: {_first_sentence(step_output)}")
+        lines.append(f"# 练习：{_first_sentence(step_output)}")
         if hint:
-            lines.append(f"# Hint: {hint}")
+            lines.append(f"# 提示：{hint}")
         lines.append("")
-        lines.append("# TODO: Write your code below")
+        lines.append("# TODO: 在下方编写代码")
         lines.append("")
 
     return "\n".join(lines) + "\n"
@@ -113,7 +113,7 @@ def _intermediate_scaffold(
     concepts = _extract_key_concepts(correct_answer)
     if concepts:
         lines.append("#")
-        lines.append("# Key APIs/concepts to use:")
+        lines.append("# 需要使用的关键 API/概念：")
         for concept in concepts:
             lines.append(f"#   - {concept}")
 
@@ -194,40 +194,40 @@ def _extract_key_concepts(code: str) -> list[str]:
 
     # Detect common patterns
     if "SparkSession.builder" in code:
-        concepts.append("SparkSession.builder (builder pattern)")
+        concepts.append("SparkSession.builder（建造者模式）")
     if ".appName(" in code:
-        concepts.append(".appName() — set application name")
+        concepts.append(".appName() — 设置应用名称")
     if ".config(" in code:
         configs = re.findall(r"\.config\(['\"]([^'\"]+)['\"]", code)
         for cfg in configs:
-            concepts.append(f".config('{cfg}', ...) — configuration key")
+            concepts.append(f".config('{cfg}', ...) — 配置项")
     if ".getOrCreate()" in code:
-        concepts.append(".getOrCreate() — create or reuse session")
+        concepts.append(".getOrCreate() — 创建或复用会话")
     if "spark.read" in code:
-        concepts.append("spark.read — batch data reader")
+        concepts.append("spark.read — 批量数据读取器")
     if "spark.readStream" in code:
-        concepts.append("spark.readStream — streaming reader")
+        concepts.append("spark.readStream — 流式读取器")
     if ".write." in code or ".save(" in code:
-        concepts.append("DataFrame.write — output writer")
+        concepts.append("DataFrame.write — 输出写入器")
     if ".groupBy(" in code:
-        concepts.append(".groupBy() — aggregation")
+        concepts.append(".groupBy() — 分组聚合")
     if ".join(" in code:
-        concepts.append(".join() — combining DataFrames")
+        concepts.append(".join() — 合并 DataFrame")
     if ".filter(" in code or ".where(" in code:
-        concepts.append(".filter() / .where() — row filtering")
+        concepts.append(".filter() / .where() — 行过滤")
     if ".withColumn(" in code:
-        concepts.append(".withColumn() — add/replace column")
+        concepts.append(".withColumn() — 添加/替换列")
     if "createDataFrame" in code:
-        concepts.append("spark.createDataFrame() — create from local data")
+        concepts.append("spark.createDataFrame() — 从本地数据创建")
     if "class " in code:
         class_names = re.findall(r"class\s+(\w+)", code)
         for name in class_names:
-            concepts.append(f"class {name} — define a class")
+            concepts.append(f"class {name} — 定义类")
     if "def " in code and "class " not in code:
         func_names = re.findall(r"def\s+(\w+)", code)
         for name in func_names:
             if name != "__init__":
-                concepts.append(f"def {name}() — define a function")
+                concepts.append(f"def {name}() — 定义函数")
 
     return concepts
 

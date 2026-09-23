@@ -1,91 +1,88 @@
 - Class: meta
-  Lesson: Machine Learning with MLlib
+  Lesson: 用 MLlib 进行机器学习
   EstimatedMinutes: 30
 
 - Class: text
   Depth: all
   Output: |
-    ## What You'll Learn
+    ## 你将学到什么
 
-    This is the final lesson of the course. You have learned to read data,
-    transform it, optimize queries, process streams, and store results in
-    reliable lakehouse tables. Now you will use these skills to build
-    **machine learning pipelines** with Spark MLlib.
+    这是本课程的最后一课。你已经学会了读取数据、转换数据、
+    优化查询、处理流数据，以及将结果存储在可靠的湖仓表中。
+    现在你将运用这些技能，用 Spark MLlib 构建**机器学习管道**。
 
-    By the end of this lesson you will be able to:
+    学完本课后，你将能够：
 
-    - Explain the Transformer/Estimator/Pipeline abstraction
-    - Prepare features with StringIndexer, OneHotEncoder, VectorAssembler
-    - Train a model, make predictions, and evaluate results
-    - Use cross-validation for hyperparameter tuning
-    - Save and load models for production use
+    - 解释 Transformer/Estimator/Pipeline 抽象
+    - 用 StringIndexer、OneHotEncoder、VectorAssembler 准备特征
+    - 训练模型、做出预测并评估结果
+    - 使用交叉验证进行超参数调优
+    - 保存和加载模型用于生产
 
 - Class: text
   Depth: beginner
   Output: |
-    Think of an ML pipeline like a factory assembly line. Raw materials
-    (data) enter one end and pass through stations that shape and prepare
-    them: one station converts categories to numbers, another assembles
-    features into a single package. The final station (the model) learns
-    patterns from the prepared data and produces predictions.
+    把 ML 管道想象成一条工厂装配线。原材料（数据）从一端进入，
+    经过各个工位被塑形和准备：一个工位将类别转换为数字，
+    另一个将特征组装成一个整体包。最后一个工位（模型）
+    从准备好的数据中学习模式并产生预测。
 
-    Spark's Pipeline API automates this entire flow so you can reproduce
-    it reliably.
+    Spark 的 Pipeline API 自动化了整个流程，让你能够可靠地复现它。
 
 - Class: text
   Depth: all
   Output: |
-    ## The ML Pipeline Abstraction
+    ## ML 管道抽象
 
-    MLlib has three core concepts:
+    MLlib 有三个核心概念：
 
-    **Transformer** — takes a DataFrame and produces a new DataFrame with
-    additional columns. Examples: model predictions, feature encoders.
-    All transformers have a `.transform(df)` method.
+    **Transformer** —— 接收一个 DataFrame，产生带有额外列的
+    新 DataFrame。示例：模型预测、特征编码器。
+    所有 transformer 都有一个 `.transform(df)` 方法。
 
-    **Estimator** — learns from data and produces a Transformer. Examples:
-    training algorithms like `LinearRegression`, feature learners like
-    `StringIndexer`. All estimators have a `.fit(df)` method.
+    **Estimator** —— 从数据中学习并产生一个 Transformer。示例：
+    训练算法如 `LinearRegression`，特征学习器如 `StringIndexer`。
+    所有 estimator 都有一个 `.fit(df)` 方法。
 
-    **Pipeline** — chains multiple Transformers and Estimators into a
-    single workflow. When you call `pipeline.fit(train_df)`, it runs each
-    stage in order, fitting estimators and passing results forward.
+    **Pipeline** —— 将多个 Transformer 和 Estimator 链接成一个
+    工作流。当你调用 `pipeline.fit(train_df)` 时，它按顺序运行每个
+    阶段，拟合 estimator 并将结果传递下去。
 
     ```
     Estimator.fit(data)  →  Transformer (trained model)
     Transformer.transform(data)  →  DataFrame with predictions
     ```
 
-    **Docs:** [MLlib Guide](https://spark.apache.org/docs/3.5.0/ml-guide.html) |
+    **文档：** [MLlib Guide](https://spark.apache.org/docs/3.5.0/ml-guide.html) |
     [ML Pipelines](https://spark.apache.org/docs/3.5.0/ml-pipeline.html)
-    — Transformer/Estimator pattern, `Pipeline.fit()`, `PipelineModel.transform()`,
-    and stage chaining.
+    —— Transformer/Estimator 模式、`Pipeline.fit()`、
+    `PipelineModel.transform()` 以及阶段链接。
 
 - Class: text
   Depth: all
   Output: |
-    ## Feature Preparation
+    ## 特征准备
 
-    ML models require numeric input vectors. Real-world data has strings,
-    categories, and multiple columns. MLlib provides stages to handle this:
+    ML 模型需要数值输入向量。真实数据有字符串、类别和多列。
+    MLlib 提供以下阶段来处理：
 
-    **StringIndexer** — converts string columns to numeric indices:
+    **StringIndexer** —— 将字符串列转换为数值索引：
     ```python
     from pyspark.ml.feature import StringIndexer
 
     indexer = StringIndexer(inputCol="city", outputCol="cityIndex")
     ```
 
-    **OneHotEncoder** — converts indices to binary vectors (for linear
-    models):
+    **OneHotEncoder** —— 将索引转换为二进制向量
+    （用于线性模型）：
     ```python
     from pyspark.ml.feature import OneHotEncoder
 
     encoder = OneHotEncoder(inputCol="cityIndex", outputCol="cityVec")
     ```
 
-    **VectorAssembler** — combines multiple feature columns into a single
-    `features` vector (required by all MLlib models):
+    **VectorAssembler** —— 将多个特征列合并为单个
+    `features` 向量（所有 MLlib 模型都需要）：
     ```python
     from pyspark.ml.feature import VectorAssembler
 
@@ -94,36 +91,36 @@
         outputCol="features")
     ```
 
-    **Docs:**
+    **文档：**
     [VectorAssembler](https://spark.apache.org/docs/3.5.0/api/python/reference/api/pyspark.ml.feature.VectorAssembler.html) |
     [StringIndexer](https://spark.apache.org/docs/3.5.0/api/python/reference/api/pyspark.ml.feature.StringIndexer.html) |
     [OneHotEncoder](https://spark.apache.org/docs/3.5.0/api/python/reference/api/pyspark.ml.feature.OneHotEncoder.html)
-    — `inputCol`, `outputCol`, `inputCols`, `handleInvalid` parameters.
+    —— `inputCol`、`outputCol`、`inputCols`、`handleInvalid` 参数。
 
 - Class: mult_question
   Depth: all
-  Output: "What does VectorAssembler do in an MLlib pipeline?"
-  AnswerChoices: "Combines multiple feature columns into a single vector column;Splits data into train and test sets;Normalizes feature values to zero mean;Removes null values from the DataFrame"
-  CorrectAnswer: "Combines multiple feature columns into a single vector column"
-  Hint: "MLlib models need one vector column as input. VectorAssembler creates it from multiple columns."
+  Output: "VectorAssembler 在 MLlib 管道中做什么？"
+  AnswerChoices: "将多个特征列合并为单个向量列;将数据拆分为训练集和测试集;将特征值标准化为零均值;从 DataFrame 中移除 null 值"
+  CorrectAnswer: "将多个特征列合并为单个向量列"
+  Hint: "MLlib 模型需要一个向量列作为输入。VectorAssembler 从多个列创建它。"
 
 - Class: cmd_question
   Depth: all
   Output: |
-    Create a VectorAssembler that combines columns `'age'`, `'income'`,
-    and `'score'` into a single column called `'features'`.
+    创建一个 VectorAssembler，将列 `'age'`、`'income'` 和 `'score'`
+    合并为一个名为 `'features'` 的列。
   CorrectAnswer: |
     from pyspark.ml.feature import VectorAssembler
 
     assembler = VectorAssembler(inputCols=["age", "income", "score"], outputCol="features")
-  Hint: "Use VectorAssembler with inputCols as a list and outputCol as 'features'."
+  Hint: "使用 VectorAssembler，inputCols 传列表，outputCol 设为 'features'。"
 
 - Class: text
   Depth: all
   Output: |
-    ## Building a Pipeline
+    ## 构建管道
 
-    Chain all preparation stages and the model into a Pipeline:
+    将所有准备阶段和模型链接成一个 Pipeline：
 
     ```python
     from pyspark.ml import Pipeline
@@ -150,35 +147,34 @@
     predictions = model.transform(test_df)
     ```
 
-    The Pipeline ensures that the same preprocessing happens during both
-    training and prediction — a common source of bugs when done manually.
+    Pipeline 确保训练和预测期间执行相同的预处理 ——
+    手动操作时这是常见的 bug 来源。
 
 - Class: text
   Depth: intermediate
   Output: |
-    ## Regression Models
+    ## 回归模型
 
-    MLlib includes several regression algorithms. All share the same
-    API — set `labelCol` and `featuresCol`, call `fit()`, then
-    `transform()`:
+    MLlib 包含多种回归算法。它们共享相同的 API ——
+    设置 `labelCol` 和 `featuresCol`，调用 `fit()`，
+    然后 `transform()`：
 
-    - **LinearRegression** — simple, interpretable, good baseline
-    - **DecisionTreeRegressor** — handles non-linear relationships,
-      interpretable
-    - **RandomForestRegressor** — ensemble of trees, more robust, less
-      overfitting
-    - **GBTRegressor** — gradient-boosted trees, often best accuracy
-      but slower to train
+    - **LinearRegression** —— 简单、可解释、良好的基线
+    - **DecisionTreeRegressor** —— 处理非线性关系，可解释
+    - **RandomForestRegressor** —— 树的集成，更鲁棒，
+      过拟合更少
+    - **GBTRegressor** —— 梯度提升树，通常准确率最高
+      但训练更慢
 
-    For classification, swap to `LogisticRegression`,
-    `RandomForestClassifier`, etc. Same API, same Pipeline.
+    对于分类，换成 `LogisticRegression`、`RandomForestClassifier` 等。
+    相同的 API，相同的 Pipeline。
 
 - Class: text
   Depth: all
   Output: |
-    ## Evaluating Models
+    ## 评估模型
 
-    After generating predictions, measure how good they are:
+    生成预测后，衡量它们有多好：
 
     ```python
     from pyspark.ml.evaluation import RegressionEvaluator
@@ -192,40 +188,37 @@
     mae = evaluator.setMetricName("mae").evaluate(predictions)
     ```
 
-    - **RMSE** (Root Mean Squared Error) — penalizes large errors more;
-      lower is better
-    - **R2** (Coefficient of Determination) — how much variance the model
-      explains; closer to 1.0 is better
-    - **MAE** (Mean Absolute Error) — average error magnitude; lower is
-      better
+    - **RMSE**（均方根误差）—— 对大误差惩罚更多；越低越好
+    - **R2**（决定系数）—— 模型解释了多少方差；越接近 1.0 越好
+    - **MAE**（平均绝对误差）—— 平均误差幅度；越低越好
 
 - Class: mult_question
   Depth: intermediate
-  Output: "Which evaluation metric ranges from 0 to 1 and indicates how well the model explains variance in the data?"
-  AnswerChoices: "R2 (coefficient of determination);RMSE (root mean squared error);MAE (mean absolute error);MSE (mean squared error)"
-  CorrectAnswer: "R2 (coefficient of determination)"
-  Hint: "This metric measures the proportion of variance explained by the model."
+  Output: "哪个评估指标范围为 0 到 1，表示模型解释数据方差的程度？"
+  AnswerChoices: "R2（决定系数）;RMSE（均方根误差）;MAE（平均绝对误差）;MSE（均方误差）"
+  CorrectAnswer: "R2（决定系数）"
+  Hint: "这个指标衡量模型解释的方差比例。"
 
 - Class: cmd_question
   Depth: intermediate
   Output: |
-    Create a RegressionEvaluator for a label column `'price'` and
-    prediction column `'prediction'`, then evaluate RMSE on a DataFrame
-    called `predictions`.
+    为标签列 `'price'` 和预测列 `'prediction'` 创建一个
+    RegressionEvaluator，然后在名为 `predictions` 的 DataFrame 上
+    评估 RMSE。
   CorrectAnswer: |
     from pyspark.ml.evaluation import RegressionEvaluator
 
     evaluator = RegressionEvaluator(labelCol="price", predictionCol="prediction")
     rmse = evaluator.setMetricName("rmse").evaluate(predictions)
-  Hint: "Create RegressionEvaluator with labelCol and predictionCol, then .setMetricName('rmse').evaluate()."
+  Hint: "用 labelCol 和 predictionCol 创建 RegressionEvaluator，然后 .setMetricName('rmse').evaluate()。"
 
 - Class: text
   Depth: advanced
   Output: |
-    ## Cross-Validation and Hyperparameter Tuning
+    ## 交叉验证与超参数调优
 
-    Different hyperparameters (number of trees, regularization strength)
-    produce different model quality. `CrossValidator` automates the search:
+    不同的超参数（树的数量、正则化强度）产生不同的模型质量。
+    `CrossValidator` 自动化搜索过程：
 
     ```python
     from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
@@ -245,17 +238,16 @@
     best_model = cv_model.bestModel
     ```
 
-    CrossValidator trains the pipeline with every parameter combination
-    across k folds. With 9 combinations and 3 folds, it trains 27 models.
-    This is computationally expensive but finds better hyperparameters
-    than guessing.
+    CrossValidator 用每组参数组合在 k 折上训练管道。
+    9 种组合 × 3 折，共训练 27 个模型。这计算量大，
+    但比猜测找到更好的超参数。
 
 - Class: text
   Depth: intermediate
   Output: |
-    ## Saving and Loading Models
+    ## 保存与加载模型
 
-    Trained models are serializable — save them for later use:
+    训练好的模型是可序列化的 —— 保存以备后用：
 
     ```python
     # Save
@@ -267,16 +259,15 @@
     predictions = loaded_model.transform(new_data)
     ```
 
-    The saved model includes all pipeline stages (indexers, assemblers,
-    trained model), so loading it gives you the complete prediction
-    pipeline.
+    保存的模型包含所有管道阶段（索引器、组装器、训练好的模型），
+    因此加载它就能得到完整的预测管道。
 
 - Class: text
   Depth: advanced
   Output: |
-    ## MLflow Integration
+    ## MLflow 集成
 
-    For production ML, track experiments with MLflow:
+    对于生产 ML，用 MLflow 跟踪实验：
 
     ```python
     import mlflow
@@ -291,52 +282,48 @@
         mlflow.spark.log_model(model, "model")
     ```
 
-    MLflow provides a UI to compare runs, a model registry for deployment,
-    and reproducible experiment tracking. It integrates natively with
-    Spark MLlib pipelines.
+    MLflow 提供 UI 来对比运行、用于部署的模型注册表，
+    以及可复现的实验跟踪。它与 Spark MLlib 管道原生集成。
 
 - Class: script
   Depth: all
   Output: |
-    ## Exercise: Build a Prediction Pipeline
+    ## 练习：构建预测管道
 
-    Implement `build_pipeline(spark)` that creates a complete ML workflow:
+    实现 `build_pipeline(spark)`，创建一个完整的 ML 工作流：
 
-    1. Create a sample housing dataset with categorical and numeric features
-    2. Split into train/test sets (80/20)
-    3. Build a Pipeline with StringIndexer, VectorAssembler, and
-       RandomForestRegressor
-    4. Train the pipeline on training data
-    5. Evaluate RMSE and R2 on test predictions
-    6. Return a dict with the model, predictions, and metrics
+    1. 创建一个包含类别和数值特征的示例房价数据集
+    2. 拆分为训练集/测试集（80/20）
+    3. 用 StringIndexer、VectorAssembler 和
+       RandomForestRegressor 构建 Pipeline
+    4. 在训练数据上训练管道
+    5. 在测试预测上评估 RMSE 和 R2
+    6. 返回一个包含模型、预测和指标的字典
 
-    This exercise ties together everything from the lesson: feature
-    preparation, pipeline construction, training, and evaluation.
+    本练习将本课的所有内容串联起来：特征准备、管道构建、
+    训练和评估。
   StarterFile: starter.py
   SolutionFile: solution.py
-  Hint: "Use StringIndexer for the categorical column, VectorAssembler to combine all features, RandomForestRegressor as the model, and RegressionEvaluator for metrics."
+  Hint: "类别列用 StringIndexer，VectorAssembler 合并所有特征，模型用 RandomForestRegressor，指标用 RegressionEvaluator。"
 
 - Class: text
   Depth: all
   Output: |
-    ## Course Summary
+    ## 课程总结
 
-    Congratulations — you have completed the Learning Spark course! Here
-    is everything you learned:
+    恭喜 —— 你已完成 Learning Spark 课程！以下是你学到的全部内容：
 
-    1. **Getting Started** — SparkSession, architecture, your first analysis
-    2. **DataFrames & Schemas** — immutable tables, StructType, column
-       expressions
-    3. **Data Sources** — CSV, JSON, Parquet, ORC, SQL views
-    4. **Complex Types & HOFs** — arrays, maps, transform, filter, aggregate
-    5. **Spark SQL** — Catalyst optimizer, execution plans, UDFs
-    6. **Optimization** — caching, partitioning, configuration tuning
-    7. **Joins** — broadcast, sort-merge, bucketing, skew handling
-    8. **Streaming** — sources, sinks, watermarks, checkpointing
-    9. **Data Lakes** — ACID transactions, schema evolution, time travel
-    10. **MLlib** — pipelines, feature prep, training, evaluation
+    1. **入门** —— SparkSession、架构、你的第一个分析
+    2. **DataFrame 与 Schema** —— 不可变表、StructType、列表达式
+    3. **数据源** —— CSV、JSON、Parquet、ORC、SQL 视图
+    4. **复杂类型与高阶函数** —— 数组、map、transform、filter、aggregate
+    5. **Spark SQL** —— Catalyst 优化器、执行计划、UDF
+    6. **性能优化** —— 缓存、分区、配置调优
+    7. **Join** —— broadcast、sort-merge、bucketing、倾斜处理
+    8. **流处理** —— 数据源、数据汇、水位线、checkpoint
+    9. **数据湖** —— ACID 事务、schema 演进、时间旅行
+    10. **MLlib** —— 管道、特征准备、训练、评估
 
-    You are now equipped to build complete data applications with Apache
-    Spark — from ingestion through transformation, optimization, and
-    machine learning. The Spark Declarative Pipelines course is a natural
-    next step to apply these skills to production-grade data engineering.
+    你现在已具备用 Apache Spark 构建完整数据应用的能力 ——
+    从摄入到转换、优化和机器学习。Spark Declarative Pipelines
+    课程是将这些技能应用于生产级数据工程的自然下一步。

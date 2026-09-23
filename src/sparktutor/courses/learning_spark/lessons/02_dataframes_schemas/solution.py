@@ -1,8 +1,7 @@
 """
-DataFrames and Schemas - Solution
+DataFrame 与 Schema - 参考答案
 
-Complete DataFrame creation with explicit schema, complex types,
-and computed columns.
+完整的 DataFrame 创建：显式 schema、复杂类型、计算列。
 """
 
 from pyspark.sql import SparkSession, functions as f
@@ -22,7 +21,7 @@ DATA = [
 
 
 def build_blogs_df(spark):
-    """Create a blogs DataFrame with schema, data, and computed column."""
+    """创建包含 schema、数据和计算列的博客 DataFrame。"""
 
     schema = StructType([
         StructField("Id", IntegerType(), False),
@@ -41,7 +40,7 @@ def build_blogs_df(spark):
     return result
 
 
-# ---- Test harness ----
+# ---- 测试代码 ----
 if __name__ == "__main__":
     spark = (SparkSession.builder
         .appName("BlogsTest")
@@ -49,13 +48,13 @@ if __name__ == "__main__":
         .getOrCreate())
 
     df = build_blogs_df(spark)
-    assert df is not None, "Function returned None"
-    assert df.count() == 6, f"Expected 6 rows, got {df.count()}"
-    assert "Big_Hitter" in df.columns, "Missing Big_Hitter column"
-    assert "Campaigns" in df.columns, "Missing Campaigns column"
+    assert df is not None, "函数返回了 None"
+    assert df.count() == 6, f"预期 6 行，实际得到 {df.count()}"
+    assert "Big_Hitter" in df.columns, "缺少 Big_Hitter 列"
+    assert "Campaigns" in df.columns, "缺少 Campaigns 列"
 
     big_hitters = df.filter(f.col("Big_Hitter") == True).count()
-    assert big_hitters == 3, f"Expected 3 big hitters, got {big_hitters}"
-    print("All tests passed!")
+    assert big_hitters == 3, f"预期 3 个高访问量博客，实际得到 {big_hitters}"
+    print("所有测试通过！")
     df.show(truncate=False)
     spark.stop()

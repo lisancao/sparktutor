@@ -1,7 +1,7 @@
 """
-Join Strategies - Solution
+Join 策略 - 参考答案
 
-Compare broadcast join vs sort merge join strategies.
+比较广播 join 与排序合并 join 策略。
 """
 
 from pyspark.sql import SparkSession, functions as f
@@ -39,7 +39,7 @@ ORDER_SCHEMA = StructType([
 
 
 def join_comparison(spark):
-    """Compare broadcast join vs sort merge join."""
+    """比较广播 join 与排序合并 join。"""
 
     users_df = spark.createDataFrame(generate_users(), USER_SCHEMA)
     orders_df = spark.createDataFrame(generate_orders(), ORDER_SCHEMA)
@@ -63,7 +63,7 @@ def join_comparison(spark):
     }
 
 
-# ---- Test harness ----
+# ---- 测试代码 ----
 if __name__ == "__main__":
     spark = (SparkSession.builder
         .appName("JoinTest")
@@ -71,15 +71,15 @@ if __name__ == "__main__":
         .getOrCreate())
 
     result = join_comparison(spark)
-    assert result is not None, "Function returned None"
+    assert result is not None, "函数返回了 None"
     bc_count = result["broadcast_result"].count()
     smj_count = result["smj_result"].count()
-    assert bc_count == smj_count, f"Counts differ: broadcast={bc_count}, smj={smj_count}"
-    assert bc_count == 5000, f"Expected 5000 rows, got {bc_count}"
+    assert bc_count == smj_count, f"行数不同：broadcast={bc_count}, smj={smj_count}"
+    assert bc_count == 5000, f"预期 5000 行，实际得到 {bc_count}"
     assert "Broadcast" in result["broadcast_plan"] or "broadcast" in result["broadcast_plan"].lower(), \
-        "Broadcast plan should mention broadcast"
-    print(f"Both joins produced {bc_count} rows")
-    print(f"\nBroadcast plan contains 'broadcast': {'broadcast' in result['broadcast_plan'].lower()}")
-    print(f"SMJ plan contains 'SortMerge' or 'sort': {'sort' in result['smj_plan'].lower()}")
-    print("All tests passed!")
+        "广播计划应提及 broadcast"
+    print(f"两种 join 均产生 {bc_count} 行")
+    print(f"\n广播计划包含 'broadcast'：{'broadcast' in result['broadcast_plan'].lower()}")
+    print(f"SMJ 计划包含 'SortMerge' 或 'sort'：{'sort' in result['smj_plan'].lower()}")
+    print("所有测试通过！")
     spark.stop()

@@ -1,4 +1,4 @@
-"""YAML lesson parser for SparkTutor."""
+﻿"""YAML lesson parser for SparkTutor."""
 
 from __future__ import annotations
 
@@ -80,7 +80,7 @@ def _parse_validation(raw) -> list[ValidationRule]:
 def load_course(course_dir: Path) -> CourseMeta:
     """Load course.yaml from a course directory."""
     course_file = course_dir / "course.yaml"
-    with open(course_file) as f:
+    with open(course_file, encoding="utf-8") as f:
         data = yaml.safe_load(f)
 
     c = data["course"]
@@ -98,7 +98,7 @@ def load_course(course_dir: Path) -> CourseMeta:
 def load_lesson(lesson_dir: Path) -> Lesson:
     """Load a lesson.yaml from a lesson directory."""
     lesson_file = lesson_dir / "lesson.yaml"
-    with open(lesson_file) as f:
+    with open(lesson_file, encoding="utf-8") as f:
         raw_steps = yaml.safe_load(f)
 
     title = ""
