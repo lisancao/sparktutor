@@ -1,13 +1,16 @@
 """
 Optimization & Tuning - Solution
 
-Demonstrate caching and partition optimization.
+Caching a reused aggregation, reading an AQE final plan, and coalescing
+output, all with Connect-safe APIs.
 """
 
 from pyspark.sql import SparkSession, functions as f
 from pyspark.sql.types import (
     StructType, StructField, StringType, IntegerType, DoubleType
 )
+import contextlib
+import io
 import random
 
 
@@ -31,8 +34,21 @@ SCHEMA = StructType([
 ])
 
 
+def plan_text(df, mode="simple"):
+    """Return what df.explain(mode) prints (works in Classic and Connect)."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        df.explain(mode=mode)
+    return buf.getvalue()
+
+
+def partition_count(df):
+    """Count non-empty partitions without the RDD API (Connect-safe)."""
+    return df.select(f.spark_partition_id()).distinct().count()
+
+
 def optimize_pipeline(spark):
-    """Demonstrate caching and partition optimization."""
+    """Demonstrate caching, partition optimization, and AQE."""
 
     spark.conf.set("spark.sql.shuffle.partitions", "8")
 
@@ -48,6 +64,8 @@ def optimize_pipeline(spark):
     agg_df.cache()
     agg_df.count()  # trigger materialization
 
+    storage_level = str(agg_df.storageLevel)
+
     top_dept = (agg_df
         .groupBy("department")
         .agg(f.sum("total_revenue").alias("dept_revenue"))
@@ -58,7 +76,8 @@ def optimize_pipeline(spark):
         .agg(f.avg("avg_revenue").alias("region_avg_revenue"))
         .orderBy(f.col("region_avg_revenue").desc()))
 
-    partitions_before = agg_df.rdd.getNumPartitions()
+    top_region.collect()  # run it so AQE finalizes the plan
+    region_plan = plan_text(top_region)
 
     agg_df.unpersist()
 
@@ -67,7 +86,8 @@ def optimize_pipeline(spark):
     return {
         "top_dept": top_dept_single,
         "top_region": top_region,
-        "agg_partitions": partitions_before,
+        "storage_level": storage_level,
+        "region_plan": region_plan,
     }
 
 
@@ -80,15 +100,26 @@ if __name__ == "__main__":
 
     result = optimize_pipeline(spark)
     assert result is not None, "Function returned None"
-    assert result["top_dept"] is not None, "top_dept is None"
-    assert result["top_region"] is not None, "top_region is None"
-    assert result["top_dept"].count() > 0, "top_dept is empty"
-    assert result["top_region"].count() > 0, "top_region is empty"
-    assert result["top_dept"].rdd.getNumPartitions() == 1, "top_dept should be 1 partition"
-    print(f"Aggregation partitions: {result['agg_partitions']}")
+    for key in ["top_dept", "top_region", "storage_level", "region_plan"]:
+        assert result.get(key) is not None, f"{key} is missing or None"
+
+    assert spark.conf.get("spark.sql.shuffle.partitions") == "8", "Shuffle partitions should be 8"
+    assert result["top_dept"].count() == 5, "Expected 5 departments"
+    assert result["top_region"].count() == 4, "Expected 4 regions"
+    assert partition_count(result["top_dept"]) == 1, "top_dept should be coalesced to 1 partition"
+    assert "Memory" in result["storage_level"], \
+        f"agg_df should have been cached in memory, got {result['storage_level']}"
+    assert "isFinalPlan=true" in result["region_plan"], \
+        "Capture the region plan after running the query so AQE has finalized it"
+    assert "InMemoryTableScan" in result["region_plan"], \
+        "The region analysis should read from the cached aggregation"
+
+    print(f"Storage level while cached: {result['storage_level']}")
     print("Top departments by total revenue:")
     result["top_dept"].show()
     print("Top regions by avg revenue:")
     result["top_region"].show()
+    print("Region plan after execution (AQE final plan):")
+    print(result["region_plan"])
     print("All tests passed!")
     spark.stop()

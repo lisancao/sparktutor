@@ -1,0 +1,181 @@
+- Class: meta
+  Lesson: "Capstone: Raw Files to Gold"
+  EstimatedMinutes: 45
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Build
+
+    One pipeline file that takes the raw retail files to business-ready
+    tables, plus an outbound feed:
+
+    ```
+    data/orders/*.json ──> bronze_orders ──> orders_typed ──> orders_checked ──┬─> silver_orders ──> billable_orders ──┬─> gold_daily_revenue
+                                 │                                 ▲            └─> quarantine_orders                   ├─> gold_customer_value
+    data/customers.csv ──> bronze_customers ──> silver_customers ──┘                                                    └─> gold_revenue_<category>
+    data/products.csv  ──────────────────────> silver_products ─────────────────────────────────────────────────────────────┘
+                                 │
+                                 └──> shipped_orders_to_feed ──> shipping_feed (JSON sink)
+    ```
+
+    You have written every piece already. The new parts are the sink and
+    the reconciliation checks, which test the layers *against each other*
+    instead of against fixed numbers alone.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Sinks: Writing Outside the Pipeline
+
+    Datasets are tables the pipeline owns. A *sink* is an external
+    destination: a Kafka topic for a downstream service, files for a
+    partner, an event hub. Sinks are Python-only and streaming-only: you
+    declare one, then attach append flows to it.
+
+    ```python
+    dp.create_sink(
+        name="shipping_feed",
+        format="json",                                   # any streaming sink format
+        options={"path": "exports/shipping_feed"},
+    )
+
+    @dp.append_flow(target="shipping_feed")
+    def shipped_orders_to_feed():
+        return (spark.readStream.table("bronze_orders")
+                .where("status = 'shipped'")
+                .select("order_id", "customer_id", "product_id", "quantity", "order_ts"))
+    ```
+
+    For Kafka, use `format="kafka"` with `kafka.bootstrap.servers` and
+    `topic` options, and produce `key`/`value` columns (for example
+    `to_json(struct("*"))` as the value).
+
+    A full refresh resets a sink flow's checkpoint but cannot un-send what
+    was already delivered: downstream consumers must tolerate replays.
+
+- Class: mult_question
+  Depth: all
+  Output: "Which statement about sinks in Spark 4.2 SDP is true?"
+  AnswerChoices: "They are written by streaming append flows and are Python-only;They can be the target of a materialized view;A full refresh deletes data already sent to the sink;They are defined with CREATE SINK in SQL"
+  CorrectAnswer: "They are written by streaming append flows and are Python-only"
+  Hint: "create_sink plus @dp.append_flow; there is no SQL form."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Reconciliation Checks
+
+    Fixed-number checks ("silver has 7 rows") only work on known data.
+    Production pipelines check invariants between layers, which hold for
+    any input:
+
+    - **Conservation**: every unique bronze order lands in exactly one of
+      silver or quarantine.
+    - **Reconciliation**: every gold table that sums revenue agrees with
+      the billable silver total.
+
+    ```python
+    @dp.materialized_view
+    def check_gold_reconciles_with_silver():
+        billable = spark.table("silver_orders").where("status <> 'cancelled'").agg(F.sum("line_total").alias("s"))
+        daily = spark.table("gold_daily_revenue").agg(F.sum("revenue").alias("d"))
+        return billable.crossJoin(daily).select(
+            F.assert_true(F.col("s") == F.col("d"), "gold_daily_revenue does not reconcile").alias("ok"))
+    ```
+
+    If someone later "fixes" one gold table to include cancelled orders,
+    this check fails the run before anybody reads a wrong dashboard.
+
+- Class: mult_question
+  Depth: all
+  Output: "gold_customer_value accidentally includes cancelled orders. Which check catches it on any data, not just this sample?"
+  AnswerChoices: "Gold revenue must reconcile with billable silver revenue;silver_orders must have 7 rows;bronze_orders must have 11 rows;quarantine_orders must have 3 rows"
+  CorrectAnswer: "Gold revenue must reconcile with billable silver revenue"
+  Hint: "Only one of these compares two layers."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Running It for Real
+
+    Outside the tutor, this file is `transformations/retail.py` in a
+    project:
+
+    ```bash
+    spark-pipelines init --name retail
+    # replace the example files with retail.py and copy data/ next to the spec
+    cd retail
+    spark-pipelines dry-run
+    spark-pipelines run
+    spark-pipelines run                         # second run: no new files, bronze appends nothing
+    spark-pipelines run --full-refresh-all      # rebuild everything from the raw files
+    ```
+
+    Add a new file to `data/orders/` between runs and watch only that file
+    flow through bronze, while every materialized view recomputes.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Taking It to Production
+
+    - **Catalog**: set `catalog`/`database` in the spec and configure an
+      Iceberg catalog in `configuration`, so tables are transactional and
+      visible to other engines. This is also what lets lesson 7's Auto CDC
+      flows run.
+    - **Cluster**: `spark-pipelines --master spark://host:7077 run` or
+      `--remote sc://host:15002`; spark-submit options before `run`.
+    - **Scheduling**: a pipeline run is a batch job with available-now
+      streaming semantics, so any scheduler (Airflow, cron, Kubernetes
+      CronJob) can trigger `spark-pipelines run`.
+    - **CI**: run `spark-pipelines dry-run` on every change; it catches
+      broken references, unresolved columns and cycles in seconds.
+    - **Known 4.2.0 gaps** covered in this course: several append flows
+      into one parquet table race on the file sink's commit log, and
+      `dropDuplicates([...])` / `.drop(...)` on pipeline datasets fail at
+      registration.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Capstone Exercise
+
+    Build the full pipeline described at the top of this lesson in one
+    file. The checks verify:
+
+    - bronze has every raw row (11) and 10 unique orders,
+    - every unique order lands in exactly one of silver (7) or
+      quarantine (3),
+    - gold daily revenue and customer value both reconcile with billable
+      silver revenue (347.43).
+
+    Use the earlier lessons as reference if you need to, but try the
+    advanced depth first: the objective alone.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  RequiresExecution: true
+  Validation:
+    - "ast_contains(call='create_sink')"
+    - execution
+  Hint: "Build it layer by layer and submit after each layer; the checks name the dataset that is wrong."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Course Complete
+
+    You have built, with the real Spark 4.2 API:
+
+    - materialized views, streaming tables, temporary views and multi-flow
+      targets,
+    - a pipeline project validated with `dry-run` and run with
+      `spark-pipelines run`,
+    - bronze ingestion with lineage, silver typing, deduplication and
+      quarantine, gold aggregates with windows and generated datasets,
+    - an Auto CDC flow (SCD Type 1) and an outbound sink,
+    - data quality checks that reconcile layers with each other.
+
+    The last lesson is optional: it rebuilds a toy version of the SDP
+    scheduler from scratch, so you can see what the framework does with
+    the graph you declare.

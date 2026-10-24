@@ -1,0 +1,183 @@
+- Class: meta
+  Lesson: "Gold: Aggregates for the Business"
+  EstimatedMinutes: 30
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    - Shaping gold tables around the questions people actually ask
+    - Aggregations, running totals, ranks and shares with window functions
+    - Generating several datasets from one definition with a `for` loop
+    - Where business rules (like "cancelled orders do not count") belong
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Gold Is Shaped by Questions
+
+    Silver is shaped by the source: one row per order. Gold is shaped by a
+    question: "revenue per day", "who are our best customers", "how is each
+    category doing". Each gold table should be small, named after the
+    question, and cheap to read from a dashboard.
+
+    Business rules live here too. Silver keeps cancelled orders because
+    they are real, valid events; gold decides they do not count as revenue.
+    Putting that rule in one shared temporary view keeps every gold table
+    consistent:
+
+    ```python
+    @dp.temporary_view
+    def billable_orders():
+        return spark.table("silver_orders").where("status <> 'cancelled'")
+    ```
+
+- Class: mult_question
+  Depth: all
+  Output: "Why does the 'cancelled orders do not count' rule live in gold rather than silver?"
+  AnswerChoices: "Cancelled orders are valid events; excluding them is a business decision about revenue;Silver cannot filter rows;Gold tables are streaming tables;Cancelled orders are malformed"
+  CorrectAnswer: "Cancelled orders are valid events; excluding them is a business decision about revenue"
+  Hint: "Silver promises clean, valid data, not business interpretations."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Aggregations and Windows
+
+    `groupBy().agg()` collapses rows. Window functions compute over a set
+    of rows *without* collapsing them, which is how you add ranks, running
+    totals and shares to an aggregate:
+
+    ```python
+    from pyspark.sql.window import Window
+
+    running = Window.orderBy("order_date").rowsBetween(Window.unboundedPreceding, Window.currentRow)
+    by_revenue = Window.orderBy(F.col("revenue").desc())
+    everyone = Window.partitionBy()
+
+    daily.withColumn("cumulative_revenue", F.sum("revenue").over(running))
+    customers.withColumn("revenue_rank", F.dense_rank().over(by_revenue))
+    customers.withColumn("revenue_share", F.col("revenue") / F.sum("revenue").over(everyone))
+    ```
+
+    `rank` leaves gaps after ties (1, 1, 3); `dense_rank` does not
+    (1, 1, 2); `row_number` breaks ties arbitrarily (1, 2, 3).
+
+- Class: mult_question
+  Depth: all
+  Output: "Two customers tie for first place. Which function ranks the next customer as 2?"
+  AnswerChoices: "dense_rank;rank;row_number;percent_rank"
+  CorrectAnswer: "dense_rank"
+  Hint: "rank would give 3 after a two-way tie."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Windows Without partitionBy
+
+    `Window.orderBy(...)` and `Window.partitionBy()` with no columns put
+    every row in a single partition on one task. That is fine for a gold
+    table with a few thousand rows (and Spark warns you about it in the
+    log), and a real problem on a fact table with billions. Rank and share
+    *after* aggregating, never on the raw fact rows.
+
+    Since Spark 4.2 you can also write the "top N per group" pattern in SQL
+    with `QUALIFY`, which filters on a window function the way `HAVING`
+    filters on an aggregate:
+
+    ```sql
+    CREATE MATERIALIZED VIEW top_customer_per_city AS
+    SELECT city, customer_id, revenue
+    FROM gold_customer_value
+    QUALIFY row_number() OVER (PARTITION BY city ORDER BY revenue DESC) = 1;
+    ```
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Generating Datasets in a Loop
+
+    A pipeline file is Python, so a loop can define several datasets:
+
+    ```python
+    CATEGORIES = ["hardware", "merch"]
+
+    for category in CATEGORIES:
+        @dp.materialized_view(name=f"gold_revenue_{category}")
+        def revenue_for_category(category: str = category) -> DataFrame:
+            return (spark.table("billable_orders")
+                    .join(spark.table("silver_products").where(F.col("category") == category), "product_id")
+                    .groupBy("product_id").agg(F.sum("line_total").alias("revenue")))
+    ```
+
+    Two details matter:
+
+    - `name=` gives each dataset a distinct name; the function name is the
+      same every iteration.
+    - `category: str = category` binds the *current* value. Without the
+      default argument every function would see the loop variable's final
+      value, because SDP calls the functions after the loop has finished.
+
+- Class: mult_question
+  Depth: all
+  Output: "Without `category: str = category`, what would every gold_revenue_<category> table contain?"
+  AnswerChoices: "The last category in the list, because the functions run after the loop ends;Each table's own category;Nothing, the pipeline fails to register;All categories combined"
+  CorrectAnswer: "The last category in the list, because the functions run after the loop ends"
+  Hint: "Python closures capture variables, not values."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Rules for Loop-Generated Datasets
+
+    The SDP guide warns that the list driving the loop must only ever grow.
+    Removing a value removes the dataset from the graph, and you will not
+    get its data back. Generating the list from a query at registration
+    time (`collect()` at module scope) works, but it runs on every
+    registration and couples your graph's shape to data; prefer a static
+    list or configuration.
+
+    Materialized views are recomputed each run. When a gold table becomes
+    expensive, the options are to partition or cluster it
+    (`partition_cols` / `cluster_by`), to pre-aggregate in a streaming
+    table, or, in Spark 4.2, to define the aggregate once as a metric view
+    (`CREATE VIEW ... WITH METRICS`) that dashboards query by dimension.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Gold Tables
+
+    The starter contains bronze and silver (from lessons 4 and 5) and the
+    `billable_orders` view. Add:
+
+    1. `gold_daily_revenue`: per `order_date` (`to_date(order_ts)`):
+       `revenue`, `order_count`, `avg_order_value` and `cumulative_revenue`.
+    2. `gold_customer_value`: per `customer_id` and `city`: `revenue`,
+       `order_count`, `revenue_rank` (dense rank, 1 = highest) and
+       `revenue_share` (fraction of all revenue).
+    3. One `gold_revenue_<category>` materialized view per entry in
+       `CATEGORIES`, generated with a loop: `product_id`, `product_name`
+       and `revenue`.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  RequiresExecution: true
+  Validation:
+    - execution
+  Hint: "Group billable_orders, then add window columns. For the loop, use @dp.materialized_view(name=f'gold_revenue_{category}') and a default argument."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - Gold tables answer specific questions and carry the business rules,
+      ideally through one shared view.
+    - Windows add ranks, running totals and shares without collapsing rows;
+      apply them after aggregating.
+    - Loops can generate datasets; give each a distinct `name` and bind the
+      loop variable with a default argument.
+
+    Next: keeping a table in sync with a source that sends inserts,
+    updates and deletes, with Spark 4.2's Auto CDC.

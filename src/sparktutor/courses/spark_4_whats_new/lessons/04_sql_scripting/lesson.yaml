@@ -1,0 +1,357 @@
+- Class: meta
+  Lesson: "SQL Scripting, SQL UDFs and the SQL Path"
+  EstimatedMinutes: 35
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    Until Spark 4, any logic beyond a single statement lived in Python: a
+    loop that runs a query, checks a value, runs another. That forced SQL
+    teams to own Python glue code. Spark 4 makes SQL procedural.
+
+    By the end of this lesson you will be able to:
+
+    - Write **SQL scripts** with `BEGIN ... END`, local variables, `IF`,
+      `CASE`, `WHILE`, `REPEAT`, `LOOP` and `FOR` (preview in 4.0, GA and on
+      by default in 4.1 via SPARK-54499)
+    - Catch errors with **condition handlers** by name, SQLSTATE or class
+    - Define **SQL UDFs**, both scalar and table-valued (4.0, SPARK-46057)
+    - Iterate with **cursors** (4.2, SPARK-54759, behind a flag)
+    - Control name resolution with **SET PATH** and `current_path()` (4.2)
+
+- Class: text
+  Depth: beginner
+  Output: |
+    A SQL script is a small program written in SQL. It has variables you
+    can declare and update, and control flow like any language:
+
+    ```sql
+    BEGIN
+      DECLARE total INT DEFAULT 0;
+      DECLARE i INT DEFAULT 1;
+      WHILE i <= 5 DO
+        SET total = total + i;
+        SET i = i + 1;
+      END WHILE;
+      SELECT total;      -- 15
+    END
+    ```
+
+    You run it with one `spark.sql(...)` call. The DataFrame you get back is
+    the result of the last query the script ran.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Compound Statements and Variables
+
+    Every script is a compound statement. Declarations come first
+    (variables, conditions, handlers, cursors), then the body:
+
+    ```sql
+    BEGIN
+      DECLARE threshold DOUBLE DEFAULT 50;
+      DECLARE n BIGINT;
+      SET n = (SELECT count(*) FROM accounts WHERE balance > threshold);
+      IF n > 3 THEN
+        SELECT 'many' AS verdict;
+      ELSEIF n > 0 THEN
+        SELECT 'some' AS verdict;
+      ELSE
+        SELECT 'none' AS verdict;
+      END IF;
+    END
+    ```
+
+    - **Local variables** live inside the block. Nested `BEGIN ... END`
+      blocks create nested scopes; labels (`outer: BEGIN ...`) disambiguate.
+    - **Session variables** (4.0) outlive a script:
+      `DECLARE OR REPLACE VARIABLE cutoff INT DEFAULT 10;` then
+      `SET VAR cutoff = 20;`. Use them to pass values between scripts.
+    - **Parameter markers** pass values in from Python:
+      `spark.sql("BEGIN ... WHILE i < :n DO ... END", args={"n": 10})`.
+    - **What comes back:** `spark.sql(script)` returns the result set of the
+      last statement that produced one.
+
+    **Docs:** [SQL Scripting](https://spark.apache.org/docs/4.2.0/sql-ref-scripting.html)
+
+- Class: mult_question
+  Depth: all
+  Output: "A script runs three SELECT statements. What does spark.sql(script) return?"
+  AnswerChoices: "The result of the last SELECT;The result of the first SELECT;A union of all three;Nothing, scripts only have side effects"
+  CorrectAnswer: "The result of the last SELECT"
+  Hint: "Think of the script as returning its final result set to the invoker."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Loops
+
+    ```sql
+    -- WHILE: test first
+    WHILE i < 10 DO SET i = i + 1; END WHILE;
+
+    -- REPEAT: test last
+    REPEAT SET i = i + 1; UNTIL i >= 10 END REPEAT;
+
+    -- LOOP with LEAVE (break) and ITERATE (continue); needs a label
+    lbl: LOOP
+      SET i = i + 1;
+      IF i >= 10 THEN LEAVE lbl; END IF;
+    END LOOP lbl;
+
+    -- FOR: iterate over a query's rows
+    FOR r AS SELECT account, balance FROM accounts DO
+      IF r.balance > 500 THEN SET golds = golds || r.account; END IF;
+    END FOR;
+    ```
+
+    A `FOR` loop is the most common shape: run a query, act on each row.
+    Remember that each iteration is driver-side control flow; a loop that
+    issues a query per row is a slow loop. Push set-based work into one
+    query and use loops for orchestration.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write a SQL script (as a `spark.sql` call) that declares an INT `i`
+    defaulting to 0, increments it in a WHILE loop until it reaches 3, then
+    selects `i`.
+  CorrectAnswer: |
+    spark.sql("""
+    BEGIN
+      DECLARE i INT DEFAULT 0;
+      WHILE i < 3 DO
+        SET i = i + 1;
+      END WHILE;
+      SELECT i;
+    END
+    """)
+  Hint: "DECLARE, then WHILE cond DO ... END WHILE;, then SELECT."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Condition Handlers
+
+    A handler catches errors raised in its compound statement:
+
+    ```sql
+    BEGIN
+      DECLARE EXIT HANDLER FOR DIVIDE_BY_ZERO
+        BEGIN
+          SELECT 'fallback' AS outcome;
+        END;
+      SELECT sum(balance) / min(balance) AS outcome FROM accounts;
+    END
+    ```
+
+    You can name what to catch three ways, from most to least specific:
+
+    - an **error condition**: `FOR DIVIDE_BY_ZERO`
+    - a **SQLSTATE**: `FOR SQLSTATE '22012'`
+    - a **class**: `FOR SQLEXCEPTION` (anything not `XX` or `02`), or
+      `FOR NOT FOUND` (SQLSTATE `02xxx`, such as running off the end of a
+      cursor)
+
+    An `EXIT` handler runs and then leaves the block. A `CONTINUE` handler
+    runs and resumes at the next statement, but in 4.2 `CONTINUE` handlers
+    are still behind the internal flag
+    `spark.sql.scripting.continueHandlerEnabled` (default `false`); without
+    it you get `UNSUPPORTED_FEATURE.CONTINUE_EXCEPTION_HANDLER`.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "Two handlers in the same block match an error: one FOR SQLSTATE '22012' and one FOR DIVIDE_BY_ZERO. Which runs?"
+  AnswerChoices: "The DIVIDE_BY_ZERO handler, because a named condition is more specific;The SQLSTATE handler, because it was declared first;Both, in declaration order;Neither, the script fails as ambiguous"
+  CorrectAnswer: "The DIVIDE_BY_ZERO handler, because a named condition is more specific"
+  Hint: "The docs define a 'most appropriate handler' by specificity."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Handler Gotchas in 4.2.0
+
+    - **Keep risky work in its own statement.** In 4.2.0, a runtime error
+      raised while evaluating a scalar subquery in `SET x = (SELECT ...)` is
+      not matched by any handler; the script dies with a
+      `NullPointerException`. The same query as a standalone `SELECT`
+      statement is caught normally. Verified on PySpark 4.2.0.
+    - **There is no `SELECT ... INTO`.** Assign with
+      `SET x = (SELECT ...)` or `FETCH` from a cursor.
+    - **No tuple assignment to local variables.** `SET (a, b) = (b, a + b)`
+      is a parse error inside a script; use a temporary variable.
+    - **`SIGNAL` is not supported** in 4.2.0 (`SIGNAL SQLSTATE ...` is a
+      parse error), so you cannot raise custom conditions from SQL yet.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## SQL UDFs (Spark 4.0)
+
+    SQL UDFs are functions whose body is a SQL expression or query. Unlike
+    Python UDFs they are transparent to Catalyst: the body is inlined into
+    the calling plan, so filters push through them and there is no Python
+    serialization cost.
+
+    ```sql
+    -- Scalar
+    CREATE OR REPLACE TEMPORARY FUNCTION tier(balance DOUBLE)
+    RETURNS STRING
+    RETURN CASE WHEN balance >= 500 THEN 'gold'
+                WHEN balance >= 50 THEN 'silver' ELSE 'basic' END;
+
+    -- Table-valued
+    CREATE OR REPLACE TEMPORARY FUNCTION accounts_above(min_balance DOUBLE)
+    RETURNS TABLE (account STRING, balance DOUBLE)
+    RETURN SELECT account, balance FROM accounts WHERE balance > min_balance;
+
+    SELECT account, tier(balance) FROM accounts_above(10);
+    ```
+
+    Gotchas: parameters are not constants, so `LIMIT n` with a parameter
+    fails (`INVALID_LIMIT_LIKE_EXPRESSION.IS_UNFOLDABLE`); filter with
+    `WHERE` instead. And you cannot shadow a built-in name: creating a SQL
+    function called `upper` fails with
+    `CANNOT_REPLACE_NON_SQL_UDF_WITH_SQL_UDF`.
+
+    **Docs:** [CREATE FUNCTION (SQL)](https://spark.apache.org/docs/4.2.0/sql-ref-syntax-ddl-create-sql-function.html)
+
+- Class: cmd_question
+  Depth: intermediate
+  Output: |
+    Create a temporary SQL scalar function `double_it(x INT)` returning
+    `INT` that returns `x * 2`.
+  CorrectAnswer: |
+    spark.sql("CREATE OR REPLACE TEMPORARY FUNCTION double_it(x INT) RETURNS INT RETURN x * 2")
+  Hint: "CREATE ... FUNCTION name(args) RETURNS type RETURN expression."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Cursors (Spark 4.2, Behind a Flag)
+
+    A `FOR` loop covers most row-by-row needs. Cursors give you explicit
+    control: open a query, fetch one row at a time into variables, stop
+    whenever you like.
+
+    ```sql
+    BEGIN
+      DECLARE bal DOUBLE;
+      DECLARE done BOOLEAN DEFAULT false;
+      DECLARE total DOUBLE DEFAULT 0;
+      DECLARE c CURSOR FOR SELECT balance FROM accounts WHERE balance < 100;
+      DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = true;
+      OPEN c;
+      REPEAT
+        FETCH c INTO bal;
+        IF NOT done THEN SET total = total + bal; END IF;
+      UNTIL done END REPEAT;
+      CLOSE c;
+      SELECT total;
+    END
+    ```
+
+    Fetching past the end raises `CURSOR_NO_MORE_ROWS` (SQLSTATE `02000`),
+    which the `NOT FOUND` handler turns into `done = true`.
+
+    In 4.2.0 cursors ship disabled. Both of these internal flags must be on,
+    otherwise you get `UNSUPPORTED_FEATURE.SQL_CURSOR` or
+    `UNSUPPORTED_FEATURE.CONTINUE_EXCEPTION_HANDLER`:
+
+    ```python
+    spark.conf.set("spark.sql.scripting.cursorEnabled", "true")
+    spark.conf.set("spark.sql.scripting.continueHandlerEnabled", "true")
+    ```
+
+    Internal flags carry no compatibility promise; treat cursors as a
+    preview.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## The SQL Path (Spark 4.2)
+
+    Spark 4.2 adds path-based name resolution (SPARK-54806). The **SQL path**
+    is the ordered list of schemas Spark searches for unqualified functions,
+    tables, views and variables; the first match wins.
+
+    ```sql
+    SELECT current_path();
+    -- system.builtin,system.session,spark_catalog.default
+
+    SET PATH = system.session, system.builtin, spark_catalog.analytics;
+    SET PATH = PATH, spark_catalog.shared;   -- append
+    SET PATH = DEFAULT_PATH;                  -- reset
+    ```
+
+    `system.builtin` holds built-in functions and `system.session` holds
+    temporary views, temporary functions and session variables. You can
+    always qualify explicitly: `system.builtin.upper(x)`,
+    `session.my_var`.
+
+    Details that matter:
+
+    - `current_path()` always works, but `SET PATH` requires
+      `spark.sql.path.enabled=true` (default `false`); otherwise
+      `UNSUPPORTED_FEATURE.SET_PATH_WHEN_DISABLED`.
+    - DDL ignores the path: `CREATE TABLE t` always goes to the current
+      schema.
+    - Persistent views and SQL UDFs freeze the path at `CREATE` time, so a
+      caller's `SET PATH` cannot change what a view's body resolves to.
+    - Change the default for every session with `spark.sql.defaultPath`.
+
+    **Docs:** [SET PATH](https://spark.apache.org/docs/4.2.0/sql-ref-syntax-aux-conf-mgmt-set-path.html)
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Related SQL Features
+
+    - **`EXECUTE IMMEDIATE`** (4.0) runs dynamic SQL with parameters:
+      `EXECUTE IMMEDIATE 'SELECT ? * 2 AS doubled' USING 21`. Inside scripts
+      it is how you build statements from variables.
+    - **Recursive CTEs** (4.1, SPARK-24497):
+      `WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5) SELECT sum(n) FROM r`.
+      Many loops people wrote in scripts are better as recursive CTEs,
+      because they stay set-based.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Procedural SQL
+
+    Implement `run_scripts(spark)`:
+
+    1. A `WHILE` script computing the `n`th Fibonacci number, with `n`
+       passed as a parameter marker (`args={"n": 10}`).
+    2. A scalar SQL UDF `tier(balance)` and a table UDF
+       `accounts_above(min_balance)`; query tiers for accounts above 10.
+    3. A `FOR` script that collects gold-tier account ids into a string.
+    4. An `EXIT HANDLER FOR DIVIDE_BY_ZERO` that returns `'fallback'`.
+    5. A cursor script summing balances under 100 (enable the two flags).
+    6. `SET PATH` (enable `spark.sql.path.enabled`), read `current_path()`,
+       then reset with `SET PATH = DEFAULT_PATH`.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Each script is one spark.sql call; read its result with .first()[column]. Keep the risky division as its own SELECT statement, not inside SET."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - **SQL scripting** (preview 4.0, GA 4.1): `BEGIN ... END`, variables,
+      `IF`/`CASE`/`WHILE`/`REPEAT`/`LOOP`/`FOR`; the last result set is
+      returned.
+    - **Handlers** catch by condition, SQLSTATE or class. `EXIT` works out of
+      the box; `CONTINUE` is flag-gated in 4.2.
+    - **SQL UDFs** (4.0) are inlined by Catalyst; parameters are not
+      constants.
+    - **Cursors** (4.2) work behind two internal flags.
+    - **SET PATH / current_path()** (4.2) control unqualified name
+      resolution; `SET PATH` needs `spark.sql.path.enabled`.
+
+    Next: the new GEOMETRY and GEOGRAPHY types.

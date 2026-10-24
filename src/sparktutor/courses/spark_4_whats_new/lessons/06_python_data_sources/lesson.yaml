@@ -1,0 +1,302 @@
+- Class: meta
+  Lesson: "Python Data Sources: Batch, Pushdown and Streaming"
+  EstimatedMinutes: 35
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    Before Spark 4, a custom connector meant Scala or Java against the
+    DataSource V2 interfaces, a JAR, and a build. Python users wrapped REST
+    APIs in `spark.createDataFrame(requests.get(...).json())`, which runs
+    on the driver and does not scale or stream.
+
+    The **Python Data Source API** (SPIP SPARK-44076, Spark 4.0) lets you
+    write a real connector in pure Python: partitioned parallel reads on
+    executors, writers, and streaming. 4.1 added filter pushdown
+    (SPARK-51271). 4.2 adds **admission control** and
+    **Trigger.AvailableNow** for streaming readers (SPARK-55304).
+
+    By the end of this lesson you will be able to:
+
+    - Implement `DataSource`, `DataSourceReader` and `InputPartition`
+    - Push filters into your source with `pushFilters`
+    - Write a streaming reader with offsets, a read limit, and AvailableNow
+    - Recognize the new 4.2 validation errors
+
+- Class: text
+  Depth: beginner
+  Output: |
+    The shape of a data source, in plain words:
+
+    - A **DataSource** class has a name (so you can write
+      `spark.read.format("sensors")`) and a schema.
+    - Its **reader** decides how to split the work into **partitions**.
+      Spark runs one task per partition, in parallel, on the executors.
+    - Each task calls the reader's **read(partition)**, which yields rows as
+      Python tuples.
+
+    For streaming, Spark also asks "how far does the data go now?" (an
+    **offset**) before each micro-batch, then reads everything between the
+    last offset and the new one.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## A Batch Data Source
+
+    ```python
+    from pyspark.sql.datasource import DataSource, DataSourceReader, InputPartition
+
+    class RangePartition(InputPartition):
+        def __init__(self, start, end):
+            self.start, self.end = start, end
+
+    class SensorDataSource(DataSource):
+        @classmethod
+        def name(cls):
+            return "sensors"
+
+        def schema(self):
+            return "seq int, sensor string, value double"
+
+        def reader(self, schema):
+            return SensorBatchReader(self.options)
+
+    class SensorBatchReader(DataSourceReader):
+        def __init__(self, options):
+            self.rows = int(options.get("rows", 30))
+
+        def partitions(self):
+            return [RangePartition(0, 15), RangePartition(15, 30)]
+
+        def read(self, partition):
+            for i in range(partition.start, partition.end):
+                yield (i, f"s{i % 3}", 20.0 + i)
+
+    spark.dataSource.register(SensorDataSource)
+    df = spark.read.format("sensors").option("rows", 30).load()
+    ```
+
+    Rules that bite:
+
+    - **Everything must pickle.** The reader and partitions are serialized
+      to executors. Open connections and clients inside `read()`, not in
+      `__init__`.
+    - **Options arrive as strings** in a case-insensitive dict. Convert
+      types yourself.
+    - **`read()` can yield `pyarrow.RecordBatch`** instead of tuples, which
+      skips per-row conversion for large reads.
+    - **Schema must match exactly (4.2).** Returning Arrow data whose column
+      types differ from the declared schema now fails with
+      `DATA_SOURCE_RETURN_SCHEMA_MISMATCH`; earlier versions only checked
+      column count and names.
+
+    **Docs:** [Python Data Source API](https://spark.apache.org/docs/4.2.0/api/python/tutorial/sql/python_data_source.html)
+
+- Class: mult_question
+  Depth: all
+  Output: "Where should a Python data source open its HTTP client or database connection?"
+  AnswerChoices: "Inside read(), which runs on the executor;In DataSource.__init__, once on the driver;In partitions(), so each partition carries it;In a module-level global"
+  CorrectAnswer: "Inside read(), which runs on the executor"
+  Hint: "The reader and partitions are pickled and shipped to executors. Sockets do not pickle."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Register a data source class `SensorDataSource` and load it as a
+    DataFrame `df`, passing the option `rows` = 30. Its `name()` returns
+    `"sensors"`.
+  CorrectAnswer: |
+    spark.dataSource.register(SensorDataSource)
+    df = spark.read.format("sensors").option("rows", 30).load()
+  Hint: "spark.dataSource.register(...), then spark.read.format(<name>)."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Filter Pushdown (Spark 4.1)
+
+    Without pushdown, `df.filter(sensor == 's2')` makes your source produce
+    every row and Spark discards most of them. If the backend can filter
+    (a SQL database, an API with query parameters), let it:
+
+    ```python
+    from pyspark.sql.datasource import EqualTo
+
+    class SensorBatchReader(DataSourceReader):
+        def pushFilters(self, filters):
+            for f in filters:
+                if isinstance(f, EqualTo) and f.attribute == ("sensor",):
+                    self.sensor_filter = f.value    # handle it ourselves
+                else:
+                    yield f                         # Spark keeps this one
+    ```
+
+    `pushFilters` receives the AND-ed conjuncts Spark can express
+    (`EqualTo`, `GreaterThan`, `In`, `IsNull`, `StringStartsWith`, ...) and
+    must return the ones you did **not** handle. `attribute` is a tuple
+    path, so a top-level column `sensor` is `("sensor",)`. OR conditions are
+    not pushed.
+
+    Two traps in 4.2:
+
+    - Pushdown is behind the internal flag
+      `spark.sql.python.filterPushdown.enabled` (default `false`).
+    - With the flag off, a reader that **implements** `pushFilters` does not
+      silently skip it: the read fails with `DATA_SOURCE_PUSHDOWN_DISABLED`.
+      Set the flag before the first read, or do not implement the method.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "Your pushFilters handles EqualTo on `sensor` and yields everything else. For `filter((sensor == 's2') & (value > 21))`, what remains in Spark's Filter node?"
+  AnswerChoices: "Only value > 21 (plus null checks);Both conditions;Neither condition;Only sensor = 's2'"
+  CorrectAnswer: "Only value > 21 (plus null checks)"
+  Hint: "The filters you yield back are the ones Spark still evaluates."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Streaming Readers
+
+    A `DataSourceStreamReader` adds offsets. Offsets are JSON-able dicts
+    that Spark checkpoints, so a restarted query resumes where it left off:
+
+    - `initialOffset()`: where a brand new query starts
+    - `latestOffset(start, limit)`: how far to read in the next micro-batch
+    - `partitions(start, end)`: split one micro-batch into tasks
+    - `read(partition)`: produce the rows (runs on executors)
+    - `commit(end)`: Spark has durably processed everything up to `end`
+
+    The 4.2 `latestOffset` signature takes the batch's `start` offset and a
+    **`ReadLimit`**, which is how admission control works: implement
+    `getDefaultReadLimit()` to return `ReadMaxRows(n)` (or `ReadMinRows`,
+    `ReadMaxFiles`, `ReadMaxBytes`) and respect the limit you are given.
+
+    ```python
+    from pyspark.sql.streaming.datasource import ReadAllAvailable, ReadMaxRows
+
+    def getDefaultReadLimit(self):
+        return ReadMaxRows(self.max_rows)
+
+    def latestOffset(self, start, limit):
+        if isinstance(limit, ReadAllAvailable):
+            return {"seq": self.total}
+        return {"seq": min(self.total, start["seq"] + limit.max_rows)}
+    ```
+
+    Note the attribute name: the `ReadMaxRows` dataclass field is
+    `max_rows`. The 4.2.0 docstring example for `latestOffset` says
+    `limit.maxRows`, which raises `AttributeError`.
+
+    The engine may still pass `ReadAllAvailable` (for example for some
+    triggers) even when your default is a limit. Always honor the limit you
+    receive, not the one you configured.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Trigger.AvailableNow (Spark 4.2)
+
+    `trigger(availableNow=True)` means "process everything that exists now,
+    in rate-limited batches, then stop". It is the right trigger for
+    scheduled incremental jobs. A source opts in by mixing in
+    `SupportsTriggerAvailableNow`:
+
+    ```python
+    class SensorStreamReader(DataSourceStreamReader, SupportsTriggerAvailableNow):
+        def prepareForTriggerAvailableNow(self):
+            self.target = self.total     # freeze "now"
+    ```
+
+    Spark calls `prepareForTriggerAvailableNow()` once at query start; from
+    then on `latestOffset` must never go past the frozen target, and must
+    eventually return `start` unchanged so the query knows it is done.
+
+    With 25 rows and `ReadMaxRows(10)`, the query runs three micro-batches of
+    10, 10 and 5 rows and terminates.
+
+- Class: mult_question
+  Depth: all
+  Output: "With availableNow=True, how does a Python streaming source tell Spark it has no more data to read?"
+  AnswerChoices: "latestOffset returns the start offset unchanged;read() raises StopIteration;commit() returns False;It calls query.stop()"
+  CorrectAnswer: "latestOffset returns the start offset unchanged"
+  Hint: "An empty offset range means an empty batch."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## SimpleDataSourceStreamReader
+
+    For sources that cannot be partitioned (a single cursor-based API),
+    `SimpleDataSourceStreamReader` collapses planning and reading into one
+    driver-side `read(start) -> (rows, end_offset)`. Spark caches the rows
+    and replays them by offset range.
+
+    4.2 adds a guard: if `read()` returns rows without advancing the end
+    offset past the start, the query fails with
+    `SIMPLE_STREAM_READER_OFFSET_DID_NOT_ADVANCE`. Earlier versions
+    reprocessed the same batch forever while the prefetch cache grew. If you
+    have a simple reader that returned `start` alongside data, it was
+    already buggy; 4.2 makes it loud.
+
+    `SupportsTriggerAvailableNow` works with the simple reader too.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Writers and Production Notes
+
+    - **Writers.** `DataSource.writer(schema, overwrite)` returns a
+      `DataSourceWriter` whose `write(iterator)` runs per task and returns a
+      `WriterCommitMessage`; `commit(messages)` runs once on the driver.
+      `streamWriter` adds a `batchId`. `DataSourceArrowWriter` (4.0) and
+      `DataSourceStreamArrowWriter` (4.1) receive `pyarrow.RecordBatch`es.
+    - **Offsets are your contract.** They are written to the checkpoint as
+      JSON. Change their shape and old checkpoints break; version them
+      (`{"v": 1, "seq": ...}`) from day one.
+    - **`reportLatestOffset()`** (4.2) lets the source report how far the
+      upstream data goes, which shows up in query progress for lag
+      monitoring.
+    - **Overriding a statically registered source** (one discovered from an
+      installed package) with `spark.dataSource.register` is allowed since
+      4.1 (SPARK-51919).
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: A Sensor Feed Connector
+
+    Complete the data source and `use_sensor_source(spark, workdir)`:
+
+    1. `SensorBatchReader.partitions()` splits `rows` into `partitions`
+       ranges; `read()` yields `reading(i)` for its range.
+    2. `pushFilters()` handles `EqualTo` on `sensor` and yields the rest;
+       `read()` applies the saved filter.
+    3. `SensorStreamReader` returns `ReadMaxRows(max_rows)` as its default
+       limit, implements `prepareForTriggerAvailableNow`, and computes
+       `latestOffset(start, limit)` honoring both limit types.
+    4. Enable `spark.sql.python.filterPushdown.enabled`, run a batch read,
+       a pushed-down filter, and an `availableNow` stream into a memory sink.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "latestOffset: if the limit is ReadAllAvailable return the target, else min(target, start['seq'] + limit.max_rows). Set the pushdown flag before the first read."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - **Python Data Source API (4.0):** `DataSource` + `DataSourceReader` +
+      `InputPartition` give parallel reads in pure Python; writers and
+      streaming readers use the same pattern.
+    - **Filter pushdown (4.1)** via `pushFilters`; flag-gated in 4.2, and
+      implementing it with the flag off is an error.
+    - **Admission control (4.2):** `latestOffset(start, limit)` plus
+      `getDefaultReadLimit()` cap micro-batch size.
+    - **Trigger.AvailableNow (4.2)** via `SupportsTriggerAvailableNow`.
+    - **4.2 validation:** schema type mismatches and non-advancing simple
+      readers now fail loudly.
+
+    Next: stateful streaming with `transformWithState`.

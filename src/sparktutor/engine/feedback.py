@@ -11,10 +11,27 @@ from sparktutor.engine.evaluator import FeedbackItem
 # Common Spark/Python error patterns → friendly messages
 ERROR_PATTERNS: list[tuple[str, str, str]] = [
     # (regex, severity, user-friendly message)
+    # Spark 4 reports errors by error class, e.g. [TABLE_OR_VIEW_NOT_FOUND] ... SQLSTATE: 42P01
+    (r"\[USER_RAISED_EXCEPTION\] (.+?)(?: SQLSTATE: \w+)?$",
+     "error", "Check failed: {0}"),
+    (r"\[TABLE_OR_VIEW_NOT_FOUND\] The table or view (\S+) cannot be found",
+     "error", "Table '{0}' doesn't exist. Check the name, and in a pipeline make sure a dataset with that name is defined."),
+    (r"\[UNRESOLVED_COLUMN\.\w+\] A column, variable, or function parameter with name (\S+) cannot be resolved",
+     "error", "Column '{0}' not found. Check your column names with df.printSchema()."),
+    (r"\[CAST_INVALID_INPUT\] The value '([^']*)'",
+     "error", "ANSI mode rejected casting '{0}'. Use try_cast(...) to turn malformed values into NULL."),
+    (r"\[DIVIDE_BY_ZERO\]",
+     "error", "Division by zero under ANSI mode. Use try_divide(...) or guard the denominator."),
+    (r"\[GRAPH_ELEMENT_DEFINED_OUTSIDE_OF_DECLARATIVE_PIPELINE\]",
+     "error", "Pipeline decorators only work inside a pipeline run. Run this file with spark-pipelines, not spark-submit."),
+    (r"\[AUTOCDC_TARGET_DOES_NOT_SUPPORT_MERGE\]",
+     "error", "Auto CDC needs a target table format that supports MERGE (for example Iceberg). Parquet and Delta targets are rejected."),
+    (r"\[(AUTOCDC_[A-Z_]+)\] (.+?)(?: SQLSTATE: \w+)?$",
+     "error", "Auto CDC error {0}: {1}"),
+    (r"\[(PIPELINE_[A-Z_]+)\] (.+?)(?: SQLSTATE: \w+)?$",
+     "error", "Pipeline error {0}: {1}"),
     (r"AnalysisException.*Table or view not found: (\S+)",
      "error", "Table '{0}' doesn't exist. Check the table name and catalog."),
-    (r"AnalysisException.*cannot resolve '(\w+)'",
-     "error", "Column '{0}' not found. Check your column names with df.printSchema()."),
     (r"Py4JJavaError.*ClassNotFoundException: (\S+)",
      "error", "Missing dependency: {0}. The JAR may not be on the classpath."),
     (r"NameError: name '(\w+)' is not defined",
@@ -30,7 +47,7 @@ ERROR_PATTERNS: list[tuple[str, str, str]] = [
     (r"spark\.sql\.shuffle\.partitions",
      "info", "Tip: shuffle partitions defaults to 200. For small data, set it lower."),
     (r"WARN.*deprecated",
-     "info", "Deprecation warning detected — the code still works but consider updating."),
+     "info", "Deprecation warning detected; the code still works but consider updating."),
 ]
 
 
@@ -43,9 +60,9 @@ def parse_stderr(stderr: str) -> list[FeedbackItem]:
     seen_messages: set[str] = set()
 
     for pattern, severity, template in ERROR_PATTERNS:
-        match = re.search(pattern, stderr, re.IGNORECASE)
+        match = re.search(pattern, stderr, re.IGNORECASE | re.MULTILINE)
         if match:
-            groups = match.groups()
+            groups = tuple(g.replace("`", "") for g in match.groups())
             message = template.format(*groups) if groups else template
             if message not in seen_messages:
                 seen_messages.add(message)

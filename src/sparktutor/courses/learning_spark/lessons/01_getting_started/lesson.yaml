@@ -1,6 +1,6 @@
 - Class: meta
   Lesson: Introduction & Getting Started
-  EstimatedMinutes: 25
+  EstimatedMinutes: 30
 
 - Class: text
   Depth: all
@@ -11,13 +11,17 @@
 
     - Explain what Apache Spark is and why it exists
     - Describe the Driver-Executor architecture
-    - Create a SparkSession — the entry point to all Spark functionality
+    - Tell Spark Classic apart from Spark Connect, the two ways a Python
+      program talks to Spark 4.x
+    - Create a SparkSession, the entry point to all Spark functionality
     - Read a CSV file into a DataFrame
     - Perform basic aggregations with `groupBy`, `agg`, and `orderBy`
     - Filter results to answer specific questions about your data
 
     This lesson establishes the foundation everything else builds on. Every
-    Spark program starts with a SparkSession and works with DataFrames.
+    Spark program starts with a SparkSession and works with DataFrames. The
+    course targets **Apache Spark 4.2.0**; where behaviour changed in the 4.x
+    line, the lesson says so.
 
 - Class: text
   Depth: all
@@ -26,17 +30,17 @@
 
     Apache Spark is a **unified analytics engine** for large-scale data
     processing. It handles SQL queries, streaming data, machine learning, and
-    graph processing — all through a single framework.
+    graph processing through a single framework.
 
-    Spark's key innovation is **in-memory processing**. The earlier MapReduce
+    Spark's key idea is **in-memory processing**. The earlier MapReduce
     model writes intermediate results to disk after every step. Spark keeps
-    data in memory across operations, which can make iterative workloads
-    (like ML training) 10-100x faster.
+    data in memory across operations, which makes iterative workloads (like
+    ML training) dramatically faster.
 
-    Spark provides APIs in Python, Scala, Java, and R. Throughout this course
-    we use PySpark — the Python API. Under the hood, PySpark communicates
-    with the same JVM-based engine, so you get full Spark performance while
-    writing Python.
+    Spark provides APIs in Python, Scala, Java, and R (SparkR is deprecated
+    in 4.x). Throughout this course we use PySpark, the Python API. PySpark
+    drives the same JVM-based engine, so you get full Spark performance
+    while writing Python.
 
 - Class: text
   Depth: beginner
@@ -45,17 +49,22 @@
 
     Think of Spark like a busy restaurant kitchen:
 
-    - The **Driver** is the **head chef** — it reads the order (your code),
+    - The **Driver** is the **head chef**. It reads the order (your code),
       plans the steps, and coordinates who does what. It does not cook
       the food itself.
-    - **Executors** are the **line cooks** — they do the actual work on their
+    - **Executors** are the **line cooks**. They do the actual work on their
       assigned portion of the data: slicing, grilling, plating.
-    - The **Cluster Manager** is the **restaurant manager** — it decides how
+    - The **Cluster Manager** is the **restaurant manager**. It decides how
       many cooks are available and assigns resources.
 
     When you submit a Spark job, the head chef (Driver) breaks it into tasks
     and hands them to line cooks (Executors), who work in parallel to get
-    the result out fast. More cooks = more parallelism = faster results.
+    the result out fast. More cooks means more parallelism and faster
+    results.
+
+    Spark Connect (later in this lesson) adds a waiter: you place your order
+    from the dining room, and the waiter carries it to the kitchen. You never
+    have to stand in the kitchen yourself.
 
 - Class: text
   Depth: all
@@ -64,30 +73,72 @@
 
     A Spark application has four core components:
 
-    - **Driver Program** — runs your `main()` function, creates the
-      SparkSession, and coordinates execution across the cluster.
-    - **Cluster Manager** — allocates resources. Options include Standalone,
-      YARN, Mesos, and Kubernetes.
-    - **Worker Nodes** — machines in the cluster that host Executors.
-    - **Executors** — JVM processes on workers that run tasks and cache data.
+    - **Driver Program**: runs your `main()` function, creates the
+      SparkSession, plans queries, and coordinates execution.
+    - **Cluster Manager**: allocates resources. Spark 4.x supports
+      Standalone, YARN, and Kubernetes (Mesos support was removed in
+      Spark 4.0). `local[*]` runs everything in one JVM for development.
+    - **Worker Nodes**: machines in the cluster that host Executors.
+    - **Executors**: JVM processes on workers that run tasks and cache data.
 
     The execution hierarchy:
 
     ```
-    Application  →  Jobs  →  Stages  →  Tasks
+    Application  ->  Jobs  ->  Stages  ->  Tasks
     ```
 
     A **job** is triggered by an action (e.g., `show()`, `count()`). Jobs are
-    divided into **stages** at shuffle boundaries. Stages contain **tasks** —
-    one per data partition — that run in parallel across executors.
+    divided into **stages** at shuffle boundaries. Stages contain **tasks**,
+    one per data partition, that run in parallel across executors.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Spark 4.x at a Glance
+
+    If you learned Spark on 3.x, these are the platform changes that matter
+    in day-to-day work:
+
+    - **Runtime**: Spark 4.2 runs on Java 17, 21, or 25, Scala 2.13, and
+      Python 3.10+. Java 8 and 11 are gone.
+    - **ANSI SQL mode is on by default** (since 4.0). Invalid casts,
+      integer overflow, and division by zero raise errors instead of
+      silently returning `NULL`. Use `try_cast`, `try_divide`, and the other
+      `try_*` functions when you want the lenient behaviour.
+    - **Spark Connect** is a first-class client-server mode. A thin Python
+      client sends query plans to a remote Spark server over gRPC.
+    - **Arrow everywhere in PySpark**. In 4.2, Arrow-based data exchange
+      (`toPandas`, `createDataFrame` from pandas) and Arrow-optimized Python
+      UDFs are on by default (SPARK-54555).
+
+    Install the version this course targets:
+
+    ```bash
+    pip install "pyspark[connect]==4.2.0"
+    ```
+
+    The `connect` extra pulls in the gRPC, pandas, and PyArrow dependencies
+    Spark Connect needs. For a pure client with no bundled JVM, there is a
+    separate `pyspark-client` package.
+
+    **Docs:** [Spark 4.2.0 overview](https://spark.apache.org/docs/4.2.0/) |
+    [ANSI compliance](https://spark.apache.org/docs/4.2.0/sql-ref-ansi-compliance.html)
+
+- Class: mult_question
+  Depth: all
+  Output: "With default settings in Spark 4.2, what does `SELECT CAST('abc' AS INT)` do?"
+  AnswerChoices: "Raises a CAST_INVALID_INPUT error;Returns NULL;Returns 0;Returns the string unchanged"
+  CorrectAnswer: "Raises a CAST_INVALID_INPUT error"
+  Hint: "ANSI mode has been the default since Spark 4.0. Lenient casting now needs try_cast."
 
 - Class: text
   Depth: intermediate
   Output: |
     ## SparkSession: The Unified Entry Point
 
-    Starting in Spark 2.0, `SparkSession` replaced the older SparkContext,
-    SQLContext, and HiveContext. You create one with the **builder pattern**:
+    `SparkSession` (since Spark 2.0) replaced the older SparkContext,
+    SQLContext, and HiveContext as the entry point. You create one with the
+    **builder pattern**:
 
     ```python
     from pyspark.sql import SparkSession
@@ -95,28 +146,74 @@
     spark = (SparkSession.builder
         .appName("MyApp")
         .master("local[*]")
-        .config("spark.some.option", "value")
+        .config("spark.sql.shuffle.partitions", "8")
         .getOrCreate())
+
+    print(spark.version)   # '4.2.0'
     ```
 
     The `master` setting controls where Spark runs:
-    - `local[*]` — use all local CPU cores (great for development)
-    - `local[4]` — use exactly 4 cores
-    - `spark://host:7077` — connect to a Standalone cluster
-    - `k8s://...` — connect to a Kubernetes cluster
+    - `local[*]`: use all local CPU cores (great for development)
+    - `local[4]`: use exactly four cores
+    - `spark://host:7077`: connect to a Standalone cluster
+    - `yarn`: submit to a Hadoop YARN cluster
+    - `k8s://https://host:port`: run on Kubernetes
 
     `getOrCreate()` either creates a new session or returns the existing one,
     so calling it multiple times is safe.
 
-    **Docs:** [SparkSession](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.SparkSession.html)
-    — builder pattern, `appName()`, `master()`, `config()`, `getOrCreate()`.
+    **Docs:** [SparkSession](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.SparkSession.html)
+    (builder pattern, `appName()`, `master()`, `remote()`, `config()`,
+    `getOrCreate()`).
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Spark Classic vs. Spark Connect
+
+    PySpark 4.x can reach the engine in two ways:
+
+    **Spark Classic**: your Python process starts (or attaches to) the
+    driver JVM and talks to it through Py4J. This is what `.master(...)`
+    gives you, and what `spark-submit` runs.
+
+    **Spark Connect**: your Python process is a thin client. It builds an
+    unresolved logical plan, serializes it with protocol buffers, and sends
+    it over gRPC to a Spark Connect server, which plans and runs it. Results
+    come back as Arrow batches.
+
+    ```python
+    # Remote server (default port 15002)
+    spark = SparkSession.builder.remote("sc://spark-host:15002").getOrCreate()
+
+    # Local Connect server started for you, handy for testing
+    spark = SparkSession.builder.remote("local[*]").getOrCreate()
+
+    # Switch an existing Classic app to Connect with one config
+    spark = (SparkSession.builder
+        .config("spark.api.mode", "connect")
+        .master("local[*]")
+        .getOrCreate())
+    ```
+
+    The DataFrame and SQL APIs are the same in both modes. What you lose in
+    Connect is anything that reaches into the driver JVM: `sparkContext`,
+    RDDs, and private handles like `df._jdf`. Lesson 11 covers Connect in
+    depth.
 
 - Class: mult_question
   Depth: all
   Output: "What is the role of the Driver in a Spark application?"
   AnswerChoices: "Coordinates execution and plans queries;Stores data on disk;Executes individual tasks on data partitions;Manages cluster resources"
   CorrectAnswer: "Coordinates execution and plans queries"
-  Hint: "Think about the head chef analogy — who plans the work but doesn't do the cooking?"
+  Hint: "Think about the head chef analogy: who plans the work but doesn't do the cooking?"
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "Which of these does NOT work when your SparkSession is a Spark Connect session?"
+  AnswerChoices: "df.rdd.map(...);df.filter(...);spark.sql(...);df.groupBy(...).agg(...)"
+  CorrectAnswer: "df.rdd.map(...)"
+  Hint: "Connect ships logical plans to the server. Which API is not expressed as a logical plan?"
 
 - Class: text
   Depth: advanced
@@ -125,26 +222,36 @@
 
     When you call an action, Spark's execution engine kicks in:
 
-    1. **DAG Scheduler** — analyzes the chain of transformations and builds a
+    1. **DAG Scheduler**: analyzes the chain of transformations and builds a
        Directed Acyclic Graph (DAG). It breaks the DAG into stages at
-       **shuffle boundaries** — points where data must be redistributed
+       **shuffle boundaries**, points where data must be redistributed
        across partitions.
 
-    2. **Task Scheduler** — takes each stage and creates tasks (one per
+    2. **Task Scheduler**: takes each stage and creates tasks (one per
        partition), then assigns them to available executors.
 
     **Narrow vs. Wide Transformations:**
-    - **Narrow** (e.g., `map`, `filter`, `select`) — each input partition
-      contributes to exactly one output partition. No data movement.
-    - **Wide** (e.g., `groupBy`, `join`, `repartition`) — input partitions
-      contribute to multiple output partitions. Requires a **shuffle** —
-      expensive network I/O.
+    - **Narrow** (e.g., `select`, `filter`, `withColumn`): each input
+      partition contributes to exactly one output partition. No data
+      movement.
+    - **Wide** (e.g., `groupBy`, `join`, `repartition`): input partitions
+      contribute to multiple output partitions. Requires a **shuffle**,
+      which means expensive network and disk I/O.
 
     **Lazy Evaluation:**
     Transformations build up a logical plan. Only actions trigger execution.
     This lets Spark's Catalyst optimizer analyze the entire pipeline and
-    rewrite it before generating code — predicate pushdown, column pruning,
-    join reordering — all happen transparently.
+    rewrite it before generating code; predicate pushdown, column pruning,
+    and join reordering all happen transparently.
+
+    With Adaptive Query Execution (on by default since 3.2), planning does
+    not stop when the job starts. At each shuffle boundary Spark looks at the
+    real shuffle statistics and can re-plan the rest of the query. Lessons 5
+    and 6 show what that looks like in a plan.
+
+    Spark Connect does not change any of this. The client only builds the
+    plan; analysis, optimization, and scheduling all happen on the server,
+    exactly as in Classic mode.
 
 - Class: cmd_question
   Depth: all
@@ -157,12 +264,23 @@
     spark = SparkSession.builder.appName("MnMCount").master("local[*]").getOrCreate()
   Hint: "Use SparkSession.builder, chain .appName() and .master(), then call .getOrCreate()."
 
+- Class: cmd_question
+  Depth: advanced
+  Output: |
+    Create a Spark Connect session that starts a local Connect server using
+    all cores, and store it in `spark`.
+  CorrectAnswer: |
+    from pyspark.sql import SparkSession
+
+    spark = SparkSession.builder.remote("local[*]").getOrCreate()
+  Hint: "Use .remote() instead of .master(). A local[...] value starts a local Connect server for you."
+
 - Class: mult_question
   Depth: all
   Output: "Which of these triggers actual computation in Spark (is an action, not a transformation)?"
   AnswerChoices: "show();select();filter();withColumn()"
   CorrectAnswer: "show()"
-  Hint: "Transformations are lazy — they build the plan. Actions trigger the plan to execute and produce results."
+  Hint: "Transformations are lazy and only build the plan. Actions trigger the plan to execute and produce results."
 
 - Class: text
   Depth: all
@@ -186,11 +304,13 @@
     df = spark.read.csv("/path/to/file.csv", header=True, inferSchema=True)
     ```
 
-    This gives you a **DataFrame** — a distributed table with named, typed
-    columns. Think of it as a spreadsheet that can span thousands of machines.
+    This gives you a **DataFrame**: a distributed table with named, typed
+    columns. Think of it as a spreadsheet that can span thousands of
+    machines.
 
-    **Docs:** [DataFrameReader.csv](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrameReader.csv.html)
-    — all parameters for `header`, `inferSchema`, `schema`, `sep`, `nullValue`, etc.
+    **Docs:** [DataFrameReader.csv](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrameReader.csv.html)
+    (all parameters for `header`, `inferSchema`, `schema`, `sep`,
+    `nullValue`, etc.)
 
 - Class: text
   Depth: all
@@ -209,10 +329,10 @@
     ```
 
     Breaking this down:
-    - `groupBy("State", "Color")` — groups rows by unique combinations
-    - `agg(f.sum("Count").alias("Total"))` — sums the Count column, names
+    - `groupBy("State", "Color")` groups rows by unique combinations
+    - `agg(f.sum("Count").alias("Total"))` sums the Count column and names
       it "Total"
-    - `orderBy(f.col("Total").desc())` — sorts descending by Total
+    - `orderBy(f.col("Total").desc())` sorts descending by Total
 
     `filter()` and `where()` select rows matching a condition:
 
@@ -221,10 +341,10 @@
     ```
 
     **Docs:**
-    [f.col](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.col.html) |
-    [f.sum](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.sum.html) |
-    [DataFrame.groupBy](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.groupBy.html) |
-    [Column.alias](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.Column.alias.html)
+    [f.col](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.col.html) |
+    [f.sum](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.sum.html) |
+    [DataFrame.groupBy](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.groupBy.html) |
+    [Column.alias](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.Column.alias.html)
 
 - Class: cmd_question
   Depth: intermediate
@@ -247,29 +367,37 @@
 
     The `option()` method configures how Spark reads files. For CSV:
 
-    - `header` — first row contains column names (true/false)
-    - `inferSchema` — scan the file to detect types (true/false)
-    - `sep` — field delimiter (default: comma)
-    - `nullValue` — string to treat as null
+    - `header`: first row contains column names (true/false)
+    - `inferSchema`: scan the file to detect types (true/false)
+    - `sep`: field delimiter (default: comma)
+    - `nullValue`: string to treat as null
 
     Common formats beyond CSV: **JSON** (semi-structured), **Parquet**
-    (columnar, compressed — Spark's preferred format), and **ORC** (similar
-    to Parquet, popular in Hive ecosystems).
+    (columnar, compressed; Spark's default format), **ORC** (similar to
+    Parquet, popular in Hive ecosystems), and **XML**, which has been a
+    built-in source since Spark 4.0.
 
-    We will explore all of these in depth in the next lesson on Data Sources.
+    We will explore all of these in depth in the lesson on Data Sources.
 
 - Class: text
   Depth: advanced
   Output: |
     ## Why inferSchema Costs You
 
-    When you set `inferSchema=true` on CSV or JSON, Spark makes **two passes**
-    over the data: one to sample rows and infer types, another to actually
-    load. For large files this doubles read time.
+    When you set `inferSchema=true` on CSV or JSON, Spark makes an extra
+    pass over the data to infer types before it actually loads it. For large
+    files that pass can cost as much as the read itself.
 
-    In production, always define schemas explicitly with `StructType`. You
-    will learn how in the next lesson. For now, `inferSchema` is fine for
-    exploration and small datasets.
+    In production, define schemas explicitly with `StructType` or a DDL
+    string such as `"State STRING, Color STRING, Count INT"`. You will learn
+    how in the next lesson. For now, `inferSchema` is fine for exploration
+    and small datasets.
+
+    ANSI mode adds a second reason. If a schema says `INT` and a later
+    transformation casts a value like `"n/a"` to it, Spark 4.x fails the
+    query with `CAST_INVALID_INPUT` instead of producing a silent null.
+    Explicit schemas plus `try_cast` at the edges keep those failures
+    intentional.
 
 - Class: script
   Depth: all
@@ -288,7 +416,8 @@
     5. Return the California-only DataFrame
 
     This exercises every skill from the lesson: SparkSession, reading data,
-    groupBy, agg, orderBy, and filter.
+    groupBy, agg, orderBy, and filter. The test harness also prints the
+    Spark version it ran on and whether ANSI mode is enabled.
   StarterFile: starter.py
   SolutionFile: solution.py
   Hint: "Read with spark.read.csv() and options. groupBy two columns, agg with f.sum(), orderBy desc, then filter where State == 'CA'."
@@ -300,15 +429,19 @@
 
     In this lesson you learned:
 
-    - **What Spark is** — a unified analytics engine with in-memory processing
-    - **Spark architecture** — Driver coordinates, Executors do the work,
-      Cluster Manager assigns resources
-    - **SparkSession** — the entry point, created with the builder pattern
-    - **Reading data** — `spark.read.csv()` with options like header and
+    - **What Spark is**: a unified analytics engine with in-memory processing
+    - **Spark architecture**: the Driver coordinates, Executors do the work,
+      the Cluster Manager (Standalone, YARN, Kubernetes) assigns resources
+    - **Spark 4.x platform**: Java 17/21/25, Scala 2.13, Python 3.10+, ANSI
+      mode on by default, Arrow on by default for PySpark data exchange
+    - **Classic vs. Connect**: `.master()` runs Spark in-process through
+      Py4J; `.remote()` talks to a Spark Connect server over gRPC
+    - **SparkSession**: the entry point, created with the builder pattern
+    - **Reading data**: `spark.read.csv()` with options like header and
       inferSchema
-    - **Aggregations** — `groupBy`, `agg`, `orderBy` for data analysis
-    - **Filtering** — `filter()` to narrow results
+    - **Aggregations**: `groupBy`, `agg`, `orderBy` for data analysis
+    - **Filtering**: `filter()` to narrow results
 
     You wrote your first complete Spark program. In the next lesson, you
-    will learn how DataFrames work under the hood — schemas, column
+    will learn how DataFrames work under the hood: schemas, column
     expressions, and the type system that makes Spark reliable at scale.

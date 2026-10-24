@@ -5,7 +5,9 @@ Implement the `build_blogs_df` function that:
 1. Defines a schema with: Id (int), First (string), Last (string),
    Url (string), Published (string), Hits (int), Campaigns (array of strings)
 2. Creates a DataFrame from the provided data using that schema
-3. Adds a boolean column "Big_Hitter" where Hits > 10000
+3. Uses one withColumns call to add:
+   - "Big_Hitter": boolean, True when Hits > 10000
+   - "Published_Date": Published (format M/d/yyyy) parsed to a DATE
 4. Returns the DataFrame
 
 Based on Example-3_6 from Learning Spark.
@@ -38,7 +40,9 @@ def build_blogs_df(spark):
     # TODO: Create the DataFrame from DATA using the schema
     blogs_df = None  # Replace with spark.createDataFrame(...)
 
-    # TODO: Add a boolean column "Big_Hitter" that is True when Hits > 10000
+    # TODO: Add two columns with a single withColumns({...}) call:
+    #       "Big_Hitter"     -> True when Hits > 10000
+    #       "Published_Date" -> f.to_date("Published", "M/d/yyyy")
     result = None  # Replace
 
     return result
@@ -46,6 +50,9 @@ def build_blogs_df(spark):
 
 # ---- Test harness (do not modify below this line) ----
 if __name__ == "__main__":
+    import datetime
+    from pyspark.sql.types import DateType
+
     spark = (SparkSession.builder
         .appName("BlogsTest")
         .master("local[*]")
@@ -59,6 +66,12 @@ if __name__ == "__main__":
 
     big_hitters = df.filter(f.col("Big_Hitter") == True).count()
     assert big_hitters == 3, f"Expected 3 big hitters, got {big_hitters}"
+
+    assert "Published_Date" in df.columns, "Missing Published_Date column"
+    assert isinstance(df.schema["Published_Date"].dataType, DateType), \
+        f"Published_Date should be a DATE, got {df.schema['Published_Date'].dataType}"
+    jules = df.filter(f.col("Id") == 1).select("Published_Date").first()[0]
+    assert jules == datetime.date(2016, 1, 4), f"Expected 2016-01-04 for Jules, got {jules}"
     print("All tests passed!")
     df.show(truncate=False)
     spark.stop()

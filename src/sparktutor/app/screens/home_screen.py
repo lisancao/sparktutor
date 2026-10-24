@@ -57,7 +57,7 @@ class HomeScreen(Screen):
                 id="welcome-art",
             )
             yield Static(
-                "[bold]Interactive Spark 4.1 Learning Environment[/]\n"
+                "[bold]Interactive Spark 4.2 Learning Environment[/]\n"
                 "[dim]Powered by Claude • Backed by lakehouse-stack[/]",
                 id="home-subtitle",
             )

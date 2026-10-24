@@ -18,10 +18,10 @@ from sparktutor.state.progress import ProgressStore
 
 
 class SparkTutorApp(App):
-    """Interactive Spark 4.1 learning environment."""
+    """Interactive Spark 4.2 learning environment."""
 
     TITLE = "SparkTutor"
-    SUB_TITLE = "Interactive Spark 4.1 Learning"
+    SUB_TITLE = "Interactive Spark 4.2 Learning"
 
     CSS_PATH = Path(__file__).parent / "css" / "sparktutor.tcss"
 
@@ -44,7 +44,7 @@ class SparkTutorApp(App):
 
     async def _detect_mode(self) -> None:
         mode = await self.executor.detect_mode()
-        self.sub_title = f"Spark 4.1 Learning — {mode.value}"
+        self.sub_title = f"Spark 4.2 Learning — {mode.value}"
 
     def start_course(
         self, course: CourseMeta, depth: Depth, resume_lesson_idx: int = 0,

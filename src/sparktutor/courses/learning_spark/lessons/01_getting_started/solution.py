@@ -52,5 +52,7 @@ if __name__ == "__main__":
     assert all(s == "CA" for s in states), f"Expected only CA rows, got {states}"
     assert df.count() == 2, f"Expected 2 CA color groups, got {df.count()}"
     print("All tests passed!")
+    print(f"Spark version: {spark.version}")
+    print(f"ANSI mode: {spark.conf.get('spark.sql.ansi.enabled')}")
     df.show(truncate=False)
     spark.stop()

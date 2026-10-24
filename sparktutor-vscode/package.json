@@ -1,8 +1,8 @@
 {
   "name": "sparktutor",
   "displayName": "SparkTutor",
-  "description": "Interactive Apache Spark 4.1 learning environment with Claude-powered tutoring",
-  "version": "0.3.0",
+  "description": "Interactive Apache Spark 4.2 learning environment with Claude-powered tutoring",
+  "version": "0.4.0",
   "publisher": "sparktutor",
   "engines": {
     "vscode": "^1.93.0"
@@ -129,11 +129,11 @@
         },
         "sparktutor.claudeModel": {
           "type": "string",
-          "default": "claude-sonnet-4-6",
+          "default": "claude-opus-5-5",
           "enum": [
-            "claude-sonnet-4-6",
-            "claude-haiku-4-5-20251001",
-            "claude-opus-4-6"
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5"
           ],
           "description": "Claude model to use for code review and chat"
         },

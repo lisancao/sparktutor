@@ -1,0 +1,221 @@
+- Class: meta
+  Lesson: "Pipeline Projects and the spark-pipelines CLI"
+  EstimatedMinutes: 30
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    - The layout of a pipeline project and every field of `spark-pipeline.yml`
+    - `spark-pipelines init`, `run` and `dry-run`
+    - Refresh selection: `--full-refresh`, `--full-refresh-all`, `--refresh`
+    - Defining datasets in SQL files next to Python files
+    - Using `dry-run` to catch broken references, bad columns and cycles
+      before any data is touched
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Project Layout
+
+    `spark-pipelines init --name retail` generates:
+
+    ```
+    retail/
+    ├── spark-pipeline.yml
+    └── transformations/
+        ├── example_python_materialized_view.py
+        └── example_sql_materialized_view.sql
+    ```
+
+    The spec file is the only thing the CLI needs to find your code:
+
+    ```yaml
+    name: retail
+    libraries:
+      - glob:
+          include: transformations/**
+    storage: file:///abs/path/retail/pipeline-storage
+    catalog: lake             # optional default catalog
+    database: retail          # optional default database (alias: schema)
+    configuration:            # optional Spark confs for the pipeline session
+      spark.sql.shuffle.partitions: "8"
+    ```
+
+    - `name`, `libraries` and `storage` are required.
+    - `libraries` globs are resolved relative to the spec file; every
+      matching `.py` and `.sql` file is loaded.
+    - `storage` holds streaming checkpoints. Lose it and every streaming
+      table starts over.
+    - `catalog` and `database` decide where unqualified dataset names live.
+    - `configuration` is where session settings go. This is also the
+      reliable place for catalog plugins such as
+      `spark.sql.catalog.lake: org.apache.iceberg.spark.SparkCatalog`.
+
+    Every exercise in this course is run by writing exactly such a project
+    (your file becomes `transformations/exercise.py`, and the sample data is
+    copied to `data/`).
+
+- Class: mult_question
+  Depth: all
+  Output: "Which spec field holds the checkpoints that make streaming tables incremental?"
+  AnswerChoices: "storage;libraries;configuration;database"
+  CorrectAnswer: "storage"
+  Hint: "It is required, and losing it resets every streaming table."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The CLI
+
+    ```bash
+    spark-pipelines init --name retail      # scaffold a project
+    spark-pipelines dry-run                 # validate the graph, write nothing
+    spark-pipelines run                     # incremental update of every dataset
+    spark-pipelines run --full-refresh orders_raw,customers
+    spark-pipelines run --full-refresh-all
+    spark-pipelines run --refresh daily_revenue
+    spark-pipelines run --spec path/to/spark-pipeline.yml
+    spark-pipelines run --remote sc://cluster:15002
+    ```
+
+    Without `--spec`, the CLI looks for `spark-pipeline.yml` or
+    `spark-pipeline.yaml` in the current directory and its parents.
+
+    `dry-run` registers every dataset and analyzes every query without
+    reading or writing data. It catches syntax errors, references to
+    datasets that do not exist, unresolved columns and cyclic dependencies.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Refresh Selection
+
+    - No flag: incremental update. Streaming tables process new input only;
+      materialized views are recomputed.
+    - `--full-refresh a,b`: clear the data *and checkpoints* of `a` and `b`
+      and recompute them from scratch. Use it after changing a streaming
+      query's logic.
+    - `--full-refresh-all`: the same for the whole graph.
+    - `--refresh a,b`: update only those datasets, without clearing them.
+
+    `--full-refresh-all` cannot be combined with the other two;
+    `--full-refresh` and `--refresh` can be combined to treat different
+    datasets differently.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## spark-submit Arguments Go Before the Subcommand
+
+    `spark-pipelines` is a thin wrapper over `spark-submit` (it launches
+    `org.apache.spark.deploy.SparkPipelines`, which forces
+    `spark.api.mode=connect` and starts a local Connect server unless you
+    pass `--remote`). It accepts every `spark-submit` option except
+    `--class`, but its argument parser stops at the first non-option, so
+    `spark-submit` options must come *before* `run`:
+
+    ```bash
+    # correct: --driver-memory reaches spark-submit
+    spark-pipelines --driver-memory 4g run --spec spark-pipeline.yml
+
+    # wrong: everything after `run` is handed to the pipeline CLI instead
+    spark-pipelines run --spec spark-pipeline.yml --driver-memory 4g
+    ```
+
+    Extra jars are a second trap: with the default local Connect server,
+    classes from `--packages` were not visible to session extensions in
+    our 4.2.0 tests, while `--driver-class-path` worked. Put catalog
+    settings in the spec's `configuration` block rather than `--conf`.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## SQL Files
+
+    A `.sql` file in `transformations/` defines datasets with DDL. SQL and
+    Python files share one graph, so each can read the other's datasets.
+    With `orders_bronze` defined in Python, `transformations/silver.sql`
+    can contain:
+
+    ```sql
+    CREATE STREAMING TABLE orders_placed
+    AS SELECT * FROM STREAM orders_bronze WHERE status = 'placed';
+
+    CREATE MATERIALIZED VIEW orders_by_status
+    AS SELECT status, count(*) AS order_count
+       FROM orders_bronze GROUP BY status;
+
+    CREATE TEMPORARY VIEW recent_orders
+    AS SELECT * FROM orders_bronze WHERE order_ts >= '2026-10-02';
+    ```
+
+    `STREAM orders_bronze` (or `STREAM(orders_bronze)`) marks a streaming
+    read. SQL pipelines do not support `PIVOT`, and sinks are Python-only.
+    (Some vendor docs show `read_files(...)` for ingestion; that function
+    is not part of open source Spark 4.2, so ingest files from Python.)
+
+- Class: mult_question
+  Depth: all
+  Output: "You changed the filter in a streaming table's query. How do you make old rows reflect the new logic?"
+  AnswerChoices: "spark-pipelines run --full-refresh <table>;spark-pipelines run (incremental is enough);spark-pipelines dry-run;Delete the transformations folder"
+  CorrectAnswer: "spark-pipelines run --full-refresh <table>"
+  Hint: "Incremental runs only process new input; old rows were written by the old query."
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "Which of these will dry-run NOT catch?"
+  AnswerChoices: "A row whose unit_price is 'N/A' at runtime;A reference to a dataset that does not exist;A column that cannot be resolved;Two datasets that read each other"
+  CorrectAnswer: "A row whose unit_price is 'N/A' at runtime"
+  Hint: "dry-run analyzes queries but never reads data."
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Make the Dry Run Pass
+
+    The starter file is a pipeline with three bugs. Its first line,
+    `# spark-pipelines: dry-run`, tells the tutor to run
+    `spark-pipelines dry-run` instead of `run`, so nothing is written.
+
+    Submit it once as-is and read the error. Fix one bug at a time; they
+    surface in this order because SDP validates the graph's shape before
+    it analyzes each query:
+
+    1. Two materialized views read each other. `revenue_by_customer`
+       should aggregate `orders_enriched`; `top_customers` ranks its output.
+    2. A dataset reads a table name that does not exist. SDP reports every
+       downstream dataset as "failed to resolve due to upstream failure";
+       look for the one line that says `Failed to resolve flow` without
+       "upstream", and the `TABLE_OR_VIEW_NOT_FOUND` error under it.
+    3. An aggregation groups by a column the input does not have
+       (customers live in a `city`).
+
+    Keep every dataset; the grader checks that they are all still defined.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  RequiresExecution: true
+  Validation:
+    - "ast_contains(function='orders_enriched')"
+    - "ast_contains(function='revenue_by_city')"
+    - "ast_contains(function='revenue_by_customer')"
+    - "ast_contains(function='top_customers')"
+    - execution
+  Hint: "Read the error class: TABLE_OR_VIEW_NOT_FOUND, UNRESOLVED_COLUMN and a circular dependency message each point at one dataset."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - A pipeline project is a spec file plus source files matched by
+      `libraries` globs; `storage` holds checkpoints.
+    - `dry-run` validates the whole graph without touching data; make it
+      part of your edit loop and your CI.
+    - `--full-refresh` resets datasets (data and checkpoints);
+      `--refresh` updates selected datasets incrementally.
+    - `spark-submit` options go before the subcommand; catalog settings go
+      in the spec's `configuration`.
+
+    Next: the bronze layer, ingesting raw files into streaming tables.

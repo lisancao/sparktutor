@@ -1,54 +1,61 @@
 - Class: meta
   Lesson: Join Strategies
-  EstimatedMinutes: 25
+  EstimatedMinutes: 35
 
 - Class: text
   Depth: all
   Output: |
     ## What You'll Learn
 
-    Joins combine data from multiple sources — and they are the most
+    Joins combine data from multiple sources, and they are the most
     expensive operation in distributed computing. The wrong join strategy
-    can turn a 10-second query into a 10-minute one.
+    can turn a quick query into one that runs for an hour.
 
     In the previous lesson you learned to tune partitions and caching.
     Now you will learn to choose and optimize joins:
 
-    - The five join types (inner, outer, semi, anti, cross)
-    - Broadcast Hash Join — the fastest strategy for small-large joins
-    - Sort Merge Join — the default for large-large joins
-    - Bucketed tables — pre-partition data to skip shuffles
+    - The join types (inner, outer, semi, anti, cross, lateral)
+    - Broadcast Hash Join, the fastest strategy for small-large joins
+    - Sort Merge Join, the default for large-large joins
+    - Shuffled Hash Join and the join hints that select each strategy
+    - How AQE changes join strategies at runtime
+    - Bucketed tables, which pre-partition data to skip shuffles
     - Handling data skew in joins
+    - The nearest-neighbour join Spark 4.2 added
 
 - Class: text
   Depth: all
   Output: |
     ## Join Types
 
-    Spark supports five join types:
+    Spark supports these join types:
 
     ```python
-    # Inner — only matching rows from both sides
+    # Inner: only matching rows from both sides
     df1.join(df2, "key", "inner")
 
-    # Left outer — all from left, matching from right (nulls for no match)
+    # Left outer: all from left, matching from right (nulls for no match)
     df1.join(df2, "key", "left")
 
-    # Full outer — all from both sides
+    # Full outer: all from both sides
     df1.join(df2, "key", "full")
 
-    # Left semi — rows from left that HAVE a match (like SQL EXISTS)
+    # Left semi: rows from left that HAVE a match (like SQL EXISTS)
     df1.join(df2, "key", "left_semi")
 
-    # Left anti — rows from left that have NO match (like SQL NOT EXISTS)
+    # Left anti: rows from left that have NO match (like SQL NOT EXISTS)
     df1.join(df2, "key", "left_anti")
+
+    # Cross: every pair (use deliberately)
+    df1.crossJoin(df2)
     ```
 
     `left_semi` and `left_anti` are powerful for filtering without actually
     bringing in columns from the right side.
 
-    **Docs:** [DataFrame.join](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.join.html)
-    — `on` (column name or expression), `how` (`inner`, `left`, `full`, `left_semi`, `left_anti`, `cross`).
+    **Docs:** [DataFrame.join](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.join.html)
+    (`on` as a column name, list, or expression; `how` as `inner`, `left`,
+    `right`, `full`, `left_semi`, `left_anti`, `cross`).
 
 - Class: text
   Depth: beginner
@@ -57,11 +64,11 @@
     (small table). Instead of searching the phone book for each guest, you
     photocopy the guest list and hand one to every worker. Each worker
     matches their section of the phone book against the local guest list.
-    No one needs to move the phone book around — that is a **Broadcast
+    No one needs to move the phone book around; that is a **Broadcast
     Hash Join**.
 
     If both tables are huge (two phone books), you have no choice but to
-    sort and merge them — that is a **Sort Merge Join**. It is slower
+    sort and merge them; that is a **Sort Merge Join**. It is slower
     because both sides must be shuffled and sorted first.
 
 - Class: text
@@ -70,10 +77,10 @@
     ## Broadcast Hash Join (BHJ)
 
     When one table is small enough to fit in executor memory, Spark
-    **broadcasts** it to every executor. The large table stays put — no
+    **broadcasts** it to every executor. The large table stays put; no
     shuffle needed for it. This is the fastest join strategy.
 
-    Spark automatically uses BHJ when one side is below
+    Spark automatically uses BHJ when one side's estimated size is below
     `spark.sql.autoBroadcastJoinThreshold` (default: **10MB**).
 
     You can force a broadcast with a hint:
@@ -84,16 +91,16 @@
     result = large_df.join(f.broadcast(small_df), "key")
     ```
 
-    Check the plan with `explain()` — look for `BroadcastHashJoin`.
+    Check the plan with `explain()`; look for `BroadcastHashJoin` fed by a
+    `BroadcastExchange`.
 
-    **Docs:** [f.broadcast](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.broadcast.html)
-    — wrap the small DataFrame in `f.broadcast(df)` inside the join call.
+    **Docs:** [f.broadcast](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.broadcast.html)
 
 - Class: mult_question
   Depth: all
   Output: "When does Spark automatically choose a Broadcast Hash Join?"
-  AnswerChoices: "When one table is smaller than autoBroadcastJoinThreshold (10MB default);When both tables are large;When the join key has an index;Always for inner joins"
-  CorrectAnswer: "When one table is smaller than autoBroadcastJoinThreshold (10MB default)"
+  AnswerChoices: "When one side is estimated below autoBroadcastJoinThreshold (10MB default);When both tables are large;When the join key has an index;Always for inner joins"
+  CorrectAnswer: "When one side is estimated below autoBroadcastJoinThreshold (10MB default)"
   Hint: "Which strategy avoids shuffling the large table by replicating the small one?"
 
 - Class: cmd_question
@@ -115,37 +122,90 @@
     When both tables are too large to broadcast, Spark falls back to
     Sort Merge Join:
 
-    1. **Shuffle** — both sides are partitioned by the join key
-    2. **Sort** — each partition is sorted by the join key
-    3. **Merge** — sorted partitions are merged (like merge sort)
+    1. **Shuffle**: both sides are partitioned by the join key
+    2. **Sort**: each partition is sorted by the join key
+    3. **Merge**: sorted partitions are merged (like merge sort)
 
-    The shuffle is the expensive part — every row must be sent across the
+    The shuffle is the expensive part: every row is sent across the
     network to the partition that owns its key's hash. This is unavoidable
-    for large-large joins.
+    for large-large joins unless the data is already partitioned by the
+    key (see bucketing below).
 
-    You can verify the strategy with `explain()` — look for
-    `SortMergeJoin` in the physical plan.
+    You can verify the strategy with `explain()`; look for
+    `SortMergeJoin` in the physical plan, with an `Exchange
+    hashpartitioning` and a `Sort` under each side.
 
 - Class: text
   Depth: intermediate
   Output: |
-    ## Forcing a Specific Join Strategy
+    ## Join Hints and Shuffled Hash Join
 
-    Sometimes you know better than the optimizer:
+    There is a third strategy between the two. **Shuffled Hash Join (SHJ)**
+    shuffles both sides like SMJ, but instead of sorting, it builds a hash
+    table from the smaller side of each partition. It skips the sort, so it
+    can beat SMJ when one side is moderately small per partition, but it
+    needs that build side to fit in memory. Spark prefers SMJ by default
+    (`spark.sql.join.preferSortMergeJoin=true`).
+
+    Hints let you choose the strategy explicitly, from either API:
 
     ```python
-    # Force broadcast (even if above threshold)
-    result = big_df.join(f.broadcast(medium_df), "key")
-
-    # Force sort-merge (disable broadcast for testing)
-    spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
-    result = df1.join(df2, "key")
-
-    # Reset to default
-    spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "10485760")
+    orders.join(users.hint("broadcast"), "user_id")      # BroadcastHashJoin
+    orders.join(users.hint("shuffle_hash"), "user_id")   # ShuffledHashJoin
+    orders.join(users.hint("merge"), "user_id")          # SortMergeJoin
     ```
 
-    Use `explain()` after the join to confirm the strategy Spark chose.
+    ```sql
+    SELECT /*+ BROADCAST(u) */ * FROM orders o JOIN users u USING (user_id);
+    SELECT /*+ SHUFFLE_HASH(u) */ * FROM orders o JOIN users u USING (user_id);
+    SELECT /*+ MERGE(o, u) */ * FROM orders o JOIN users u USING (user_id);
+    ```
+
+    `SHUFFLE_REPLICATE_NL` asks for a shuffle-and-replicate nested loop
+    join; it only applies to inner-like joins and is rarely what you want.
+    A hint is a request: if the strategy cannot handle the join type,
+    Spark ignores it and logs a warning.
+
+    To see SMJ without hints, disable automatic broadcasting:
+
+    ```python
+    spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
+    result = df1.join(df2, "key")
+    spark.conf.unset("spark.sql.autoBroadcastJoinThreshold")   # back to default
+    ```
+
+    **Docs:** [Join strategy hints](https://spark.apache.org/docs/4.2.0/sql-ref-syntax-qry-select-hints.html)
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "Which join hint asks Spark for a Shuffled Hash Join?"
+  AnswerChoices: "shuffle_hash;merge;broadcast;shuffle_replicate_nl"
+  CorrectAnswer: "shuffle_hash"
+  Hint: "The hint name describes what the strategy does: shuffle both sides, then hash one of them."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## AQE Rewrites Joins at Runtime
+
+    The static planner chooses a join strategy from size *estimates*. AQE
+    (on by default) re-plans after each shuffle stage using real sizes:
+
+    - **SMJ to BHJ**: if a side turns out to be small after filters ran,
+      AQE switches to a broadcast join. The threshold for this runtime
+      decision is `spark.sql.adaptive.autoBroadcastJoinThreshold`, which
+      defaults to the regular `autoBroadcastJoinThreshold`.
+    - **Local shuffle reader**: once AQE has converted to a broadcast join,
+      it reads the already-written shuffle files locally instead of
+      shuffling again (`spark.sql.adaptive.localShuffleReader.enabled`).
+    - **SMJ to SHJ**: if every partition of one side is below
+      `spark.sql.adaptive.maxShuffledHashJoinLocalMapThreshold` (default
+      0, which means off), AQE can switch to a shuffled hash join.
+    - **Skew splitting**: covered below.
+
+    You will only see these decisions in the *final* plan, so call
+    `explain()` after an action, or open the SQL tab in the 4.2 Web UI,
+    which shows the initial and final plans side by side.
 
 - Class: text
   Depth: intermediate
@@ -154,10 +214,9 @@
 
     If two tables are frequently joined on the same key, save them as
     **bucketed** tables. Bucketing pre-partitions and pre-sorts the data,
-    so joins between same-bucketed tables skip the shuffle entirely:
+    so joins between compatibly bucketed tables skip the shuffle:
 
     ```python
-    # Write bucketed
     (orders_df.write
         .bucketBy(8, "user_id")
         .sortBy("user_id")
@@ -168,14 +227,21 @@
         .sortBy("user_id")
         .saveAsTable("users_bucketed"))
 
-    # Join — no shuffle needed!
     orders = spark.table("orders_bucketed")
     users = spark.table("users_bucketed")
-    result = orders.join(users, "user_id")
+    result = orders.join(users, "user_id")   # no Exchange in the plan
     ```
 
-    Both tables must have the **same number of buckets** and the **same
-    bucket column** for the optimization to apply.
+    Both tables must be bucketed on the join key, and the bucket counts must
+    match. (With `spark.sql.bucketing.coalesceBucketsInJoin.enabled`, off by
+    default, Spark can also join tables whose bucket counts divide evenly.)
+    Bucketing only works for tables written with
+    `saveAsTable`, not for plain `parquet(path)` output.
+
+    Table formats offer the DSv2 analogue: **storage-partitioned joins**
+    let Spark skip the shuffle when both sides of a join are partitioned
+    compatibly by the connector (for example, Iceberg tables with matching
+    partition transforms).
 
 - Class: mult_question
   Depth: intermediate
@@ -189,30 +255,35 @@
   Output: |
     ## Handling Data Skew in Joins
 
-    Data skew occurs when one join key has far more rows than others — a
+    Data skew occurs when one join key has far more rows than others; a
     single partition becomes a bottleneck while other partitions finish
     quickly. Common causes: null keys, popular users, default categories.
 
-    **Solution 1: AQE Skew Join** (automatic in Spark 3.2+)
-    AQE detects skewed partitions at runtime and splits them into smaller
-    sub-partitions. Enable with:
+    **Solution 1: AQE skew join** (on by default). AQE treats a partition as
+    skewed when it is larger than `skewedPartitionFactor` (default 5) times
+    the median partition size **and** larger than
+    `skewedPartitionThresholdInBytes` (default 256MB). It splits that
+    partition and replicates the matching partition on the other side:
     ```python
     spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
     spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionFactor", "5")
+    spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes", "256m")
     ```
 
-    **Solution 2: Salting** — add a random prefix to the skewed key to
-    spread it across partitions:
+    **Solution 2: Salting**: add a random suffix to the skewed key on the
+    big side, and replicate the small side once per suffix:
     ```python
     from pyspark.sql import functions as f
-    salted = df.withColumn("salted_key",
-        f.concat(f.col("key"), f.lit("_"), (f.rand() * 10).cast("int")))
+    SALTS = 10
+    big = big.withColumn("salt", (f.rand() * SALTS).cast("int"))
+    small = small.crossJoin(spark.range(SALTS).withColumnRenamed("id", "salt"))
+    result = big.join(small, ["key", "salt"])
     ```
-    Then join on the salted key. This trades a slightly larger shuffle for
-    eliminating the bottleneck.
+    This trades a larger small side for eliminating the bottleneck.
 
-    **Solution 3: Filter nulls** — if null keys cause the skew, filter
-    them out, handle them separately, then union the results.
+    **Solution 3: Filter nulls**: if null keys cause the skew, filter
+    them out, handle them separately, then union the results. (Inner and
+    left joins never match null keys anyway.)
 
 - Class: cmd_question
   Depth: advanced
@@ -226,26 +297,70 @@
     result.explain()
   Hint: "Set the threshold to -1, join, then call explain() to see the plan."
 
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Lateral Joins and Nearest-Neighbour Joins
+
+    **LATERAL** (SQL since 3.x, `DataFrame.lateralJoin` since 4.0) lets the
+    right side reference columns of the current left row, which makes
+    "top-N per group" a join instead of a window:
+
+    ```sql
+    SELECT u.name, t.order_id, t.amount
+    FROM users u
+    JOIN LATERAL (
+      SELECT order_id, amount FROM orders o
+      WHERE o.user_id = u.user_id
+      ORDER BY amount DESC LIMIT 1
+    ) t
+    ```
+
+    **Nearest-by joins** (new in 4.2, SPARK-56395) return, for each left
+    row, the `k` right rows that rank best on an expression, such as the
+    closest store to each customer:
+
+    ```python
+    dist = f.sqrt((f.col("cx") - f.col("sx")) ** 2 + (f.col("cy") - f.col("sy")) ** 2)
+    customers.nearestByJoin(stores, dist, numResults=1, mode="exact", direction="distance")
+    ```
+
+    ```sql
+    SELECT c.cid, s.store
+    FROM customers c JOIN stores s
+      EXACT NEAREST 2 BY DISTANCE sqrt(pow(cx - sx, 2) + pow(cy - sy, 2))
+    ```
+
+    `direction` is `distance` (smallest first) or `similarity` (largest
+    first); `mode` is `exact` or `approx`. In 4.2.0 both modes evaluate the
+    full cross product (the plan contains a `CartesianProduct`) and keep
+    the best `k` per left row; index-backed approximate search is planned
+    but not implemented. Pre-filter the right side when it is large.
+
 - Class: script
   Depth: all
   Output: |
     ## Exercise: Join Strategy Comparison
 
-    Implement `join_comparison(spark)` that demonstrates both join
-    strategies on the same data:
+    Implement `join_comparison(spark)` that runs the same join with three
+    strategies and captures each plan:
 
-    1. Create a users DataFrame (small) and an events DataFrame (larger)
-    2. Perform a broadcast hash join (using f.broadcast hint)
-    3. Perform a sort merge join (by disabling broadcast threshold)
-    4. Capture the explain plans for both
-    5. Reset the broadcast threshold to default
-    6. Return both results and plans
+    1. Create the users DataFrame (small) and the orders DataFrame (larger)
+    2. Broadcast hash join: use the `f.broadcast` hint on users
+    3. Shuffled hash join: use the `"shuffle_hash"` hint on users
+    4. Sort merge join: set `spark.sql.autoBroadcastJoinThreshold` to `-1`
+       and join without hints
+    5. Capture each plan with the provided `plan_text()` helper *while the
+       relevant setting is in effect*
+    6. Restore the broadcast threshold to its original value, even if
+       something fails (use `try`/`finally`)
+    7. Return the results and plans in a dict
 
-    This exercise gives you hands-on experience reading physical plans
-    and understanding the difference between join strategies.
+    This gives you hands-on experience reading physical plans and seeing
+    how hints and configuration steer the planner.
   StarterFile: starter.py
   SolutionFile: solution.py
-  Hint: "Use f.broadcast(users_df) for BHJ, set threshold to -1 for SMJ, capture plans with explain(), and reset threshold to 10485760."
+  Hint: "Save spark.conf.get('spark.sql.autoBroadcastJoinThreshold') first, set it to '-1' inside try, and set it back in finally. Look for BroadcastHashJoin, ShuffledHashJoin, and SortMergeJoin in the plans."
 
 - Class: text
   Depth: all
@@ -254,16 +369,21 @@
 
     In this lesson you learned:
 
-    - **Join types** — inner, left/right/full outer, left_semi (EXISTS),
-      left_anti (NOT EXISTS)
-    - **Broadcast Hash Join** — fastest for small-large joins; auto-selected
-      below 10MB threshold; force with `f.broadcast()`
-    - **Sort Merge Join** — default for large-large joins; shuffle + sort +
+    - **Join types**: inner, left/right/full outer, left_semi (EXISTS),
+      left_anti (NOT EXISTS), cross, and lateral
+    - **Broadcast Hash Join**: fastest for small-large joins; auto-selected
+      below the 10MB threshold; force with `f.broadcast()` or `BROADCAST`
+    - **Sort Merge Join**: default for large-large joins; shuffle, sort,
       merge
-    - **Bucketed tables** — pre-partition data to skip shuffles on frequent
-      joins
-    - **Skew handling** — AQE skew join, salting, or null filtering
+    - **Shuffled Hash Join** and the `shuffle_hash` / `merge` /
+      `shuffle_replicate_nl` hints
+    - **AQE**: runtime switch to broadcast, local shuffle reads, skew
+      splitting; visible in the final plan
+    - **Bucketed tables** and storage-partitioned joins skip shuffles
+    - **Skew handling**: AQE skew join, salting, or null filtering
+    - **Nearest-by joins** (4.2): top-k matches per row by distance or
+      similarity
 
     You can now write efficient joins and diagnose join performance with
     `explain()`. In the next lesson, you will shift from batch to
-    **streaming** — processing data continuously as it arrives.
+    **streaming**: processing data continuously as it arrives.

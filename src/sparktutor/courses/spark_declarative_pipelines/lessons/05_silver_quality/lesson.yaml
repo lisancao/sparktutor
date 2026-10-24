@@ -1,0 +1,220 @@
+- Class: meta
+  Lesson: "Silver: Types, Duplicates and Quarantine"
+  EstimatedMinutes: 35
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    - Turning bronze strings into real types safely with `try_cast`
+    - Deduplicating with a window, and why `dropDuplicates(["col"])` fails
+      inside a Spark 4.2 pipeline
+    - The quarantine pattern: every bronze row ends up in exactly one of
+      silver or quarantine, with a reason
+    - Data quality checks in open source SDP
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What Silver Promises
+
+    Silver is the layer analysts and downstream jobs trust. Each row has:
+
+    - correct types (decimals, timestamps, dates, not strings),
+    - one row per business key (no duplicate events),
+    - valid values, and references that resolve (no orders for customers
+      that do not exist).
+
+    Rows that break a rule are not silently dropped. They go to a
+    *quarantine* table with the reason, so someone can fix the source.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Safe Casting Under ANSI Mode
+
+    ANSI SQL mode has been on by default since Spark 4.0. Under ANSI rules,
+    `CAST('N/A' AS DECIMAL(10,2))` raises `CAST_INVALID_INPUT` and fails the
+    flow. In Spark 3 the same cast quietly returned NULL.
+
+    `try_cast` keeps the Spark 3 behaviour on purpose, one expression at a
+    time:
+
+    ```python
+    F.expr("try_cast(unit_price AS DECIMAL(10,2))").alias("unit_price")
+    F.col("unit_price").try_cast("decimal(10,2)")          # Column API, Spark 4.0+
+    F.to_timestamp("order_ts").alias("order_ts")
+    ```
+
+    A NULL from `try_cast` where the input was not NULL means "malformed",
+    which is exactly the signal the quarantine needs.
+
+- Class: mult_question
+  Depth: all
+  Output: "Under Spark 4 defaults, what does CAST('N/A' AS DECIMAL(10,2)) do?"
+  AnswerChoices: "Raises CAST_INVALID_INPUT and fails the query;Returns NULL;Returns 0.00;Returns the string unchanged"
+  CorrectAnswer: "Raises CAST_INVALID_INPUT and fails the query"
+  Hint: "spark.sql.ansi.enabled is true by default since 4.0; try_cast is the tolerant version."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Deduplicating Inside a Pipeline
+
+    The natural code is `spark.table("bronze_orders").dropDuplicates(["order_id"])`.
+    In Spark 4.2.0 that fails while the pipeline is *registering* the
+    dataset, with `TABLE_OR_VIEW_NOT_FOUND` for `bronze_orders`, even
+    though `bronze_orders` is defined. The same happens with
+    `.drop("some_column")`.
+
+    The cause is in the Spark Connect planner: for those two operations it
+    resolves column names against the input eagerly, at registration time,
+    before the pipeline's own datasets exist in the catalog. Operations
+    such as `select`, `where`, `withColumn`, `join` and window functions
+    are resolved later and work fine.
+
+    The window pattern avoids it, and it is more explicit about *which*
+    duplicate wins:
+
+    ```python
+    from pyspark.sql.window import Window
+
+    latest_first = Window.partitionBy("order_id").orderBy(F.col("_ingested_at").desc())
+
+    (spark.table("bronze_orders")
+        .withColumn("_rn", F.row_number().over(latest_first))
+        .where("_rn = 1")
+        .select("order_id", "customer_id", ...))   # explicit select instead of .drop("_rn")
+    ```
+
+- Class: mult_question
+  Depth: all
+  Output: "Inside a Spark 4.2.0 pipeline, which of these fails at registration with TABLE_OR_VIEW_NOT_FOUND?"
+  AnswerChoices: "spark.table('bronze_orders').dropDuplicates(['order_id']);spark.table('bronze_orders').where('quantity > 0');spark.table('bronze_orders').withColumn('x', F.lit(1));spark.table('bronze_orders').select('order_id')"
+  CorrectAnswer: "spark.table('bronze_orders').dropDuplicates(['order_id'])"
+  Hint: "Deduplicate-by-name and drop-by-name are resolved eagerly by the Connect planner."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Quarantine Pattern
+
+    Compute a `_reason` once, then split on it:
+
+    ```python
+    @dp.temporary_view
+    def orders_checked():
+        known = spark.table("silver_customers").select("customer_id", F.lit(True).alias("_known"))
+        return (
+            spark.table("orders_typed").join(known, "customer_id", "left")
+            .withColumn("_reason",
+                F.when(F.col("unit_price").isNull(), "invalid_price")
+                 .when(F.col("quantity") <= 0, "invalid_quantity")
+                 .when(F.col("_known").isNull(), "unknown_customer"))
+        )
+
+    @dp.materialized_view
+    def silver_orders():
+        return spark.table("orders_checked").where("_reason IS NULL").select(...)
+
+    @dp.materialized_view
+    def quarantine_orders():
+        return spark.table("orders_checked").where("_reason IS NOT NULL").select(...)
+    ```
+
+    Because both tables come from the same view, every row lands in
+    exactly one of them. That invariant is easy to check: the two counts
+    must add up to the deduplicated input.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Data Quality in Open Source SDP
+
+    Databricks pipelines have expectation decorators (`@dlt.expect`,
+    `expect_or_drop`, `expect_or_fail`). Open source Spark 4.2's
+    `pyspark.pipelines` does not: its public API is `materialized_view`,
+    `table`, `temporary_view`, `create_streaming_table`, `append_flow`,
+    `create_sink` and `create_auto_cdc_flow`.
+
+    Two building blocks cover most needs:
+
+    - **Quarantine tables** for row-level rules (keep the bad rows, with a
+      reason).
+    - **Check datasets** for table-level rules: a materialized view that
+      aggregates and calls `assert_true`, which fails the run with your
+      message. Every exercise in this course is graded that way:
+
+    ```python
+    @dp.materialized_view
+    def check_silver_orders():
+        return spark.table("silver_orders").agg(F.count("*").alias("n")).select(
+            F.assert_true(F.col("n") > 0, "silver_orders is empty").alias("ok"))
+    ```
+
+    Aggregate before asserting, so the check always produces exactly one
+    row; a filter that matches nothing would otherwise pass silently.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Streaming Silver
+
+    Here silver is a materialized view, recomputed each run, which is right
+    for corrections and small data. For high-volume append-only data you
+    would make silver a streaming table that reads
+    `spark.readStream.table("bronze_orders")`. Then:
+
+    - deduplication needs bounded state:
+      `withWatermark("order_ts", "1 day")` plus
+      `dropDuplicatesWithinWatermark(["order_id"])` (Spark 3.5+), keeping
+      the registration-time caveat above in mind;
+    - stream-static joins against a materialized view dimension see the
+      dimension as of each micro-batch;
+    - late corrections to already-written rows need a CDC flow (lesson 7)
+      rather than an append.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Silver and Quarantine
+
+    The starter already contains the bronze layer from lesson 4. Add:
+
+    1. `silver_customers` (materialized view): `bronze_customers` with
+       `signup_date` cast to DATE; columns `customer_id, name, email, city, signup_date`.
+    2. `orders_typed` (temporary view): `bronze_orders` deduplicated on
+       `order_id` with a window (keep the latest `_ingested_at`), with
+       `unit_price` as `DECIMAL(10,2)` via `try_cast` and `order_ts` as a
+       timestamp.
+    3. `orders_checked` (temporary view): `orders_typed` plus `_reason`
+       (`invalid_price`, `invalid_quantity` or `unknown_customer`, else NULL).
+    4. `silver_orders` (materialized view): rows with no `_reason`, plus
+       `city` from `silver_customers` and `line_total` = quantity * unit_price.
+    5. `quarantine_orders` (materialized view): rows with a `_reason`.
+
+    Cancelled orders are valid silver rows; whether to count them is a
+    gold decision.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  RequiresExecution: true
+  Validation:
+    - execution
+  Hint: "Use F.row_number().over(Window.partitionBy('order_id').orderBy(F.col('_ingested_at').desc())), then where('_rn = 1') and an explicit select."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - Cast with `try_cast` so malformed values become NULL instead of
+      failing the run under ANSI mode.
+    - Deduplicate with `row_number()` over a window; in 4.2.0 pipelines,
+      avoid `dropDuplicates([...])` and `.drop(...)` on pipeline datasets.
+    - Split rows into silver and quarantine from one checked view, so every
+      input row is accounted for.
+    - OSS SDP has no expectation decorators; use quarantine tables and
+      `assert_true` check datasets.
+
+    Next: gold aggregates for the business.

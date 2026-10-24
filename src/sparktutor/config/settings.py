@@ -34,13 +34,13 @@ class DatabricksConfig(BaseModel):
 
 
 class DockerConfig(BaseModel):
-    container_name: str = "spark-master-41"
+    container_name: str = "spark-master-42"
     spark_master_url: str = "spark://localhost:7078"
 
 
 class ClaudeConfig(BaseModel):
     api_key: Optional[str] = Field(default=None)
-    model: str = "claude-sonnet-4-6"
+    model: str = "claude-opus-5-5"
 
     def get_api_key(self) -> Optional[str]:
         return self.api_key or os.environ.get("ANTHROPIC_API_KEY")

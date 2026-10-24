@@ -1,0 +1,232 @@
+- Class: meta
+  Lesson: "SQL Pipe Syntax and QUALIFY"
+  EstimatedMinutes: 25
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    SQL's clause order (`SELECT ... FROM ... WHERE ... GROUP BY ...`) is not
+    the order it executes in, which is why real queries turn into nested
+    subqueries read inside out. Spark 4.0 added **pipe syntax** (SPARK-49555),
+    which lets you write a query top to bottom in execution order. 4.2 makes
+    it nicer to type and adds **QUALIFY**, the missing clause for filtering on
+    window functions.
+
+    By the end of this lesson you will be able to:
+
+    - Write queries with `|>` and the pipe operators (`WHERE`, `AGGREGATE`,
+      `EXTEND`, `SET`, `DROP`, `AS`, `JOIN`, ...)
+    - Use the 4.2 additions: `|` as the pipe token (SPARK-51518) and aggregate
+      functions in a pipe `SELECT` (SPARK-54292)
+    - Replace "subquery plus `WHERE rn = 1`" with `QUALIFY` (SPARK-31561, 4.2)
+    - Mix pipe and regular SQL freely
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Think of a pipe query as a recipe. Start with a table, then apply one
+    step at a time, each step working on the result of the step before:
+
+    ```sql
+    FROM orders                    -- start with all orders
+    |> WHERE amount > 5            -- keep the bigger ones
+    |> AGGREGATE sum(amount) AS revenue GROUP BY region
+    |> ORDER BY revenue DESC       -- sort the result
+    ```
+
+    You read it in the same order Spark runs it. No jumping back to the
+    top to figure out what a column name refers to.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Pipe Syntax Basics (Spark 4.0)
+
+    A pipe query starts from any table expression (`FROM t`, `TABLE t`, or
+    a whole regular query) and chains operators with `|>`:
+
+    - `|> WHERE cond`: filter rows. After an aggregate it acts like HAVING.
+    - `|> SELECT exprs`: project (window functions allowed).
+    - `|> EXTEND expr AS c`: add columns, keep the existing ones.
+    - `|> SET c = expr`: replace a column in place.
+    - `|> DROP c1, c2`: remove columns.
+    - `|> AS alias`: name the intermediate result for later references.
+    - `|> AGGREGATE aggs GROUP BY keys`: aggregate; output is keys, then aggregates.
+    - `|> JOIN t ON ...`: join the current result with another table.
+    - `|> ORDER BY`, `|> LIMIT`: sort, limit.
+    - `|> UNION ALL`, `|> PIVOT`, `|> UNPIVOT`, `|> TABLESAMPLE`: as in regular SQL.
+
+    Each operator sees only the output of the previous one, so every prefix
+    of a pipe chain is itself a valid query. Highlight the first three lines
+    in a notebook, run them, and you are debugging the intermediate result.
+
+    **Docs:** [SQL Pipe Syntax](https://spark.apache.org/docs/4.2.0/sql-pipe-syntax.html)
+
+- Class: mult_question
+  Depth: all
+  Output: "Which pipe operator adds a computed column while keeping all existing columns?"
+  AnswerChoices: "EXTEND;SELECT;SET;AS"
+  CorrectAnswer: "EXTEND"
+  Hint: "SELECT replaces the column list; SET overwrites an existing column; AS renames the table."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Using `spark.sql`, write a pipe query over the view `orders` that keeps
+    rows with `amount > 5`, then computes `sum(amount) AS revenue` grouped by
+    `region` with the AGGREGATE operator.
+  CorrectAnswer: |
+    spark.sql("FROM orders |> WHERE amount > 5 |> AGGREGATE sum(amount) AS revenue GROUP BY region")
+  Hint: "Start with FROM orders, then |> WHERE, then |> AGGREGATE ... GROUP BY region."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What 4.2 Adds to Pipes
+
+    **`|` as the pipe token** (SPARK-51518). `FROM orders | WHERE amount > 5`
+    works, controlled by `spark.sql.parser.singleCharacterPipeOperator.enabled`
+    (default `true`). The parser tells the two meanings apart by position:
+    `SELECT 1 | 2` is still bitwise OR and returns `3`.
+
+    **Aggregates in pipe `SELECT`** (SPARK-54292). Before 4.2 you had to use
+    `AGGREGATE`; a pipe `SELECT` containing `sum()` was an error. Now both work:
+
+    ```sql
+    FROM orders |> SELECT region, sum(amount) AS revenue GROUP BY region
+    FROM orders |> AGGREGATE sum(amount) AS revenue GROUP BY region
+    ```
+
+    One difference: `SELECT ... GROUP BY` keeps your column order, while
+    `AGGREGATE` always emits the grouping keys first.
+
+    Gotcha: the 4.2.0 pipe syntax docs page still says aggregates are not
+    supported in the pipe `SELECT` operator. The engine and the release notes
+    say otherwise; trust the engine.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "In Spark 4.2, what does `SELECT 6 | 3` return?"
+  AnswerChoices: "7, because | is bitwise OR in an expression;A syntax error, because | is now the pipe token;3;6"
+  CorrectAnswer: "7, because | is bitwise OR in an expression"
+  Hint: "The single-character pipe only means 'pipe' between query operators, not inside expressions."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## QUALIFY (Spark 4.2)
+
+    Window functions run after `WHERE` and `HAVING`, so you cannot filter
+    on them there. The classic workaround is a subquery:
+
+    ```sql
+    SELECT * FROM (
+      SELECT *, row_number() OVER (PARTITION BY customer ORDER BY order_date DESC) AS rn
+      FROM orders
+    ) WHERE rn = 1
+    ```
+
+    `QUALIFY` is a `WHERE` that runs after window functions:
+
+    ```sql
+    SELECT customer, order_id, order_date
+    FROM orders
+    QUALIFY row_number() OVER (PARTITION BY customer ORDER BY order_date DESC) = 1
+    ```
+
+    It can reference a window alias from the `SELECT` list
+    (`... AS rk FROM t QUALIFY rk <= 3`) or define the window inline, and it
+    works with a named `WINDOW` clause. Clause order: `WHERE`, `GROUP BY`,
+    `HAVING`, `WINDOW`, `QUALIFY`, then `ORDER BY`.
+
+    **Docs:** [QUALIFY Clause](https://spark.apache.org/docs/4.2.0/sql-ref-syntax-qry-select-qualify.html)
+
+- Class: mult_question
+  Depth: all
+  Output: "Which is the most common use of QUALIFY?"
+  AnswerChoices: "Deduplicating to the latest row per key with row_number();Filtering groups by an aggregate;Filtering rows before a join;Limiting the number of output rows"
+  CorrectAnswer: "Deduplicating to the latest row per key with row_number()"
+  Hint: "QUALIFY filters on window function results."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## QUALIFY Rules and Errors
+
+    - **A window function is required** somewhere in the `SELECT` list or the
+      `QUALIFY` condition. `SELECT region FROM sales QUALIFY region = 'east'`
+      fails with `QUALIFY_REQUIRES_WINDOW_FUNCTION`.
+    - **No bare aggregates in the condition.** `QUALIFY sum(amt) > 10` is
+      rejected; use `HAVING` for that. Aggregates *inside* a window over a
+      grouped query are fine:
+      `... GROUP BY region QUALIFY rank() OVER (ORDER BY sum(amt) DESC) = 1`.
+    - **Name collisions.** If a `SELECT` alias matches an input column name,
+      the input column wins inside `QUALIFY`. Give window aliases distinct
+      names (`rk`, `rn`) to avoid surprises.
+    - **Ties.** `row_number()` picks one row arbitrarily among ties; use
+      `rank()` if you want all tied rows, and add a tiebreaker to `ORDER BY`
+      if you want determinism.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Pipes, Windows and QUALIFY Together
+
+    Pipe syntax has no `QUALIFY` operator because it does not need one: the
+    pipe `WHERE` already filters the output of the previous step, window
+    columns included.
+
+    ```sql
+    FROM orders
+    |> AGGREGATE sum(amount) AS revenue GROUP BY region, product
+    |> EXTEND rank() OVER (PARTITION BY region ORDER BY revenue DESC) AS rk
+    |> WHERE rk = 1
+    |> DROP rk
+    ```
+
+    Note the `EXTEND` after `AGGREGATE`: a window over aggregated results
+    without a nested subquery, which in regular SQL needs either a subquery
+    or `QUALIFY` with the aggregate repeated inside the window.
+
+    Pipe syntax is also valid inside views, CTEs and subqueries, and you can
+    append pipe operators to any regular query
+    (`SELECT ... FROM t WHERE ... |> EXTEND ...`). That makes it a low-risk
+    refactoring tool: convert the outermost layer first.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Rewrite a Report With Pipes and QUALIFY
+
+    Implement `pipe_report(spark)` returning four DataFrames:
+
+    1. `region_revenue`: orders with `amount > 5`, `sum(amount) AS revenue`
+       and `count(*) AS n` per region, highest revenue first, using `|>` and
+       `AGGREGATE`.
+    2. `region_revenue_42`: the same result using `|` and a pipe `SELECT`
+       with aggregates (both 4.2).
+    3. `latest_per_customer`: each customer's most recent order
+       (`customer, order_id, order_date`) using `QUALIFY`.
+    4. `top_product`: the highest revenue product per region, columns
+       `region, product, revenue`, with pipe `AGGREGATE`, `EXTEND` a `rank()`,
+       `WHERE`, `DROP`.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "For the pipe SELECT form, put GROUP BY at the end of the SELECT operator. For QUALIFY, use row_number() OVER (PARTITION BY customer ORDER BY order_date DESC) = 1."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - **Pipe syntax (4.0)** writes queries in execution order with `|>`; every
+      prefix is a valid query, which makes debugging trivial.
+    - **4.2** adds `|` as a shorter pipe token and aggregates in pipe `SELECT`.
+    - **QUALIFY (4.2)** filters on window function results without a
+      subquery; it needs a window function and rejects bare aggregates.
+    - Pipe and regular SQL mix freely, so you can adopt pipes one query at a
+      time.
+
+    Next: SQL scripting, where SQL gets variables, loops and error handlers.

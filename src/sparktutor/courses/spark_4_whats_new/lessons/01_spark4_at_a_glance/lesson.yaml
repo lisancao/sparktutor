@@ -1,0 +1,369 @@
+- Class: meta
+  Lesson: "Spark 4 at a Glance: ANSI, Errors, Connect and Arrow"
+  EstimatedMinutes: 30
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    Spark 4.0 shipped in May 2025, 4.1 followed, and 4.2.0 is the current
+    release. Most of this course is about shiny new features, but this first
+    lesson covers the defaults that changed under you. If you upgrade a 3.5
+    job and something breaks, it is almost always one of these.
+
+    By the end of this lesson you will be able to:
+
+    - Explain why ANSI mode is now the default (4.0) and what it breaks
+    - Use the `try_*` family to opt back into lenient behavior, per expression
+    - Catch errors by **condition** and **SQLSTATE** instead of parsing messages,
+      including errors raised on the Python side (4.2)
+    - Run the same PySpark code over **Spark Connect** or **Spark Classic**
+    - Know what changed for Python UDFs and Arrow in 4.2, and which runtimes
+      Spark 4 supports (Java 17 minimum since 4.0, Java 25 support in 4.2)
+
+    Every feature in this course is tagged with the release it landed in, and
+    every code sample was run against PySpark 4.2.0.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    A quick mental model before we start. Spark 3.x was forgiving: if you
+    asked it to turn the string `'abc'` into a number, it quietly gave you
+    `NULL` and kept going. That sounds friendly until a typo in a feed turns
+    a revenue column into NULLs and nobody notices for a month.
+
+    Spark 4 behaves like a strict database. Bad input stops the query with
+    a clear error. When you *want* the forgiving behavior, you ask for it
+    explicitly, one expression at a time, with functions whose names start
+    with `try_`.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## ANSI Mode Is the Default (Spark 4.0)
+
+    `spark.sql.ansi.enabled` defaults to `true` since 4.0 (SPARK-44444).
+    ANSI mode changes three families of behavior:
+
+    - **Invalid casts fail.** `CAST('abc' AS INT)` raises
+      `CAST_INVALID_INPUT` instead of returning NULL.
+    - **Arithmetic overflow fails.** `2147483647 + 1` on INT raises
+      `ARITHMETIC_OVERFLOW` instead of wrapping to a negative number.
+    - **Division by zero fails.** `1/0` raises `DIVIDE_BY_ZERO` instead of
+      returning NULL.
+
+    It also tightens implicit type coercion and makes out-of-range array
+    and map access an error (`element_at(array(1,2), 5)` fails).
+
+    Why the change: silent NULLs and wrapped integers are data corruption
+    that looks like data. Every other serious SQL engine fails loudly here,
+    and the Spark community decided correctness should be the default and
+    leniency the opt-in.
+
+    ```sql
+    SELECT CAST('abc' AS INT);
+    -- [CAST_INVALID_INPUT] The value 'abc' of the type "STRING" cannot be
+    -- cast to "INT" because it is malformed. ... Use `try_cast` to tolerate
+    -- malformed input and return NULL instead. SQLSTATE: 22018
+    ```
+
+    Notice that the error message tells you the fix.
+
+    **Docs:** [ANSI Compliance](https://spark.apache.org/docs/4.2.0/sql-ref-ansi-compliance.html)
+
+- Class: mult_question
+  Depth: all
+  Output: "In Spark 4 with default settings, what does `SELECT 10 / 0` do?"
+  AnswerChoices: "Fails with DIVIDE_BY_ZERO;Returns NULL;Returns Infinity;Returns 0"
+  CorrectAnswer: "Fails with DIVIDE_BY_ZERO"
+  Hint: "ANSI mode is on by default since 4.0. What does a strict SQL engine do with division by zero?"
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The try_* Escape Hatches
+
+    Turning ANSI off globally (`spark.sql.ansi.enabled=false`) is the blunt
+    fix and the wrong one: it brings back silent corruption everywhere.
+    Use the per-expression tolerant variants instead:
+
+    | Strict (fails)            | Tolerant (returns NULL)        |
+    |---------------------------|--------------------------------|
+    | `CAST(x AS INT)`          | `try_cast(x AS INT)`           |
+    | `a / b`                   | `try_divide(a, b)`             |
+    | `a + b`, `a * b`          | `try_add(a, b)`, `try_multiply(a, b)` |
+    | `element_at(arr, i)`      | `try_element_at(arr, i)`       |
+    | `to_number(s, fmt)`       | `try_to_number(s, fmt)`        |
+    | `to_timestamp(s, fmt)`    | `try_to_timestamp(s, fmt)`     |
+
+    In the DataFrame API, `Column.try_cast` mirrors `Column.cast`:
+
+    ```python
+    from pyspark.sql import functions as sf
+
+    clean = raw.select(
+        sf.col("amount").try_cast("double").alias("amount"),
+        sf.try_divide("amount", "qty").alias("unit_price"),
+    )
+    ```
+
+    Most `try_*` functions existed in 3.x; ANSI-by-default is what turned
+    them from niche to essential.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write a DataFrame expression that converts the string column `qty` of
+    `df` to an integer, returning NULL for malformed values instead of
+    failing. Alias the result `qty`.
+  CorrectAnswer: |
+    df.select(sf.col("qty").try_cast("int").alias("qty"))
+  Hint: "Column has a try_cast method that mirrors cast."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Upgrade Gotchas With ANSI
+
+    The failures you hit in practice after a 3.5 to 4.x upgrade:
+
+    - **CSV/JSON string columns cast to numbers.** Any dirty value now kills
+      the job. Audit with `try_cast(...) IS NULL AND col IS NOT NULL` to find
+      the offending rows before switching to strict casts.
+    - **Integer overflow in aggregates over INT columns.** `sum` widens to
+      BIGINT, but expressions like `col_a * col_b` on two INT columns do not.
+      Cast to BIGINT before multiplying.
+    - **Implicit string to number comparisons.** `WHERE int_col = '1x'` used
+      to compare as NULL; now the cast fails.
+    - **Pandas API on Spark** also enabled ANSI by default in 4.1
+      (SPARK-53295).
+
+    If you must ship a legacy job unchanged, set
+    `spark.sql.ansi.enabled=false` for that job only, and treat it as debt.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Error Conditions and SQLSTATE
+
+    Spark 4 errors are structured. Every engine error has:
+
+    - an **error condition** (formerly "error class"), a stable identifier
+      such as `CAST_INVALID_INPUT` or `UNRESOLVED_COLUMN.WITH_SUGGESTION`
+    - a five-character **SQLSTATE** from the SQL standard, such as `22018`
+      (invalid character value for cast) or `42703` (undefined column)
+    - message parameters you can read programmatically
+
+    SQLSTATE became mandatory for engine errors in 4.0 (SPARK-45581). In
+    PySpark every error derives from `pyspark.errors.PySparkException`:
+
+    ```python
+    from pyspark.errors import PySparkException
+
+    try:
+        spark.sql("SELECT 1/0").collect()
+    except PySparkException as e:
+        e.getCondition()          # 'DIVIDE_BY_ZERO'
+        e.getSqlState()           # '22012'
+        e.getMessageParameters()  # {'config': '"spark.sql.ansi.enabled"'}
+    ```
+
+    Match on the condition, never on message text: messages get reworded
+    between releases, conditions do not.
+
+    **New in 4.2 (SPARK-54532):** errors raised by PySpark itself, before
+    anything reaches the JVM, now carry a SQLSTATE as well. Passing a plain
+    Python value where a Column is expected raises a `PySparkTypeError` with
+    condition `NOT_EXPECTED_TYPE` and SQLSTATE `42K09`. One `except
+    PySparkException` handler can now route both kinds of failure by
+    SQLSTATE class.
+
+    **Docs:** [Error Conditions](https://spark.apache.org/docs/4.2.0/sql-error-conditions.html)
+
+- Class: mult_question
+  Depth: all
+  Output: "Which value should production code match on to detect a malformed cast?"
+  AnswerChoices: "e.getCondition() == 'CAST_INVALID_INPUT';'malformed' in str(e);type(e).__name__ == 'NumberFormatException';e.getMessageParameters() is not None"
+  CorrectAnswer: "e.getCondition() == 'CAST_INVALID_INPUT'"
+  Hint: "One of these is a stable identifier; the others depend on wording or implementation details."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## SQLSTATE Classes Worth Knowing
+
+    The first two characters are the class. Routing on the class gives you
+    coarse, stable error handling:
+
+    - `22xxx` data exception (bad cast `22018`, divide by zero `22012`,
+      overflow `22003`). Usually a bad record: quarantine and continue.
+    - `42xxx` syntax or access rule violation (unresolved column `42703`,
+      unresolved routine `42883`, type mismatch `42K09`). A code bug: fail fast.
+    - `0A000` feature not supported. You hit a disabled or unimplemented
+      feature; you will see this several times in this course.
+    - `XX000` internal error. A Spark bug; report it.
+
+    SQL scripting condition handlers (lesson 4) can also catch by SQLSTATE,
+    so the same taxonomy works in SQL and in Python.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Spark Connect vs. Spark Classic
+
+    Spark Connect decouples the client from the driver. Your Python process
+    builds unresolved logical plans and ships them over gRPC to a Spark
+    Connect server, which analyzes, optimizes and executes them. Spark
+    Classic is the original model: your Python process *is* the driver,
+    talking to a JVM over Py4J.
+
+    Why it matters:
+
+    - **Thin clients.** `pip install pyspark-client` gives you a pure Python
+      client with no JVM.
+    - **Isolation.** A client crash or a runaway `collect()` cannot take
+      down a shared driver, and client and server can upgrade separately.
+    - **Same API.** DataFrame and SQL code is the same; a few low level
+      escape hatches (`df.rdd`, `sparkContext`, `_jdf`) do not exist.
+
+    Three ways to get a Connect session:
+
+    ```python
+    # 1. Connect to a running server
+    spark = SparkSession.builder.remote("sc://host:15002").getOrCreate()
+
+    # 2. Start a local server in-process and connect to it (plain python)
+    spark = SparkSession.builder.remote("local[*]").getOrCreate()
+
+    # 3. Flip the API mode: works with spark-submit too
+    spark = SparkSession.builder.config("spark.api.mode", "connect").getOrCreate()
+    ```
+
+    `spark.api.mode` arrived in 4.0 (SPARK-50605) to make migration a config
+    change. Option 2 refuses to run under `spark-submit`, because a Spark
+    master and a Connect URL cannot both be set
+    (`CANNOT_CONFIGURE_SPARK_CONNECT_MASTER`). This lesson's exercise uses
+    option 3 for that reason.
+
+    **Docs:** [Spark Connect Overview](https://spark.apache.org/docs/4.2.0/spark-connect-overview.html)
+
+- Class: mult_question
+  Depth: all
+  Output: "Which of these does NOT work in a Spark Connect session?"
+  AnswerChoices: "df.rdd.map(...);spark.sql('SELECT 1');df.groupBy('k').count();Python UDFs"
+  CorrectAnswer: "df.rdd.map(...)"
+  Hint: "Connect clients send logical plans. Which API exposes the driver's internals directly?"
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Connect Behavior Differences
+
+    Code that runs on both still has a few semantic differences:
+
+    - **Analysis is lazy.** In Classic, `df.select("nope")` fails
+      immediately. In Connect, the plan is not analyzed until an action or
+      a schema access, so the error surfaces later. In 4.2, `df.nope`
+      attribute access on Connect also stopped validating eagerly; set
+      `PYSPARK_VALIDATE_COLUMN_NAME_LEGACY=1` to restore it.
+    - **Exceptions come from a different module.** Connect raises
+      `pyspark.errors.exceptions.connect.ArithmeticException`, Classic raises
+      `pyspark.errors.exceptions.captured.ArithmeticException`. Both are
+      `PySparkException`, so catch the base class and match on condition.
+    - **Caught errors are still logged.** The server logs the error with a
+      full JVM stack trace before your `except` runs. Do not panic at the log.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Python UDFs and Arrow in 4.2
+
+    Spark 4.2 flips two defaults (SPARK-54555):
+
+    - `spark.sql.execution.pythonUDF.arrow.enabled` is `true`: plain `@udf`
+      functions run through Arrow batches (`ArrowEvalPython` in the plan)
+      instead of pickled rows (`BatchEvalPython`).
+    - `spark.sql.execution.arrow.pyspark.enabled` is `true`: `toPandas()`
+      and `createDataFrame(pandas_df)` use Arrow.
+
+    Python UDTFs are Arrow-optimized by default too. Opt a single UDF out
+    with `@udf(returnType, useArrow=False)`.
+
+    Related 4.2 changes from the PySpark migration guide: the minimum
+    PyArrow is now 18.0.0, PyPy is no longer supported, and a pandas UDF
+    that receives a nullable integer column with nulls now sees a pandas
+    nullable dtype (`Int64`) instead of `float64`.
+
+    4.1 added `@arrow_udf` and `@arrow_udtf` (SPARK-52214, SPARK-52979),
+    which hand your function `pyarrow` arrays directly with no pandas
+    conversion at all.
+
+    **Docs:** [PySpark Migration Guide](https://spark.apache.org/docs/4.2.0/api/python/migration_guide/pyspark_upgrade.html)
+
+- Class: cmd_question
+  Depth: intermediate
+  Output: |
+    Define a Python UDF `legacy_upper` that upper-cases a string but opts
+    out of Arrow execution, using the decorator form.
+  CorrectAnswer: |
+    @sf.udf("string", useArrow=False)
+    def legacy_upper(s):
+        return s.upper() if s is not None else None
+  Hint: "The udf decorator takes a useArrow keyword argument."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Runtimes and Platform
+
+    - **Java 17 is the minimum** since 4.0 (SPARK-45315 dropped JDK 8 and
+      11). Java 21 is supported. 4.2 adds build and run support for
+      **Java 25** (SPARK-51167), and the Kubernetes image moved to a
+      `25-jre` base.
+    - **Scala 2.13 only.** Scala 2.12 builds are gone since 4.0.
+    - **Python 3.10+** for PySpark 4.x.
+
+    If you pin a container image, check the Java version first: a Spark 4
+    job on a Java 11 image fails at JVM startup, not at your code.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Audit a Payments Feed Under ANSI Mode
+
+    Implement `audit_payments(spark)`. The harness runs it on a **Spark
+    Connect** session created with `spark.api.mode=connect`.
+
+    1. Cast `amount` to double and `qty` to int the strict way, inside a
+       `try`, and capture `(condition, sqlstate)` from the
+       `PySparkException`. Remember that nothing runs until an action.
+    2. Build `clean` with `try_cast` for both columns and a `unit_price`
+       column computed with `try_divide`.
+    3. Count rows where `amount` or `qty` is NULL after cleaning.
+    4. Trigger a Python-side error (pass the int `5` to `withColumn` as the
+       column) and capture its condition and SQLSTATE.
+    5. Return the dict described in the starter.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Call .collect() inside the try block so the strict cast actually executes. Column.try_cast and functions.try_divide do the tolerant work."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - **ANSI mode (4.0)** makes bad casts, overflow and division by zero
+      fail. Use `try_cast`, `try_divide` and friends per expression rather
+      than turning ANSI off.
+    - **Error conditions and SQLSTATE** are the stable contract. Catch
+      `PySparkException`, match `getCondition()`, route on `getSqlState()`.
+      In 4.2 PySpark-side errors carry a SQLSTATE too.
+    - **Spark Connect** runs the same DataFrame code over gRPC.
+      `spark.api.mode=connect` (4.0) switches without code changes; analysis
+      becomes lazy and the RDD API is unavailable.
+    - **4.2 defaults:** Arrow-optimized Python UDFs, UDTFs and Arrow-based
+      pandas conversion are on; PyArrow 18 is the minimum.
+    - **Runtimes:** Java 17+ since 4.0, Java 25 support in 4.2.
+
+    Next: the VARIANT type, Spark's answer to JSON columns.

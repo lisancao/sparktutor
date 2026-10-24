@@ -1,0 +1,238 @@
+- Class: meta
+  Lesson: "VARIANT: Semi-Structured Data Without the String Tax"
+  EstimatedMinutes: 30
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    Every data platform has a column called `payload` holding JSON as a
+    string. Spark 4.0 added a real type for it: **VARIANT** (SPARK-45827).
+    4.1 made it GA, on by default, with **shredding** for fast Parquet reads
+    (SPARK-54454), and added the `:` path operator (SPARK-52494).
+
+    By the end of this lesson you will be able to:
+
+    - Explain what VARIANT replaces and why it is faster than JSON strings
+    - Parse JSON into VARIANT with `parse_json` and `try_parse_json`
+    - Extract fields with `variant_get`, `try_variant_get`, `:` paths and
+      `::` casts
+    - Discover the shape of messy data with `schema_of_variant` and
+      `schema_of_variant_agg`
+    - Avoid the VARIANT gotchas: no equality, no grouping, strict casts
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Picture a column of JSON strings. Every time a query wants one field,
+    Spark has to read the whole string and parse it from the first brace,
+    on every row, in every query. A VARIANT stores the JSON already parsed,
+    in a compact binary format that knows where each field lives. Asking
+    for one field becomes a lookup instead of a parse.
+
+    You still get the flexibility of JSON: rows do not need the same fields,
+    and new fields can show up tomorrow without a schema change.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Why Not a String, and Why Not a Struct?
+
+    Before VARIANT you had two options for semi-structured data:
+
+    - **JSON string + `from_json`/`get_json_object`.** Flexible, but every
+      read re-parses the text, and the column stats Parquet keeps are useless
+      for a string blob.
+    - **A STRUCT with a fixed schema.** Fast, but the schema is frozen at
+      write time. A new field upstream means a migration; a field that is
+      sometimes a number and sometimes a string breaks the write.
+
+    VARIANT is a self-describing binary encoding whose spec is developed in
+    the Apache Parquet project (Spark's `common/variant/README.md` pins the
+    version it implements). Each value carries its own types and field offsets, so
+    extraction skips straight to the field. With **shredding** (4.1), the
+    Parquet writer pulls frequently occurring fields out into real typed
+    columns behind the scenes, so readers get columnar pruning and statistics
+    on fields you never declared.
+
+    **Docs:** [Data Types](https://spark.apache.org/docs/4.2.0/sql-ref-datatypes.html)
+
+- Class: mult_question
+  Depth: all
+  Output: "What is the main performance advantage of VARIANT over storing JSON in a STRING column?"
+  AnswerChoices: "Field extraction reads a pre-parsed binary encoding instead of re-parsing text;VARIANT values are always smaller than strings;VARIANT enforces a fixed schema;VARIANT columns can be used as join keys"
+  CorrectAnswer: "Field extraction reads a pre-parsed binary encoding instead of re-parsing text"
+  Hint: "Think about what happens on every row when a query asks for one field of a JSON string."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Getting Data Into VARIANT
+
+    ```sql
+    SELECT parse_json('{"user": {"id": 1}, "tags": ["a", "b"]}') AS v;
+    SELECT try_parse_json('{not json') AS v;   -- NULL, no error
+    ```
+
+    `parse_json` fails the query on malformed input (it follows ANSI
+    strictness, like everything else in Spark 4). `try_parse_json` returns
+    NULL, which is what you want at the edge of a pipeline: parse leniently,
+    count the NULLs, quarantine them.
+
+    You can also build a VARIANT from typed data with `to_variant_object`
+    (structs, maps, arrays) or `CAST(x AS VARIANT)` for scalars, and turn
+    one back into JSON text with `to_json(v)` or `CAST(v AS STRING)`.
+
+    In Python, collecting a VARIANT gives you a `pyspark.sql.types.VariantVal`.
+    Call `.toPython()` for dicts and lists, or `.toJson()` for a string.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Extracting Fields
+
+    Three equivalent ways to pull out `user.id` as an INT:
+
+    ```sql
+    SELECT variant_get(v, '$.user.id', 'int')  FROM events;  -- 4.0
+    SELECT v:user.id::int                      FROM events;  -- `:` is 4.1, `::` is 4.0
+    SELECT CAST(v:user.id AS INT)              FROM events;
+    ```
+
+    Path syntax: `.field` for keys, `[n]` for array positions (zero-based),
+    and `['key with spaces']` for awkward names. Keys are **case-sensitive**:
+    `v:User` is not `v:user`. A missing path returns NULL, not an error.
+
+    Without a cast, `v:user` returns a VARIANT, so you can keep drilling or
+    keep the sub-object flexible.
+
+    **The cast is where strictness bites.** If the value at the path cannot
+    become the target type, `variant_get` and `::` raise
+    `INVALID_VARIANT_CAST`. Use `try_variant_get` to get NULL instead:
+
+    ```sql
+    SELECT try_variant_get(v, '$.amount', 'double') AS amount FROM events;
+    ```
+
+    Variant casts follow normal cast rules, so a JSON string `"12.00"`
+    becomes the double `12.0`, but `"n/a"` does not.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write a SQL query (as a `spark.sql` call) that selects the `plan` field
+    nested under `user` from the VARIANT column `v` of the view `events` as
+    a STRING, using the `:` path and `::` cast syntax. Alias it `plan`.
+  CorrectAnswer: |
+    spark.sql("SELECT v:user.plan::string AS plan FROM events")
+  Hint: "Path first with a colon, then the cast with two colons."
+
+- Class: mult_question
+  Depth: all
+  Output: "`v:amount::int` fails with INVALID_VARIANT_CAST on some rows. What is the idiomatic fix?"
+  AnswerChoices: "try_variant_get(v, '$.amount', 'int');Set spark.sql.ansi.enabled=false;Wrap the query in try/except;Convert v to a string first"
+  CorrectAnswer: "try_variant_get(v, '$.amount', 'int')"
+  Hint: "Lesson 1's lesson applies here: tolerate bad values per expression, not globally."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Discovering the Shape of Your Data
+
+    With JSON strings you discover the schema by reading samples. With
+    VARIANT you ask Spark:
+
+    ```sql
+    SELECT schema_of_variant(v) FROM events;           -- per row
+    SELECT schema_of_variant_agg(v) FROM events;       -- merged across rows
+    ```
+
+    The merged schema is the union of every field seen. When a field has
+    different types in different rows, the merged type is `VARIANT`: that is
+    your signal that the producer is inconsistent. For example, an `amount`
+    that is sometimes `49.5` and sometimes `"12.00"` merges to
+    `amount: VARIANT`.
+
+    To iterate over keys, use the table-valued function `variant_explode`:
+
+    ```sql
+    SELECT key, value FROM events, LATERAL variant_explode(v);
+    ```
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## VARIANT Gotchas
+
+    - **No comparison, no grouping, no sorting.** `v1 = v2`, `GROUP BY v`
+      and `ORDER BY v` all fail at analysis (`INVALID_ORDERING_TYPE`,
+      `GROUP_EXPRESSION_TYPE_IS_NOT_ORDERABLE`). Extract and cast the fields
+      you want to compare first.
+    - **No VARIANT join keys.** Same reason. Join on `v:id::bigint`.
+    - **JSON null vs SQL NULL.** `parse_json('null')` is a VARIANT holding a
+      JSON null, which is not SQL NULL. Test it with `is_variant_null(v)`.
+    - **Cast at the edge, not everywhere.** If a field is queried in every
+      dashboard, promote it to a typed column in your silver layer. VARIANT
+      is for the long tail of fields, not a reason to never model data.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Shredding and Storage
+
+    When Spark writes VARIANT to Parquet, 4.1 infers a **shredding schema**
+    from the data being written (SPARK-53659): common fields with stable
+    types are stored as typed Parquet columns alongside the residual binary.
+    Readers then push `v:user.id::int` style extractions into the scan, read
+    only that column, and use its min/max statistics for data skipping.
+
+    The knobs are internal confs (`spark.sql.variant.writeShredding.enabled`,
+    `spark.sql.variant.inferShreddingSchema`,
+    `spark.sql.variant.shredding.maxSchemaWidth`), all on with sensible
+    defaults; there is no public API to control the shredding schema yet.
+    4.1 also reads the Parquet VARIANT logical type (SPARK-54410), which is
+    what makes VARIANT files readable by other engines that implement the
+    spec. The spec is not finalized, and Spark's implementation does not yet
+    support UUID, TIME or nanosecond timestamps inside a VARIANT.
+
+    Practical consequence: the stable fields in a VARIANT column are close
+    to free to query. The fields whose type wobbles are the ones that stay
+    in the binary residual and cost you a decode.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Analyze a Messy Event Feed
+
+    Implement `analyze_events(spark)`:
+
+    1. Parse the `raw` column with `try_parse_json` into a view `events`
+       and count the malformed rows.
+    2. Build `flat` with `event_type`, `user_id` (int), `plan` (string),
+       `amount` (double, via `try_variant_get`) and `items` (left as VARIANT),
+       for parsed rows only.
+    3. Compute the merged schema with `schema_of_variant_agg`.
+    4. Sum `amount` per `user_id` for purchases with a readable amount, and
+       count purchases whose amount could not be read.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Use spark.sql with v:path::type for the stable fields and try_variant_get(v, '$.amount', 'double') for the unreliable one."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - **VARIANT (4.0, GA in 4.1)** stores semi-structured data pre-parsed,
+      so extraction is a lookup and Parquet can shred stable fields into
+      real columns.
+    - **Ingest** with `try_parse_json` at the edge; `parse_json` is strict.
+    - **Extract** with `v:path::type` (`:` since 4.1, `::` since 4.0) or
+      `variant_get`; use `try_variant_get` when the type is unreliable.
+    - **Explore** with `schema_of_variant_agg`; a merged type of `VARIANT`
+      means the producer is inconsistent.
+    - **Do not** compare, group, sort or join on a raw VARIANT: extract and
+      cast first.
+
+    Next: SQL pipe syntax and QUALIFY.

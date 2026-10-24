@@ -1,0 +1,330 @@
+- Class: meta
+  Lesson: "CDC, NEAREST BY Joins, time_bucket and Metric Views"
+  EstimatedMinutes: 35
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    The last lesson covers four Spark 4.2 additions that target everyday
+    analytics plumbing:
+
+    - **Change Data Capture**: a SQL `CHANGES` clause and a DataFrame
+      `changes()` API for reading row-level changes (SPARK-55668)
+    - **NEAREST BY**: a top-K ranking join for nearest-neighbor queries
+      (SPIP SPARK-56395)
+    - **time_bucket**: fixed-size time buckets with an origin (SPARK-56594)
+    - **Metric views**: `CREATE VIEW ... WITH METRICS`, measures defined once
+      and sliced by any dimension (SPARK-54119)
+
+    One honest caveat up front: CDC is an **API and a connector contract**.
+    The tables Spark ships with (the built-in session catalog) do not
+    produce changelogs, so you cannot run `CHANGES` against a local Parquet
+    table. This lesson shows the exact error, teaches the contract, and
+    builds a runnable approximation with the same output shape.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Change Data Capture answers "what changed in this table since version
+    N?" Instead of re-reading the whole table and comparing, you read a
+    feed of changes: this row was inserted, that one deleted, this one
+    updated from 100 to 90.
+
+    Every incremental pipeline needs this, and before 4.2 each table format
+    had its own way to ask (Delta's `table_changes`, Iceberg's changelog
+    views). 4.2 gives Spark one standard way to ask, and each table format
+    plugs into it.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## CDC: The Query Surface (Spark 4.2)
+
+    ```sql
+    -- Batch: changes between two versions (or timestamps)
+    SELECT * FROM inventory CHANGES FROM VERSION 10 TO VERSION 20;
+    SELECT * FROM inventory CHANGES FROM TIMESTAMP '2026-01-01' EXCLUSIVE;
+
+    -- Streaming: the start is optional
+    SELECT * FROM STREAM inventory CHANGES FROM VERSION 10;
+    ```
+
+    ```python
+    spark.read.option("startingVersion", "10").option("endingVersion", "20").changes("inventory")
+    spark.readStream.option("startingVersion", "10").changes("inventory")
+    ```
+
+    Every row carries three metadata columns:
+
+    - `_change_type`: `insert`, `delete`, `update_preimage`, `update_postimage`
+    - `_commit_version`: the version that made the change (LONG or STRING)
+    - `_commit_timestamp`: when that version committed
+
+    Options control post-processing: `deduplicationMode` is `none`,
+    `dropCarryovers` (the default; removes identical delete/insert pairs
+    that copy-on-write file rewrites produce) or `netChanges` (collapse to
+    one net change per row across the range), and `computeUpdates` derives
+    pre/post images from delete/insert pairs.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## CDC: Why It Fails Locally
+
+    `CHANGES` and `changes()` work only for DSv2 tables whose catalog
+    implements `TableCatalog.loadChangelog()`. Spark's built-in session
+    catalog does not, so on a local Parquet table:
+
+    ```text
+    [UNSUPPORTED_FEATURE.CHANGE_DATA_CAPTURE] The feature is not supported:
+    Catalog spark_catalog does not support Change Data Capture (CDC). SQLSTATE: 0A000
+    ```
+
+    That is by design: change tracking is a property of the table format
+    (it needs versioned commits), not of Spark. Spark 4.2 standardizes the
+    query surface, the metadata columns and the post-processing; a connector
+    (a table format's catalog) supplies the raw changes through the
+    `Changelog` interface. In the Spark source tree, the only implementation
+    is the test-only `InMemoryChangelogCatalog`.
+
+    The exercise catches this error by condition, then builds the same
+    changelog shape by diffing two snapshots, which is what you would do
+    against a table format without CDC support.
+
+- Class: mult_question
+  Depth: all
+  Output: "Why does `SELECT * FROM t CHANGES FROM VERSION 0` fail on a plain Parquet table in Spark 4.2?"
+  AnswerChoices: "The session catalog does not implement TableCatalog.loadChangelog();CDC requires Spark Connect;CHANGES only works in streaming queries;Parquet tables need spark.sql.cdc.enabled=true"
+  CorrectAnswer: "The session catalog does not implement TableCatalog.loadChangelog()"
+  Hint: "The error names the catalog, not the file format or a config."
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "A row's qty changes from 100 to 90 in one commit. With computeUpdates on, how does it appear in the changelog?"
+  AnswerChoices: "Two rows: update_preimage with 100 and update_postimage with 90;One update row with old and new columns;A delete followed by an insert, always;Nothing, updates are not captured"
+  CorrectAnswer: "Two rows: update_preimage with 100 and update_postimage with 90"
+  Hint: "The metadata column has four possible values."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## CDC Internals Worth Knowing
+
+    - **Pushdown is restricted.** When post-processing applies, Spark only
+      pushes predicates on `_commit_version`, `_commit_timestamp` and the
+      row id columns into the connector. Pushing a filter on `_change_type`
+      could drop half of a delete/insert pair and corrupt update detection.
+    - **Streaming output lags by one commit.** Streaming post-processing
+      uses `_commit_timestamp` as event time with a zero-delay watermark, so
+      a commit's rows are emitted when a later batch advances the watermark
+      past it. The last commit is emitted when the source terminates.
+    - **netChanges in streaming** only merges changes buffered together; for
+      a full-range collapse use a batch read.
+    - **Declarative pipelines.** 4.2 also adds Auto CDC to Spark Declarative
+      Pipelines (SPARK-56249): `create_auto_cdc_flow(target, source, keys,
+      sequence_by, ...)` in `pyspark.pipelines` applies a CDC feed to a
+      streaming table as SCD Type 1. It runs inside a pipeline
+      (`spark-pipelines run`), not in a plain script, so it is not part of
+      this exercise.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## NEAREST BY: Top-K Joins (Spark 4.2)
+
+    "For each store, the two closest warehouses" used to be a cross join,
+    a window function and a filter. 4.2 makes it a join type:
+
+    ```sql
+    SELECT s.store, w.warehouse
+    FROM stores s
+    JOIN warehouses w
+      EXACT NEAREST 2 BY DISTANCE sqrt(pow(s.sx - w.wx, 2) + pow(s.sy - w.wy, 2))
+    ```
+
+    Grammar: `{ APPROX | EXACT } NEAREST [k] BY { DISTANCE | SIMILARITY } expr`.
+
+    - `DISTANCE` keeps the smallest values; `SIMILARITY` keeps the largest
+      (use it with cosine similarity or a negated distance).
+    - `k` is 1 to 100000, default 1.
+    - Only `INNER` (default) and `LEFT OUTER` are allowed; `FULL OUTER`
+      fails with `NEAREST_BY_JOIN.UNSUPPORTED_JOIN_TYPE`.
+    - `EXACT` forces brute force and requires a deterministic expression;
+      `APPROX` allows index-backed strategies, which are planned but not
+      implemented yet, so today both evaluate the full cross product.
+
+    The DataFrame API is `nearestByJoin`:
+
+    ```python
+    stores.nearestByJoin(warehouses, ranking_expr, 1, "exact", "distance")
+    ```
+
+    **Docs:** [JOIN (nearest_by_clause)](https://spark.apache.org/docs/4.2.0/sql-ref-syntax-qry-select-join.html)
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Using the DataFrame API, join `users` to `products` keeping, for each
+    user, the 3 products with the highest `score` column on `products`
+    (similarity), exact mode.
+  CorrectAnswer: |
+    users.nearestByJoin(products, products.score, 3, "exact", "similarity")
+  Hint: "nearestByJoin(other, rankingExpression, numResults, mode, direction)."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## NEAREST BY Performance and Semantics
+
+    The 4.2 implementation evaluates every (left, right) pair and keeps a
+    bounded heap of `k` per left row: work is
+    `O(|left| x |right| x log k)`, memory is bounded by `k` per row. That is
+    fine for thousands of candidates and painful for millions. Pre-filter the
+    right side (a bounding box, a region match) in a subquery.
+
+    Ties are broken arbitrarily. Output rows per left row come out best
+    first, but downstream operators may reorder; add `ORDER BY` if order
+    matters. For geospatial points (lesson 5), a haversine expression over
+    extracted coordinates works as the ranking expression.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## time_bucket (Spark 4.2)
+
+    `time_bucket(bucket_size, ts[, origin])` returns the start of the
+    fixed-size bucket containing `ts`, aligned to `origin` (default
+    `1970-01-01 00:00:00`):
+
+    ```sql
+    SELECT time_bucket(INTERVAL '15' MINUTE, TIMESTAMP '2024-06-20 09:47:00');
+    -- 2024-06-20 09:45:00
+    SELECT time_bucket(INTERVAL '1' HOUR, ts, TIMESTAMP '2024-01-01 00:30:00');
+    -- hourly buckets starting at half past
+    ```
+
+    Compared with `window()` it returns a plain timestamp (not a struct),
+    supports month and year intervals, and takes an explicit origin.
+    `date_trunc` only knows calendar units; `time_bucket` does any size.
+
+    Rules: the bucket size must be a positive, constant interval (not a
+    string like `'15 minutes'`); `ts` and `origin` must be the same flavor
+    (`TIMESTAMP` or `TIMESTAMP_NTZ`); dates and strings are rejected. For
+    `TIMESTAMP_NTZ`, bucketing is done in UTC; for `TIMESTAMP`, month and
+    day components align to the session time zone. Use `TIMESTAMP_NTZ` when
+    you want results that do not depend on the session zone.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write a DataFrame expression that buckets the timestamp column `ts` of
+    `df` into 15-minute buckets, aliased `bucket`.
+  CorrectAnswer: |
+    df.select(sf.time_bucket(sf.expr("INTERVAL 15 MINUTES"), "ts").alias("bucket"))
+  Hint: "The bucket size is an interval Column; build it with sf.expr."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Metric Views (Spark 4.2)
+
+    Every BI team has redefined "revenue" in five dashboards. A **metric
+    view** defines dimensions and measures once, in YAML, on top of a table
+    or query; consumers pick dimensions and Spark generates the aggregation:
+
+    ```sql
+    CREATE VIEW order_metrics
+    WITH METRICS
+    LANGUAGE YAML
+    AS $$
+    version: "0.1"
+    source: orders_t            # a table name or a SQL query
+    filter: qty > 0             # optional
+    dimensions:
+      - name: region
+        expr: region
+    measures:
+      - name: revenue
+        expr: sum(qty * price)
+    $$;
+
+    SELECT region, measure(revenue) FROM order_metrics GROUP BY region;
+    SELECT measure(revenue) FROM order_metrics WHERE region = 'east';
+    ```
+
+    The measure is an aggregate expression evaluated at whatever grain the
+    query asks for. That is the difference from a regular view with a
+    `GROUP BY` baked in: a ratio like `sum(a) / sum(b)` stays correct at any
+    grain instead of being averaged across pre-aggregated rows.
+
+    **Docs:** [CREATE VIEW](https://spark.apache.org/docs/4.2.0/sql-ref-syntax-ddl-create-view.html)
+
+- Class: mult_question
+  Depth: all
+  Output: "Why define `avg_order_value` as a measure `sum(revenue) / count(order_id)` instead of averaging a pre-aggregated daily view?"
+  AnswerChoices: "The measure is computed at the query's grain, so the ratio is exact for any grouping;Measures are cached and faster;Pre-aggregated views cannot be grouped;Metric views skip the Catalyst optimizer"
+  CorrectAnswer: "The measure is computed at the query's grain, so the ratio is exact for any grouping"
+  Hint: "An average of daily averages is not the overall average."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Metric View Gotchas in 4.2.0
+
+    - **Always wrap measures in `measure()`.** `SELECT total_qty FROM
+      order_metrics` without `measure()` fails with an `INTERNAL_ERROR` at
+      planning in 4.2.0, not a friendly message.
+    - **Persistent only.** `CREATE TEMP VIEW ... WITH METRICS` is a parse
+      error. You need a catalog: the local session catalog works (the view
+      lives in the warehouse directory), and 4.2 also supports metric views
+      on DSv2 catalogs.
+    - **`DESCRIBE TABLE EXTENDED`** shows `Type: METRIC_VIEW`, the YAML text,
+      and the source and filter as table properties.
+    - Dimensions can be expressions (`upper(region)`), and `WHERE` on a
+      dimension filters before aggregation.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: A Tour of the 4.2 Analytics Features
+
+    Implement `whats_new_tour(spark)`:
+
+    1. Save `SNAPSHOT_V1` as table `inventory`, try both
+       `... CHANGES FROM VERSION 0` and
+       `spark.read.option("startingVersion", "0").changes(...)`, and record
+       each error condition.
+    2. Complete `changes_between(...)` so it diffs two snapshots into a
+       changelog with `_change_type`, `_commit_version`, `_commit_timestamp`.
+    3. `NEAREST BY`: the 2 closest warehouses per store in SQL, and the
+       single closest with `nearestByJoin` using `similarity` on a negated
+       distance.
+    4. `time_bucket`: 15-minute buckets of `qty`, and 30-minute buckets with
+       origin `TIMESTAMP_NTZ '2024-06-01 09:10:00'`.
+    5. A metric view over `orders_t` with `units`, `revenue`, `avg_price`;
+       query units and revenue per region and widget revenue.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "For the diff, full outer join on the key and compare non-key columns with eqNullSafe. Update rows emit both a preimage (from before) and a postimage (from after)."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - **CDC (4.2):** `CHANGES FROM VERSION ...` and `read.changes()` return
+      rows with `_change_type`, `_commit_version`, `_commit_timestamp`. It
+      needs a connector whose catalog implements `loadChangelog()`; the
+      built-in catalog raises `UNSUPPORTED_FEATURE.CHANGE_DATA_CAPTURE`.
+    - **NEAREST BY (4.2):** a top-K join with `DISTANCE` or `SIMILARITY`,
+      brute force today, `INNER` or `LEFT OUTER` only.
+    - **time_bucket (4.2):** arbitrary fixed-size buckets with an origin.
+    - **Metric views (4.2):** measures defined once in YAML, queried with
+      `measure()` at any grain.
+
+    That completes the tour. You have now run code for the major Spark 4.0,
+    4.1 and 4.2 features: ANSI by default, Spark Connect, VARIANT, pipe
+    syntax and QUALIFY, SQL scripting, geospatial types, Python data
+    sources, transformWithState, and the 4.2 analytics additions.

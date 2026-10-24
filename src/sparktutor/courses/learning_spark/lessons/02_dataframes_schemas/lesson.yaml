@@ -1,6 +1,6 @@
 - Class: meta
   Lesson: DataFrames & Schemas
-  EstimatedMinutes: 25
+  EstimatedMinutes: 30
 
 - Class: text
   Depth: all
@@ -8,18 +8,21 @@
     ## What You'll Learn
 
     In the previous lesson you created a SparkSession and performed your
-    first aggregation. Now you will understand the **DataFrame** — Spark's
-    core data abstraction — and the **schema system** that gives it
+    first aggregation. Now you will understand the **DataFrame**, Spark's
+    core data abstraction, and the **schema system** that gives it
     structure.
 
     By the end of this lesson you will be able to:
 
     - Explain what a DataFrame is and why it is immutable
-    - Use `select`, `filter`, `withColumn`, `drop`, and `withColumnRenamed`
+    - Use `select`, `filter`, `withColumn`, `withColumns`, `drop`, and
+      `withColumnRenamed`
     - Write column expressions with `col()`, bracket notation, and `expr()`
-    - Define explicit schemas with `StructType` and `StructField`
+    - Define explicit schemas with `StructType` or DDL strings
     - Create DataFrames from Python data
-    - Work with complex types: arrays, maps, and nested structs
+    - Work with complex types (arrays, maps, nested structs) and know which
+      types Spark 4.x added
+    - Explain how ANSI mode changes type conversion and arithmetic
 
 - Class: text
   Depth: all
@@ -27,17 +30,19 @@
     ## DataFrames: Distributed Tables
 
     A DataFrame is a distributed collection of data organized into named,
-    typed columns — like a table in a relational database. Two critical
+    typed columns, like a table in a relational database. Two critical
     properties:
 
-    1. **Immutable** — every transformation returns a *new* DataFrame. The
+    1. **Immutable**: every transformation returns a *new* DataFrame. The
        original is never modified. This makes Spark programs safe to
        parallelize.
-    2. **Lazy** — transformations build up a logical plan. Nothing executes
+    2. **Lazy**: transformations build up a logical plan. Nothing executes
        until you call an action like `show()`, `count()`, or `collect()`.
 
     Under the hood, a DataFrame tracks a **schema** (column names and types)
     and a **logical plan** (the chain of transformations that produces it).
+    In Spark Connect mode the client holds exactly that: a schema it can ask
+    the server for, and a plan it ships to the server on each action.
 
 - Class: text
   Depth: beginner
@@ -45,16 +50,16 @@
     ## Analogy: DataFrames as Spreadsheets
 
     Think of a DataFrame like a spreadsheet. Each column has a name and a
-    type (text, number, date). You cannot change cells in place — instead,
+    type (text, number, date). You cannot change cells in place; instead,
     you create a new sheet with your changes applied.
 
-    - `filter()` — highlight rows matching a condition, copy them to a new
+    - `filter()`: highlight rows matching a condition, copy them to a new
       sheet
-    - `withColumn()` — add a new column computed from existing ones
-    - `select()` — pick only the columns you need
-    - `drop()` — remove a column
+    - `withColumn()`: add a new column computed from existing ones
+    - `select()`: pick only the columns you need
+    - `drop()`: remove a column
 
-    The original sheet is never touched. This "copy-on-write" approach is
+    The original sheet is never touched. This copy-on-write approach is
     what makes Spark safe to run across hundreds of machines simultaneously.
 
 - Class: text
@@ -80,24 +85,35 @@
     df.withColumn("Double_Hits", col("Hits") * 2)
     ```
 
+    **Adding several columns in one step** (one projection in the plan
+    instead of one per call):
+    ```python
+    df.withColumns({
+        "Double_Hits": col("Hits") * 2,
+        "Full_Name": f.concat_ws(" ", "First", "Last"),
+    })
+    ```
+
     **Removing a column:**
     ```python
     df.drop("Url")
     ```
 
-    **Renaming a column:**
+    **Renaming columns:**
     ```python
     df.withColumnRenamed("First", "FirstName")
+    df.withColumnsRenamed({"First": "FirstName", "Last": "LastName"})
     ```
 
-    All of these return new DataFrames. They are transformations (lazy) —
+    All of these return new DataFrames. They are transformations (lazy);
     nothing executes until you call an action.
 
     **Docs:**
-    [select](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.select.html) |
-    [filter](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.filter.html) |
-    [withColumn](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.withColumn.html) |
-    [drop](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.drop.html)
+    [select](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.select.html) |
+    [filter](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.filter.html) |
+    [withColumn](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.withColumn.html) |
+    [withColumns](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.withColumns.html) |
+    [drop](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.drop.html)
 
 - Class: mult_question
   Depth: all
@@ -121,7 +137,7 @@
     expr("Hits")         # SQL expression string
     ```
 
-    `expr()` is the most powerful because it accepts full SQL syntax:
+    `expr()` is the most flexible because it accepts full SQL syntax:
 
     ```python
     expr("Hits * 2")
@@ -129,7 +145,7 @@
     expr("CASE WHEN Hits > 10000 THEN 'big' ELSE 'small' END")
     ```
 
-    All three produce **Column objects** — lazy descriptions of computation.
+    All three produce **Column objects**: lazy descriptions of computation.
     They describe *what* to compute, not *when*. Spark evaluates them only
     when an action triggers execution.
 
@@ -142,7 +158,8 @@
     and nullability. You define one with `StructType` and `StructField`:
 
     ```python
-    from pyspark.sql.types import *
+    from pyspark.sql.types import (
+        StructType, StructField, StringType, IntegerType, ArrayType)
 
     schema = StructType([
         StructField("Id", IntegerType(), False),       # not nullable
@@ -155,17 +172,26 @@
 
     Each `StructField` takes three arguments: **name**, **type**, **nullable**.
 
+    The same schema as a **DDL string**, which every API that takes a schema
+    also accepts:
+
+    ```python
+    schema = "Id INT NOT NULL, First STRING NOT NULL, Last STRING NOT NULL, " \
+             "Hits INT NOT NULL, Campaigns ARRAY<STRING> NOT NULL"
+    ```
+
     Common types: `StringType`, `IntegerType`, `LongType`, `DoubleType`,
-    `BooleanType`, `TimestampType`, `DateType`.
+    `DecimalType`, `BooleanType`, `DateType`, `TimestampType`,
+    `TimestampNTZType` (timestamp without time zone).
 
     Complex types: `ArrayType(elementType)`, `MapType(keyType, valueType)`,
     and nested `StructType` for struct-within-struct.
 
     **Docs:**
-    [StructType](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.types.StructType.html) |
-    [ArrayType](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.types.ArrayType.html) |
-    [MapType](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.types.MapType.html)
-    — schema definition with `StructField(name, type, nullable)`.
+    [StructType](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.types.StructType.html) |
+    [ArrayType](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.types.ArrayType.html) |
+    [MapType](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.types.MapType.html) |
+    [Data types reference](https://spark.apache.org/docs/4.2.0/sql-ref-datatypes.html)
 
 - Class: cmd_question
   Depth: all
@@ -185,6 +211,40 @@
 - Class: text
   Depth: intermediate
   Output: |
+    ## Types Added in Spark 4.x
+
+    **VARIANT** (`VariantType`, since 4.0) stores semi-structured data such
+    as JSON in an efficient binary encoding, without fixing a schema up
+    front. You create it with `parse_json()` and read fields out with
+    `variant_get()` or the `:` path syntax in SQL:
+
+    ```python
+    events = df.select(f.parse_json("payload_json").alias("payload"))
+    events.select(f.variant_get("payload", "$.device.os", "string"))
+    spark.sql("SELECT payload:device.os::string FROM events")
+    ```
+
+    VARIANT is the right type when the shape of the data varies from row
+    to row; a `StructType` is still better when the shape is fixed. Lesson 4
+    covers it in detail.
+
+    **Collated strings** (since 4.0) attach comparison rules to a string
+    type. `STRING COLLATE UTF8_LCASE` compares case-insensitively, so
+    `'Alice'` and `'alice'` group, join, and deduplicate as equal:
+
+    ```python
+    df = spark.createDataFrame([("Alice",), ("alice",)], "name STRING COLLATE UTF8_LCASE")
+    df.distinct().count()   # 1
+    ```
+
+    A `TIME` type (time of day without a date) exists in the 4.2 codebase
+    but sits behind an internal flag that is off by default, so `TIME`
+    literals fail with `UNSUPPORTED_TIME_TYPE` on a stock 4.2.0 build. Treat
+    it as not yet available.
+
+- Class: text
+  Depth: intermediate
+  Output: |
     ## Schema Inference vs. Explicit Schemas
 
     When reading CSV or JSON, Spark can infer the schema:
@@ -193,17 +253,18 @@
     df = spark.read.option("inferSchema", "true").csv("data.csv")
     ```
 
-    However, **inferSchema reads the data twice** — once to sample rows and
-    determine types, once to actually load. For production workloads, always
-    define schemas explicitly:
+    However, **inferSchema scans the data an extra time** to determine
+    types before loading it. For production workloads, define schemas
+    explicitly:
 
-    - **Faster** — avoids the extra scan
-    - **More reliable** — you control the types, not Spark's guesses
-    - **Catches issues early** — malformed data raises errors at load time
-      instead of producing silent nulls
+    - **Faster**: avoids the extra scan
+    - **More reliable**: you control the types, not Spark's guesses
+    - **Catches issues early**: in the default PERMISSIVE parse mode,
+      malformed fields become nulls, and with `mode="FAILFAST"` they raise
+      immediately; either way the type is the one you chose
 
     Parquet and ORC embed schemas in their file metadata, so inference is
-    free for those formats. This is one reason Parquet is Spark's preferred
+    free for those formats. This is one reason Parquet is Spark's default
     format.
 
 - Class: text
@@ -234,14 +295,20 @@
     ```
 
     Row objects are convenient for quick prototyping. For production code,
-    prefer explicit schemas — they are unambiguous and self-documenting.
+    prefer explicit schemas; they are unambiguous and self-documenting.
+
+    `createDataFrame` also accepts a pandas DataFrame, a PyArrow `Table`, or
+    a NumPy array. In 4.2 these conversions go through Arrow by default
+    (`spark.sql.execution.arrow.pyspark.enabled` now defaults to `true`), and
+    `df.toArrow()` (since 4.0) returns a `pyarrow.Table` without going
+    through pandas at all.
 
 - Class: mult_question
   Depth: intermediate
   Output: "What happens when you use inferSchema=True with CSV files?"
-  AnswerChoices: "Spark reads the data twice — once to infer types, once to load;Spark guesses types from column names alone;Schema inference is instant with no extra cost;Spark reads only the first row for type detection"
-  CorrectAnswer: "Spark reads the data twice — once to infer types, once to load"
-  Hint: "CSV stores everything as text, so Spark must sample the data to figure out which columns are numbers, dates, etc."
+  AnswerChoices: "Spark scans the data an extra time to infer types before loading it;Spark guesses types from column names alone;Schema inference is instant with no extra cost;Spark reads only the first row for type detection"
+  CorrectAnswer: "Spark scans the data an extra time to infer types before loading it"
+  Hint: "CSV stores everything as text, so Spark must look at the data to figure out which columns are numbers, dates, etc."
 
 - Class: cmd_question
   Depth: intermediate
@@ -253,6 +320,40 @@
 
     result = blogs_df.withColumn("Big_Hitter", f.col("Hits") > 10000)
   Hint: "Use withColumn with a boolean expression: f.col('Hits') > 10000."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## ANSI Mode: Types Mean What They Say
+
+    Since Spark 4.0, `spark.sql.ansi.enabled` defaults to `true`. The type
+    system stops papering over bad data:
+
+    | Operation | Spark 3.x default | Spark 4.x default |
+    |-----------|-------------------|-------------------|
+    | `CAST('x' AS INT)` | `NULL` | error `CAST_INVALID_INPUT` |
+    | `INT` overflow (`2147483647 + 1`) | wraps around | error `ARITHMETIC_OVERFLOW` |
+    | `1 / 0` | `NULL` | error `DIVIDE_BY_ZERO` |
+    | `to_date('13/45/2019', 'M/d/yyyy')` | `NULL` | error `CANNOT_PARSE_TIMESTAMP` |
+
+    Every strict operation has a lenient twin that returns `NULL`:
+
+    ```python
+    f.col("s").try_cast("int")          # Column.try_cast, since 4.0
+    f.try_divide("a", "b")
+    f.try_add("a", "b")
+    f.try_to_date("Published", "M/d/yyyy")
+    ```
+
+    Use the strict form by default so bad data fails loudly, and the `try_`
+    form only where you have decided a `NULL` is an acceptable answer.
+
+- Class: mult_question
+  Depth: all
+  Output: "In Spark 4.2 with default settings, how do you convert a string column to INT so that malformed values become NULL instead of failing the query?"
+  AnswerChoices: "col('s').try_cast('int');col('s').cast('int');col('s').astype('int');f.to_number('s')"
+  CorrectAnswer: "col('s').try_cast('int')"
+  Hint: "ANSI mode makes cast() strict. The lenient variant has a try_ prefix."
 
 - Class: text
   Depth: advanced
@@ -274,8 +375,14 @@
     ```
 
     builds a **logical plan**. Spark's Catalyst optimizer then rewrites
-    this plan — pushing filters below projections, pruning unused columns,
-    folding constants — before generating the physical execution plan.
+    this plan (pushing filters below projections, pruning unused columns,
+    folding constants) before generating the physical execution plan.
+
+    Under Spark Connect the same Column objects become protobuf expression
+    messages; resolution happens on the server. One visible consequence:
+    since 4.1 and 4.2, `df["typo"]` and `df.typo` on a Connect DataFrame no
+    longer validate the name eagerly, so a misspelled column surfaces when
+    the plan is analyzed, not when you write the expression.
 
     Defining schemas explicitly helps the optimizer: it knows exact types
     and can choose more efficient operations (integer comparison vs. string
@@ -293,15 +400,18 @@
     1. Define a schema with columns: Id (int), First (string), Last (string),
        Url (string), Published (string), Hits (int), Campaigns (array of strings)
     2. Create a DataFrame from the provided DATA using that schema
-    3. Add a boolean column `Big_Hitter` where Hits > 10000
+    3. Use one `withColumns` call to add:
+       - `Big_Hitter`: boolean, `True` when Hits > 10000
+       - `Published_Date`: the `Published` string (format `M/d/yyyy`) parsed
+         into a DATE with `f.to_date`
     4. Return the resulting DataFrame
 
     This exercise practices schema definition, DataFrame creation, and
-    adding computed columns — skills you will use in every lesson going
-    forward.
+    computed columns. Under ANSI mode a malformed date would fail the query;
+    the test data is clean, so `to_date` is the right call.
   StarterFile: starter.py
   SolutionFile: solution.py
-  Hint: "Campaigns is ArrayType(StringType()). Use spark.createDataFrame(DATA, schema), then withColumn for the boolean column."
+  Hint: "Campaigns is ArrayType(StringType()). Use spark.createDataFrame(DATA, schema), then withColumns({...}) with f.col('Hits') > 10000 and f.to_date('Published', 'M/d/yyyy')."
 
 - Class: text
   Depth: all
@@ -311,16 +421,17 @@
     In this lesson you learned:
 
     - **DataFrames** are immutable, distributed tables with named, typed
-      columns — every transformation returns a new DataFrame
-    - **Core operations** — `select`, `filter`, `withColumn`, `drop`, and
-      `withColumnRenamed` are your daily tools
-    - **Column expressions** — `col()`, `df["col"]`, and `expr()` all
+      columns; every transformation returns a new DataFrame
+    - **Core operations**: `select`, `filter`, `withColumn`, `withColumns`,
+      `drop`, and `withColumnRenamed` are your daily tools
+    - **Column expressions**: `col()`, `df["col"]`, and `expr()` all
       produce lazy Column objects; `expr()` supports full SQL syntax
-    - **Schemas** — `StructType` and `StructField` define structure;
-      explicit schemas beat inference for production
-    - **Complex types** — `ArrayType`, `MapType`, and nested `StructType`
-      handle real-world nested data
-    - **createDataFrame** — build DataFrames from Python lists or Row objects
+    - **Schemas**: `StructType`/`StructField` or a DDL string; explicit
+      schemas beat inference for production
+    - **Complex and new types**: arrays, maps, nested structs, plus
+      `VARIANT` and collated strings from Spark 4.x
+    - **ANSI mode**: strict casts and arithmetic by default, with `try_*`
+      functions for deliberate leniency
 
-    Next, you will learn how to read and write data in multiple formats —
-    CSV, JSON, Parquet, and ORC — and understand when to use each.
+    Next, you will learn how to read and write data in multiple formats
+    (CSV, JSON, Parquet, ORC, XML) and when to use each.

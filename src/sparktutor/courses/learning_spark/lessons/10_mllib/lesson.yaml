@@ -1,16 +1,16 @@
 - Class: meta
   Lesson: Machine Learning with MLlib
-  EstimatedMinutes: 30
+  EstimatedMinutes: 35
 
 - Class: text
   Depth: all
   Output: |
     ## What You'll Learn
 
-    This is the final lesson of the course. You have learned to read data,
-    transform it, optimize queries, process streams, and store results in
-    reliable lakehouse tables. Now you will use these skills to build
-    **machine learning pipelines** with Spark MLlib.
+    You have learned to read data, transform it, optimize queries, process
+    streams, and store results in reliable lakehouse tables. Now you will
+    use these skills to build **machine learning pipelines** with Spark
+    MLlib.
 
     By the end of this lesson you will be able to:
 
@@ -19,6 +19,8 @@
     - Train a model, make predictions, and evaluate results
     - Use cross-validation for hyperparameter tuning
     - Save and load models for production use
+    - Run the same pipeline over Spark Connect, which `pyspark.ml` supports
+      since Spark 4.0
 
 - Class: text
   Depth: beginner
@@ -37,29 +39,32 @@
   Output: |
     ## The ML Pipeline Abstraction
 
-    MLlib has three core concepts:
+    MLlib's DataFrame-based API (`pyspark.ml`) has three core concepts:
 
-    **Transformer** — takes a DataFrame and produces a new DataFrame with
-    additional columns. Examples: model predictions, feature encoders.
+    **Transformer**: takes a DataFrame and produces a new DataFrame with
+    additional columns. Examples: trained models, feature encoders.
     All transformers have a `.transform(df)` method.
 
-    **Estimator** — learns from data and produces a Transformer. Examples:
+    **Estimator**: learns from data and produces a Transformer. Examples:
     training algorithms like `LinearRegression`, feature learners like
     `StringIndexer`. All estimators have a `.fit(df)` method.
 
-    **Pipeline** — chains multiple Transformers and Estimators into a
+    **Pipeline**: chains multiple Transformers and Estimators into a
     single workflow. When you call `pipeline.fit(train_df)`, it runs each
-    stage in order, fitting estimators and passing results forward.
+    stage in order, fitting estimators and passing results forward. The
+    result is a `PipelineModel`, itself a Transformer.
 
     ```
-    Estimator.fit(data)  →  Transformer (trained model)
-    Transformer.transform(data)  →  DataFrame with predictions
+    Estimator.fit(data)          ->  Transformer (trained model)
+    Transformer.transform(data)  ->  DataFrame with predictions
     ```
 
-    **Docs:** [MLlib Guide](https://spark.apache.org/docs/3.5.0/ml-guide.html) |
-    [ML Pipelines](https://spark.apache.org/docs/3.5.0/ml-pipeline.html)
-    — Transformer/Estimator pattern, `Pipeline.fit()`, `PipelineModel.transform()`,
-    and stage chaining.
+    The older RDD-based `pyspark.mllib` package has been in maintenance mode
+    for years and, because it is built on RDDs, does not work under Spark
+    Connect. Use `pyspark.ml` for new code.
+
+    **Docs:** [MLlib Guide](https://spark.apache.org/docs/4.2.0/ml-guide.html) |
+    [ML Pipelines](https://spark.apache.org/docs/4.2.0/ml-pipeline.html)
 
 - Class: text
   Depth: all
@@ -69,23 +74,25 @@
     ML models require numeric input vectors. Real-world data has strings,
     categories, and multiple columns. MLlib provides stages to handle this:
 
-    **StringIndexer** — converts string columns to numeric indices:
+    **StringIndexer**: converts string columns to numeric indices (the most
+    frequent value gets 0.0 by default):
     ```python
     from pyspark.ml.feature import StringIndexer
 
-    indexer = StringIndexer(inputCol="city", outputCol="cityIndex")
+    indexer = StringIndexer(inputCol="city", outputCol="cityIndex",
+                            handleInvalid="keep")
     ```
 
-    **OneHotEncoder** — converts indices to binary vectors (for linear
-    models):
+    **OneHotEncoder**: converts indices to sparse binary vectors (for linear
+    models, which would otherwise read the index as an ordered number):
     ```python
     from pyspark.ml.feature import OneHotEncoder
 
     encoder = OneHotEncoder(inputCol="cityIndex", outputCol="cityVec")
     ```
 
-    **VectorAssembler** — combines multiple feature columns into a single
-    `features` vector (required by all MLlib models):
+    **VectorAssembler**: combines multiple feature columns into a single
+    `features` vector (the input every MLlib model expects):
     ```python
     from pyspark.ml.feature import VectorAssembler
 
@@ -94,11 +101,14 @@
         outputCol="features")
     ```
 
+    `handleInvalid` decides what happens to a category seen at prediction
+    time but not during training: `error` (default), `skip` the row, or
+    `keep` it in an extra bucket.
+
     **Docs:**
-    [VectorAssembler](https://spark.apache.org/docs/3.5.0/api/python/reference/api/pyspark.ml.feature.VectorAssembler.html) |
-    [StringIndexer](https://spark.apache.org/docs/3.5.0/api/python/reference/api/pyspark.ml.feature.StringIndexer.html) |
-    [OneHotEncoder](https://spark.apache.org/docs/3.5.0/api/python/reference/api/pyspark.ml.feature.OneHotEncoder.html)
-    — `inputCol`, `outputCol`, `inputCols`, `handleInvalid` parameters.
+    [VectorAssembler](https://spark.apache.org/docs/4.2.0/api/python/reference/api/pyspark.ml.feature.VectorAssembler.html) |
+    [StringIndexer](https://spark.apache.org/docs/4.2.0/api/python/reference/api/pyspark.ml.feature.StringIndexer.html) |
+    [OneHotEncoder](https://spark.apache.org/docs/4.2.0/api/python/reference/api/pyspark.ml.feature.OneHotEncoder.html)
 
 - Class: mult_question
   Depth: all
@@ -151,27 +161,32 @@
     ```
 
     The Pipeline ensures that the same preprocessing happens during both
-    training and prediction — a common source of bugs when done manually.
+    training and prediction, a common source of bugs when done manually.
+    Tree models do not need one-hot encoding; a `StringIndexer` index is
+    enough for them to split on.
 
 - Class: text
   Depth: intermediate
   Output: |
-    ## Regression Models
+    ## Regression and Classification Models
 
     MLlib includes several regression algorithms. All share the same
-    API — set `labelCol` and `featuresCol`, call `fit()`, then
+    API: set `labelCol` and `featuresCol`, call `fit()`, then
     `transform()`:
 
-    - **LinearRegression** — simple, interpretable, good baseline
-    - **DecisionTreeRegressor** — handles non-linear relationships,
+    - **LinearRegression**: simple, interpretable, good baseline
+    - **DecisionTreeRegressor**: handles non-linear relationships,
       interpretable
-    - **RandomForestRegressor** — ensemble of trees, more robust, less
+    - **RandomForestRegressor**: ensemble of trees, more robust, less
       overfitting
-    - **GBTRegressor** — gradient-boosted trees, often best accuracy
+    - **GBTRegressor**: gradient-boosted trees, often best accuracy
       but slower to train
 
     For classification, swap to `LogisticRegression`,
-    `RandomForestClassifier`, etc. Same API, same Pipeline.
+    `RandomForestClassifier`, `GBTClassifier`, etc. Same API, same Pipeline.
+    Tree ensembles expose `featureImportances`, a vector aligned with the
+    assembler's `inputCols`, which is the first thing to check when a model
+    behaves oddly.
 
 - Class: text
   Depth: all
@@ -192,19 +207,19 @@
     mae = evaluator.setMetricName("mae").evaluate(predictions)
     ```
 
-    - **RMSE** (Root Mean Squared Error) — penalizes large errors more;
+    - **RMSE** (Root Mean Squared Error): penalizes large errors more;
       lower is better
-    - **R2** (Coefficient of Determination) — how much variance the model
+    - **R2** (Coefficient of Determination): how much variance the model
       explains; closer to 1.0 is better
-    - **MAE** (Mean Absolute Error) — average error magnitude; lower is
+    - **MAE** (Mean Absolute Error): average error magnitude; lower is
       better
 
 - Class: mult_question
   Depth: intermediate
-  Output: "Which evaluation metric ranges from 0 to 1 and indicates how well the model explains variance in the data?"
+  Output: "Which evaluation metric is at most 1 and indicates how well the model explains variance in the data?"
   AnswerChoices: "R2 (coefficient of determination);RMSE (root mean squared error);MAE (mean absolute error);MSE (mean squared error)"
   CorrectAnswer: "R2 (coefficient of determination)"
-  Hint: "This metric measures the proportion of variance explained by the model."
+  Hint: "This metric measures the proportion of variance explained by the model. A model worse than predicting the mean can even score below 0."
 
 - Class: cmd_question
   Depth: intermediate
@@ -239,23 +254,26 @@
         estimator=pipeline,
         estimatorParamMaps=paramGrid,
         evaluator=evaluator,
-        numFolds=3)
+        numFolds=3,
+        parallelism=4)
 
     cv_model = cv.fit(train_df)
     best_model = cv_model.bestModel
     ```
 
-    CrossValidator trains the pipeline with every parameter combination
-    across k folds. With 9 combinations and 3 folds, it trains 27 models.
-    This is computationally expensive but finds better hyperparameters
-    than guessing.
+    CrossValidator trains the pipeline for every parameter combination in
+    every fold: nine combinations over three folds is 27 fits, plus one
+    final fit on the full training set. `parallelism` controls how many of
+    those fits run concurrently. `TrainValidationSplit` evaluates each
+    combination once on a single held-out split, which is much cheaper
+    when data is plentiful.
 
 - Class: text
   Depth: intermediate
   Output: |
     ## Saving and Loading Models
 
-    Trained models are serializable — save them for later use:
+    Trained models are serializable; save them for later use:
 
     ```python
     # Save
@@ -269,14 +287,53 @@
 
     The saved model includes all pipeline stages (indexers, assemblers,
     trained model), so loading it gives you the complete prediction
-    pipeline.
+    pipeline. The format is portable across languages: a pipeline saved
+    from PySpark loads in Scala, and vice versa.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## MLlib on Spark Connect
+
+    Since Spark 4.0 (SPARK-49907), `pyspark.ml` works over Spark Connect
+    with no code changes. The pipeline in this lesson runs as-is against
+    `SparkSession.builder.remote(...)`.
+
+    What happens underneath is different from Classic mode:
+
+    - `fit()` sends the estimator and its parameters to the server, which
+      trains the model there. The client gets back a **reference** to a
+      server-side model object, not the model's weights.
+    - `transform()` on that model adds a plan node that the server
+      resolves against the cached model.
+    - Model attributes (`featureImportances`, `coefficients`, summaries)
+      are fetched from the server when you access them.
+    - `save()` / `load()` read and write on the server's filesystem.
+
+    Because models live in a per-session cache on the server, 4.1 added
+    controls for it under
+    `spark.connect.session.connectML.mlCache.memoryControl.*`: models
+    beyond `maxInMemorySize` are offloaded to the driver's local disk, a
+    single model is capped by `maxModelSize` (default 1g), and the total
+    cache by `maxStorageSize` (default 10g). Very large models (big tree
+    ensembles, wide feature hashing) are where you will meet these limits.
+
+    The RDD-based `pyspark.mllib` API is not available over Connect.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "Under Spark Connect, where does `pipeline.fit(train_df)` train the model?"
+  AnswerChoices: "On the Spark Connect server, which caches the model and returns a reference;In the Python client process;On the client after downloading the training data;It cannot run under Spark Connect"
+  CorrectAnswer: "On the Spark Connect server, which caches the model and returns a reference"
+  Hint: "The Connect client never holds the data. Where does the data live?"
 
 - Class: text
   Depth: advanced
   Output: |
     ## MLflow Integration
 
-    For production ML, track experiments with MLflow:
+    For production ML, track experiments with MLflow (a separate project
+    you install alongside PySpark):
 
     ```python
     import mlflow
@@ -292,51 +349,68 @@
     ```
 
     MLflow provides a UI to compare runs, a model registry for deployment,
-    and reproducible experiment tracking. It integrates natively with
-    Spark MLlib pipelines.
+    and reproducible experiment tracking. Check that your MLflow version
+    supports Spark Connect models before logging them from a Connect
+    session.
 
 - Class: script
   Depth: all
   Output: |
     ## Exercise: Build a Prediction Pipeline
 
-    Implement `build_pipeline(spark)` that creates a complete ML workflow:
+    Implement `build_pipeline(spark, model_path)` that creates a complete
+    ML workflow:
 
-    1. Create a sample housing dataset with categorical and numeric features
-    2. Split into train/test sets (80/20)
-    3. Build a Pipeline with StringIndexer, VectorAssembler, and
+    1. Create the sample housing dataset with categorical and numeric
+       features
+    2. Split into train/test sets (80/20, seed 42)
+    3. Build a Pipeline with StringIndexers for `neighborhood` and
+       `condition`, a VectorAssembler over `FEATURE_COLS`, and a
        RandomForestRegressor
     4. Train the pipeline on training data
     5. Evaluate RMSE and R2 on test predictions
-    6. Return a dict with the model, predictions, and metrics
+    6. Map the forest's `featureImportances` back to `FEATURE_COLS` as a
+       dict
+    7. Save the fitted model to `model_path`, load it back with
+       `PipelineModel.load`, and confirm it predicts the same values
+    8. Return a dict with the model, predictions, metrics, importances,
+       and the loaded model
 
-    This exercise ties together everything from the lesson: feature
-    preparation, pipeline construction, training, and evaluation.
+    The harness runs on Spark Classic. Because `pyspark.ml` supports Spark
+    Connect, the same function runs unchanged on a Connect session.
   StarterFile: starter.py
   SolutionFile: solution.py
-  Hint: "Use StringIndexer for the categorical column, VectorAssembler to combine all features, RandomForestRegressor as the model, and RegressionEvaluator for metrics."
+  Hint: "The forest is model.stages[-1]; its featureImportances.toArray() lines up with FEATURE_COLS. Save with model.write().overwrite().save(model_path)."
 
 - Class: text
   Depth: all
   Output: |
     ## Course Summary
 
-    Congratulations — you have completed the Learning Spark course! Here
-    is everything you learned:
+    You have reached the end of the core course. Here is everything you
+    learned:
 
-    1. **Getting Started** — SparkSession, architecture, your first analysis
-    2. **DataFrames & Schemas** — immutable tables, StructType, column
-       expressions
-    3. **Data Sources** — CSV, JSON, Parquet, ORC, SQL views
-    4. **Complex Types & HOFs** — arrays, maps, transform, filter, aggregate
-    5. **Spark SQL** — Catalyst optimizer, execution plans, UDFs
-    6. **Optimization** — caching, partitioning, configuration tuning
-    7. **Joins** — broadcast, sort-merge, bucketing, skew handling
-    8. **Streaming** — sources, sinks, watermarks, checkpointing
-    9. **Data Lakes** — ACID transactions, schema evolution, time travel
-    10. **MLlib** — pipelines, feature prep, training, evaluation
+    1. **Getting Started**: SparkSession, architecture, Spark 4.x defaults,
+       Classic vs. Connect
+    2. **DataFrames & Schemas**: immutable tables, StructType and DDL,
+       VARIANT, ANSI mode
+    3. **Data Sources**: CSV, JSON, Parquet, ORC, XML, Python data sources
+    4. **Complex Types & HOFs**: arrays, maps, transform, filter,
+       aggregate, VARIANT
+    5. **Spark SQL**: Catalyst, execution plans, pipe syntax, QUALIFY,
+       scripting, Arrow UDFs
+    6. **Optimization**: caching, partitioning, AQE, the 4.2 Spark UI
+    7. **Joins**: broadcast, sort-merge, shuffled hash, hints, skew,
+       nearest-by joins
+    8. **Streaming**: sources, sinks, watermarks, transformWithState,
+       Real-Time Mode
+    9. **Data Lakes**: ACID transactions, schema evolution, time travel,
+       CDC
+    10. **MLlib**: pipelines, feature prep, training, evaluation, ML on
+        Connect
 
-    You are now equipped to build complete data applications with Apache
-    Spark — from ingestion through transformation, optimization, and
-    machine learning. The Spark Declarative Pipelines course is a natural
-    next step to apply these skills to production-grade data engineering.
+    The final lesson takes a closer look at **Spark Connect**, the
+    client-server architecture that runs everything you have learned from a
+    thin client. After that, the Spark Declarative Pipelines course is a
+    natural next step to apply these skills to production-grade data
+    engineering.

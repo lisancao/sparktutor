@@ -1,6 +1,6 @@
 - Class: meta
   Lesson: Data Sources & Formats
-  EstimatedMinutes: 25
+  EstimatedMinutes: 30
 
 - Class: text
   Depth: all
@@ -8,17 +8,19 @@
     ## What You'll Learn
 
     In the previous lesson you defined schemas and created DataFrames from
-    Python data. Real Spark applications read from files — CSV, JSON,
-    Parquet, ORC — and write results back for downstream consumers.
+    Python data. Real Spark applications read from files (CSV, JSON,
+    Parquet, ORC, XML) and write results back for downstream consumers.
 
     By the end of this lesson you will be able to:
 
     - Use the DataFrameReader and DataFrameWriter APIs
-    - Read and write CSV, JSON, Parquet, and ORC formats
-    - Explain why Parquet is Spark's preferred format
+    - Read and write CSV, JSON, Parquet, ORC, and XML
+    - Explain why Parquet is Spark's default format
     - Choose the right write mode (append, overwrite, ignore, error)
     - Create SQL views from DataFrames and query them with `spark.sql()`
     - Partition output files by column values
+    - Load JSON into a `VARIANT` column and write a custom source with the
+      Python Data Source API
 
 - Class: text
   Depth: all
@@ -35,16 +37,16 @@
         .load("/path/to/data"))   # where to read from
     ```
 
-    The chain is always: **format → options → schema → load**. Spark also
+    The chain is always: **format, options, schema, load**. Spark also
     provides shorthand methods: `spark.read.csv()`, `spark.read.json()`,
-    `spark.read.parquet()`.
+    `spark.read.parquet()`, `spark.read.orc()`, `spark.read.xml()`.
 
     **Docs:**
-    [DataFrameReader.csv](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrameReader.csv.html) |
-    [.json](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrameReader.json.html) |
-    [.parquet](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrameReader.parquet.html) |
-    [DataFrameWriter.mode](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrameWriter.mode.html) |
-    [.parquet](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrameWriter.parquet.html)
+    [DataFrameReader.csv](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrameReader.csv.html) |
+    [.json](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrameReader.json.html) |
+    [.parquet](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrameReader.parquet.html) |
+    [DataFrameWriter.mode](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrameWriter.mode.html) |
+    [Generic data source options](https://spark.apache.org/docs/4.2.0/sql-data-sources-generic-options.html)
 
 - Class: text
   Depth: beginner
@@ -54,36 +56,40 @@
     has a header row"), and it hands you back a DataFrame. No matter what
     format the data starts in, you get the same DataFrame API to work with.
 
-    DataFrameWriter is the reverse — it takes your DataFrame and saves it
+    DataFrameWriter is the reverse: it takes your DataFrame and saves it
     in whatever format you choose.
 
 - Class: text
   Depth: all
   Output: |
-    ## Parquet: Spark's Preferred Format
+    ## Parquet: Spark's Default Format
 
     **Parquet** is a columnar storage format. Instead of storing rows
     together (like CSV), it stores each column together. This gives three
     advantages:
 
-    1. **Column pruning** — if your query only needs 3 of 50 columns, Spark
-       reads only those 3. CSV would read all 50.
-    2. **Efficient compression** — similar values in a column compress
-       better than mixed values in a row.
-    3. **Schema embedded** — the column names and types are stored in the
-       file, so no schema inference or header parsing is needed.
+    1. **Column pruning**: if your query only needs a handful of columns,
+       Spark reads only those. CSV would read every column.
+    2. **Efficient compression**: similar values in a column compress
+       better than mixed values in a row. Spark writes Snappy-compressed
+       Parquet by default (`spark.sql.parquet.compression.codec`).
+    3. **Schema embedded**: column names and types are stored in the file,
+       so no schema inference or header parsing is needed.
 
     Parquet also supports **predicate pushdown**: if you filter on a column,
-    Spark can skip entire row groups whose metadata shows they cannot match
-    the filter.
+    Spark can skip entire row groups whose min/max statistics show they
+    cannot match the filter.
 
     ```python
-    # Reading Parquet — no options needed, schema is in the file
+    # Reading Parquet: no options needed, the schema is in the file
     df = spark.read.parquet("/data/flights.parquet")
 
     # Writing Parquet
     df.write.parquet("/output/flights")
     ```
+
+    `spark.sql.sources.default` is `parquet`, so `df.write.save(path)` with
+    no format also writes Parquet.
 
 - Class: text
   Depth: all
@@ -99,22 +105,25 @@
     ```python
     df = (spark.read
         .option("header", "true")       # first row has column names
-        .option("inferSchema", "true")   # auto-detect types (slow!)
-        .option("sep", ",")              # field delimiter
-        .option("nullValue", "NA")       # treat "NA" as null
-        .option("quote", '"')            # quote character
+        .option("inferSchema", "true")  # auto-detect types (extra scan)
+        .option("sep", ",")             # field delimiter
+        .option("nullValue", "NA")      # treat "NA" as null
+        .option("quote", '"')           # quote character
+        .option("mode", "FAILFAST")     # fail on malformed rows
         .csv("/data/orders.csv"))
     ```
 
-    For production, replace `inferSchema` with an explicit schema you
-    defined with `StructType` (from the previous lesson).
+    The `mode` option controls malformed rows: `PERMISSIVE` (default; bad
+    fields become null, optionally captured in `columnNameOfCorruptRecord`),
+    `DROPMALFORMED`, or `FAILFAST`. For production, replace `inferSchema`
+    with an explicit schema.
 
 - Class: text
   Depth: all
   Output: |
     ## JSON: Semi-Structured Data
 
-    Spark reads **single-line JSON** by default — one JSON object per line
+    Spark reads **single-line JSON** by default, one JSON object per line
     (also called JSON Lines or NDJSON):
 
     ```json
@@ -122,14 +131,40 @@
     {"name": "Bob", "age": 25}
     ```
 
-    For multi-line JSON (one big array), set `multiLine=True`:
+    For multi-line JSON (one big array or pretty-printed objects), set
+    `multiLine`:
 
     ```python
     df = spark.read.option("multiLine", "true").json("/data/users.json")
     ```
 
-    JSON handles nested data naturally — Spark maps nested objects to
+    JSON handles nested data naturally: Spark maps nested objects to
     `StructType` and arrays to `ArrayType`.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## JSON into VARIANT
+
+    Schema inference on JSON has a weakness: if records disagree on shape,
+    the inferred struct is the union of every field Spark saw, and a field
+    that is a number in one record and an object in another collapses to a
+    string. Spark 4.x can skip inference entirely and load each record as a
+    `VARIANT`:
+
+    ```python
+    raw = spark.read.option("singleVariantColumn", "raw").json("/data/events/")
+    raw.printSchema()
+    # root
+    #  |-- raw: variant (nullable = true)
+
+    raw.select(f.variant_get("raw", "$.payload.device", "string").alias("device"))
+    ```
+
+    You can also mix fixed and flexible columns in a DDL schema:
+    `spark.read.schema("id INT, payload VARIANT").json(path)`. VARIANT
+    columns write to Parquet natively, so the raw shape survives the bronze
+    layer of a pipeline untouched.
 
 - Class: mult_question
   Depth: all
@@ -141,23 +176,43 @@
 - Class: text
   Depth: intermediate
   Output: |
-    ## ORC and Avro
+    ## ORC, Avro, and XML
 
-    **ORC** (Optimized Row Columnar) is similar to Parquet — columnar,
-    compressed, with embedded schema. It is historically preferred in the
+    **ORC** (Optimized Row Columnar) is similar to Parquet: columnar,
+    compressed, with an embedded schema. It is historically preferred in the
     Hive ecosystem. For most Spark workloads, Parquet and ORC perform
     comparably.
 
     **Avro** is a **row-based** format, better suited for write-heavy
     workloads and schema evolution. It is commonly used as a serialization
-    format with Kafka. Read with:
+    format with Kafka. The `avro` source ships with Spark as the external
+    `spark-avro` module, so add it to the classpath before reading:
 
     ```python
     df = spark.read.format("avro").load("/data/events.avro")
     ```
 
+    **XML** became a **built-in** source in Spark 4.0 (it used to require
+    the separate spark-xml package). `rowTag` names the element that
+    becomes one row:
+
+    ```python
+    books = spark.read.option("rowTag", "book").xml("/data/books.xml")
+
+    (df.write
+        .option("rootTag", "delays")
+        .option("rowTag", "route")
+        .xml("/output/delays_xml"))
+    ```
+
+    XML attributes become columns prefixed with `_` (`<book id="1">` gives
+    `_id`).
+
     **Rule of thumb**: use Parquet for analytics (read-heavy), Avro for
-    streaming and messaging (write-heavy with schema evolution).
+    streaming and messaging (write-heavy with schema evolution), and
+    CSV/JSON/XML at the edges where other systems hand you data.
+
+    **Docs:** [XML files](https://spark.apache.org/docs/4.2.0/sql-data-sources-xml.html)
 
 - Class: text
   Depth: all
@@ -176,13 +231,15 @@
 
     | Mode | Behavior |
     |------|----------|
-    | `error` (default) | Raise an error if data exists |
+    | `error` / `errorifexists` (default) | Raise an error if data exists |
     | `overwrite` | Delete existing data, write new |
     | `append` | Add new data alongside existing |
     | `ignore` | Silently skip if data exists |
 
     Use `mode("overwrite")` for development and `mode("append")` for
-    incremental production pipelines.
+    incremental production pipelines. Plain file directories give you no
+    atomicity: a failed overwrite can leave a half-written directory. That
+    gap is what table formats like Delta Lake and Iceberg close (Lesson 9).
 
 - Class: cmd_question
   Depth: all
@@ -220,7 +277,13 @@
     the current SparkSession. For application-wide visibility, use
     `createOrReplaceGlobalTempView` and access via `global_temp.view_name`.
 
-    SQL and the DataFrame API produce the **same execution plan** — the
+    You can also query files directly without registering anything:
+
+    ```python
+    spark.sql("SELECT * FROM parquet.`/output/flights` WHERE delay > 30")
+    ```
+
+    SQL and the DataFrame API produce the **same execution plan**; the
     Catalyst optimizer treats them identically. Choose whichever is more
     readable for your use case.
 
@@ -229,7 +292,7 @@
   Output: "What is the main advantage of Parquet over CSV for analytical workloads?"
   AnswerChoices: "Columnar storage enables column pruning and predicate pushdown;Parquet files are human-readable;CSV files cannot store numbers;Parquet is always smaller"
   CorrectAnswer: "Columnar storage enables column pruning and predicate pushdown"
-  Hint: "Think about what happens when you SELECT only 3 of 50 columns, or WHERE a column matches a value."
+  Hint: "Think about what happens when you SELECT a few of many columns, or filter on a column's value."
 
 - Class: text
   Depth: intermediate
@@ -250,12 +313,12 @@
     /output/data/year=2024/month=12/part-00000.parquet
     ```
 
-    **Partition pruning** — when you filter on a partitioned column, Spark
+    **Partition pruning**: when you filter on a partitioned column, Spark
     skips entire directories that cannot match. A query for `year = 2025`
     never touches the `year=2024` directory.
 
     **Warning**: do not partition by high-cardinality columns (e.g., user
-    IDs). You will create millions of tiny files, which hurts performance
+    IDs). You will create a flood of tiny files, which hurts performance
     more than it helps.
 
 - Class: cmd_question
@@ -266,6 +329,15 @@
   CorrectAnswer: |
     df.write.mode("overwrite").partitionBy("country").parquet("/output/data")
   Hint: "Chain .mode(), .partitionBy(), and .parquet() on df.write."
+
+- Class: cmd_question
+  Depth: intermediate
+  Output: |
+    Read the XML file `'/data/books.xml'`, where each `<book>` element is
+    one record, into a DataFrame called `books`.
+  CorrectAnswer: |
+    books = spark.read.option("rowTag", "book").xml("/data/books.xml")
+  Hint: "XML is built in since Spark 4.0. The rowTag option names the element that becomes a row."
 
 - Class: text
   Depth: advanced
@@ -278,24 +350,70 @@
     | ORC | Columnar | Embedded | Excellent | Hive ecosystem |
     | CSV | Row | External | None by default | Interchange, debugging |
     | JSON | Row | Self-describing | Moderate | APIs, semi-structured |
+    | XML | Row | Self-describing | Moderate | Legacy and enterprise feeds |
     | Avro | Row | Embedded | Good | Streaming, Kafka |
 
-    For Spark workloads, default to **Parquet**. Use CSV/JSON only for
-    ingestion from external systems. Use Avro when integrating with Kafka
-    or when schema evolution is critical.
+    For Spark workloads, default to **Parquet** (or a table format built on
+    it). Use CSV/JSON/XML only for ingestion from external systems. Use Avro
+    when integrating with Kafka or when schema evolution is critical.
 
     **Predicate pushdown support**: Parquet and ORC push filters into the
-    file reader (skip row groups). CSV and JSON cannot — Spark must read
-    and filter all rows.
+    file reader (skip row groups and stripes). CSV and JSON parse every row
+    before filtering, though Spark can still push simple filters into the
+    parser to skip building rows it would discard.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Custom Sources in Pure Python
+
+    Since Spark 4.0 you can write a data source in Python, no JVM code
+    required. Subclass `DataSource` for the metadata and `DataSourceReader`
+    for the rows, register it, and use it like any built-in format:
+
+    ```python
+    from pyspark.sql.datasource import DataSource, DataSourceReader
+
+    class Counter(DataSource):
+        @classmethod
+        def name(cls):
+            return "counter"
+
+        def schema(self):
+            return "n INT, sq INT"
+
+        def reader(self, schema):
+            return CounterReader(self.options)
+
+    class CounterReader(DataSourceReader):
+        def __init__(self, options):
+            self.limit = int(options.get("limit", 3))
+
+        def read(self, partition):
+            for i in range(self.limit):
+                yield (i, i * i)
+
+    spark.dataSource.register(Counter)
+    spark.read.format("counter").option("limit", 4).load().show()
+    ```
+
+    The same API covers writers (`DataSourceWriter`) and streaming readers
+    (`DataSourceStreamReader`); in 4.2, Python streaming readers also support
+    admission control and `Trigger.AvailableNow` (SPARK-55304). One 4.2
+    behaviour change: if the Arrow data a Python source returns does not
+    match its declared column types, the read fails with
+    `DATA_SOURCE_RETURN_SCHEMA_MISMATCH`.
+
+    **Docs:** [Python Data Source API](https://spark.apache.org/docs/4.2.0/api/python/tutorial/sql/python_data_source.html)
 
 - Class: script
   Depth: all
   Output: |
     ## Exercise: Multi-Format Data Pipeline
 
-    Implement `data_pipeline(spark, output_path)` that demonstrates the
-    full read-write-query cycle:
+    Implement two functions that exercise the full read-write-query cycle.
 
+    `data_pipeline(spark, output_path)`:
     1. Create a sample DataFrame of flight delay data
     2. Write it to Parquet at the given path (overwrite mode)
     3. Read the Parquet back into a new DataFrame
@@ -303,11 +421,16 @@
     5. Run a SQL query to find the top 3 destinations by total delay
     6. Return the query result DataFrame
 
-    This exercise ties together everything from the lesson: reading,
-    writing, format conversion, SQL views, and queries.
+    `xml_roundtrip(spark, df, xml_path)`:
+    1. Write `df` as XML (overwrite mode) with `rootTag` `"delays"` and
+       `rowTag` `"route"`
+    2. Read it back with the same `rowTag` and return the DataFrame
+
+    This exercise ties together reading, writing, format conversion, SQL
+    views, queries, and the built-in XML source from Spark 4.0.
   StarterFile: starter.py
   SolutionFile: solution.py
-  Hint: "Use spark.createDataFrame with SCHEMA, df.write.mode('overwrite').parquet(), spark.read.parquet(), createOrReplaceTempView, and spark.sql()."
+  Hint: "Use spark.createDataFrame with SCHEMA, df.write.mode('overwrite').parquet(), spark.read.parquet(), createOrReplaceTempView, and spark.sql(). For XML, df.write.mode('overwrite').option('rootTag', ...).option('rowTag', ...).xml(path) and spark.read.option('rowTag', ...).xml(path)."
 
 - Class: text
   Depth: all
@@ -316,18 +439,22 @@
 
     In this lesson you learned:
 
-    - **DataFrameReader** — the universal API for reading any format
-    - **Parquet** — Spark's preferred columnar format with column pruning,
+    - **DataFrameReader**: the universal API for reading any format
+    - **Parquet**: Spark's default columnar format with column pruning,
       compression, and embedded schemas
-    - **CSV** and **JSON** — common interchange formats with more options
-      to configure
-    - **DataFrameWriter** — write modes (error, overwrite, append, ignore)
-    - **SQL views** — `createOrReplaceTempView` lets you query DataFrames
+    - **CSV** and **JSON**: common interchange formats with more options
+      to configure, including parse `mode`
+    - **VARIANT ingestion**: `singleVariantColumn` loads JSON without
+      fixing a schema
+    - **XML**: built in since Spark 4.0 via `rowTag`/`rootTag`
+    - **DataFrameWriter**: write modes (error, overwrite, append, ignore)
+    - **SQL views**: `createOrReplaceTempView` lets you query DataFrames
       with standard SQL
-    - **Partitioning** — organize output by column values for efficient
+    - **Partitioning**: organize output by column values for efficient
       filtering
+    - **Python Data Source API**: custom batch and streaming sources in
+      pure Python
 
-    You can now read data from any common format, transform it, and write
-    results. In the next lesson, you will work with complex data types —
-    arrays, maps, and nested structs — and the higher-order functions that
+    In the next lesson, you will work with complex data types (arrays,
+    maps, nested structs, and VARIANT) and the higher-order functions that
     manipulate them.

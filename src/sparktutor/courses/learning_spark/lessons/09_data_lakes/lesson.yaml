@@ -1,6 +1,6 @@
 - Class: meta
   Lesson: Data Lakes & Lakehouses
-  EstimatedMinutes: 25
+  EstimatedMinutes: 35
 
 - Class: text
   Depth: all
@@ -10,7 +10,8 @@
     You have learned to read Parquet files, run SQL queries, and even
     process streaming data. But what happens when two jobs write to the
     same table at once? What if a write fails halfway? How do you query
-    last week's version of your data?
+    last week's version of your data, or ask for just the rows that changed
+    since yesterday?
 
     Plain files (Parquet, CSV) cannot answer these questions. **Lakehouse
     table formats** add the reliability of a database to the scale of a
@@ -21,68 +22,76 @@
     - Explain the evolution from data lakes to lakehouses
     - Compare Delta Lake, Apache Iceberg, and Apache Hudi
     - Describe ACID guarantees and why they matter
-    - Use schema enforcement and schema evolution
+    - Use schema enforcement and schema evolution, including the
+      `WITH SCHEMA EVOLUTION` SQL that Spark 4.2 added
     - Query historical data with time travel
-    - Understand when to choose which format
+    - Upsert with `MERGE INTO` and the DataFrame `mergeInto` API (4.0)
+    - Read row-level changes with Spark 4.2's Change Data Capture API
+      (`changes()` and the `CHANGES` clause), and know where it works
 
 - Class: text
   Depth: all
   Output: |
     ## The Evolution of Data Architectures
 
-    **Databases** (1970s-2000s) — structured, ACID-compliant, limited
-    scale. Great for transactions, expensive for large analytics.
+    **Databases**: structured, ACID-compliant, limited scale. Great for
+    transactions, expensive for large analytics.
 
-    **Data warehouses** — optimized for analytics, structured data,
+    **Data warehouses**: optimized for analytics on structured data,
     expensive to scale. Good for BI but rigid schemas.
 
-    **Data lakes** (2010s) — store everything cheaply on distributed
-    storage (HDFS, S3, ADLS). Schema-on-read means any format goes.
-    Problem: no transactions, no quality enforcement, data becomes a
-    "data swamp."
+    **Data lakes**: store everything cheaply on distributed storage (HDFS,
+    S3, ADLS, GCS). Schema-on-read means any format goes. Problem: no
+    transactions, no quality enforcement, and data becomes a "data swamp."
 
-    **Lakehouses** (2020s) — combine lake storage with warehouse
-    reliability. You get cheap, scalable storage with ACID transactions,
-    schema enforcement, and time travel.
+    **Lakehouses**: combine lake storage with warehouse reliability. You get
+    cheap, scalable storage with ACID transactions, schema enforcement, and
+    time travel, through an open table format sitting on top of Parquet
+    files.
 
 - Class: text
   Depth: beginner
   Output: |
-    A data lake is like a massive warehouse where you dump everything —
-    boxes of documents, photos, recordings — in whatever format. It is
+    A data lake is like a massive warehouse where you dump everything
+    (boxes of documents, photos, recordings) in whatever format. It is
     cheap and flexible, but things get messy fast. You cannot undo a
     mistake, and two people dropping boxes at the same time can corrupt
     each other's work.
 
     A lakehouse adds organization: labeled shelves (schema enforcement),
-    an inventory system (transaction log), and the ability to undo
-    mistakes (time travel). You keep the flexibility of a lake with the
-    reliability of a database.
+    an inventory system (transaction log), the ability to undo mistakes
+    (time travel), and a delivery log that lists every box that came in or
+    went out (change data capture). You keep the flexibility of a lake with
+    the reliability of a database.
 
 - Class: text
   Depth: all
   Output: |
     ## Three Major Lakehouse Formats
 
-    **Delta Lake** — developed by Databricks. Uses a JSON-based
-    transaction log (`_delta_log/`). Deep Spark integration. Strong
-    community and tooling.
+    **Delta Lake**: created at Databricks, now a Linux Foundation project.
+    Uses a transaction log of JSON commits plus Parquet checkpoints
+    (`_delta_log/`). Deep Spark integration.
 
-    **Apache Iceberg** — developed at Netflix. Uses metadata files with
-    manifest lists. Designed for multi-engine access (Spark, Trino, Flink,
-    Dremio). Supports hidden partitioning and partition evolution.
+    **Apache Iceberg**: created at Netflix, an Apache project. Uses a tree
+    of metadata files, manifest lists, and manifests. Designed for
+    multi-engine access (Spark, Trino, Flink, and others). Supports hidden
+    partitioning and partition evolution.
 
-    **Apache Hudi** — developed at Uber. Optimized for upserts and
-    incremental processing. Good for streaming + change data capture (CDC).
+    **Apache Hudi**: created at Uber, an Apache project. Optimized for
+    upserts and incremental processing; strong for streaming ingestion and
+    change data capture (CDC).
 
     All three provide ACID transactions, schema enforcement, time travel,
-    and merge (upsert) operations. The choice depends on your ecosystem.
+    and merge (upsert) operations. None of them ships inside Apache Spark:
+    each is a separate connector you add with `--packages` and session
+    extensions, and connector releases trail Spark releases, so check the
+    format's compatibility matrix for Spark 4.2 before you upgrade.
 
     **Docs:**
     [Delta Lake Quickstart](https://docs.delta.io/latest/quick-start.html) |
     [Iceberg Spark Guide](https://iceberg.apache.org/docs/latest/spark-getting-started/) |
     [Hudi Spark Guide](https://hudi.apache.org/docs/quick-start-guide)
-    — setup, read/write, time travel, and schema evolution for each format.
 
 - Class: mult_question
   Depth: all
@@ -98,13 +107,14 @@
 
     Lakehouses provide the same ACID properties as databases:
 
-    - **Atomicity** — a write either succeeds completely or not at all.
+    - **Atomicity**: a write either succeeds completely or not at all.
       No partial writes that leave corrupt data.
-    - **Consistency** — schema enforcement ensures every row matches the
+    - **Consistency**: schema enforcement ensures every row matches the
       table schema. Bad data is rejected at write time.
-    - **Isolation** — concurrent readers see consistent snapshots. A reader
-      never sees a half-written batch.
-    - **Durability** — once a write is committed, it is permanent — stored
+    - **Isolation**: concurrent readers see consistent snapshots. A reader
+      never sees a half-written batch. Concurrent writers are resolved by
+      optimistic concurrency: one commit wins, the other retries or fails.
+    - **Durability**: once a write is committed, it is permanent, recorded
       in the transaction log.
 
     These guarantees mean you can run pipelines confidently without
@@ -123,18 +133,29 @@
     rewriting existing data:
 
     ```python
-    # Delta Lake — merge schema on append
+    # Delta Lake: merge schema on append
     (new_df.write
         .format("delta")
         .mode("append")
         .option("mergeSchema", "true")
         .save(path))
 
-    # Iceberg — ALTER TABLE
+    # Any table format: explicit DDL
     spark.sql("ALTER TABLE catalog.db.events ADD COLUMN browser STRING")
     ```
 
-    Existing data is unchanged — new columns appear as `null` in old rows.
+    Spark 4.2 adds a format-neutral SQL form for DSv2 tables
+    (SPARK-54971, SPARK-55690): the insert itself declares that new source
+    columns may be added to the target.
+
+    ```sql
+    INSERT WITH SCHEMA EVOLUTION INTO catalog.db.events
+    SELECT * FROM staged_events
+    ```
+
+    `MERGE WITH SCHEMA EVOLUTION INTO ...` is the merge equivalent. The
+    connector decides which changes it supports. Existing data is unchanged;
+    new columns appear as `NULL` in old rows.
 
 - Class: text
   Depth: intermediate
@@ -142,24 +163,30 @@
     ## Time Travel: Querying Historical Data
 
     Every write creates a new **version** (or **snapshot**). You can query
-    any previous version:
+    any previous version. Spark's SQL grammar has standard syntax that
+    table formats implement:
+
+    ```sql
+    SELECT * FROM catalog.db.events VERSION AS OF 5;
+    SELECT * FROM catalog.db.events TIMESTAMP AS OF '2025-01-15 00:00:00';
+    ```
+
+    And the reader options:
 
     ```python
-    # Delta Lake — by version number
+    # Delta Lake: by version number or timestamp
     spark.read.format("delta").option("versionAsOf", 5).load(path)
-
-    # Delta Lake — by timestamp
     spark.read.format("delta").option("timestampAsOf", "2025-01-15").load(path)
 
-    # Iceberg — by snapshot ID
-    spark.read.format("iceberg").option("snapshot-id", 12345).load("db.table")
+    # Iceberg: by snapshot ID
+    spark.read.option("snapshot-id", 10963874102873).table("catalog.db.events")
     ```
 
     Use cases for time travel:
-    - **Auditing** — prove what data looked like at a specific date
-    - **Debugging** — compare current vs. previous versions to find when
+    - **Auditing**: prove what data looked like at a specific date
+    - **Debugging**: compare current vs. previous versions to find when
       data went wrong
-    - **Reproducibility** — re-run an analysis on the exact data it
+    - **Reproducibility**: re-run an analysis on the exact data it
       originally used
 
 - Class: mult_question
@@ -181,19 +208,133 @@
   Hint: "Write with format('delta'), then read with option('versionAsOf', 0)."
 
 - Class: text
+  Depth: intermediate
+  Output: |
+    ## Upserts: MERGE INTO
+
+    `MERGE INTO` applies inserts, updates, and deletes from a source in one
+    atomic commit:
+
+    ```sql
+    MERGE INTO catalog.hr.employees t
+    USING updates s
+    ON t.id = s.id
+    WHEN MATCHED THEN UPDATE SET *
+    WHEN NOT MATCHED THEN INSERT *
+    WHEN NOT MATCHED BY SOURCE THEN DELETE
+    ```
+
+    Since Spark 4.0 the same thing is available from the DataFrame API:
+
+    ```python
+    (updates_df.mergeInto("catalog.hr.employees", f.expr("t.id = s.id"))
+        .whenMatched().updateAll()
+        .whenNotMatched().insertAll()
+        .whenNotMatchedBySource().delete()
+        .merge())
+    ```
+
+    `withSchemaEvolution()` on the builder is the DataFrame form of
+    `MERGE WITH SCHEMA EVOLUTION`. Both need a target table whose connector
+    supports row-level operations (Delta, Iceberg, Hudi); plain
+    `spark_catalog` Parquet tables do not. For simple partition-scoped
+    replacement, 4.2 also adds `INSERT INTO ... REPLACE WHERE <condition>`
+    and `INSERT INTO ... REPLACE USING (cols)` (SPARK-56001), and DSv2 now
+    reports row counts for `UPDATE`, `DELETE`, `INSERT`, and `MERGE`
+    (SPARK-56524, SPARK-56551, SPARK-56680).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Change Data Capture in Spark 4.2
+
+    Time travel answers "what did the table look like?". **Change data
+    capture (CDC)** answers "which rows changed between two versions?",
+    which is what incremental pipelines need. Each format used to expose
+    this its own way (Delta's change data feed, Iceberg's changelog views).
+    Spark 4.2 adds one engine-level API (SPARK-55668):
+
+    ```python
+    # Batch: changes between two versions
+    changes = (spark.read
+        .option("startingVersion", "10")
+        .option("endingVersion", "20")
+        .changes("catalog.db.orders"))
+
+    # Streaming: an open-ended change feed
+    stream = spark.readStream.changes("catalog.db.orders")
+    ```
+
+    ```sql
+    SELECT * FROM catalog.db.orders CHANGES FROM VERSION 10 TO VERSION 20;
+    SELECT * FROM catalog.db.orders
+      CHANGES FROM TIMESTAMP '2025-01-01 00:00:00'
+      WITH ('deduplicationMode' = 'netChanges');
+    ```
+
+    Every change row carries the data columns plus `_change_type`
+    (`insert`, `delete`, `update_preimage`, `update_postimage`),
+    `_commit_version`, and `_commit_timestamp`.
+
+    **Where it works**: only on DSv2 tables whose catalog implements
+    `TableCatalog.loadChangelog()`. Spark itself ships no such catalog. On
+    the built-in `spark_catalog` with Parquet tables, both forms fail with
+    `UNSUPPORTED_FEATURE.CHANGE_DATA_CAPTURE` ("Catalog spark_catalog does
+    not support Change Data Capture"). You get CDC once your table format's
+    connector implements the new interface.
+
+- Class: mult_question
+  Depth: all
+  Output: "You run `spark.read.option('startingVersion', '1').changes('sales')` on a Parquet table in the default spark_catalog in Spark 4.2. What happens?"
+  AnswerChoices: "It fails with UNSUPPORTED_FEATURE.CHANGE_DATA_CAPTURE;It returns every row as an insert;It returns an empty DataFrame;It diffs the Parquet files automatically"
+  CorrectAnswer: "It fails with UNSUPPORTED_FEATURE.CHANGE_DATA_CAPTURE"
+  Hint: "The CDC API needs a DSv2 catalog that implements loadChangelog(). The built-in session catalog does not."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## CDC Post-Processing Options
+
+    A raw changelog is noisy. Copy-on-write table formats rewrite whole
+    files, so an update to one row can appear as a delete and re-insert of
+    every *other* row in that file (carry-over rows). The CDC API cleans
+    this up for you, controlled by options on `.option(...)` or the SQL
+    `WITH (...)` clause:
+
+    - `deduplicationMode`:
+      - `dropCarryovers` (default): remove identical insert/delete pairs
+        produced by file rewrites
+      - `netChanges`: collapse all changes to a row identity within the
+        range into its net effect (inserted then deleted means nothing)
+      - `none`: raw rows from the connector
+    - `computeUpdates` (default `false`): derive `update_preimage` /
+      `update_postimage` pairs from matching delete/insert pairs, for
+      connectors that record updates that way
+
+    Connectors declare which clean-up they need (`containsCarryoverRows`,
+    `containsIntermediateChanges`, `representsUpdateAsDeleteAndInsert` on
+    the `Changelog` interface), so Spark skips the work when the source is
+    already clean. Streaming reads support row-level post-processing and
+    `netChanges` too (SPARK-56686, SPARK-56687).
+
+    On top of the same machinery, Spark Declarative Pipelines gained
+    **Auto CDC** in 4.2 (SPARK-56249): Python APIs that apply a CDC feed to
+    a target as SCD Type 1 (latest value wins).
+
+- Class: text
   Depth: advanced
   Output: |
     ## Delta Lake vs. Iceberg: Choosing a Format
 
     | Feature | Delta Lake | Apache Iceberg |
     |---------|-----------|----------------|
-    | Transaction log | JSON + checkpoint Parquet | Metadata files + manifests |
-    | Multi-engine | Spark-centric (expanding) | Spark, Trino, Flink, Dremio |
-    | Partitioning | Explicit `PARTITIONED BY` | Hidden partitioning, partition evolution |
-    | Schema evolution | mergeSchema option | ALTER TABLE, full type promotion |
-    | Community | Databricks-led | Apache Foundation, multi-vendor |
+    | Transaction log | JSON commits + Parquet checkpoints | Metadata files + manifest lists + manifests |
+    | Multi-engine | Spark-first, growing elsewhere | Designed for many engines |
+    | Partitioning | Explicit partition columns (plus liquid clustering) | Hidden partitioning, partition evolution |
+    | Schema evolution | `mergeSchema`, ALTER TABLE | ALTER TABLE, type promotion |
+    | Governance | Linux Foundation | Apache Software Foundation |
 
-    **Choose Delta** when working primarily with Spark and Databricks.
+    **Choose Delta** when you work primarily with Spark and Databricks.
     **Choose Iceberg** when you need multi-engine access or advanced
     partition management.
 
@@ -207,26 +348,28 @@
     Lakehouse tables accumulate old data files over time. Regular
     maintenance keeps them performant:
 
-    **Compaction** — merge small files into larger ones for better read
-    performance.
+    **Compaction**: merge small files into larger ones for better read
+    performance (`OPTIMIZE` in Delta, `rewrite_data_files` in Iceberg).
 
-    **Vacuum / Expire snapshots** — remove old data files no longer
-    needed by any active version:
+    **Vacuum / Expire snapshots**: remove old data files no longer
+    needed by any retained version:
     ```python
     # Delta Lake
     spark.sql("VACUUM delta.`/data/events` RETAIN 168 HOURS")
 
     # Iceberg
-    spark.sql("CALL catalog.system.expire_snapshots('db.events', TIMESTAMP '2025-01-01')")
+    spark.sql("CALL catalog.system.expire_snapshots('db.events', TIMESTAMP '2025-01-01 00:00:00')")
     ```
 
-    **History** — view all operations:
+    **History**: view all operations:
     ```python
     spark.sql("DESCRIBE HISTORY delta.`/data/events`")
     ```
 
-    Never vacuum below the default retention (7 days for Delta) unless
-    you are certain no long-running queries need older versions.
+    Expiring snapshots also ends time travel and CDC to those versions.
+    Never vacuum below the default retention (7 days for Delta) unless you
+    are certain no long-running query or downstream CDC consumer needs older
+    versions.
 
 - Class: mult_question
   Depth: advanced
@@ -240,23 +383,30 @@
   Output: |
     ## Exercise: Lakehouse Simulation
 
-    Since this exercise runs in dry-run mode (no Delta/Iceberg JARs
-    required), you will simulate lakehouse concepts using versioned
-    Parquet directories.
+    This exercise runs on plain PySpark (no Delta or Iceberg JARs), so you
+    will simulate lakehouse concepts with versioned Parquet directories and
+    build the change feed yourself, in the same shape as Spark 4.2's CDC
+    API.
 
     Implement `lakehouse_simulation(spark, base_path)`:
 
-    1. Create initial employee data and write as "version 0"
-    2. Add new employees and write combined data as "version 1"
-    3. Read both versions to demonstrate time travel
-    4. Verify schema consistency between versions
-    5. Return a dict with both versions and schema comparison
+    1. Write the initial employees as version 0 (`v0/`)
+    2. Build version 1: the initial employees with Bob's raise applied
+       (`RAISES`), plus the new hires. Write it to `v1/`.
+    3. Read both versions back (time travel)
+    4. Verify the schemas match
+    5. Compute the changes from v0 to v1 with `exceptAll` in both
+       directions. Rows only in v1 are `insert`, rows only in v0 are
+       `delete`. Add `_change_type` and `_commit_version` (1) columns.
+    6. Return a dict with both versions, their counts, the schema check,
+       and the changes DataFrame
 
-    This simulates the core lakehouse workflow: write, evolve, query
-    historical versions.
+    A changed row (Bob) shows up as a delete plus an insert, which is
+    exactly the shape `computeUpdates` turns into
+    `update_preimage`/`update_postimage`.
   StarterFile: starter.py
   SolutionFile: solution.py
-  Hint: "Use spark.createDataFrame with SCHEMA, write each version to a versioned subdirectory, read both back, and compare schemas."
+  Hint: "v1 = initial_df with salary replaced for ids in RAISES (f.when or a join), unioned with the new hires. Changes: v1.exceptAll(v0).withColumn('_change_type', f.lit('insert')) unioned with v0.exceptAll(v1) labelled 'delete'."
 
 - Class: text
   Depth: all
@@ -265,19 +415,23 @@
 
     In this lesson you learned:
 
-    - **Data architecture evolution** — databases → warehouses → lakes →
+    - **Data architecture evolution**: databases, warehouses, lakes, then
       lakehouses
-    - **Three formats** — Delta Lake, Apache Iceberg, Apache Hudi provide
-      ACID transactions on data lake storage
-    - **ACID guarantees** — atomicity, consistency, isolation, durability
+    - **Three formats**: Delta Lake, Apache Iceberg, and Apache Hudi
+      provide ACID transactions on data lake storage, as connectors you add
+      to Spark
+    - **ACID guarantees**: atomicity, consistency, isolation, durability
       prevent corruption from failures and concurrency
-    - **Schema enforcement/evolution** — reject bad writes, safely add
-      columns
-    - **Time travel** — query any historical version for auditing,
-      debugging, or reproducibility
-    - **Maintenance** — vacuum/expire old snapshots, compact small files
+    - **Schema enforcement/evolution**: reject bad writes, safely add
+      columns; `INSERT/MERGE WITH SCHEMA EVOLUTION` in 4.2
+    - **Time travel**: `VERSION AS OF` / `TIMESTAMP AS OF` for auditing,
+      debugging, and reproducibility
+    - **MERGE INTO** and `DataFrame.mergeInto` for upserts
+    - **CDC (4.2)**: `spark.read.changes()`, `readStream.changes()`, and
+      the `CHANGES` clause, with `_change_type`, `_commit_version`, and
+      dedup options; available once a DSv2 connector implements it
+    - **Maintenance**: vacuum/expire old snapshots, compact small files
 
     You now understand the storage layer that production data platforms
-    are built on. In the final lesson, you will use everything you have
-    learned as we explore **machine learning with MLlib** — Spark's
-    built-in library for training and deploying models at scale.
+    are built on. In the next lesson you will use everything you have
+    learned to build **machine learning pipelines with MLlib**.

@@ -193,41 +193,58 @@ def _extract_key_concepts(code: str) -> list[str]:
     concepts = []
 
     # Detect common patterns
+    # Spark Declarative Pipelines (pyspark.pipelines)
+    sdp_apis = [
+        ("@dp.materialized_view", "@dp.materialized_view: batch dataset recomputed each run"),
+        ("@dp.table", "@dp.table: streaming table fed incrementally"),
+        ("@dp.temporary_view", "@dp.temporary_view: intermediate view, not stored"),
+        ("dp.create_streaming_table(", "dp.create_streaming_table(): declare a target for flows"),
+        ("@dp.append_flow(", "@dp.append_flow(target=...): add a flow into a table or sink"),
+        ("dp.create_auto_cdc_flow(", "dp.create_auto_cdc_flow(): apply a CDC feed (keys, sequence_by)"),
+        ("dp.create_sink(", "dp.create_sink(): external destination for append flows"),
+        ("spark.table(", "spark.table(name): read another dataset in the pipeline"),
+        ("try_cast", "try_cast: NULL instead of an ANSI cast error"),
+        (".over(", "window functions: F.row_number() / F.rank() .over(Window...)"),
+    ]
+    for marker, concept in sdp_apis:
+        if marker in code:
+            concepts.append(concept)
+
     if "SparkSession.builder" in code:
         concepts.append("SparkSession.builder (builder pattern)")
     if ".appName(" in code:
-        concepts.append(".appName() — set application name")
+        concepts.append(".appName(): set application name")
     if ".config(" in code:
         configs = re.findall(r"\.config\(['\"]([^'\"]+)['\"]", code)
         for cfg in configs:
-            concepts.append(f".config('{cfg}', ...) — configuration key")
+            concepts.append(f".config('{cfg}', ...): configuration key")
     if ".getOrCreate()" in code:
-        concepts.append(".getOrCreate() — create or reuse session")
+        concepts.append(".getOrCreate(): create or reuse session")
     if "spark.read" in code:
-        concepts.append("spark.read — batch data reader")
+        concepts.append("spark.read: batch data reader")
     if "spark.readStream" in code:
-        concepts.append("spark.readStream — streaming reader")
+        concepts.append("spark.readStream: streaming reader")
     if ".write." in code or ".save(" in code:
-        concepts.append("DataFrame.write — output writer")
+        concepts.append("DataFrame.write: output writer")
     if ".groupBy(" in code:
-        concepts.append(".groupBy() — aggregation")
+        concepts.append(".groupBy(): aggregation")
     if ".join(" in code:
-        concepts.append(".join() — combining DataFrames")
+        concepts.append(".join(): combining DataFrames")
     if ".filter(" in code or ".where(" in code:
-        concepts.append(".filter() / .where() — row filtering")
+        concepts.append(".filter() / .where(): row filtering")
     if ".withColumn(" in code:
-        concepts.append(".withColumn() — add/replace column")
+        concepts.append(".withColumn(): add/replace column")
     if "createDataFrame" in code:
-        concepts.append("spark.createDataFrame() — create from local data")
+        concepts.append("spark.createDataFrame(): create from local data")
     if "class " in code:
         class_names = re.findall(r"class\s+(\w+)", code)
         for name in class_names:
-            concepts.append(f"class {name} — define a class")
+            concepts.append(f"class {name}: define a class")
     if "def " in code and "class " not in code:
         func_names = re.findall(r"def\s+(\w+)", code)
         for name in func_names:
             if name != "__init__":
-                concepts.append(f"def {name}() — define a function")
+                concepts.append(f"def {name}(): define a function")
 
     return concepts
 

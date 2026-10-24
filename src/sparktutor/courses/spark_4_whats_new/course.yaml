@@ -1,0 +1,20 @@
+course:
+  id: spark_4_whats_new
+  title: "What's New in Apache Spark 4.x"
+  description: "A hands-on tour of Spark 4.0, 4.1 and 4.2: ANSI by default, Spark Connect, VARIANT, pipe syntax, SQL scripting, geospatial types, Python data sources, transformWithState, CDC, NEAREST BY joins and metric views"
+  version: "1.0.0"
+  requires_lakehouse: false
+  prerequisites:
+    - "Python 3.10+"
+    - "Java 17 or newer (Spark 4.x dropped Java 8 and 11; 4.2 also runs on Java 25)"
+    - "pip install \"pyspark[connect]==4.2.0\""
+    - "Comfort with DataFrames and Spark SQL (the learning_spark course covers both)"
+  lessons:
+    - 01_spark4_at_a_glance
+    - 02_variant
+    - 03_pipe_syntax_qualify
+    - 04_sql_scripting
+    - 05_geospatial
+    - 06_python_data_sources
+    - 07_transform_with_state
+    - 08_cdc_nearest_metrics

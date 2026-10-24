@@ -2,7 +2,7 @@
 Built-in Data Sources - Solution
 
 Complete data pipeline: create, write to Parquet, read back,
-create SQL view, and query.
+create SQL view, and query; then an XML round trip.
 """
 
 from pyspark.sql import SparkSession, functions as f
@@ -46,6 +46,20 @@ def data_pipeline(spark, output_path):
     return result
 
 
+def xml_roundtrip(spark, df, xml_path):
+    """Write df as XML and read it back (XML is built in since Spark 4.0)."""
+
+    (df.write
+        .mode("overwrite")
+        .option("rootTag", "delays")
+        .option("rowTag", "route")
+        .xml(xml_path))
+
+    xml_df = spark.read.option("rowTag", "route").xml(xml_path)
+
+    return xml_df
+
+
 # ---- Test harness ----
 if __name__ == "__main__":
     import tempfile, os, shutil
@@ -67,8 +81,19 @@ if __name__ == "__main__":
         assert "total_delay" in cols, f"Missing total_delay column, got {cols}"
         top = df.collect()[0]
         assert top.destination == "ORD", f"Expected ORD as top destination, got {top.destination}"
+
+        xml_df = xml_roundtrip(spark, df, os.path.join(tmp, "delays_xml"))
+        assert xml_df is not None, "xml_roundtrip returned None"
+        assert xml_df.count() == 3, f"Expected 3 XML rows, got {xml_df.count()}"
+        assert set(c.lower() for c in xml_df.columns) == {"destination", "total_delay"}, \
+            f"Unexpected XML columns: {xml_df.columns}"
+        xml_top = xml_df.orderBy(f.col("total_delay").desc()).first()
+        assert xml_top.destination == "ORD", f"XML round trip lost data: {xml_top}"
+
         print("All tests passed!")
         df.show(truncate=False)
+        print("Read back from XML:")
+        xml_df.show(truncate=False)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
         spark.stop()

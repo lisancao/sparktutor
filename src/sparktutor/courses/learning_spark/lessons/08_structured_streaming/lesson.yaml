@@ -1,13 +1,13 @@
 - Class: meta
   Lesson: Structured Streaming
-  EstimatedMinutes: 30
+  EstimatedMinutes: 45
 
 - Class: text
   Depth: all
   Output: |
     ## What You'll Learn
 
-    Everything so far has been **batch** processing — read a complete
+    Everything so far has been **batch** processing: read a complete
     dataset, transform it, write the output. But real data often arrives
     continuously: user clicks, sensor readings, transaction events.
 
@@ -17,11 +17,15 @@
     By the end of this lesson you will be able to:
 
     - Explain the streaming execution model (unbounded table)
-    - Set up sources (files, Kafka, sockets) and sinks (files, console)
+    - Set up sources (files, Kafka, rate) and sinks (files, Kafka, console,
+      memory, foreachBatch)
     - Choose the right output mode (append, update, complete)
-    - Configure triggers for processing frequency
+    - Configure triggers, including `availableNow` and the Real-Time Mode
+      trigger PySpark gained in 4.2
     - Apply watermarks to handle late-arriving data
-    - Understand fault tolerance via checkpointing
+    - Write custom stateful logic with `transformWithState` (Python, 4.x)
+    - Understand fault tolerance via checkpointing, and the 4.2 work on
+      evolving a query without losing its checkpoint
 
 - Class: text
   Depth: beginner
@@ -31,8 +35,8 @@
     each batch as it comes. You keep a running tally (state) that updates
     with each new batch.
 
-    Structured Streaming works the same way — it processes data in
-    micro-batches, applying your familiar DataFrame operations to each
+    Structured Streaming works the same way: by default it processes data
+    in micro-batches, applying your familiar DataFrame operations to each
     batch. Your code looks almost identical to batch code.
 
 - Class: text
@@ -47,12 +51,15 @@
 
     The core components:
 
-    - **Source** — where data comes from: files, Kafka, socket, rate
-      (synthetic)
-    - **Query** — your DataFrame transformations (same API as batch)
-    - **Sink** — where results go: files, Kafka, console, memory, foreach
-    - **Trigger** — how often to check for new data
-    - **Output mode** — what to write to the sink each trigger
+    - **Source**: where data comes from: files, Kafka, rate (synthetic),
+      socket (testing only), or a Python data source
+    - **Query**: your DataFrame transformations (same API as batch)
+    - **Sink**: where results go: files, Kafka, console, memory,
+      `foreach`, `foreachBatch`
+    - **Trigger**: when to process the next batch of data
+    - **Output mode**: what to write to the sink each trigger
+    - **Checkpoint**: where progress and state are stored so the query can
+      restart exactly where it stopped
 
 - Class: text
   Depth: all
@@ -62,28 +69,28 @@
     Replace `spark.read` with `spark.readStream`:
 
     ```python
-    # File source — picks up new files as they appear
+    # File source: picks up new files as they appear in the directory
     stream_df = (spark.readStream
-        .format("csv")
-        .option("header", "true")
-        .schema(my_schema)       # required for streaming!
+        .format("json")
+        .schema("sensor STRING, temp INT, event_time TIMESTAMP")
         .load("/data/incoming/"))
 
-    # Socket source — for development/testing
-    lines = (spark.readStream
-        .format("socket")
-        .option("host", "localhost")
-        .option("port", 9999)
+    # Kafka source (needs the spark-sql-kafka connector on the classpath)
+    events = (spark.readStream
+        .format("kafka")
+        .option("kafka.bootstrap.servers", "broker:9092")
+        .option("subscribe", "events")
         .load())
+
+    # Rate source: generates rows for testing
+    rate = spark.readStream.format("rate").option("rowsPerSecond", 10).load()
     ```
 
-    **Important**: streaming sources **require** an explicit schema.
-    `inferSchema` is not available because there is no complete dataset
-    to sample from.
+    **Important**: file sources **require** an explicit schema by default.
+    Inference would need the whole (unbounded) dataset, so it is off unless
+    you set `spark.sql.streaming.schemaInference`.
 
-    **Docs:** [Structured Streaming Programming Guide](https://spark.apache.org/docs/3.5.0/structured-streaming-programming-guide.html)
-    — sources, sinks, output modes, triggers, watermarks, fault tolerance,
-    and stream-stream joins with full code examples.
+    **Docs:** [Structured Streaming Programming Guide](https://spark.apache.org/docs/4.2.0/streaming/index.html)
 
 - Class: text
   Depth: all
@@ -96,14 +103,26 @@
     query = (result_df.writeStream
         .outputMode("complete")
         .format("console")
+        .option("checkpointLocation", "/checkpoints/word_count")
         .trigger(processingTime="10 seconds")
         .start())
 
-    query.awaitTermination()  # blocks until the stream is stopped
+    query.awaitTermination()  # blocks until the stream stops
     ```
 
-    `start()` returns a `StreamingQuery` object you can use to monitor
-    and stop the stream.
+    `start()` returns a `StreamingQuery` you can use to monitor
+    (`query.status`, `query.lastProgress`, `query.recentProgress`) and stop
+    (`query.stop()`) the stream.
+
+    For anything the built-in sinks cannot do, `foreachBatch` hands you
+    each micro-batch as a regular DataFrame plus a batch id:
+
+    ```python
+    def upsert(batch_df, batch_id):
+        batch_df.write.mode("append").parquet("/output/events")
+
+    query = stream_df.writeStream.foreachBatch(upsert).start()
+    ```
 
 - Class: text
   Depth: all
@@ -112,66 +131,129 @@
 
     The output mode determines **what** is written to the sink each trigger:
 
-    **`append`** — only new rows since the last trigger. Use for stateless
-    transforms (select, filter, map) or after watermark-based aggregations.
+    **`append`** (default): only rows that will never change again. For a
+    stateless query that is every new row. For a windowed aggregation it
+    means a window is emitted once, after the watermark passes the end of
+    the window.
 
-    **`update`** — only rows that changed since the last trigger. Good for
-    aggregations where you only care about the latest value.
+    **`update`**: only rows that changed since the last trigger. Good for
+    aggregations where downstream consumers want the latest value.
 
-    **`complete`** — the entire result table every trigger. Required for
-    aggregations without watermarks. Can be expensive for large results.
+    **`complete`**: the entire result table every trigger. Only allowed for
+    aggregations, and the state grows with the number of groups, so keep it
+    for small result tables.
 
-    Not all modes work with all operations. Aggregations require `complete`
-    or `update`. Stateless transforms support all three modes.
+    Not every mode works with every query. Aggregations without a watermark
+    support `update` and `complete` but not `append` (Spark could never be
+    sure a group is final). With a watermark on the event-time column, an
+    aggregation also supports `append`.
 
 - Class: mult_question
   Depth: all
   Output: "Which output mode writes the entire result table to the sink after every trigger?"
   AnswerChoices: "complete;append;update;overwrite"
   CorrectAnswer: "complete"
-  Hint: "This mode outputs everything — not just new or changed rows."
+  Hint: "This mode outputs everything, not just new or changed rows."
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "A windowed aggregation with a watermark runs in append mode. When does a given window's result reach the sink?"
+  AnswerChoices: "Once, after the watermark passes the end of the window;Every trigger, with the latest count;Only when the query stops;Immediately when the first event for the window arrives"
+  CorrectAnswer: "Once, after the watermark passes the end of the window"
+  Hint: "Append mode only emits rows that can never change again."
 
 - Class: text
   Depth: all
   Output: |
     ## Stateless vs. Stateful Transforms
 
-    **Stateless** — operate on individual rows without history: `select`,
-    `filter`, `withColumn`, `flatMap`. These work with all output modes
-    and require no special configuration.
+    **Stateless**: operate on individual rows without history: `select`,
+    `filter`, `withColumn`, `explode`. They need no state store and support
+    `append` and `update`.
 
-    **Stateful** — maintain state across micro-batches: `groupBy`
+    **Stateful**: maintain state across micro-batches: `groupBy`
     aggregations, windowed aggregations, stream-stream joins,
-    `dropDuplicates`. These need state management and may restrict output
-    modes.
+    `dropDuplicates` / `dropDuplicatesWithinWatermark`, and arbitrary
+    stateful operators like `transformWithState`. These need state
+    management and may restrict output modes.
 
-    The distinction matters because stateful operations accumulate memory.
-    Without bounds (like watermarks), state can grow indefinitely.
+    The distinction matters because stateful operations accumulate state.
+    Without bounds (like watermarks or state TTL), state can grow
+    indefinitely.
 
 - Class: text
   Depth: intermediate
   Output: |
     ## Triggers
 
-    Triggers control how often Spark checks for new data:
+    Triggers control when Spark processes the next batch:
 
     ```python
-    # Process every 10 seconds
+    # Micro-batch every 10 seconds
     .trigger(processingTime="10 seconds")
 
-    # Process all available data in one batch, then stop
+    # Process everything available now (in several batches), then stop
     .trigger(availableNow=True)
 
-    # Process one micro-batch, then stop (for testing)
+    # Deprecated since 3.4: one batch, then stop. Use availableNow instead.
     .trigger(once=True)
 
-    # Default: process as fast as possible
+    # Real-Time Mode (PySpark since 4.2): long-running batches, low latency
+    .trigger(realTime="5 seconds")
+
+    # Default: start the next micro-batch as soon as the previous one ends
     # (no trigger specified)
     ```
 
-    `availableNow` is particularly useful for bridging batch and streaming
-    — run it on a schedule (e.g., hourly via cron) to process whatever
-    data has accumulated.
+    `availableNow` bridges batch and streaming: run the query on a schedule
+    and it processes whatever accumulated since the last run, with the same
+    exactly-once checkpointing as a continuous stream. Since 4.0, if any
+    source does not support `availableNow`, Spark falls back to a single
+    batch rather than risk duplicates or data loss.
+
+    The older `continuous="1 second"` trigger (Continuous Processing) still
+    exists but is experimental and limited; Real-Time Mode is the newer path
+    to low latency.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Real-Time Mode
+
+    Micro-batches pay a fixed scheduling cost per batch, which puts a floor
+    under latency. **Real-Time Mode** (Scala in 4.1, PySpark in 4.2 via
+    SPARK-54660) runs long-lived batches whose tasks process records as they
+    arrive and stream results to the sink, with checkpoints at each batch
+    boundary:
+
+    ```python
+    query = (kafka_df
+        .selectExpr("CAST(key AS STRING) AS k", "CAST(value AS STRING) AS v")
+        .where("v IS NOT NULL")
+        .writeStream
+        .format("kafka")
+        .option("kafka.bootstrap.servers", "broker:9092")
+        .option("topic", "clean-events")
+        .option("checkpointLocation", "/checkpoints/rtm")
+        .outputMode("update")
+        .trigger(realTime="5 seconds")
+        .start())
+    ```
+
+    The constraints in 4.2.0, from the source:
+
+    - **Sources**: the source must support real-time reads; in the
+      built-in connectors that is **Kafka**.
+    - **Sinks**: Kafka, `foreach`, and console (an allowlist checked at
+      start; `spark.sql.streaming.realTimeMode.allowlistCheck`).
+    - **Output mode**: `update` only.
+    - **Operators**: stateless ones (project, filter, explode, union,
+      broadcast joins against static data, watermarks); stateful
+      aggregations are not on the allowlist.
+    - **Batch duration**: at least
+      `spark.sql.streaming.realTimeMode.minBatchDuration` (default 5s); this
+      is the checkpoint interval, not the latency.
+    - Async progress tracking must be off.
 
 - Class: text
   Depth: intermediate
@@ -192,25 +274,31 @@
     windowed = (events
         .groupBy(window("event_time", "10 minutes", "5 minutes"))
         .count())
+
+    # Session windows: a session closes after 5 minutes of inactivity
+    sessions = (events
+        .groupBy("user_id", f.session_window("event_time", "5 minutes"))
+        .count())
     ```
 
     Tumbling windows partition time into non-overlapping buckets. Sliding
-    windows overlap, so each event appears in multiple windows.
+    windows overlap, so each event appears in multiple windows. Session
+    windows have a dynamic length per key.
 
 - Class: mult_question
   Depth: intermediate
   Output: "What is the purpose of watermarks in Structured Streaming?"
   AnswerChoices: "Define how late data can arrive before being dropped, allowing Spark to clean up old state;Limit the output rate of the stream;Control the number of output partitions;Encrypt data in transit"
   CorrectAnswer: "Define how late data can arrive before being dropped, allowing Spark to clean up old state"
-  Hint: "Watermarks set a threshold for late-arriving data. What happens to state that's older than the threshold?"
+  Hint: "Watermarks set a threshold for late-arriving data. What happens to state that is older than the threshold?"
 
 - Class: text
   Depth: intermediate
   Output: |
     ## Watermarks: Handling Late Data
 
-    In the real world, events can arrive late — a sensor reading from
-    5 minutes ago arrives now. Watermarks tell Spark how long to wait:
+    In the real world, events can arrive late: a sensor reading from
+    several minutes ago arrives now. Watermarks tell Spark how long to wait:
 
     ```python
     result = (events
@@ -219,16 +307,16 @@
         .count())
     ```
 
-    Spark tracks the maximum event time seen so far. Any event arriving
-    more than 10 minutes behind the max is dropped. This lets Spark
-    discard old state and bound memory usage.
+    Spark tracks the maximum event time seen so far. The watermark is that
+    maximum minus 10 minutes; events older than the watermark may be
+    dropped, and state for windows that end before it is discarded. That is
+    what bounds memory.
 
     Without a watermark, stateful operations keep all state forever,
     eventually running out of memory.
 
-    **Docs:** [f.window](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.window.html)
-    — `windowDuration`, `slideDuration`, and `startTime` parameters for
-    tumbling and sliding windows.
+    **Docs:** [f.window](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.window.html)
+    (`windowDuration`, `slideDuration`, and `startTime`)
 
 - Class: cmd_question
   Depth: all
@@ -260,25 +348,94 @@
   Output: |
     ## Stream-Stream and Stream-Static Joins
 
-    **Stream-static join** — join a streaming DataFrame with a batch
-    DataFrame. The static side is re-read each micro-batch. Useful for
-    enrichment (e.g., joining click events with a product catalog):
+    **Stream-static join**: join a streaming DataFrame with a batch
+    DataFrame. Useful for enrichment (e.g., joining click events with a
+    product catalog):
 
     ```python
     enriched = click_stream.join(product_catalog, "product_id")
     ```
 
-    **Stream-stream join** — both sides are streams. Requires watermarks
-    to bound state. Spark buffers rows from both sides and matches them
-    as they arrive:
+    **Stream-stream join**: both sides are streams. Spark buffers rows from
+    both sides and matches them as they arrive. Watermarks plus a time-range
+    condition bound that buffer:
 
     ```python
     clicks = clicks.withWatermark("click_time", "10 minutes")
     impressions = impressions.withWatermark("imp_time", "10 minutes")
 
-    matched = clicks.join(impressions,
-        expr("click_id = imp_id AND click_time BETWEEN imp_time AND imp_time + interval 5 minutes"))
+    matched = clicks.join(impressions, f.expr(
+        "click_ad_id = imp_ad_id AND "
+        "click_time BETWEEN imp_time AND imp_time + interval 5 minutes"))
     ```
+
+    Spark 4.2 adds `update` output mode for non-outer stream-stream joins
+    (SPARK-56384) and integrates a new state format for stream-stream
+    joins (V4, SPARK-55628).
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Custom State with transformWithState
+
+    Built-in aggregations cover counts and sums. For anything else (alerts,
+    sessionization with custom rules, deduplication with expiry) you write
+    a **stateful processor**. `transformWithState` replaces the older
+    `applyInPandasWithState` / `flatMapGroupsWithState` APIs. In Python
+    there are two flavours: `transformWithStateInPandas` (4.0, pandas
+    DataFrames in and out) and `transformWithState` (4.1, `Row` objects in
+    and out).
+
+    ```python
+    from pyspark.sql import Row
+    from pyspark.sql.streaming import StatefulProcessor, StatefulProcessorHandle
+
+    class Violations(StatefulProcessor):
+        def init(self, handle: StatefulProcessorHandle):
+            # one value per key, persisted in the state store
+            self.count = handle.getValueState("violations", "count INT")
+
+        def handleInputRows(self, key, rows, timerValues):
+            n = self.count.get()[0] if self.count.exists() else 0
+            for r in rows:
+                if r.temp > 100:
+                    n += 1
+            self.count.update((n,))
+            yield Row(sensor=key[0], violations=n)
+
+        def close(self):
+            pass
+
+    spark.conf.set("spark.sql.streaming.stateStore.providerClass",
+        "org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider")
+
+    alerts = (readings.groupBy("sensor").transformWithState(
+        statefulProcessor=Violations(),
+        outputStructType="sensor STRING, violations INT",
+        outputMode="Update",
+        timeMode="None"))
+    ```
+
+    Notes from the API:
+    - The **RocksDB state store** is required; the default HDFS-backed
+      provider does not support this operator.
+    - State variables: `getValueState`, `getListState`, `getMapState`, each
+      with an optional `ttlDurationMs` for automatic expiry.
+    - **Timers**: with `timeMode="ProcessingTime"` or `"EventTime"`,
+      `handle.registerTimer(ms)` schedules a callback to
+      `handleExpiredTimer`.
+    - `key` is a tuple of the grouping values, hence `key[0]`.
+    - An optional `initialState` seeds state on the first batch; 4.2 made
+      that path faster (SPARK-54392).
+
+    **Docs:** [transformWithState guide](https://spark.apache.org/docs/4.2.0/streaming/structured-streaming-transform-with-state.html)
+
+- Class: mult_question
+  Depth: advanced
+  Output: "Which state store provider must be configured to run transformWithState?"
+  AnswerChoices: "RocksDBStateStoreProvider;HDFSBackedStateStoreProvider;InMemoryStateStoreProvider;No state store is needed"
+  CorrectAnswer: "RocksDBStateStoreProvider"
+  Hint: "The default provider in 4.2 is still the HDFS-backed one, and it is not enough for this operator."
 
 - Class: text
   Depth: advanced
@@ -286,41 +443,84 @@
     ## Fault Tolerance: Checkpointing
 
     Structured Streaming uses **checkpointing** for exactly-once
-    processing. Set a checkpoint location in your writeStream:
+    processing with replayable sources and idempotent or transactional
+    sinks. Set a checkpoint location in your writeStream:
 
     ```python
     query = (result.writeStream
-        .outputMode("update")
+        .outputMode("append")
         .option("checkpointLocation", "/checkpoints/my_query")
         .format("parquet")
         .start("/output/data"))
     ```
 
-    On restart, Spark replays from the checkpoint to recover state. Two
-    rules to remember:
-    1. Never change the query logic between restarts without clearing
-       the checkpoint
-    2. Never share checkpoint locations between different queries
+    On restart, Spark reads the offset and commit logs and the state store
+    snapshot, then resumes. Rules to remember:
+    1. Do not change the query in incompatible ways (new stateful
+       operators, different grouping keys) without a new checkpoint
+    2. Never share a checkpoint location between different queries
+    3. Since 4.2, restarting from a checkpoint whose metadata file is
+       missing while the offset or commit logs have data fails with
+       `STREAMING_CHECKPOINT_MISSING_METADATA_FILE`, instead of silently
+       starting a new query id and risking duplicates
+
+    You can inspect a checkpoint's state as a table with the state data
+    source: `spark.read.format("statestore").load("/checkpoints/my_query")`.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Naming Sources so Queries Can Evolve
+
+    A checkpoint identifies sources by their position in the query, so
+    adding, removing, or reordering sources used to break it. Spark 4.2
+    lets you give each source a stable name (SPARK-54909):
+
+    ```python
+    spark.conf.set("spark.sql.streaming.queryEvolution.enableSourceEvolution", "true")
+
+    orders = spark.readStream.format("kafka").name("orders_topic") \
+        .option("subscribe", "orders").option("kafka.bootstrap.servers", "broker:9092").load()
+    ```
+
+    The SQL form is `IDENTIFIED BY`. Two caveats from the 4.2.0 source:
+    the API is marked experimental, and it only works with the
+    `enableSourceEvolution` config switched on (an internal flag, off by
+    default). Without the flag, `.name()` fails with
+    `SOURCE_NAMING_NOT_SUPPORTED`; with it, *every* source in the query
+    must be named. Names may contain only ASCII letters, digits, and
+    underscores. Treat it as something to try on new queries, not to
+    retrofit onto production ones yet.
 
 - Class: script
   Depth: all
   Output: |
-    ## Exercise: Streaming Word Count
+    ## Exercise: Streaming Word Count and Sensor Alerts
 
-    Implement a batch-mode simulation of streaming word count (dry-run
-    compatible — no actual streaming source needed).
+    The first two functions practice streaming logic on batch DataFrames,
+    which is how you unit-test streaming code. The last two run real
+    streaming queries over a directory of JSON files, using
+    `trigger(availableNow=True)` and the `memory` sink so they finish on
+    their own.
 
-    Complete both functions:
-    1. `streaming_word_count(spark, lines_df)` — split lines into words,
-       group by word, count, order by count descending
-    2. `streaming_windowed_count(spark, events_df)` — count events in
-       5-minute tumbling windows, ordered by window start time
-
-    These exercises practice the core streaming patterns (split/explode,
-    groupBy, window) using batch DataFrames.
+    1. `streaming_word_count(spark)`: split lines into words, group by
+       word, count, order by count descending
+    2. `streaming_windowed_count(spark)`: count words in 10-minute tumbling
+       windows, ordered by window
+    3. `sensor_window_stream(spark, input_dir, checkpoint_dir)`: stream the
+       JSON files in `input_dir` (schema `READING_SCHEMA`), apply a
+       10-minute watermark on `event_time`, compute `max(temp)` as
+       `max_temp` per 10-minute window and sensor, and write to the memory
+       sink as query `sensor_windows` in complete mode. Wait for it to
+       finish and return `spark.table("sensor_windows")`.
+    4. `sensor_violations(spark, input_dir, checkpoint_dir)`: stream the
+       same files through the provided `ViolationCounter` processor with
+       `transformWithState` (RocksDB state store, update mode), write to
+       the memory sink as query `sensor_violations`, wait, and return
+       `spark.table("sensor_violations")`.
   StarterFile: starter.py
   SolutionFile: solution.py
-  Hint: "Use f.split() + f.explode() for words, groupBy().count() for aggregation, and f.window() for time-based grouping."
+  Hint: "spark.readStream.schema(READING_SCHEMA).json(input_dir); .writeStream.format('memory').queryName(...).outputMode(...).option('checkpointLocation', ...).trigger(availableNow=True).start(); then query.awaitTermination()."
 
 - Class: text
   Depth: all
@@ -329,17 +529,22 @@
 
     In this lesson you learned:
 
-    - **Streaming model** — unbounded input table processed incrementally
-    - **Sources and sinks** — readStream/writeStream with familiar formats
-    - **Output modes** — append (new rows), update (changed rows), complete
-      (everything)
-    - **Triggers** — control processing frequency; `availableNow` bridges
-      batch and streaming
-    - **Windowed aggregations** — tumbling and sliding time windows
-    - **Watermarks** — bound state by defining a late-data threshold
-    - **Checkpointing** — enables exactly-once fault tolerance
+    - **Streaming model**: unbounded input table processed incrementally
+    - **Sources and sinks**: `readStream`/`writeStream` with familiar
+      formats, plus `foreachBatch` for anything custom
+    - **Output modes**: append (final rows), update (changed rows),
+      complete (everything), and which queries allow which
+    - **Triggers**: `processingTime`, `availableNow` (bridges batch and
+      streaming), and `realTime` for Real-Time Mode, now in PySpark 4.2
+    - **Windowed aggregations**: tumbling, sliding, and session windows
+    - **Watermarks**: bound state by defining a late-data threshold
+    - **transformWithState**: custom per-key state with TTL and timers, on
+      the RocksDB state store
+    - **Checkpointing**: exactly-once recovery; 4.2 refuses to restart from
+      a checkpoint that lost its metadata, and experimental source naming
+      lets queries evolve
 
     You can now process both batch and streaming data with Spark. In the
-    next lesson, you will learn about **data lakes and lakehouses** — the
+    next lesson, you will learn about **data lakes and lakehouses**: the
     storage layer that makes large-scale data reliable with ACID
-    transactions and time travel.
+    transactions, time travel, and change data capture.

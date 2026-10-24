@@ -2,7 +2,7 @@
 DataFrames and Schemas - Solution
 
 Complete DataFrame creation with explicit schema, complex types,
-and computed columns.
+and computed columns (withColumns plus an ANSI-strict date parse).
 """
 
 from pyspark.sql import SparkSession, functions as f
@@ -36,13 +36,19 @@ def build_blogs_df(spark):
 
     blogs_df = spark.createDataFrame(DATA, schema)
 
-    result = blogs_df.withColumn("Big_Hitter", f.col("Hits") > 10000)
+    result = blogs_df.withColumns({
+        "Big_Hitter": f.col("Hits") > 10000,
+        "Published_Date": f.to_date("Published", "M/d/yyyy"),
+    })
 
     return result
 
 
 # ---- Test harness ----
 if __name__ == "__main__":
+    import datetime
+    from pyspark.sql.types import DateType
+
     spark = (SparkSession.builder
         .appName("BlogsTest")
         .master("local[*]")
@@ -56,6 +62,12 @@ if __name__ == "__main__":
 
     big_hitters = df.filter(f.col("Big_Hitter") == True).count()
     assert big_hitters == 3, f"Expected 3 big hitters, got {big_hitters}"
+
+    assert "Published_Date" in df.columns, "Missing Published_Date column"
+    assert isinstance(df.schema["Published_Date"].dataType, DateType), \
+        f"Published_Date should be a DATE, got {df.schema['Published_Date'].dataType}"
+    jules = df.filter(f.col("Id") == 1).select("Published_Date").first()[0]
+    assert jules == datetime.date(2016, 1, 4), f"Expected 2016-01-04 for Jules, got {jules}"
     print("All tests passed!")
     df.show(truncate=False)
     spark.stop()

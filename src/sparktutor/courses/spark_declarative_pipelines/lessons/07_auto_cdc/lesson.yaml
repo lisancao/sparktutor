@@ -1,0 +1,195 @@
+- Class: meta
+  Lesson: "Auto CDC: Keeping a Table in Sync (Spark 4.2)"
+  EstimatedMinutes: 30
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    - What change data capture (CDC) feeds look like and why appending them
+      is wrong
+    - SCD Type 1 with `dp.create_auto_cdc_flow`, new in Spark 4.2
+    - How `keys`, `sequence_by` and `apply_as_deletes` turn a stream of
+      changes into a current-state table
+    - What the target table must support, and the state of that support in
+      open source today
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Problem
+
+    Operational databases change rows in place. A CDC tool (Debezium, a
+    database's change feed, Spark 4.2's own `CHANGES` clause on supporting
+    tables) turns those changes into events:
+
+    | customer_id | city | op | seq |
+    |---|---|---|---|
+    | c-01 | Toronto | UPSERT | 1 |
+    | c-02 | Vancouver | UPSERT | 2 |
+    | c-03 | Montreal | UPSERT | 3 |
+    | c-01 | Hanoi | UPSERT | 5 |
+    | c-02 | Vancouver | DELETE | 6 |
+    | c-01 | Ottawa | UPSERT | 4 |
+
+    That is `data/customer_changes`. Appending it gives three rows for
+    `c-01` and keeps `c-02`, which was deleted. What you want is the
+    *current* state: one row per customer, deletes applied, and events
+    applied in `seq` order even though `seq 4` arrived after `seq 5`.
+
+    Doing that by hand means a `MERGE` per micro-batch, ordering logic,
+    tombstones for late deletes and state for out-of-order events. Auto CDC
+    does it for you.
+
+- Class: mult_question
+  Depth: all
+  Output: "After applying every event above in seq order, what is c-01's city?"
+  AnswerChoices: "Hanoi;Ottawa;Toronto;c-01 is deleted"
+  CorrectAnswer: "Hanoi"
+  Hint: "Order by seq, not by arrival: seq 5 (Hanoi) is the latest change, even though seq 4 arrived last."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The API
+
+    ```python
+    dp.create_streaming_table("customers_current")
+
+    dp.create_auto_cdc_flow(
+        target="customers_current",
+        source="bronze_customer_changes",
+        keys=["customer_id"],
+        sequence_by="seq",
+        apply_as_deletes=F.expr("op = 'DELETE'"),
+        except_column_list=["op", "seq", "_source_file", "_ingested_at"],
+        stored_as_scd_type=1,
+    )
+    ```
+
+    - `target` must already be declared with `dp.create_streaming_table`.
+    - `source` is a streaming dataset of change events (here, the bronze
+      streaming table).
+    - `keys` identify a row. The key set is part of the flow's persisted
+      state: changing it later needs a full refresh of the target.
+    - `sequence_by` orders events per key; the highest value wins, so late,
+      out-of-order events cannot overwrite newer data.
+    - `apply_as_deletes` marks delete events (a SQL string or a Column).
+    - `column_list` / `except_column_list` choose the output columns (one
+      or the other, unqualified names only).
+    - `stored_as_scd_type` accepts only `1` in Spark 4.2: keep the latest
+      version of each row. SCD Type 2 (keep history) is being built
+      upstream but is not in 4.2.
+
+- Class: mult_question
+  Depth: all
+  Output: "What does sequence_by protect against?"
+  AnswerChoices: "An older change arriving late and overwriting a newer one;Duplicate keys in the target;Schema changes in the source;Running out of memory"
+  CorrectAnswer: "An older change arriving late and overwriting a newer one"
+  Hint: "Look at seq 4 arriving after seq 5."
+
+- Class: cmd_question
+  Depth: intermediate
+  Output: |
+    Write the `apply_as_deletes` argument (just the keyword argument) that
+    treats rows whose `op` column equals `'D'` as deletes, using a SQL
+    expression string.
+  CorrectAnswer: "apply_as_deletes=\"op = 'D'\""
+  Hint: "apply_as_deletes accepts a SQL expression string or a Column."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What the Target Must Support
+
+    Auto CDC writes with row-level operations (`MERGE`, `UPDATE`,
+    `DELETE`), so the target's table format must implement Spark's Data
+    Source V2 `SupportsRowLevelOperations`. When it does not, the flow
+    fails at start with `AUTOCDC_TARGET_DOES_NOT_SUPPORT_MERGE`.
+
+    What we found on stock Spark 4.2.0 while building this lesson:
+
+    - The default parquet `spark_catalog` target is rejected.
+    - Delta Lake (`delta-spark_4.2_2.13` 4.4.1) loads, but its tables are
+      rejected too: Delta does not implement the DSv2 row-level interface.
+    - Apache Iceberg implements it, and is the format the feature was
+      tested against. At the time of writing there is no released
+      `iceberg-spark-runtime-4.2` artifact, and the 4.1 runtime fails on
+      4.2 with `SparkView can not implement ... View, because it is not an
+      interface` (Spark 4.2 changed `View` into a class).
+
+    So the exercise runs as a **dry run**, which fully validates the flow
+    (source, keys, sequencing column, column lists) without writing. To run
+    it for real, point the spec's `catalog` at an Iceberg catalog built for
+    Spark 4.2 (the lakehouse execution mode), for example:
+
+    ```yaml
+    catalog: lake
+    database: crm
+    configuration:
+      spark.sql.catalog.lake: org.apache.iceberg.spark.SparkCatalog
+      spark.sql.catalog.lake.type: hadoop
+      spark.sql.catalog.lake.warehouse: file:///abs/path/warehouse
+    ```
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Under the Hood
+
+    The target gets a reserved column, `__spark_autocdc_metadata`, which
+    Auto CDC uses to track per-key sequencing. A user-specified target
+    schema therefore has to account for it. Deletes are
+    remembered as tombstones so that a late upsert with an older sequence
+    value does not resurrect a deleted row. Because that bookkeeping lives
+    next to the target, the target's catalog must be durable: an in-memory
+    catalog loses it on restart.
+
+    Auto CDC complements Spark 4.2's other CDC feature: the SQL `CHANGES`
+    clause and DataFrame `changes()` API *read* a change feed from tables
+    whose connector exposes one, while `create_auto_cdc_flow` *applies* a
+    change feed to a target.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Current Customers from a Change Feed
+
+    The starter has the bronze change feed. Its first line,
+    `# spark-pipelines: dry-run`, validates without writing (see "What the
+    Target Must Support" above for why).
+
+    1. Declare the streaming table `customers_current`.
+    2. Add an Auto CDC flow into it from `bronze_customer_changes`, keyed by
+       `customer_id`, sequenced by `seq`, treating `op = 'DELETE'` as
+       deletes, SCD Type 1, and excluding `op`, `seq`, `_source_file` and
+       `_ingested_at` from the output.
+    3. Add a materialized view `customers_by_city` with `city` and
+       `customer_count` read from `customers_current`.
+
+    Try breaking it on purpose (key on a column that does not exist) and
+    submit again to see dry-run catch it.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  RequiresExecution: true
+  Validation:
+    - "ast_contains(call='create_auto_cdc_flow')"
+    - "ast_contains(call='create_streaming_table')"
+    - "ast_contains(function='customers_by_city')"
+    - execution
+  Hint: "dp.create_streaming_table('customers_current'), then dp.create_auto_cdc_flow(target=..., source=..., keys=[...], sequence_by=..., apply_as_deletes=..., except_column_list=[...], stored_as_scd_type=1)."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - CDC feeds must be *applied*, not appended; Auto CDC (Spark 4.2) does
+      it declaratively with `dp.create_auto_cdc_flow`.
+    - `keys` identify rows, `sequence_by` orders changes per key,
+      `apply_as_deletes` marks deletes; 4.2 supports SCD Type 1.
+    - The target must support row-level operations (Iceberg); parquet and
+      Delta targets are rejected.
+
+    Next: the capstone, a complete pipeline from raw files to gold.

@@ -6,7 +6,7 @@
     "ghcr.io/devcontainers/features/node:1": { "version": "20" },
     "ghcr.io/devcontainers/features/sshd:1": { "version": "latest" }
   },
-  "onCreateCommand": "pip install pyspark==4.1.0 pyyaml pydantic && cd sparktutor-vscode && npm install && bash package-vsix.sh",
+  "onCreateCommand": "pip install -e '.[spark]' && cd sparktutor-vscode && npm install && bash package-vsix.sh",
   "postCreateCommand": "bash .devcontainer/install-extension.sh",
   "customizations": {
     "vscode": {

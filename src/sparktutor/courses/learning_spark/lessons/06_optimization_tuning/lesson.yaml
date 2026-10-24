@@ -1,6 +1,6 @@
 - Class: meta
   Lesson: Optimization & Tuning
-  EstimatedMinutes: 30
+  EstimatedMinutes: 35
 
 - Class: text
   Depth: all
@@ -14,9 +14,12 @@
     By the end of this lesson you will be able to:
 
     - Configure the most impactful Spark settings
-    - Manage partitions with `repartition` and `coalesce`
+    - Manage partitions with `repartition` and `coalesce`, and know when
+      AQE does it for you
     - Cache DataFrames strategically and know when NOT to cache
-    - Read execution plans to diagnose performance bottlenecks
+    - Read the Spark UI, including the reworked SQL views in 4.2
+    - Account for 4.x defaults (Arrow data exchange, ANSI mode, shuffle
+      checksums) when you measure performance
     - Apply a systematic approach to Spark tuning
 
 - Class: text
@@ -38,35 +41,47 @@
     Spark has hundreds of config knobs, but a handful dominate performance:
 
     **Parallelism:**
-    - `spark.sql.shuffle.partitions` — number of partitions after a shuffle
-      (default: 200). Set to 2-3x your total executor cores.
-    - `spark.default.parallelism` — default partitions for RDD operations
+    - `spark.sql.shuffle.partitions`: number of partitions after a shuffle
+      (default: 200). With AQE on, treat this as the *starting* count that
+      AQE coalesces down from; set it high enough for your largest stage.
+    - `spark.default.parallelism`: default partitions for RDD operations
 
     **Memory:**
-    - `spark.executor.memory` — memory per executor (e.g., `4g`)
-    - `spark.driver.memory` — memory for the driver
-    - `spark.memory.fraction` — fraction of executor memory for execution
-      and storage (default: 0.6)
+    - `spark.executor.memory`: memory per executor (e.g., `4g`)
+    - `spark.driver.memory`: memory for the driver
+    - `spark.memory.fraction`: fraction of heap used for execution and
+      storage (default: 0.6)
 
     **File reading:**
-    - `spark.sql.files.maxPartitionBytes` — max size per partition when
+    - `spark.sql.files.maxPartitionBytes`: max size per partition when
       reading files (default: 128MB)
 
-    Set configs via the builder, conf file, or at runtime:
+    **Adaptive execution:**
+    - `spark.sql.adaptive.enabled` (default `true`)
+    - `spark.sql.adaptive.advisoryPartitionSizeInBytes` (default 64MB)
+    - `spark.sql.adaptive.coalescePartitions.parallelismFirst` (default
+      `true`): ignore the advisory size and coalesce only as far as keeps
+      the cluster's default parallelism busy. Set it to `false` on a busy
+      shared cluster so AQE produces fewer, right-sized partitions.
+
+    Set configs via the builder, `spark-defaults.conf`, or at runtime:
     ```python
     spark.conf.set("spark.sql.shuffle.partitions", "50")
     ```
 
-    **Docs:** [Spark Configuration](https://spark.apache.org/docs/3.5.0/configuration.html)
-    — searchable list of every config property including `spark.sql.shuffle.partitions`,
-    `spark.executor.memory`, `spark.memory.fraction`, and more.
+    Runtime `spark.conf.set` works only for SQL configs. Static settings
+    like `spark.executor.memory` must be set before the session starts;
+    setting them later raises `CANNOT_MODIFY_CONFIG`.
+
+    **Docs:** [Spark Configuration](https://spark.apache.org/docs/4.2.0/configuration.html) |
+    [Performance Tuning](https://spark.apache.org/docs/4.2.0/sql-performance-tuning.html)
 
 - Class: mult_question
   Depth: all
   Output: "What does spark.sql.shuffle.partitions control?"
   AnswerChoices: "Number of partitions created after a shuffle operation;Maximum memory per partition;Number of executor cores;Size of each data block"
   CorrectAnswer: "Number of partitions created after a shuffle operation"
-  Hint: "After a groupBy or join, data is reshuffled. This setting controls how many partitions the result has."
+  Hint: "After a groupBy or join, data is reshuffled. This setting controls how many partitions the result starts with."
 
 - Class: text
   Depth: all
@@ -75,13 +90,14 @@
 
     Two tools for changing the number of partitions:
 
-    **`repartition(n)`** — shuffles data into exactly `n` partitions. This
+    **`repartition(n)`** shuffles data into exactly `n` partitions. This
     is a full shuffle (expensive) but produces evenly-balanced partitions.
     Use when you need to *increase* partitions or *rebalance* skewed data.
+    `repartition(n, "col")` hash-partitions by a column.
 
-    **`coalesce(n)`** — reduces partitions by merging adjacent ones.
-    No shuffle — just reassignment. Use when *decreasing* partitions
-    (e.g., before writing small output files).
+    **`coalesce(n)`** reduces partitions by merging adjacent ones.
+    No shuffle, just reassignment. Use when *decreasing* partitions
+    (e.g., before writing a handful of output files).
 
     ```python
     # Increase to 100 partitions (full shuffle)
@@ -91,8 +107,10 @@
     df = df.coalesce(10)
     ```
 
-    **Rule of thumb**: always use `coalesce` when reducing, `repartition`
-    when increasing or when you need balanced partitions.
+    **Rule of thumb**: use `coalesce` when reducing, `repartition`
+    when increasing or when you need balanced partitions. Watch out for
+    `coalesce(1)` on a large result: it also collapses the *upstream*
+    work into one task, because no shuffle separates them.
 
 - Class: cmd_question
   Depth: all
@@ -104,6 +122,36 @@
   Hint: "You're reducing partitions, so use coalesce (not repartition) to avoid an unnecessary shuffle."
 
 - Class: text
+  Depth: intermediate
+  Output: |
+    ## Let AQE Size Your Shuffles
+
+    With AQE on (the default), a hand-picked `spark.sql.shuffle.partitions`
+    matters less than it used to. After each shuffle stage AQE reads the
+    real partition sizes and merges small neighbours:
+
+    ```
+    AdaptiveSparkPlan isFinalPlan=true
+    +- == Final Plan ==
+       ResultQueryStage 1
+       +- *(2) HashAggregate(keys=[department], functions=[sum(revenue)])
+          +- AQEShuffleRead coalesced
+             +- ShuffleQueryStage 0
+                +- Exchange hashpartitioning(department, 8)
+    +- == Initial Plan ==
+       ...
+    ```
+
+    `AQEShuffleRead coalesced` means the exchange wrote eight partitions
+    and AQE read them back as fewer. `isFinalPlan=true` appears only once
+    the query has executed; call `explain()` after an action to see what
+    AQE actually did.
+
+    Use `repartition` yourself when you need a specific layout (for
+    example, to control file counts or to partition by a key before a
+    write); let AQE handle "how many partitions after this groupBy".
+
+- Class: text
   Depth: all
   Output: |
     ## Caching and Persistence
@@ -112,52 +160,55 @@
     caching avoids recomputing it from scratch each time:
 
     ```python
-    df.cache()      # shorthand for persist(MEMORY_AND_DISK)
+    df.cache()      # mark for caching
     df.count()      # triggers caching (cache is lazy!)
     # ... use df multiple times ...
     df.unpersist()  # release memory when done
     ```
 
-    Caching is **lazy** — calling `cache()` only marks the DataFrame.
-    The actual data is materialized on the first action after cache().
+    Caching is **lazy**: calling `cache()` only marks the DataFrame.
+    The actual data is materialized on the first action after `cache()`.
+    `df.storageLevel` tells you what level a DataFrame is cached at.
 
     **Docs:**
-    [cache](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.cache.html) |
-    [persist](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.persist.html) |
-    [unpersist](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.unpersist.html)
-    — `StorageLevel` parameter for `persist()`, lazy materialization behavior.
+    [cache](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.cache.html) |
+    [persist](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.persist.html) |
+    [unpersist](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.unpersist.html)
 
 - Class: text
   Depth: intermediate
   Output: |
     ## Storage Levels
 
-    `cache()` uses `MEMORY_AND_DISK` by default. `persist()` gives you
-    more control:
+    For a DataFrame, `cache()` is `persist()` with the default level, which
+    in PySpark is `MEMORY_AND_DISK_DESER`: keep deserialized blocks in
+    memory and spill to disk when memory runs out. `persist()` lets you
+    choose another level from `pyspark.StorageLevel`:
 
     | Level | Where | Tradeoff |
     |-------|-------|----------|
-    | `MEMORY_ONLY` | RAM | Fastest, risks OOM |
-    | `MEMORY_AND_DISK` | RAM + disk | Safe default |
+    | `MEMORY_AND_DISK_DESER` | RAM, spill to disk | DataFrame default |
+    | `MEMORY_AND_DISK` | RAM (serialized), spill to disk | Smaller footprint, CPU to deserialize |
+    | `MEMORY_ONLY` | RAM | Partitions that do not fit are recomputed |
     | `DISK_ONLY` | Disk | Slowest, memory-safe |
-    | `MEMORY_ONLY_SER` | RAM (serialized) | Less memory, CPU overhead |
-    | `OFF_HEAP` | Tungsten memory | Outside JVM GC |
+    | `OFF_HEAP` | Off-heap memory | Outside JVM GC; needs off-heap memory configured |
+    | `..._2` variants | Two replicas | Survives losing an executor |
 
     ```python
     from pyspark import StorageLevel
-    df.persist(StorageLevel.MEMORY_ONLY_SER)
+    df.persist(StorageLevel.DISK_ONLY)
     ```
 
-    For most cases, `cache()` (MEMORY_AND_DISK) is the right choice. Use
-    `MEMORY_ONLY_SER` when you need to cache more data than fits in
-    deserialized form.
+    For most cases, `cache()` is the right choice. Python's
+    `StorageLevel` has no `_SER` variants; those names exist only in the
+    Scala/Java API.
 
 - Class: mult_question
   Depth: all
-  Output: "What is the difference between cache() and persist()?"
-  AnswerChoices: "cache() uses MEMORY_AND_DISK by default; persist() lets you choose the StorageLevel;cache() is faster than persist();persist() only uses disk storage;cache() works only with RDDs"
-  CorrectAnswer: "cache() uses MEMORY_AND_DISK by default; persist() lets you choose the StorageLevel"
-  Hint: "cache() is just a convenience method — what does it wrap?"
+  Output: "What is the difference between cache() and persist() on a DataFrame?"
+  AnswerChoices: "cache() uses the default storage level while persist() lets you choose one;cache() is faster than persist();persist() only uses disk storage;cache() works only with RDDs"
+  CorrectAnswer: "cache() uses the default storage level while persist() lets you choose one"
+  Hint: "cache() is a convenience method. What does it wrap?"
 
 - Class: text
   Depth: all
@@ -165,8 +216,8 @@
     ## When to Cache (and When Not To)
 
     **Cache when:**
-    - A DataFrame is used 2+ times AND is expensive to compute (joins,
-      aggregations, complex transformations)
+    - A DataFrame is used more than once AND is expensive to compute
+      (joins, aggregations, complex transformations)
     - A DataFrame is the input to an iterative algorithm (ML training)
 
     **Do NOT cache when:**
@@ -177,7 +228,8 @@
     - You are writing output immediately (just write it, don't cache first)
 
     Always `unpersist()` when you are done. Forgotten caches consume cluster
-    memory and can cause OOM errors in later stages.
+    memory and push later stages into spilling. `spark.catalog.clearCache()`
+    drops every cached table and DataFrame in the session.
 
 - Class: cmd_question
   Depth: intermediate
@@ -192,29 +244,87 @@
   Hint: "cache() marks it, count() materializes it, unpersist() releases it."
 
 - Class: text
+  Depth: intermediate
+  Output: |
+    ## PySpark Data Exchange Is Arrow by Default in 4.2
+
+    Moving data between the JVM and Python is often the hidden cost in a
+    PySpark job. Spark 4.2 turns Arrow on for all of it (SPARK-54555):
+
+    - `spark.sql.execution.arrow.pyspark.enabled` now defaults to `true`, so
+      `toPandas()` and `createDataFrame(pandas_df)` transfer columnar Arrow
+      batches instead of pickled rows.
+    - `spark.sql.execution.pythonUDF.arrow.enabled` and
+      `spark.sql.execution.pythonUDTF.arrow.enabled` default to `true`, so
+      plain Python UDFs and UDTFs use Arrow batches too.
+    - `df.toArrow()` (since 4.0) returns a `pyarrow.Table` with no pandas
+      step at all.
+    - `spark.sql.execution.arrow.maxRecordsPerBatch` (default 10000) caps
+      the rows per Arrow batch; lower it if Python workers run out of memory
+      on wide rows.
+
+    When you benchmark against a 3.x or 4.1 baseline, remember these
+    defaults moved. A regression after upgrading can be a UDF that relied on
+    the old pickled path (for example, nullable integer columns now arrive
+    in pandas UDFs as `Int64` extension dtype rather than `float64`); flip
+    the specific flag back to confirm before rewriting code.
+
+- Class: text
   Depth: advanced
   Output: |
     ## A Systematic Tuning Approach
 
     When a Spark job is slow, follow this diagnostic process:
 
-    **1. Check the Spark UI** — look at stage timelines, task durations,
-    and shuffle sizes. The UI reveals bottlenecks that code cannot.
+    **1. Check the Spark UI** (port 4040 on the driver). Look at stage
+    timelines, task durations, and shuffle sizes. The UI reveals
+    bottlenecks that code cannot.
 
-    **2. Look for data skew** — one task taking 10x longer than others
-    means a partition has disproportionate data. Solutions: salting,
-    AQE skew join, or repartitioning by a better key.
+    **2. Look for data skew**: one task running far longer than its
+    siblings means a partition has disproportionate data. Solutions: AQE
+    skew join, salting, or repartitioning by a better key.
 
-    **3. Check shuffle sizes** — large shuffles (>1GB per task) suggest
-    too few partitions or missing broadcast opportunities.
+    **3. Check shuffle sizes**: very large shuffle reads per task suggest
+    too few partitions or a missing broadcast opportunity.
 
-    **4. Check partition counts** — `df.rdd.getNumPartitions()`. Target
-    ~128MB per partition. Too few = underutilized cores. Too many =
+    **4. Check partition counts**: `df.rdd.getNumPartitions()` in Classic
+    mode, or `df.select(f.spark_partition_id()).distinct().count()` (counts
+    non-empty partitions) anywhere, including Spark Connect. Target roughly
+    100 to 200MB per partition. Too few means idle cores; too many means
     scheduling overhead.
 
-    **5. Check for unnecessary computation** — is the same DataFrame
+    **5. Check for unnecessary computation**: is the same DataFrame
     recomputed multiple times? Cache it. Are you reading columns you
     don't need? Use `select()` early.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## The Spark 4.2 Web UI
+
+    Spark 4.2 reworked the Web UI (SPARK-55760). The changes that matter for
+    tuning:
+
+    - **SQL plan visualization** is compact, with a detail side panel per
+      node, pan and zoom, and search that highlights matching nodes
+      (SPARK-55785, SPARK-56792, SPARK-56799). Large plans are finally
+      navigable.
+    - **Initial vs. Final plan, side by side** for AQE queries
+      (SPARK-55877), so you can see exactly which joins AQE switched and
+      which shuffles it coalesced.
+    - **Job Timeline on the SQL execution page** (SPARK-55878) ties a query
+      to the jobs and stages it spawned.
+    - **Copy plan text and share link** buttons on the SQL execution page
+      (SPARK-56048), and sortable, paginated query lists on the SQL tab.
+    - **Environment page** highlights configuration values that differ from
+      the defaults and can export the config (SPARK-55835, SPARK-55839).
+      When a job is mysteriously slow, check this first.
+    - The **Query ID** is displayed (SPARK-55008), and there is a dark mode
+      toggle (SPARK-55766).
+
+    In Spark Connect deployments, the **Connect** tab lists sessions and
+    the operations they ran; 4.2 makes it available in the History Server
+    as well (SPARK-57601).
 
 - Class: text
   Depth: advanced
@@ -222,13 +332,32 @@
     ## Monitoring Cache Usage
 
     The **Storage tab** in the Spark UI shows what is cached, memory used,
-    and the fraction cached. If a DataFrame shows < 100% cached, data is
-    spilling to disk — either the cluster is memory-constrained or you are
-    caching too much.
+    and the fraction cached. If a DataFrame shows less than 100% cached,
+    partitions did not fit: with a `MEMORY_AND_DISK*` level the rest went
+    to disk, and with `MEMORY_ONLY` it will be recomputed on each use.
 
     **Practical tip**: cache the *filtered* DataFrame, not the raw read.
-    A 100GB raw read cached is wasteful; a 5GB filtered + aggregated
+    Caching a huge raw read is wasteful; a filtered and aggregated
     intermediate result is a good cache candidate.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Defaults That Cost (a Little) for Correctness
+
+    Two 4.x defaults trade a small amount of speed for correctness. Know
+    them before you blame your code:
+
+    - **ANSI mode** adds overflow and cast checks to arithmetic and casts.
+      The checks are cheap; the bigger effect is that bad data now fails
+      the job instead of silently producing nulls.
+    - **Order-independent shuffle checksums** (on by default in 4.2):
+      Spark checksums each mapper's shuffle output. If an indeterminate
+      stage is retried and produces different data, Spark detects the
+      mismatch and re-runs the dependent stages instead of silently mixing
+      old and new output. Disable with
+      `spark.sql.shuffle.orderIndependentChecksum.enabled=false` only if you
+      have measured a real cost and your stages are deterministic.
 
 - Class: script
   Depth: all
@@ -236,18 +365,24 @@
     ## Exercise: Optimize a Pipeline
 
     Implement `optimize_pipeline(spark)` that demonstrates caching
-    strategy and partition management:
+    strategy, partition management, and AQE:
 
-    1. Set shuffle partitions to 10 (for local mode)
-    2. Create a sample sales DataFrame with 1000 rows
-    3. Cache an expensive aggregation (group by product, sum revenue)
-    4. Reuse the cached result for two separate analyses
-    5. Unpersist the cache
-    6. Coalesce the final output to 2 partitions
-    7. Return the results
+    1. Set shuffle partitions to 8 (plenty for local mode)
+    2. Create the sample sales DataFrame (10000 generated rows)
+    3. Cache an expensive aggregation (group by department and region,
+       sum and average revenue) and materialize it with `count()`
+    4. Record `agg_df.storageLevel` while it is cached
+    5. Reuse the cached result for two separate analyses (top departments
+       by total revenue, top regions by average revenue)
+    6. Run the region analysis and capture its plan *after* the action
+       with the provided `plan_text()` helper, so the plan shows what AQE
+       did
+    7. Unpersist the cache
+    8. Coalesce the department result to 1 partition
+    9. Return everything in a dict
   StarterFile: starter.py
   SolutionFile: solution.py
-  Hint: "Use spark.conf.set for shuffle partitions, .cache() + .count() to materialize, and .coalesce() before returning."
+  Hint: "spark.conf.set for shuffle partitions, .cache() + .count() to materialize, str(agg_df.storageLevel), collect() the region result before plan_text(), then .unpersist() and .coalesce(1)."
 
 - Class: text
   Depth: all
@@ -256,15 +391,20 @@
 
     In this lesson you learned:
 
-    - **Key configs** — `shuffle.partitions`, executor/driver memory, and
-      file partition sizes are the most impactful settings
-    - **repartition vs. coalesce** — repartition for increasing or
-      balancing; coalesce for reducing without shuffle
-    - **Caching** — cache DataFrames reused 2+ times; always unpersist
-    - **Storage levels** — MEMORY_AND_DISK is the safe default; use SER
-      variants to fit more data
-    - **Tuning process** — Spark UI → skew → shuffles → partitions → caching
+    - **Key configs**: `shuffle.partitions`, executor/driver memory, file
+      partition sizes, and the `spark.sql.adaptive.*` family
+    - **repartition vs. coalesce**: repartition for increasing or
+      balancing; coalesce for reducing without shuffle; AQE coalesces
+      shuffle output for you
+    - **Caching**: cache DataFrames that are reused and expensive; always
+      unpersist; the PySpark default level is `MEMORY_AND_DISK_DESER`
+    - **Arrow by default**: 4.2 uses Arrow for `toPandas`, `createDataFrame`
+      from pandas, and Python UDFs
+    - **Spark UI**: the 4.2 SQL views (initial vs. final plans, search,
+      timelines) and the Environment page's non-default highlighting
+    - **Tuning process**: Spark UI, then skew, shuffles, partitions,
+      caching
 
     You now have the tools to diagnose and fix performance problems. In
-    the next lesson, you will tackle **joins** — the most expensive and
+    the next lesson, you will tackle **joins**, the most expensive and
     most important operation in distributed data processing.

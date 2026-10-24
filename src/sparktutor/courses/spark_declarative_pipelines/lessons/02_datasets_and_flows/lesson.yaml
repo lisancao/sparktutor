@@ -1,0 +1,219 @@
+- Class: meta
+  Lesson: "Datasets and Flows"
+  EstimatedMinutes: 30
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    - When to use a materialized view, a streaming table or a temporary view
+    - How `@dp.table` turns a streaming read into an incrementally updated table
+    - How to write several flows into one streaming table with
+      `dp.create_streaming_table` and `@dp.append_flow`
+    - The options every dataset decorator accepts
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Three Dataset Types
+
+    | Decorator | Dataset | Query | Refresh behaviour |
+    |-----------|---------|-------|-------------------|
+    | `@dp.materialized_view` | Materialized view | batch (`spark.read`, `spark.table`) | recomputed from its inputs on each run |
+    | `@dp.table` | Streaming table | streaming (`spark.readStream`) | processes only data that arrived since the last run |
+    | `@dp.temporary_view` | Temporary view | batch or streaming | not stored; exists only during the run |
+
+    The deciding question is *how the input grows*:
+
+    - Append-only input (files landing in a directory, Kafka topics, event
+      logs) fits a **streaming table**: each run picks up only new records,
+      tracked by a checkpoint in the pipeline's `storage` directory.
+    - Small or frequently corrected input (dimension tables, aggregates
+      over everything) fits a **materialized view**: the result always
+      equals the query over the current inputs.
+    - Shared intermediate logic that does not need to be stored fits a
+      **temporary view**.
+
+- Class: mult_question
+  Depth: all
+  Output: "New JSON files land in a directory every hour and are never modified. Which dataset type should ingest them?"
+  AnswerChoices: "A streaming table defined with @dp.table;A materialized view;A temporary view;A Python list of DataFrames"
+  CorrectAnswer: "A streaming table defined with @dp.table"
+  Hint: "Append-only input that grows over time is what streaming tables are for."
+
+- Class: text
+  Depth: beginner
+  Output: |
+    ## A Streaming Table
+
+    ```python
+    @dp.table
+    def bronze_orders() -> DataFrame:
+        return spark.readStream.schema(ORDER_SCHEMA).json("data/orders")
+    ```
+
+    The only difference from a materialized view is `readStream` instead of
+    `read`, and `@dp.table` instead of `@dp.materialized_view`. Streaming
+    file sources need an explicit schema, because Spark cannot sample files
+    that have not arrived yet.
+
+    A downstream materialized view can read a streaming table in batch with
+    `spark.table("bronze_orders")`; a downstream streaming table reads it
+    incrementally with `spark.readStream.table("bronze_orders")`.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Several Flows, One Table
+
+    A decorator like `@dp.table` creates a dataset and its single flow
+    together. Sometimes one table needs several writers: a one-time backfill
+    plus a live feed, or one feed per region. Split the two steps:
+
+    ```python
+    dp.create_streaming_table("orders_raw")
+
+    @dp.append_flow(target="orders_raw")
+    def backfill() -> DataFrame:
+        return spark.readStream.schema(ORDER_SCHEMA).json("archive/orders")
+
+    @dp.append_flow(target="orders_raw")
+    def live() -> DataFrame:
+        return spark.readStream.schema(ORDER_SCHEMA).json("landing/orders")
+    ```
+
+    Each append flow has its own checkpoint, so you can add a new flow later
+    without reprocessing the others. (Read the known issue below before you
+    point several flows at a parquet table.) The SQL equivalent is
+    `CREATE STREAMING TABLE orders_raw;` followed by
+    `CREATE FLOW backfill AS INSERT INTO orders_raw SELECT * FROM STREAM(...)`.
+
+- Class: mult_question
+  Depth: all
+  Output: "What does dp.create_streaming_table(\"orders_raw\") do on its own?"
+  AnswerChoices: "Declares the target table so append flows can write into it;Reads every file into memory;Starts a streaming query immediately;Creates a temporary view"
+  CorrectAnswer: "Declares the target table so append flows can write into it"
+  Hint: "It defines the dataset without any flow; @dp.append_flow adds the flows."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Dataset Options
+
+    `@dp.materialized_view` and `@dp.table` accept the same keyword
+    arguments (verified against the Spark 4.2 `pyspark.pipelines.api`):
+
+    ```python
+    @dp.table(
+        name="orders_bronze",            # table name, defaults to the function name
+        comment="Raw order events",
+        table_properties={"quality": "bronze"},
+        partition_cols=["order_date"],   # or cluster_by=[...], not both
+        schema="order_id STRING, ...",   # enforce the output schema
+        format="parquet",                # table format; parquet unless the catalog says otherwise
+        spark_conf={"spark.sql.shuffle.partitions": "8"},  # per-flow configuration
+    )
+    def bronze_orders(): ...
+    ```
+
+    `dp.create_streaming_table` takes the same options, plus `name` as its
+    first argument. `@dp.append_flow` accepts `target`, `name` and
+    `spark_conf`. `@dp.temporary_view` accepts `name`, `comment` and
+    `spark_conf` (it is never stored, so storage options do not apply).
+
+- Class: cmd_question
+  Depth: intermediate
+  Output: |
+    Write a streaming table named `events_bronze` (use the `name` argument)
+    whose function `ingest_events` reads JSON from `landing/events` with the
+    schema in the variable `EVENT_SCHEMA`.
+  CorrectAnswer: |
+    @dp.table(name="events_bronze")
+    def ingest_events() -> DataFrame:
+        return spark.readStream.schema(EVENT_SCHEMA).json("landing/events")
+  Hint: "Use @dp.table(name=...) and spark.readStream.schema(...).json(...)."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## How Incrementality Is Tracked
+
+    Each streaming flow gets a checkpoint under
+    `<storage>/_checkpoints/<catalog>/<database>/<table>/<flow>`. A run executes
+    streaming flows with available-now semantics: process everything new,
+    then stop. Run twice without new files and the second run appends
+    nothing.
+
+    Consequences worth internalizing:
+
+    - Renaming a flow abandons its checkpoint; the renamed flow starts from
+      scratch and will re-append everything. Name flows deliberately.
+    - Changing a streaming query (new filter, new column) does not rewrite
+      old rows. Use `spark-pipelines run --full-refresh orders_raw` to clear
+      the table and its checkpoints and recompute.
+    - Materialized views have no checkpoint; every run recomputes them from
+      their inputs.
+
+- Class: mult_question
+  Depth: advanced
+  Output: "You rename an append flow from `live` to `live_feed` and rerun. What happens?"
+  AnswerChoices: "The new flow has no checkpoint, so it re-reads and re-appends all source data;Nothing changes;SDP migrates the checkpoint automatically;The pipeline refuses to run"
+  CorrectAnswer: "The new flow has no checkpoint, so it re-reads and re-appends all source data"
+  Hint: "Checkpoints are keyed by flow name."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Known Issue in Spark 4.2.0: Concurrent Flows into a Parquet Table
+
+    While building this course we ran two append flows into one
+    parquet-backed streaming table on local Spark 4.2.0. Both flows started
+    at once, both tried to commit batch 0 to the table's shared
+    `_spark_metadata` log, and one failed with
+    `IllegalStateException: Race while writing batch 0`. After the automatic
+    retry the run reported success, but readers saw only one flow's rows:
+    the other flow's parquet files were on disk yet missing from the log.
+
+    The API is right; the default parquet file sink is the problem, because
+    it keeps a single commit log per table. Until that is fixed, treat
+    multi-flow targets as something to run on a table format with real
+    transactional commits (Iceberg, through a catalog in the spec), and
+    always put a row-count check downstream of them. The exercise below
+    uses one append flow, which is safe on parquet.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: A Declared Table, a Flow and Two Readers
+
+    Build this graph:
+
+    1. `orders_raw`: a streaming table declared with `dp.create_streaming_table`.
+    2. Append flow `ingest_orders` into `orders_raw`: stream every JSON file
+       in `data/orders` using `ORDER_SCHEMA`.
+    3. `placed_orders`: a temporary view with the rows of `orders_raw`
+       whose `status` is `placed`.
+    4. `orders_by_status`: a materialized view with one row per `status`
+       and the column `order_count`.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  RequiresExecution: true
+  Validation:
+    - execution
+  Hint: "dp.create_streaming_table('orders_raw'), then @dp.append_flow(target='orders_raw') on a function returning spark.readStream.schema(ORDER_SCHEMA).json('data/orders')."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - Streaming tables (`@dp.table`) for append-only input, materialized
+      views for recomputed results, temporary views for shared logic.
+    - `dp.create_streaming_table` + `@dp.append_flow` let several flows feed
+      one table, each with its own checkpoint.
+    - Dataset decorators share options such as `name`, `comment`,
+      `partition_cols`, `cluster_by`, `schema` and `table_properties`.
+
+    Next: the pipeline project around your code, and the `spark-pipelines`
+    CLI that runs it.

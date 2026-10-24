@@ -2,31 +2,33 @@
 Join Strategies - Starter Code
 
 Implement the `join_comparison` function that:
-1. Creates a "users" DataFrame (1000 rows: user_id, name, city)
-2. Creates an "orders" DataFrame (5000 rows: order_id, user_id, amount)
-3. Performs a broadcast join (hint the users table)
-4. Performs a sort merge join (disable broadcast threshold)
-5. Returns both results and their explain plan strings
+1. Creates a small users DataFrame and a larger orders DataFrame
+2. Performs a broadcast hash join using the f.broadcast() hint
+3. Performs a shuffled hash join using the "shuffle_hash" hint
+4. Performs a sort merge join by setting autoBroadcastJoinThreshold to -1
+5. Captures each plan with plan_text() while its setting is in effect
+6. Restores the original threshold in a finally block
+7. Returns a dict with the three results and three plans
 
-This exercise demonstrates the difference between join strategies.
+This exercise shows how hints and configuration steer the join planner.
 """
 
 from pyspark.sql import SparkSession, functions as f
 from pyspark.sql.types import (
     StructType, StructField, StringType, IntegerType, DoubleType
 )
+import contextlib
+import io
 import random
 
 
 def generate_users(n=1000):
-    """Generate sample user data."""
     cities = ["New York", "San Francisco", "Chicago", "Seattle", "Austin"]
     random.seed(42)
     return [(i, f"user_{i}", random.choice(cities)) for i in range(n)]
 
 
 def generate_orders(n=5000, max_user_id=1000):
-    """Generate sample order data."""
     random.seed(99)
     return [
         (i, random.randint(0, max_user_id - 1), round(random.uniform(10, 500), 2))
@@ -47,33 +49,42 @@ ORDER_SCHEMA = StructType([
 ])
 
 
+def plan_text(df, mode="simple"):
+    """Return what df.explain(mode) prints (works in Classic and Connect)."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        df.explain(mode=mode)
+    return buf.getvalue()
+
+
 def join_comparison(spark):
-    """Compare broadcast join vs sort merge join."""
+    """Compare broadcast, shuffled hash, and sort merge joins."""
 
     users_df = spark.createDataFrame(generate_users(), USER_SCHEMA)
     orders_df = spark.createDataFrame(generate_orders(), ORDER_SCHEMA)
 
-    # TODO: Broadcast join — join orders with users using broadcast hint on users
+    # TODO: Broadcast hash join: orders_df joined to f.broadcast(users_df) on "user_id"
     broadcast_result = None  # Replace
+    broadcast_plan = None  # plan_text(...)
 
-    # Capture broadcast join plan
-    broadcast_plan = broadcast_result._jdf.queryExecution().simpleString()
+    # TODO: Shuffled hash join: use users_df.hint("shuffle_hash")
+    shuffle_hash_result = None  # Replace
+    shuffle_hash_plan = None  # plan_text(...)
 
-    # TODO: Sort merge join — disable broadcast by setting threshold to -1,
-    #       then join orders with users (no broadcast hint)
-    # Set config here
+    # TODO: Save the current spark.sql.autoBroadcastJoinThreshold value
+    original = None  # Replace
+
+    # TODO: In a try block, set the threshold to "-1", join without hints,
+    #       and capture the plan. In the finally block, restore `original`.
     smj_result = None  # Replace
-
-    # Capture sort merge join plan
-    smj_plan = smj_result._jdf.queryExecution().simpleString()
-
-    # TODO: Reset the threshold back to default (10MB = 10485760)
-    # Your code here
+    smj_plan = None  # Replace
 
     return {
         "broadcast_result": broadcast_result,
+        "shuffle_hash_result": shuffle_hash_result,
         "smj_result": smj_result,
         "broadcast_plan": broadcast_plan,
+        "shuffle_hash_plan": shuffle_hash_plan,
         "smj_plan": smj_plan,
     }
 
@@ -85,16 +96,28 @@ if __name__ == "__main__":
         .master("local[*]")
         .getOrCreate())
 
+    threshold_before = spark.conf.get("spark.sql.autoBroadcastJoinThreshold")
     result = join_comparison(spark)
     assert result is not None, "Function returned None"
-    bc_count = result["broadcast_result"].count()
-    smj_count = result["smj_result"].count()
-    assert bc_count == smj_count, f"Counts differ: broadcast={bc_count}, smj={smj_count}"
-    assert bc_count == 5000, f"Expected 5000 rows, got {bc_count}"
-    assert "Broadcast" in result["broadcast_plan"] or "broadcast" in result["broadcast_plan"].lower(), \
-        "Broadcast plan should mention broadcast"
-    print(f"Both joins produced {bc_count} rows")
-    print(f"\nBroadcast plan contains 'broadcast': {'broadcast' in result['broadcast_plan'].lower()}")
-    print(f"SMJ plan contains 'SortMerge' or 'sort': {'sort' in result['smj_plan'].lower()}")
+    for key in ["broadcast_result", "shuffle_hash_result", "smj_result",
+                "broadcast_plan", "shuffle_hash_plan", "smj_plan"]:
+        assert result.get(key) is not None, f"{key} is missing or None"
+
+    counts = {k: result[k].count() for k in ["broadcast_result", "shuffle_hash_result", "smj_result"]}
+    assert set(counts.values()) == {5000}, f"Every strategy should return 5000 rows, got {counts}"
+
+    assert "BroadcastHashJoin" in result["broadcast_plan"], "Broadcast plan should use BroadcastHashJoin"
+    assert "ShuffledHashJoin" in result["shuffle_hash_plan"], "shuffle_hash hint should give ShuffledHashJoin"
+    assert "SortMergeJoin" in result["smj_plan"], "With broadcast disabled the plan should use SortMergeJoin"
+    assert spark.conf.get("spark.sql.autoBroadcastJoinThreshold") == threshold_before, \
+        "Restore autoBroadcastJoinThreshold when you are done"
+
+    def join_line(plan):
+        return next(l.strip() for l in plan.splitlines() if "Join" in l)
+
+    print(f"Every strategy produced {counts['smj_result']} rows")
+    print("Broadcast:   ", join_line(result["broadcast_plan"]))
+    print("Shuffle hash:", join_line(result["shuffle_hash_plan"]))
+    print("Sort merge:  ", join_line(result["smj_plan"]))
     print("All tests passed!")
     spark.stop()

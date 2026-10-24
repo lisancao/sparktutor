@@ -1,20 +1,21 @@
 course:
   id: spark_declarative_pipelines
-  title: "Spark 4.1 Declarative Pipelines"
-  description: "Build production-grade bronze-silver-gold data pipelines"
-  version: "1.0.0"
-  requires_lakehouse: true
+  title: "Spark 4.2 Declarative Pipelines"
+  description: "Build bronze-silver-gold pipelines with pyspark.pipelines and the spark-pipelines CLI, including Auto CDC"
+  version: "2.0.0"
+  requires_lakehouse: false
   prerequisites:
     - "Python 3.10+"
-    - "pip install pyspark"
-    - "Docker Desktop (for Lakehouse Stack mode — Kafka, Iceberg)"
-    - "lakehouse-stack repo (optional, for full infrastructure)"
+    - "Java 17+ (Java 21 or 25 also work)"
+    - 'pip install "pyspark[pipelines]==4.2.0" "pandas<3"'
+    - "Lakehouse Stack mode (optional): an Iceberg catalog, needed to run Auto CDC flows for real"
   lessons:
-    - 01_spark_session
-    - 02_functions_and_transforms
-    - 03_reading_writing_data
-    - 04_pipeline_framework
-    - 05_bronze_layer
-    - 06_silver_layer
-    - 07_gold_layer
-    - 08_full_pipeline
+    - 01_why_declarative
+    - 02_datasets_and_flows
+    - 03_pipeline_projects
+    - 04_bronze_ingestion
+    - 05_silver_quality
+    - 06_gold_aggregates
+    - 07_auto_cdc
+    - 08_capstone
+    - 09_under_the_hood

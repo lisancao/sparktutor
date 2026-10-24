@@ -1,6 +1,6 @@
 - Class: meta
   Lesson: Complex Types & Higher-Order Functions
-  EstimatedMinutes: 25
+  EstimatedMinutes: 30
 
 - Class: text
   Depth: all
@@ -18,7 +18,11 @@
     - `explode` to flatten arrays into rows
     - Higher-order functions (`transform`, `filter`, `exists`, `aggregate`)
       that operate on arrays *without* exploding them
-    - `collect_list` and `collect_set` to reassemble arrays from rows
+    - `collect_list` and `collect_set` to reassemble arrays from rows, and
+      the `IGNORE NULLS` / `RESPECT NULLS` syntax Spark 4.2 added for them
+    - The `VARIANT` type (Spark 4.0) for JSON whose shape you do not know
+      in advance
+    - How ANSI mode changes out-of-bounds array access
 
 - Class: text
   Depth: all
@@ -27,17 +31,17 @@
 
     Spark supports three complex types within `StructType` schemas:
 
-    **ArrayType** — an ordered list of elements (all same type):
+    **ArrayType**: an ordered list of elements (all same type):
     ```python
     StructField("tags", ArrayType(StringType()))
     ```
 
-    **MapType** — key-value pairs:
+    **MapType**: key-value pairs:
     ```python
     StructField("preferences", MapType(StringType(), StringType()))
     ```
 
-    **Nested StructType** — a struct within a struct:
+    **Nested StructType**: a struct within a struct:
     ```python
     StructField("address", StructType([
         StructField("city", StringType()),
@@ -47,18 +51,22 @@
     ```
 
     You access nested fields with dot notation: `col("address.city")`.
+    In DDL form the same types read `ARRAY<STRING>`,
+    `MAP<STRING, STRING>`, and `STRUCT<city: STRING, state: STRING>`.
 
 - Class: text
   Depth: beginner
   Output: |
     Think of complex types in terms of everyday data:
 
-    - An **array** is like a shopping list — ordered items:
+    - An **array** is like a shopping list, ordered items:
       `["milk", "eggs", "bread"]`
-    - A **map** is like a settings page — keys and values:
+    - A **map** is like a settings page, keys and values:
       `{"theme": "dark", "language": "en"}`
-    - A **nested struct** is like a mailing label — a group of related
+    - A **nested struct** is like a mailing label, a group of related
       fields bundled together: `{city: "SF", state: "CA", zip: "94102"}`
+    - A **variant** is like a sealed envelope: you know it holds a JSON
+      document, and you open it to look for a field only when you need it
 
     Spark can read, filter, and transform all of these without you having
     to flatten them first.
@@ -75,7 +83,7 @@
     from pyspark.sql import functions as f
 
     # Before: id=1, tags=["spark", "python", "data"]
-    # After:  three rows — (1, "spark"), (1, "python"), (1, "data")
+    # After:  three rows: (1, "spark"), (1, "python"), (1, "data")
 
     df.select("id", f.explode("tags").alias("tag"))
     ```
@@ -86,7 +94,9 @@
     # (1, 0, "spark"), (1, 1, "python"), (1, 2, "data")
     ```
 
-    Use explode when you need to analyze individual array elements as rows.
+    `explode` drops rows whose array is empty or null; `explode_outer`
+    keeps them with a null element. Use explode when you need to analyze
+    individual array elements as rows.
 
 - Class: cmd_question
   Depth: all
@@ -105,8 +115,8 @@
   Output: |
     ## Collect: Rows Back to Arrays
 
-    The reverse of explode — `collect_list()` and `collect_set()` gather
-    rows back into arrays during aggregation:
+    The reverse of explode: `collect_list()` (alias `array_agg()`) and
+    `collect_set()` gather rows back into arrays during aggregation:
 
     ```python
     # Collect all tags per user into an array
@@ -116,8 +126,18 @@
     )
     ```
 
-    `collect_list` preserves duplicates and order. `collect_set` removes
-    duplicates (order is not guaranteed).
+    `collect_list` keeps duplicates; `collect_set` removes them. Neither
+    guarantees element order after a shuffle; if order matters, collect
+    structs and sort them, or use `array_sort`.
+
+    Both skip `NULL` inputs by default. Spark 4.2 makes that explicit in SQL
+    and lets you opt out (SPARK-55256, SPARK-55533):
+
+    ```sql
+    SELECT array_agg(x) IGNORE NULLS   AS no_nulls,     -- [1, 2]
+           collect_list(x) RESPECT NULLS AS with_nulls  -- [1, NULL, 2]
+    FROM VALUES (1), (NULL), (2) AS t(x)
+    ```
 
 - Class: text
   Depth: all
@@ -128,31 +148,36 @@
     transformations that should stay within the array, Spark provides
     **higher-order functions** that operate element-by-element:
 
-    **`transform()`** — apply a function to every element (like Python's
+    **`transform()`**: apply a function to every element (like Python's
     `map()`):
     ```python
     df.select(f.transform("prices", lambda x: x * 1.1).alias("with_tax"))
     ```
 
-    **`filter()`** — keep elements matching a condition:
+    **`filter()`**: keep elements matching a condition:
     ```python
     df.select(f.filter("scores", lambda x: x > 80).alias("passing"))
     ```
 
-    **`exists()`** — true if any element matches:
+    **`exists()`** and **`forall()`**: true if any (or every) element
+    matches:
     ```python
     df.select(f.exists("tags", lambda x: x == "urgent").alias("is_urgent"))
     ```
 
-    These keep your DataFrame structure intact — no explosion of rows.
+    These keep your DataFrame structure intact; no explosion of rows. The
+    lambdas are not Python code at runtime: PySpark calls them once to build
+    a Catalyst expression, which then runs in the JVM like any built-in
+    function. That is why they are fast, and why only Column operations
+    (not arbitrary Python) work inside them.
 
     **Docs:**
-    [transform](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.transform.html) |
-    [filter (HOF)](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.filter.html) |
-    [exists](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.exists.html) |
-    [aggregate](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.aggregate.html) |
-    [explode](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.explode.html) |
-    [collect_list](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.collect_list.html)
+    [transform](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.transform.html) |
+    [filter (HOF)](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.filter.html) |
+    [exists](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.exists.html) |
+    [aggregate](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.aggregate.html) |
+    [explode](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.explode.html) |
+    [collect_list](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.collect_list.html)
 
 - Class: mult_question
   Depth: all
@@ -178,24 +203,24 @@
   Output: |
     ## Aggregate: Folding an Array
 
-    `aggregate()` folds an array into a single value, like Python's
-    `functools.reduce()`. It takes four arguments:
+    `aggregate()` (alias `reduce()`) folds an array into a single value,
+    like Python's `functools.reduce()`. It takes up to four arguments:
 
     ```python
     f.aggregate(
-        "column",          # the array column
-        f.lit(0),          # initial accumulator value (zero)
+        "column",                 # the array column
+        f.lit(0),                 # initial accumulator value (zero)
         lambda acc, x: acc + x,   # merge function
         lambda acc: acc           # finish function (optional)
     )
     ```
 
-    **Example — sum all elements in an array:**
+    **Example: sum all elements in an array:**
     ```python
     df.select(f.aggregate("scores", f.lit(0), lambda acc, x: acc + x).alias("total"))
     ```
 
-    **Example — concatenate strings with a separator:**
+    **Example: concatenate strings with a separator:**
     ```python
     df.select(f.aggregate(
         "words",
@@ -205,12 +230,17 @@
     ).alias("sentence"))
     ```
 
+    The zero value fixes the accumulator type. `f.lit(0)` is an `INT`, so
+    summing a `DOUBLE` array needs `f.lit(0.0)`; otherwise the merge
+    function returns a `DOUBLE` for an `INT` accumulator and analysis fails
+    with `DATATYPE_MISMATCH`.
+
 - Class: mult_question
   Depth: intermediate
   Output: "What does aggregate() do with an array column?"
   AnswerChoices: "Folds the array into a single value using an accumulator function;Splits the array into multiple rows;Sorts the array elements;Counts the number of elements"
   CorrectAnswer: "Folds the array into a single value using an accumulator function"
-  Hint: "Think of Python's functools.reduce() — it takes an initial value and combines elements one by one."
+  Hint: "Think of Python's functools.reduce(): it takes an initial value and combines elements one by one."
 
 - Class: text
   Depth: intermediate
@@ -221,13 +251,17 @@
     or `element_at()`:
 
     ```python
-    # Access a specific key
-    df.select(df["preferences"]["theme"])      # bracket notation
-    df.select(f.element_at("preferences", "theme"))  # function
+    # Access a specific key (missing key returns NULL)
+    df.select(df["preferences"]["theme"])            # bracket notation
+    df.select(f.element_at("preferences", f.lit("theme")))  # function
 
     # Get all keys or values
     df.select(f.map_keys("preferences"))
     df.select(f.map_values("preferences"))
+
+    # Higher-order functions for maps
+    df.select(f.map_filter("preferences", lambda k, v: k != "debug"))
+    df.select(f.transform_values("preferences", lambda k, v: f.upper(v)))
 
     # Explode a map into key-value rows
     df.select(f.explode("preferences").alias("key", "value"))
@@ -242,17 +276,91 @@
     ```
 
 - Class: text
+  Depth: intermediate
+  Output: |
+    ## Array Access Under ANSI Mode
+
+    ANSI mode (default since 4.0) makes out-of-bounds array access an
+    error instead of a silent `NULL`:
+
+    | Expression on a 3-element array | Spark 4.x result |
+    |---------------------------------|------------------|
+    | `f.col("arr")[10]` (0-based) | error `INVALID_ARRAY_INDEX` |
+    | `f.element_at("arr", 10)` (1-based) | error `INVALID_ARRAY_INDEX_IN_ELEMENT_AT` |
+    | `f.get("arr", 10)` (0-based) | `NULL` |
+    | `f.try_element_at("arr", f.lit(10))` | `NULL` |
+
+    Missing **map** keys still return `NULL` with both `[]` and
+    `element_at`. When array length varies by row, reach for `get` or
+    `try_element_at` rather than turning ANSI off.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## VARIANT: JSON Without a Fixed Schema
+
+    Structs need you to know the shape up front. When the shape varies from
+    record to record (third-party webhooks, event payloads, config blobs),
+    Spark 4.0's `VARIANT` type stores the parsed document in a compact
+    binary form and lets each query pull out what it needs:
+
+    ```python
+    events = raw.withColumn("payload", f.parse_json("payload_json"))
+
+    events.select(
+        f.variant_get("payload", "$.priority", "string").alias("priority"),
+        f.try_variant_get("payload", "$.gift", "boolean").alias("gift"),
+    )
+    ```
+
+    - `parse_json(str)` builds a VARIANT; malformed JSON raises an error,
+      `try_parse_json` returns `NULL` instead.
+    - `variant_get(v, path, type)` extracts and casts. A missing path gives
+      `NULL`; a value that cannot be cast (the string `"x"` as `int`)
+      raises `INVALID_VARIANT_CAST`. `try_variant_get` returns `NULL` for
+      both.
+    - In SQL, the `:` path operator is shorthand:
+      `SELECT payload:priority::string FROM events`.
+    - `schema_of_variant(v)` describes one value; `schema_of_variant_agg(v)`
+      merges the shapes across all rows, which is useful when you are ready
+      to promote a VARIANT column to a proper struct.
+
+    **Docs:** [parse_json](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.parse_json.html) |
+    [variant_get](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.variant_get.html)
+
+- Class: mult_question
+  Depth: all
+  Output: "A VARIANT column `payload` holds `{\"qty\": \"many\"}` for one row. What does `variant_get(payload, '$.qty', 'int')` do on that row?"
+  AnswerChoices: "Raises INVALID_VARIANT_CAST;Returns NULL;Returns 0;Returns the string many"
+  CorrectAnswer: "Raises INVALID_VARIANT_CAST"
+  Hint: "variant_get casts strictly. Its try_ twin is the one that returns NULL."
+
+- Class: cmd_question
+  Depth: intermediate
+  Output: |
+    A DataFrame `orders` has a string column `attrs` holding JSON such as
+    `{"priority": "high"}`. Add a column `priority` (string) extracted from
+    it using `parse_json` and `variant_get`.
+  CorrectAnswer: |
+    from pyspark.sql import functions as f
+
+    result = orders.withColumn(
+        "priority", f.variant_get(f.parse_json("attrs"), "$.priority", "string"))
+  Hint: "parse_json turns the string into a VARIANT; variant_get takes the variant, a JSON path like '$.priority', and a target type."
+
+- Class: text
   Depth: advanced
   Output: |
     ## Performance: Explode vs. Higher-Order Functions
 
     `explode()` is convenient but has a cost: it multiplies the number of
-    rows, which increases shuffle sizes and memory usage. If an array
-    column averages 10 elements, exploding it makes your DataFrame 10x
+    rows, which increases shuffle sizes and memory usage. Exploding a column
+    whose arrays average ten elements makes the DataFrame about ten times
     larger.
 
-    Higher-order functions (`transform`, `filter`, `aggregate`) avoid this
-    by operating within each row. They are:
+    Higher-order functions (`transform`, `filter`, `aggregate`, `zip_with`,
+    `array_sort` with a comparator) avoid this by operating within each
+    row. They are:
     - More memory-efficient (no row multiplication)
     - Faster for large arrays (no shuffle expansion)
     - Easier to reason about (output has same row count as input)
@@ -260,6 +368,16 @@
     **When to explode**: you need to join or group by individual array
     elements. **When to use HOFs**: you need to transform, filter, or
     reduce array contents while keeping the row structure intact.
+
+    Two 4.2 aggregate additions remove common explode-then-rank patterns:
+    `max_by(x, y, k)` and `min_by(x, y, k)` return the top or bottom `k`
+    values of `x` ordered by `y` as an array (SPARK-55322), and
+    `listagg(x, ',') WITHIN GROUP (ORDER BY y)` (since 4.0) builds an
+    ordered delimited string.
+
+    VARIANT has a cost model of its own: every `variant_get` walks the
+    binary encoding, so a field you read in every query is worth promoting
+    to a real column once its shape settles.
 
 - Class: cmd_question
   Depth: intermediate
@@ -276,22 +394,28 @@
 - Class: script
   Depth: all
   Output: |
-    ## Exercise: Order Analysis with HOFs
+    ## Exercise: Order Analysis with HOFs and VARIANT
 
     Implement `analyze_orders(spark)` that creates order data with array
-    columns and demonstrates higher-order functions:
+    and JSON columns:
 
-    1. Create a DataFrame with columns: order_id, region, total, items (array)
-    2. Use `transform()` to uppercase all items → new column `items_upper`
-    3. Use `filter()` to keep only items starting with "p" → new column `p_items`
-    4. Add a window-based rank by total (descending) within each region
-    5. Return the result
+    1. Create a DataFrame with columns: order_id, region, total, items
+       (array of strings), attrs (JSON string)
+    2. Use `transform()` to uppercase all items into a new column
+       `items_upper`
+    3. Use `filter()` to keep only items starting with "p" in a new column
+       `p_items`
+    4. Parse `attrs` with `parse_json` and extract `$.priority` as a string
+       column `priority` with `variant_get`
+    5. Add a window-based rank by total (descending) within each region as
+       `region_rank`
+    6. Return the result
 
-    This exercise combines complex type operations with window functions —
-    a common pattern in real analytics.
+    This exercise combines complex type operations, semi-structured data,
+    and window functions, a common pattern in real analytics.
   StarterFile: starter.py
   SolutionFile: solution.py
-  Hint: "Use f.transform with f.upper(), f.filter with startswith(), and Window.partitionBy().orderBy() with f.rank()."
+  Hint: "Use f.transform with f.upper(), f.filter with startswith(), f.variant_get(f.parse_json('attrs'), '$.priority', 'string'), and Window.partitionBy().orderBy() with f.rank()."
 
 - Class: text
   Depth: all
@@ -300,18 +424,21 @@
 
     In this lesson you learned:
 
-    - **Complex types** — `ArrayType`, `MapType`, and nested `StructType`
+    - **Complex types**: `ArrayType`, `MapType`, and nested `StructType`
       model real-world nested data
-    - **explode / posexplode** — flatten arrays into rows for per-element
+    - **explode / posexplode**: flatten arrays into rows for per-element
       analysis
-    - **collect_list / collect_set** — reassemble rows into arrays during
-      aggregation
-    - **Higher-order functions** — `transform`, `filter`, `exists`, and
-      `aggregate` operate on arrays without creating extra rows
-    - **Map operations** — `element_at`, `map_keys`, `map_values`, and
-      `create_map`
+    - **collect_list / collect_set**: reassemble rows into arrays; 4.2 adds
+      `IGNORE NULLS` / `RESPECT NULLS`
+    - **Higher-order functions**: `transform`, `filter`, `exists`,
+      `forall`, and `aggregate` operate on arrays without creating extra rows
+    - **Map operations**: `element_at`, `map_keys`, `map_values`,
+      `map_filter`, `transform_values`, and `create_map`
+    - **ANSI array access**: out-of-bounds indexes raise; `get` and
+      `try_element_at` return `NULL`
+    - **VARIANT**: `parse_json`, `variant_get`, `try_variant_get`, and the
+      `:` path syntax for JSON whose shape varies
 
-    You can now handle any data shape Spark throws at you. In the next
-    lesson, you will dive into Spark SQL — the query engine that powers
-    both the DataFrame API and SQL queries — and learn to read execution
-    plans and write user-defined functions.
+    In the next lesson, you will dive into Spark SQL, the query engine
+    that powers both the DataFrame API and SQL queries, along with the SQL
+    syntax Spark 4.x added and how Python UDFs run in 4.2.

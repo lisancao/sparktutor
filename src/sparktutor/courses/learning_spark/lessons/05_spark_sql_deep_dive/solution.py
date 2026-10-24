@@ -1,13 +1,16 @@
 """
 Spark SQL Deep Dive - Solution
 
-Compare DataFrame API and SQL execution plans.
+One query written with the DataFrame API, standard SQL, and SQL pipe
+syntax, plus a QUALIFY query and plans captured without touching the JVM.
 """
 
 from pyspark.sql import SparkSession, functions as f
 from pyspark.sql.types import (
     StructType, StructField, StringType, IntegerType, DoubleType
 )
+import contextlib
+import io
 
 
 EMPLOYEE_DATA = [
@@ -29,8 +32,20 @@ SCHEMA = StructType([
 ])
 
 
+def plan_text(df, mode="simple"):
+    """Return what df.explain(mode) prints, as a string.
+
+    explain() prints in both Spark Classic and Spark Connect, so capturing
+    stdout works everywhere (df._jdf does not exist under Connect).
+    """
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        df.explain(mode=mode)
+    return buf.getvalue()
+
+
 def compare_plans(spark):
-    """Compare DataFrame API and SQL execution plans."""
+    """Write one query with the DataFrame API, SQL, and pipe syntax."""
 
     emp_df = spark.createDataFrame(EMPLOYEE_DATA, SCHEMA)
 
@@ -50,14 +65,29 @@ def compare_plans(spark):
         ORDER BY avg_salary DESC
     """)
 
-    df_plan = df_result._jdf.queryExecution().simpleString()
-    sql_plan = sql_result._jdf.queryExecution().simpleString()
+    pipe_result = spark.sql("""
+        FROM employees
+        |> WHERE salary > 50000
+        |> AGGREGATE AVG(salary) AS avg_salary GROUP BY department
+        |> ORDER BY avg_salary DESC
+    """)
+
+    df_plan = plan_text(df_result)
+    sql_plan = plan_text(sql_result)
+
+    top_earners = spark.sql("""
+        SELECT department, name, salary
+        FROM employees
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY department ORDER BY salary DESC) = 1
+    """)
 
     return {
         "df_result": df_result,
         "sql_result": sql_result,
+        "pipe_result": pipe_result,
         "df_plan": df_plan,
         "sql_plan": sql_plan,
+        "top_earners": top_earners,
     }
 
 
@@ -70,13 +100,31 @@ if __name__ == "__main__":
 
     result = compare_plans(spark)
     assert result is not None, "Function returned None"
-    assert result["df_result"].count() == 3, "DataFrame API should return 3 departments"
-    assert result["sql_result"].count() == 3, "SQL should return 3 departments"
-    assert len(result["df_plan"]) > 0, "df_plan should not be empty"
-    assert len(result["sql_plan"]) > 0, "sql_plan should not be empty"
+    for key in ["df_result", "sql_result", "pipe_result", "df_plan", "sql_plan", "top_earners"]:
+        assert result.get(key) is not None, f"{key} is missing or None"
+
+    def rows(df):
+        return [(r["department"], round(r["avg_salary"], 2)) for r in df.collect()]
+
+    expected = [("Engineering", 95666.67), ("Sales", 63500.0), ("Marketing", 59000.0)]
+    assert rows(result["df_result"]) == expected, f"DataFrame API result wrong: {rows(result['df_result'])}"
+    assert rows(result["sql_result"]) == expected, f"SQL result wrong: {rows(result['sql_result'])}"
+    assert rows(result["pipe_result"]) == expected, f"Pipe syntax result wrong: {rows(result['pipe_result'])}"
+
+    for key in ["df_plan", "sql_plan"]:
+        assert "HashAggregate" in result[key], f"{key} should contain a HashAggregate node"
+
+    top = {r["department"]: r["name"] for r in result["top_earners"].collect()}
+    assert top == {"Engineering": "Eve", "Marketing": "Charlie", "Sales": "Grace"}, \
+        f"QUALIFY result wrong: {top}"
+
     print("DataFrame API result:")
     result["df_result"].show()
-    print("SQL result:")
-    result["sql_result"].show()
+    print("Pipe syntax result:")
+    result["pipe_result"].show()
+    print("Top earner per department (QUALIFY):")
+    result["top_earners"].orderBy("department").show()
+    print("SQL physical plan:")
+    print(result["sql_plan"])
     print("All tests passed!")
     spark.stop()

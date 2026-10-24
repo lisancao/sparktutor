@@ -7,7 +7,7 @@ import click
 @click.option("--dry-run", is_flag=True, help="Force dry-run mode (no Spark execution)")
 @click.pass_context
 def main(ctx: click.Context, dry_run: bool) -> None:
-    """SparkTutor — Interactive Spark 4.1 learning environment."""
+    """SparkTutor — Interactive Spark 4.2 learning environment."""
     ctx.ensure_object(dict)
     ctx.obj["dry_run"] = dry_run
     if ctx.invoked_subcommand is None:

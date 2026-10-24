@@ -1,6 +1,6 @@
 - Class: meta
   Lesson: Spark SQL & the Catalyst Optimizer
-  EstimatedMinutes: 30
+  EstimatedMinutes: 40
 
 - Class: text
   Depth: all
@@ -10,15 +10,18 @@
     You have been using the DataFrame API for several lessons. Behind the
     scenes, every `select()`, `filter()`, and `groupBy()` passes through
     the same engine: **Spark SQL**. In this lesson you will look under the
-    hood.
+    hood, then at the SQL language itself, which grew a lot in the 4.x line.
 
     By the end of this lesson you will be able to:
 
     - Explain the four phases of the Catalyst optimizer pipeline
     - Read execution plans with `explain()`
-    - Write SQL queries against DataFrames using temporary views
-    - Create and use User-Defined Functions (UDFs)
-    - Understand why DataFrames outperform RDDs
+    - Write parameterized SQL against DataFrames using temporary views
+    - Use SQL pipe syntax (`|>`, and the `|` alias added in 4.2)
+    - Filter on window functions with `QUALIFY` (4.2)
+    - Write procedural logic with SQL scripting (4.0)
+    - Choose between Python UDFs, Arrow UDFs, and pandas UDFs, knowing that
+      Python UDFs are Arrow-optimized by default in 4.2
     - Explain what Adaptive Query Execution (AQE) does at runtime
 
 - Class: text
@@ -26,22 +29,25 @@
   Output: |
     ## The Catalyst Optimizer
 
-    Spark SQL is not just a query language — it is an **optimization
+    Spark SQL is not just a query language; it is an **optimization
     engine**. Whether you write DataFrame API code or raw SQL, your query
     passes through the same four-phase pipeline:
 
-    1. **Parsing** — your code is converted into an unresolved logical plan
+    1. **Parsing**: your code is converted into an unresolved logical plan
        (a tree of operations with placeholder column names)
-    2. **Analysis** — column names, table references, and types are resolved
+    2. **Analysis**: column names, table references, and types are resolved
        using the catalog
-    3. **Optimization** — the plan is rewritten with rules like predicate
+    3. **Optimization**: the plan is rewritten with rules like predicate
        pushdown, constant folding, and column pruning
-    4. **Physical Planning** — Spark chooses execution strategies (join
-       algorithms, scan methods) and generates JVM bytecode
+    4. **Physical Planning**: Spark chooses execution strategies (join
+       algorithms, scan methods) and generates JVM bytecode with
+       whole-stage code generation
 
     This is why `df.filter(...).select(...)` and
-    `spark.sql("SELECT ... WHERE ...")` produce identical results — they
-    both go through Catalyst.
+    `spark.sql("SELECT ... WHERE ...")` produce identical plans; they
+    both go through Catalyst. With Spark Connect, the client does only
+    step 1 (it builds the unresolved plan); steps 2 to 4 happen on the
+    server.
 
 - Class: text
   Depth: beginner
@@ -50,7 +56,10 @@
     want to go (your query), and it figures out the best route (execution
     plan). It considers shortcuts (optimizations like skipping unneeded
     columns) and traffic conditions (data statistics) to find the fastest
-    path. You do not need to know the route — just the destination.
+    path. You do not need to know the route, just the destination.
+
+    Adaptive Query Execution is the GPS re-routing you mid-trip when it sees
+    an accident ahead.
 
 - Class: mult_question
   Depth: all
@@ -64,25 +73,29 @@
   Output: |
     ## Key Catalyst Optimizations
 
-    **Predicate pushdown** — filters are pushed as close to the data source
+    **Predicate pushdown**: filters are pushed as close to the data source
     as possible. If you filter after a join, Catalyst moves the filter
     *before* the join (when applicable), reducing the amount of data
     shuffled.
 
-    **Column pruning** — only columns actually used in the query are read.
+    **Column pruning**: only columns actually used in the query are read.
     With Parquet, this means entire columns are skipped at the file level.
 
-    **Constant folding** — expressions like `1 + 2` or `lit("a") == lit("a")`
-    are evaluated at plan time, not at runtime for every row.
+    **Constant folding**: expressions like `1 + 2` or `lit("a") == lit("a")`
+    are evaluated at plan time, not at runtime for every row. Under ANSI
+    mode this has a visible side effect: `SELECT 1/0` fails during
+    optimization, before any data is read.
 
-    **Join reordering** — when joining multiple tables, Catalyst can
-    rearrange the join order to minimize intermediate result sizes.
+    **Join reordering**: with cost-based optimization enabled
+    (`spark.sql.cbo.enabled`, off by default) and table statistics
+    collected, Catalyst can rearrange multi-way joins to minimize
+    intermediate result sizes.
 
     These optimizations happen automatically. You get them for free by using
     the DataFrame API or SQL.
 
-    **Docs:** [Spark SQL Programming Guide](https://spark.apache.org/docs/3.5.0/sql-programming-guide.html)
-    — covers Catalyst phases, predicate pushdown, column pruning, and plan optimization.
+    **Docs:** [Spark SQL Programming Guide](https://spark.apache.org/docs/4.2.0/sql-programming-guide.html) |
+    [Performance Tuning](https://spark.apache.org/docs/4.2.0/sql-performance-tuning.html)
 
 - Class: text
   Depth: all
@@ -97,18 +110,25 @@
 
     The `explain()` method has several modes:
 
-    - `explain()` or `explain("simple")` — physical plan only
-    - `explain("extended")` — all plans (parsed, analyzed, optimized,
+    - `explain()` or `explain("simple")`: physical plan only
+    - `explain("extended")`: all plans (parsed, analyzed, optimized,
       physical)
-    - `explain("formatted")` — human-readable with section headers
-    - `explain("cost")` — includes statistics estimates
-    - `explain("codegen")` — shows generated Java bytecode
+    - `explain("formatted")`: an operator outline followed by numbered
+      details for each node
+    - `explain("cost")`: logical plan with statistics estimates
+    - `explain("codegen")`: the generated Java code
 
-    Start with `explain("formatted")` — it is the most readable. Look for:
-    - `FileScan` — how data is read (which columns, pushed filters)
-    - `Filter` — where filtering happens in the plan
-    - `HashAggregate` / `SortAggregate` — aggregation strategy
-    - `BroadcastHashJoin` / `SortMergeJoin` — join strategy
+    Start with `explain("formatted")`; it is the most readable. Look for:
+    - `FileScan` / `Scan`: how data is read (which columns, pushed filters)
+    - `Filter`: where filtering happens in the plan
+    - `HashAggregate` / `SortAggregate`: aggregation strategy
+    - `BroadcastHashJoin` / `SortMergeJoin`: join strategy
+    - `AdaptiveSparkPlan isFinalPlan=false|true`: AQE is in charge; the
+      plan becomes final only after the query has run
+
+    `explain()` prints to stdout in both Classic and Connect mode. To keep a
+    plan as a string, capture stdout (`contextlib.redirect_stdout`) rather
+    than reaching for `df._jdf`, which does not exist under Spark Connect.
 
 - Class: cmd_question
   Depth: all
@@ -128,23 +148,185 @@
     DataFrame as a SQL table. Here is the full workflow:
 
     ```python
-    # Register the DataFrame as a SQL view
     employees_df.createOrReplaceTempView("employees")
 
-    # Query with standard SQL
     result = spark.sql("""
         SELECT department, AVG(salary) AS avg_salary
         FROM employees
-        WHERE hire_date > '2020-01-01'
+        WHERE hire_date > :since
         GROUP BY department
-        HAVING AVG(salary) > 80000
+        HAVING AVG(salary) > :floor
         ORDER BY avg_salary DESC
-    """)
+    """, args={"since": "2020-01-01", "floor": 80000})
     ```
+
+    Pass values through **parameter markers** rather than f-strings.
+    `args` takes a dict for named markers (`:since`) or a list for
+    positional ones (`?`). The values are bound as literals, so there is no
+    SQL injection and no quoting bugs. To reference a table whose name is a
+    parameter, use `IDENTIFIER(:tbl)`. You can also hand DataFrames straight
+    to `spark.sql` as keyword arguments:
+    `spark.sql("SELECT * FROM {t} WHERE salary > {m}", t=df, m=90000)`.
 
     SQL and DataFrames are interchangeable. Use SQL when the query is
     naturally expressed as a SELECT statement. Use DataFrames when you
     need programmatic composition (building queries dynamically).
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "What is the safest way to pass a user-supplied value into a spark.sql() query?"
+  AnswerChoices: "A parameter marker bound through args;An f-string;String concatenation with manual quoting;A Python format() call"
+  CorrectAnswer: "A parameter marker bound through args"
+  Hint: "Spark binds marker values as literals, so nothing the user types is parsed as SQL."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## SQL Pipe Syntax
+
+    Spark 4.0 added **pipe syntax**: a query is a starting table followed
+    by a chain of operators, each consuming the result of the previous one.
+    It reads top to bottom in the order Spark executes it, much like a
+    DataFrame chain:
+
+    ```sql
+    FROM employees
+    |> WHERE salary > 50000
+    |> EXTEND salary * 1.1 AS proposed
+    |> AGGREGATE AVG(salary) AS avg_salary, COUNT(*) AS n
+       GROUP BY department
+    |> ORDER BY avg_salary DESC
+    |> LIMIT 10
+    ```
+
+    Operators include `SELECT`, `EXTEND` (add columns), `SET` (replace
+    columns), `DROP`, `AS` (alias the table), `WHERE`, `AGGREGATE`, `JOIN`,
+    `ORDER BY`, `LIMIT`, `UNION ALL`, `TABLESAMPLE`, `PIVOT`, and `UNPIVOT`.
+    You can apply `WHERE` after `AGGREGATE`, which replaces `HAVING`, and
+    you can mix pipe queries with regular SQL anywhere a subquery fits.
+
+    Two 4.2 additions (SPARK-51518, SPARK-54292):
+
+    ```sql
+    -- `|` works as an alias for `|>`
+    TABLE employees | WHERE department = 'Engineering' | SELECT name, salary
+
+    -- aggregate functions and GROUP BY are allowed in a pipe SELECT
+    FROM employees |> SELECT department, MAX(salary) AS top GROUP BY department
+    ```
+
+    **Docs:** [SQL Pipe Syntax](https://spark.apache.org/docs/4.2.0/sql-pipe-syntax.html)
+
+- Class: cmd_question
+  Depth: intermediate
+  Output: |
+    Using pipe syntax inside `spark.sql`, start from the `employees` view,
+    keep rows with `salary > 50000`, compute `AVG(salary) AS avg_salary`
+    per `department`, and sort by `avg_salary` descending.
+  CorrectAnswer: |
+    result = spark.sql("""
+        FROM employees
+        |> WHERE salary > 50000
+        |> AGGREGATE AVG(salary) AS avg_salary GROUP BY department
+        |> ORDER BY avg_salary DESC
+    """)
+  Hint: "Start with FROM employees, then chain |> WHERE, |> AGGREGATE ... GROUP BY, and |> ORDER BY."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## QUALIFY: Filtering on Window Functions
+
+    "Top earner per department" used to need a subquery, because `WHERE`
+    runs before window functions are computed. Spark 4.2 adds the `QUALIFY`
+    clause (SPARK-31561), which filters *after* window functions:
+
+    ```sql
+    SELECT department, name, salary,
+           RANK() OVER (PARTITION BY department ORDER BY salary DESC) AS rnk
+    FROM employees
+    QUALIFY rnk = 1
+    ```
+
+    You can also put the window function directly in the condition:
+    `QUALIFY ROW_NUMBER() OVER (PARTITION BY department ORDER BY salary DESC) = 1`.
+    The `SELECT` list or the `QUALIFY` condition must contain at least one
+    window function, and plain aggregates are not allowed in `QUALIFY`.
+
+    **Docs:** [QUALIFY clause](https://spark.apache.org/docs/4.2.0/sql-ref-syntax-qry-select-qualify.html)
+
+- Class: mult_question
+  Depth: all
+  Output: "Which clause, new in Spark 4.2, filters rows based on the result of a window function without a subquery?"
+  AnswerChoices: "QUALIFY;HAVING;WHERE;FILTER"
+  CorrectAnswer: "QUALIFY"
+  Hint: "HAVING filters groups after aggregation. This clause filters after window functions."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## More 4.x SQL Worth Knowing
+
+    **Time bucketing** (4.2, SPARK-56594): `time_bucket` returns the start
+    of the fixed-size interval a timestamp falls into, optionally aligned to
+    an origin:
+
+    ```sql
+    SELECT time_bucket(INTERVAL '15' MINUTE, event_time) AS bucket, COUNT(*)
+    FROM events GROUP BY 1
+    ```
+
+    Unlike `window()`, it is a plain scalar function, so it works in any
+    `SELECT`, `GROUP BY`, or join condition.
+
+    **Session variables** (4.0): `DECLARE VARIABLE min_sal DOUBLE DEFAULT
+    90000;` then `SELECT name FROM employees WHERE salary > min_sal`.
+    `SET VAR min_sal = 100000` changes it.
+
+    **EXECUTE IMMEDIATE** (4.0) runs a SQL string with bound parameters:
+    `EXECUTE IMMEDIATE 'SELECT count(*) FROM employees WHERE department = ?' USING 'Sales'`.
+
+    **Collations** (4.0): `WHERE name = 'alice' COLLATE UTF8_LCASE` compares
+    case-insensitively; 4.2 adds `SHOW COLLATIONS`.
+
+    **Top-k aggregates** (4.2): `max_by(name, salary, 3)` returns the three
+    highest-paid names as an array.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## SQL Scripting
+
+    Since Spark 4.0, a single `spark.sql()` call can run a **script**: a
+    `BEGIN ... END` compound statement with local variables, control flow,
+    and error handlers. The result of the last statement that returns rows
+    is the result of the call. `spark.sql.scripting.enabled` defaults to
+    `true` in 4.2.
+
+    ```python
+    verdict = spark.sql("""
+    BEGIN
+      DECLARE total DOUBLE DEFAULT 0;
+      FOR r AS SELECT salary FROM employees WHERE salary > 60000 DO
+        SET total = total + r.salary;
+      END FOR;
+      IF total > 300000 THEN
+        SELECT 'big payroll' AS verdict, total;
+      ELSE
+        SELECT 'small payroll' AS verdict, total;
+      END IF;
+    END
+    """)
+    ```
+
+    Available constructs include `IF`/`ELSEIF`/`ELSE`, `CASE`, `WHILE`,
+    `REPEAT`, `LOOP`, `FOR`, `LEAVE`/`ITERATE`, and `DECLARE ... HANDLER`
+    for exceptions. Spark 4.2 adds cursors (SPARK-54759). Scripting is for
+    orchestration glue that belongs next to the data (conditional DDL,
+    small loops over metadata); row-by-row loops over large tables are
+    still a job for set-based SQL.
+
+    **Docs:** [SQL Scripting](https://spark.apache.org/docs/4.2.0/sql-ref-scripting.html)
 
 - Class: text
   Depth: intermediate
@@ -156,35 +338,68 @@
 
     ```python
     from pyspark.sql.functions import udf
-    from pyspark.sql.types import StringType
 
-    @udf(returnType=StringType())
+    @udf(returnType="string")
     def normalize_name(name):
         return name.strip().title() if name else None
 
     df.withColumn("clean_name", normalize_name(col("name")))
+    spark.udf.register("normalize_name", normalize_name)   # use from SQL
     ```
 
-    **Important tradeoffs:**
-    - UDFs are **opaque** to Catalyst — the optimizer cannot look inside
-      them to push filters or prune logic
-    - Python UDFs add **serialization overhead** — data is sent from JVM
-      to Python and back for every row
-    - Prefer built-in functions when possible — they run natively in the
+    **What changed in Spark 4.2**: regular Python UDFs are
+    **Arrow-optimized by default** (SPARK-54555;
+    `spark.sql.execution.pythonUDF.arrow.enabled` now defaults to `true`).
+    Rows move between the JVM and the Python worker in Arrow columnar
+    batches instead of being pickled one by one. In a plan you will see
+    `ArrowEvalPython` where 4.1 showed `BatchEvalPython`. Your function body
+    does not change; you opt out per UDF with `@udf(..., useArrow=False)`.
+    Python UDTFs are Arrow-optimized by default in 4.2 as well.
+
+    Two vectorized alternatives process a whole batch per call:
+
+    ```python
+    import pandas as pd
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    from pyspark.sql.functions import pandas_udf, arrow_udf
+
+    @pandas_udf("string")
+    def upper_pd(s: pd.Series) -> pd.Series:
+        return s.str.upper()
+
+    @arrow_udf("string")                     # since 4.1
+    def upper_arrow(s: pa.Array) -> pa.Array:
+        return pc.utf8_upper(s)
+    ```
+
+    **Tradeoffs that still hold:**
+    - UDFs are **opaque** to Catalyst; the optimizer cannot push filters
+      through them or reason about their output
+    - Every UDF call still crosses the JVM-to-Python boundary; Arrow makes
+      the crossing cheaper, not free
+    - Prefer built-in functions when possible; they run natively in the
       JVM and are optimized by Catalyst
 
     **Docs:**
-    [udf](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.udf.html) |
-    [pandas_udf](https://spark.apache.org/docs/3.5.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.pandas_udf.html) |
-    [Arrow in PySpark](https://spark.apache.org/docs/3.5.0/api/python/user_guide/sql/arrow_pandas.html)
-    — `returnType` parameter, batch UDF signatures, and performance guidance.
+    [udf](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.udf.html) |
+    [arrow_udf](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.arrow_udf.html) |
+    [pandas_udf](https://spark.apache.org/docs/4.2.0/api/python/reference/pyspark.sql/api/pyspark.sql.functions.pandas_udf.html) |
+    [Arrow Python UDFs](https://spark.apache.org/docs/4.2.0/api/python/tutorial/sql/arrow_python_udf.html)
 
 - Class: mult_question
   Depth: intermediate
-  Output: "Why are Python UDFs generally slower than built-in Spark SQL functions?"
-  AnswerChoices: "Data must be serialized between JVM and Python for every row;UDFs use more memory;UDFs cannot run in parallel;Built-in functions skip the Catalyst optimizer"
-  CorrectAnswer: "Data must be serialized between JVM and Python for every row"
-  Hint: "PySpark runs on top of the JVM. What happens when Python code needs to process JVM data?"
+  Output: "Why are Python UDFs still slower than built-in Spark SQL functions, even with Arrow optimization on by default in 4.2?"
+  AnswerChoices: "Data still crosses the JVM-Python boundary and the UDF is opaque to Catalyst;UDFs cannot run in parallel;Arrow is slower than pickling;Built-in functions skip the Catalyst optimizer"
+  CorrectAnswer: "Data still crosses the JVM-Python boundary and the UDF is opaque to Catalyst"
+  Hint: "Arrow changes how data is serialized, not where the code runs or what the optimizer can see."
+
+- Class: mult_question
+  Depth: advanced
+  Output: "In Spark 4.2, which physical operator appears in the plan for a plain @udf Python UDF with default settings?"
+  AnswerChoices: "ArrowEvalPython;BatchEvalPython;MapInPandas;FlatMapGroupsInPandas"
+  CorrectAnswer: "ArrowEvalPython"
+  Hint: "spark.sql.execution.pythonUDF.arrow.enabled defaults to true as of 4.2."
 
 - Class: text
   Depth: intermediate
@@ -194,15 +409,18 @@
     Spark has two main APIs: DataFrames and RDDs (Resilient Distributed
     Datasets). DataFrames are almost always better because:
 
-    - **Catalyst optimization** — DataFrames go through the full optimizer
-      pipeline. RDDs are opaque — Spark cannot optimize your lambdas.
-    - **Tungsten memory** — DataFrames use Spark's compact binary format.
-      RDDs use Java object serialization (slower, more memory).
-    - **Code generation** — Spark generates JVM bytecode for DataFrame
-      operations. RDD operations are interpreted.
+    - **Catalyst optimization**: DataFrames go through the full optimizer
+      pipeline. RDD lambdas are opaque; Spark cannot optimize them.
+    - **Tungsten memory**: DataFrames use Spark's compact binary row format.
+      RDDs of Python objects pay for pickling on every hop.
+    - **Code generation**: Spark generates JVM bytecode for DataFrame
+      operations. RDD operations run your functions as written.
+    - **Portability**: RDDs are not available under Spark Connect at all.
+      Spark 4.2 keeps closing the gap with DataFrame equivalents such as
+      `DataFrame.zipWithIndex()` and `DataFrame.toJSON()` on Connect.
 
     Use DataFrames unless you need fine-grained control over partitioning
-    or work with types that do not map to Spark's type system.
+    that the DataFrame API cannot express.
 
 - Class: text
   Depth: advanced
@@ -213,15 +431,16 @@
     **runtime** based on actual shuffle statistics. It fixes problems that
     the static optimizer cannot predict:
 
-    **1. Coalescing post-shuffle partitions** — after a shuffle, many
-    partitions may be tiny. AQE merges them to reduce task overhead and
-    small file problems.
+    **1. Coalescing post-shuffle partitions**: after a shuffle, many
+    partitions may be tiny. AQE merges them toward
+    `spark.sql.adaptive.advisoryPartitionSizeInBytes` (default 64MB). In a
+    plan this shows up as `AQEShuffleRead coalesced`.
 
-    **2. Switching join strategies** — if the optimizer planned a Sort
+    **2. Switching join strategies**: if the optimizer planned a Sort
     Merge Join but one side turns out to be small after filtering, AQE
     converts it to a Broadcast Hash Join at runtime.
 
-    **3. Skew join optimization** — if one partition is much larger than
+    **3. Skew join optimization**: if one partition is much larger than
     others (data skew), AQE splits it into smaller sub-partitions to
     prevent stragglers.
 
@@ -231,6 +450,11 @@
     spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
     spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
     ```
+
+    Run `explain()` after an action and the plan header changes from
+    `AdaptiveSparkPlan isFinalPlan=false` to `isFinalPlan=true`, followed by
+    both the `Final Plan` and the `Initial Plan`. The 4.2 Web UI shows the
+    two side by side on the SQL tab (SPARK-55877).
 
 - Class: cmd_question
   Depth: advanced
@@ -245,22 +469,28 @@
 - Class: script
   Depth: all
   Output: |
-    ## Exercise: DataFrame API vs. SQL
+    ## Exercise: One Query, Three Syntaxes
 
-    Implement `compare_plans(spark)` that writes the same query in both
-    the DataFrame API and Spark SQL, then captures the execution plans.
+    Implement `compare_plans(spark)`, which writes the same query three
+    ways and shows they agree. The query: average salary per department,
+    for employees earning more than 50000, highest average first.
 
-    This demonstrates that both APIs produce the same optimized plan — a
-    key insight for choosing between them in practice.
+    1. Create the employee DataFrame and register it as the `employees`
+       temp view
+    2. Write the query with the DataFrame API (`df_result`)
+    3. Write it in standard SQL (`sql_result`)
+    4. Write it in SQL pipe syntax (`pipe_result`)
+    5. Capture the DataFrame and SQL plans as strings with the provided
+       `plan_text()` helper (`df_plan`, `sql_plan`)
+    6. Use `QUALIFY` to return the single top earner per department
+       (`top_earners`: columns `department`, `name`, `salary`)
+    7. Return all six values in a dict
 
-    1. Create a sample employee DataFrame
-    2. Write a filter → groupBy → agg → orderBy using the DataFrame API
-    3. Register as a temp view and write the same query in SQL
-    4. Capture both explain plans as strings
-    5. Return a dict with both results and plans
+    `plan_text()` captures what `explain()` prints, so the exercise runs
+    unchanged under Spark Connect.
   StarterFile: starter.py
   SolutionFile: solution.py
-  Hint: "Register the DataFrame as a temp view, write the same filter-groupBy-agg-orderBy in both APIs, and use explain() to capture plans."
+  Hint: "Pipe syntax: FROM employees |> WHERE ... |> AGGREGATE AVG(salary) AS avg_salary GROUP BY department |> ORDER BY avg_salary DESC. QUALIFY: SELECT ... QUALIFY ROW_NUMBER() OVER (PARTITION BY department ORDER BY salary DESC) = 1."
 
 - Class: text
   Depth: all
@@ -269,18 +499,22 @@
 
     In this lesson you learned:
 
-    - **Catalyst optimizer** — the four-phase pipeline (parse, analyze,
+    - **Catalyst optimizer**: the four-phase pipeline (parse, analyze,
       optimize, physical plan) that powers all Spark queries
-    - **Key optimizations** — predicate pushdown, column pruning, constant
-      folding, and join reordering happen automatically
-    - **explain()** — read execution plans to understand and debug what
-      Spark actually does
-    - **SQL queries** — `spark.sql()` with temp views gives you full SQL
-      alongside the DataFrame API
-    - **UDFs** — custom logic with a performance tradeoff; prefer built-in
-      functions when possible
-    - **AQE** — runtime re-optimization that adapts to actual data
+    - **Key optimizations**: predicate pushdown, column pruning, constant
+      folding, and cost-based join reordering
+    - **explain()**: read execution plans to understand and debug what
+      Spark actually does; capture stdout instead of using `_jdf`
+    - **Parameterized SQL**: `spark.sql(query, args=...)` with `:name` or
+      `?` markers
+    - **Pipe syntax**: `FROM t |> WHERE ... |> AGGREGATE ...`, with `|` and
+      aggregates in pipe `SELECT` new in 4.2
+    - **QUALIFY** (4.2), `time_bucket` (4.2), session variables, `EXECUTE
+      IMMEDIATE`, and SQL scripting (4.0)
+    - **UDFs**: Arrow-optimized by default in 4.2; `arrow_udf` and
+      `pandas_udf` for vectorized logic; built-ins still win
+    - **AQE**: runtime re-optimization that adapts to actual data
 
     Understanding the optimizer is what separates Spark users from Spark
     experts. In the next lesson, you will use this knowledge to tune
-    performance — caching, partitioning, and configuration.
+    performance: caching, partitioning, configuration, and the Spark UI.

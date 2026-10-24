@@ -1,0 +1,6 @@
+customer_id,name,email,city,signup_date
+c-01,Ada Nguyen,ada@example.com,Toronto,2025-03-14
+c-02,Bao Tran,bao@example.com,Vancouver,2025-07-02
+c-03,Chloe Martin,chloe@example.com,Montreal,2026-01-20
+c-04,Dev Patel,dev@example.com,Toronto,2026-05-09
+c-05,Elif Kaya,elif@example.com,Calgary,2026-08-30

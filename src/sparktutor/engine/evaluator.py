@@ -12,6 +12,15 @@ from sparktutor.config.settings import Settings
 from sparktutor.engine.normalizer import choices_match, code_match
 
 
+def _response_text(response) -> str:
+    """Join the text blocks of a Messages API response.
+
+    Current models return thinking blocks before the answer, so the first
+    content block is not necessarily text.
+    """
+    return "".join(block.text for block in response.content if block.type == "text")
+
+
 @dataclass
 class FeedbackItem:
     line: Optional[int]
@@ -78,6 +87,29 @@ class Evaluator:
             return EvalResult(passed=True, encouragement="Well done!")
         return EvalResult(passed=False)
 
+    def check_execution(self, exec_result) -> EvalResult:
+        """Grade a step whose checks live in the code itself (Validation: [execution]).
+
+        Pipeline exercises embed their assertions as check_* datasets, so a
+        successful run means every check passed.
+        """
+        if exec_result is None:
+            return EvalResult(passed=False, feedback=[FeedbackItem(
+                line=None, severity="error", category="bug",
+                message="This exercise is graded by running it, but it was not run.",
+                suggestion="Switch the execution mode to local or lakehouse.",
+            )])
+        if exec_result.exit_code != 0:
+            from sparktutor.engine.feedback import parse_stderr
+            output = "\n".join([exec_result.stdout, exec_result.stderr])
+            details = [f for f in parse_stderr(output) if f.severity == "error"]
+            return EvalResult(passed=False, feedback=details or [FeedbackItem(
+                line=None, severity="error", category="bug",
+                message=f"Code execution failed (exit code {exec_result.exit_code}).",
+                suggestion="Check the Output panel for error details.",
+            )])
+        return EvalResult(passed=True, encouragement="Your pipeline ran and every check passed.")
+
     def check_ast_contains(self, code: str, checks: list[dict]) -> EvalResult:
         """Check that code AST contains required elements."""
         try:
@@ -140,10 +172,13 @@ class Evaluator:
                         for node in ast.walk(tree)
                     )
                 elif key == "call":
+                    # Matches bare calls (foo()) and attribute calls (dp.foo())
                     found = any(
                         isinstance(node, ast.Call)
-                        and isinstance(node.func, ast.Name)
-                        and node.func.id == value
+                        and (
+                            (isinstance(node.func, ast.Name) and node.func.id == value)
+                            or (isinstance(node.func, ast.Attribute) and node.func.attr == value)
+                        )
                         for node in ast.walk(tree)
                     )
 
@@ -281,11 +316,11 @@ Rules:
         try:
             response = client.messages.create(
                 model=self.settings.claude.get_model(),
-                max_tokens=1024,
+                max_tokens=16000,
+                output_config={"effort": "low"},
                 messages=messages,
             )
-            text = response.content[0].text
-            return self.parse_review_response(text)
+            return self.parse_review_response(_response_text(response))
         except Exception as e:
             return EvalResult(
                 passed=False,
@@ -329,6 +364,9 @@ Rules:
             ast_result = self.check_ast_contains(code, ast_checks)
             if not ast_result.passed:
                 return ast_result
+
+        if any(v.type == "execution" for v in step.validation):
+            return self.check_execution(exec_result)
 
         # Claude review for script steps or when local checks are insufficient
         has_claude_review = any(v.type == "claude_review" for v in step.validation)
@@ -419,6 +457,9 @@ Rules:
             ast_result = self.check_ast_contains(code, ast_checks)
             if not ast_result.passed:
                 return ast_result, False, {}
+
+        if any(v.type == "execution" for v in step.validation):
+            return self.check_execution(exec_result), False, {}
 
         # Claude review for script steps or when local checks are insufficient
         has_claude_review = any(v.type == "claude_review" for v in step.validation)
@@ -532,10 +573,11 @@ Student question: {question}"""
             user_messages = [m for m in messages if m["role"] != "system"]
             response = client.messages.create(
                 model=self.settings.claude.get_model(),
-                max_tokens=1024,
+                max_tokens=16000,
+                output_config={"effort": "low"},
                 system=system_msg,
                 messages=user_messages,
             )
-            return response.content[0].text
+            return _response_text(response)
         except Exception as e:
             return f"Chat error: {e}"

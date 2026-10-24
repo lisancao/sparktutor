@@ -1,0 +1,6 @@
+{"customer_id": "c-01", "name": "Ada Nguyen", "city": "Toronto", "op": "UPSERT", "seq": 1}
+{"customer_id": "c-02", "name": "Bao Tran", "city": "Vancouver", "op": "UPSERT", "seq": 2}
+{"customer_id": "c-03", "name": "Chloe Martin", "city": "Montreal", "op": "UPSERT", "seq": 3}
+{"customer_id": "c-01", "name": "Ada Nguyen", "city": "Hanoi", "op": "UPSERT", "seq": 5}
+{"customer_id": "c-02", "name": "Bao Tran", "city": "Vancouver", "op": "DELETE", "seq": 6}
+{"customer_id": "c-01", "name": "Ada Nguyen", "city": "Ottawa", "op": "UPSERT", "seq": 4}

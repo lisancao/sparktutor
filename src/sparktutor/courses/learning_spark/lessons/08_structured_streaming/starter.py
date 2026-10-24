@@ -1,22 +1,28 @@
 """
 Structured Streaming - Starter Code
 
-Implement the `streaming_word_count` function that:
-1. Creates a batch DataFrame simulating streaming text data
-2. Splits lines into individual words using split + explode
-3. Groups by word and counts occurrences
-4. Orders by count descending
-5. Returns the word count DataFrame
+Part 1 (batch DataFrames, the way you unit-test streaming logic):
+1. `streaming_word_count`: split lines into words, count them, order by
+   count descending
+2. `streaming_windowed_count`: count words per 10-minute tumbling window
 
-This exercise simulates a streaming word count in batch mode
-(dry-run compatible — no actual stream needed).
+Part 2 (real streaming queries over a directory of JSON files):
+3. `sensor_window_stream`: readStream with READING_SCHEMA, a 10-minute
+   watermark, max(temp) per 10-minute window and sensor, memory sink
+   "sensor_windows", complete mode, trigger(availableNow=True)
+4. `sensor_violations`: the same stream through the ViolationCounter
+   processor with transformWithState (RocksDB state store), memory sink
+   "sensor_violations", update mode, trigger(availableNow=True)
 
-In a real streaming scenario, you would replace spark.createDataFrame
-with spark.readStream.format("socket") or .format("kafka").
+availableNow processes every file that is already in the directory and
+then stops, so each query finishes on its own.
 """
 
-from pyspark.sql import SparkSession, functions as f
-from pyspark.sql.types import StructType, StructField, StringType
+from datetime import datetime, timedelta
+
+from pyspark.sql import Row, SparkSession, functions as f
+from pyspark.sql.streaming import StatefulProcessor, StatefulProcessorHandle
+from pyspark.sql.types import StructType, StructField, StringType, TimestampType
 
 
 TEXT_DATA = [
@@ -31,6 +37,11 @@ TEXT_DATA = [
 SCHEMA = StructType([
     StructField("line", StringType(), False),
 ])
+
+# Schema of the JSON sensor readings the harness writes to input_dir.
+READING_SCHEMA = "sensor STRING, temp INT, event_time TIMESTAMP"
+
+ROCKSDB_PROVIDER = "org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider"
 
 
 def streaming_word_count(spark):
@@ -57,9 +68,6 @@ def streaming_windowed_count(spark):
     Creates timestamped word data, applies a time-based window,
     and counts words per window.
     """
-    from pyspark.sql.types import TimestampType
-    from datetime import datetime, timedelta
-
     base_time = datetime(2024, 1, 1, 12, 0, 0)
     timestamped_data = [
         ("hello spark", base_time),
@@ -81,21 +89,87 @@ def streaming_windowed_count(spark):
     words_df = None  # Replace
 
     # TODO: Group by 10-minute tumbling window on event_time and word,
-    #       count occurrences
+    #       count occurrences, order by window then count descending
     #       Use: f.window("event_time", "10 minutes")
     windowed_counts = None  # Replace
 
     return windowed_counts
 
 
+def sensor_window_stream(spark, input_dir, checkpoint_dir):
+    """Max temperature per sensor per 10-minute window, as a real stream."""
+
+    # TODO: Read input_dir as a JSON stream with READING_SCHEMA
+    readings = None  # Replace with spark.readStream...
+
+    # TODO: Watermark event_time by 10 minutes, then group by
+    #       f.window("event_time", "10 minutes") and "sensor",
+    #       computing f.max("temp").alias("max_temp")
+    windowed = None  # Replace
+
+    # TODO: Start the query: memory sink, queryName "sensor_windows",
+    #       outputMode "complete", checkpointLocation checkpoint_dir,
+    #       trigger(availableNow=True). Then wait for it to finish.
+    query = None  # Replace
+
+    return spark.table("sensor_windows")
+
+
+class ViolationCounter(StatefulProcessor):
+    """Keeps a running count of readings above 100 degrees per sensor."""
+
+    def init(self, handle: StatefulProcessorHandle) -> None:
+        self.violations = handle.getValueState("violations", "count INT")
+
+    def handleInputRows(self, key, rows, timerValues):
+        count = self.violations.get()[0] if self.violations.exists() else 0
+        for row in rows:
+            if row.temp is not None and row.temp > 100:
+                count += 1
+        self.violations.update((count,))
+        yield Row(sensor=key[0], violations=count)
+
+    def close(self) -> None:
+        pass
+
+
+def sensor_violations(spark, input_dir, checkpoint_dir):
+    """Count over-temperature readings per sensor with transformWithState."""
+
+    # TODO: transformWithState needs the RocksDB state store. Set
+    #       spark.sql.streaming.stateStore.providerClass to ROCKSDB_PROVIDER
+    # Your code here
+
+    # TODO: Read input_dir as a JSON stream with READING_SCHEMA
+    readings = None  # Replace
+
+    # TODO: groupBy("sensor").transformWithState(...) with
+    #       statefulProcessor=ViolationCounter(),
+    #       outputStructType="sensor STRING, violations INT",
+    #       outputMode="Update", timeMode="None"
+    alerts = None  # Replace
+
+    # TODO: Start the query: memory sink, queryName "sensor_violations",
+    #       outputMode "update", checkpointLocation checkpoint_dir,
+    #       trigger(availableNow=True). Then wait for it to finish.
+    query = None  # Replace
+
+    return spark.table("sensor_violations")
+
+
 # ---- Test harness (do not modify below this line) ----
 if __name__ == "__main__":
+    import json
+    import os
+    import shutil
+    import tempfile
+
     spark = (SparkSession.builder
         .appName("StreamingTest")
         .master("local[*]")
+        .config("spark.sql.shuffle.partitions", "4")
         .getOrCreate())
 
-    # Test 1: Basic word count
     wc = streaming_word_count(spark)
     assert wc is not None, "streaming_word_count returned None"
     top_word = wc.collect()[0]
@@ -103,12 +177,47 @@ if __name__ == "__main__":
     print("Word counts:")
     wc.show(truncate=False)
 
-    # Test 2: Windowed count
     ww = streaming_windowed_count(spark)
     assert ww is not None, "streaming_windowed_count returned None"
     assert "window" in ww.columns, "Missing window column"
     print("\nWindowed word counts:")
     ww.show(truncate=False)
 
-    print("All tests passed!")
-    spark.stop()
+    tmp = tempfile.mkdtemp()
+    try:
+        input_dir = os.path.join(tmp, "readings")
+        os.makedirs(input_dir)
+        readings = [
+            ("s1", 50, "2024-01-01 12:00:00"),
+            ("s1", 120, "2024-01-01 12:03:00"),
+            ("s2", 130, "2024-01-01 12:04:00"),
+            ("s1", 150, "2024-01-01 12:11:00"),
+            ("s2", 20, "2024-01-01 12:12:00"),
+        ]
+        with open(os.path.join(input_dir, "batch-0001.json"), "w") as fh:
+            for sensor, temp, ts in readings:
+                fh.write(json.dumps({"sensor": sensor, "temp": temp, "event_time": ts}) + "\n")
+
+        windows = sensor_window_stream(spark, input_dir, os.path.join(tmp, "ck_windows"))
+        assert windows is not None, "sensor_window_stream returned None"
+        assert windows.count() == 4, f"Expected 4 (window, sensor) rows, got {windows.count()}"
+        first_window_s1 = (windows
+            .filter((f.col("sensor") == "s1") & (f.col("window.start") == datetime(2024, 1, 1, 12, 0)))
+            .first())
+        assert first_window_s1["max_temp"] == 120, f"Wrong max_temp for s1 12:00-12:10: {first_window_s1}"
+        print("\nStreaming windows (memory sink):")
+        windows.orderBy("window", "sensor").show(truncate=False)
+
+        violations = sensor_violations(spark, input_dir, os.path.join(tmp, "ck_violations"))
+        assert violations is not None, "sensor_violations returned None"
+        got = {r["sensor"]: r["violations"] for r in violations.collect()}
+        assert got == {"s1": 2, "s2": 1}, f"Expected s1=2, s2=1 violations, got {got}"
+        print("transformWithState violations (memory sink):")
+        violations.orderBy("sensor").show()
+
+        print("All tests passed!")
+    finally:
+        for q in spark.streams.active:
+            q.stop()
+        shutil.rmtree(tmp, ignore_errors=True)
+        spark.stop()

@@ -1,0 +1,193 @@
+- Class: meta
+  Lesson: "Bronze: Ingesting Raw Data"
+  EstimatedMinutes: 30
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    - What belongs in the bronze layer, and what does not
+    - Ingesting files incrementally with streaming tables and explicit schemas
+    - Capturing lineage with the hidden `_metadata` column
+    - Bronze ingestion from Kafka
+    - Labelling datasets with `comment` and `table_properties`
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Bronze Contract
+
+    Bronze is the system of record for what arrived. It answers "what did
+    the source send us, and when?", so it should be:
+
+    - **Append-only**: a streaming table, so each run only adds new input.
+    - **Faithful**: no filtering, no deduplication, no business rules. If
+      the source sent a duplicate or an `"N/A"` price, bronze keeps it;
+      that is how you debug the source later.
+    - **Lineage-rich**: which file (or Kafka partition and offset) each row
+      came from, and when it was ingested.
+
+    Cleaning happens in silver. Keeping the two apart means you can always
+    rebuild silver from bronze when the rules change.
+
+- Class: mult_question
+  Depth: all
+  Output: "The orders feed contains a duplicate event. Where should it be removed?"
+  AnswerChoices: "In silver; bronze keeps exactly what arrived;In bronze, before writing;In gold;Nowhere, duplicates are harmless"
+  CorrectAnswer: "In silver; bronze keeps exactly what arrived"
+  Hint: "Bronze is a faithful record of the source."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Explicit Schemas for Streaming Files
+
+    Streaming file sources require a schema up front:
+
+    ```python
+    ORDER_SCHEMA = (
+        "order_id STRING, customer_id STRING, product_id STRING, quantity INT, "
+        "unit_price STRING, status STRING, order_ts STRING"
+    )
+
+    @dp.table
+    def bronze_orders() -> DataFrame:
+        return spark.readStream.schema(ORDER_SCHEMA).json("data/orders")
+    ```
+
+    Notice `unit_price STRING` and `order_ts STRING`. The source sometimes
+    sends `"N/A"` for a price; with ANSI mode on (the default since Spark
+    4.0) a strict cast would fail the whole run. Bronze stores the raw
+    string, and silver converts it with `try_cast`, which turns malformed
+    values into NULL so they can be quarantined.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    ## Lineage Columns
+
+    Every file-based DataFrame has a hidden `_metadata` struct. Select its
+    fields to record where a row came from:
+
+    ```python
+    from pyspark.sql import functions as F
+
+    (spark.readStream.schema(ORDER_SCHEMA).json("data/orders")
+        .withColumn("_source_file", F.col("_metadata.file_name"))
+        .withColumn("_ingested_at", F.current_timestamp()))
+    ```
+
+    `_metadata` also has `file_path`, `file_size`,
+    `file_modification_time` and `file_block_start`. The leading underscore
+    on the new columns is a convention: these describe ingestion, not the
+    business data.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Useful File Source Options
+
+    ```python
+    (spark.readStream
+        .schema(ORDER_SCHEMA)
+        .option("maxFilesPerTrigger", 100)       # cap work per micro-batch
+        .option("pathGlobFilter", "*.json")      # only matching file names
+        .option("recursiveFileLookup", "true")   # descend into subdirectories
+        .json("landing/orders"))
+    ```
+
+    A pipeline run uses available-now semantics: it processes every file
+    that arrived since the last checkpoint (in as many micro-batches as
+    `maxFilesPerTrigger` requires) and then stops. Files are identified by
+    path, so rewriting a file in place does not re-ingest it.
+
+    Older tutorials use `input_file_name()` for lineage. It still works,
+    but `_metadata` gives you the path, name, size and modification time
+    in one struct, and makes it obvious in the code that the value comes
+    from the file source.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Bronze from Kafka
+
+    ```python
+    @dp.table(comment="Raw order events from Kafka")
+    def bronze_orders_kafka() -> DataFrame:
+        return (
+            spark.readStream.format("kafka")
+            .option("kafka.bootstrap.servers", "localhost:9092")
+            .option("subscribe", "orders")
+            .option("startingOffsets", "earliest")
+            .load()
+            .select(
+                F.col("key").cast("string"),
+                F.col("value").cast("string").alias("payload"),
+                "topic", "partition", "offset",
+                F.col("timestamp").alias("_kafka_ts"),
+            )
+        )
+    ```
+
+    Keep the payload as a string (or binary) in bronze and parse it with
+    `from_json` in silver: a schema change upstream then breaks silver
+    loudly instead of silently dropping fields at ingestion.
+    `topic`/`partition`/`offset` are your lineage. The Kafka source needs
+    the `spark-sql-kafka-0-10_2.13` package matching your Spark version;
+    the lakehouse execution mode has it preinstalled.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write the expression that adds a `_source_file` column holding the
+    name of the file each row came from, to a DataFrame called `raw`.
+  CorrectAnswer: 'raw.withColumn("_source_file", F.col("_metadata.file_name"))'
+  Hint: "The hidden _metadata column has a file_name field."
+
+- Class: mult_question
+  Depth: all
+  Output: "Why does bronze store unit_price as a STRING?"
+  AnswerChoices: "So malformed values like 'N/A' are kept instead of failing an ANSI cast;Strings are faster to aggregate;Parquet cannot store decimals;Streaming tables only support strings"
+  CorrectAnswer: "So malformed values like 'N/A' are kept instead of failing an ANSI cast"
+  Hint: "ANSI mode is on by default since Spark 4.0."
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: The Bronze Layer
+
+    Define three bronze datasets:
+
+    1. `bronze_orders`: streaming table over `data/orders` using
+       `ORDER_SCHEMA`, plus `_source_file` (file name) and `_ingested_at`
+       (current timestamp). Give it a comment and the table property
+       `quality` = `bronze`.
+    2. `bronze_customer_changes`: streaming table over
+       `data/customer_changes` using `CHANGE_SCHEMA`, plus the same two
+       lineage columns.
+    3. `bronze_customers`: materialized view over `data/customers.csv`
+       (header row, `CUSTOMER_SCHEMA`) plus `_ingested_at`.
+
+    Do not filter or deduplicate anything.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  RequiresExecution: true
+  Validation:
+    - execution
+  Hint: "@dp.table(comment=..., table_properties={'quality': 'bronze'}) on a function returning spark.readStream.schema(...).json(...).withColumn(...)."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - Bronze is append-only, faithful and lineage-rich; cleaning waits for
+      silver.
+    - Streaming file sources need explicit schemas; keep fragile fields as
+      strings and convert them later with `try_cast`.
+    - `_metadata.file_name` / `_metadata.file_path` record lineage for
+      files; `topic`/`partition`/`offset` do the same for Kafka.
+
+    Next: silver, where duplicates, malformed values and orphans are dealt
+    with.

@@ -1,0 +1,306 @@
+- Class: meta
+  Lesson: "Stateful Streaming With transformWithState"
+  EstimatedMinutes: 35
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    Arbitrary stateful streaming in Spark 3 meant `mapGroupsWithState` or
+    `applyInPandasWithState`: one opaque state object per key, timeouts as
+    the only clock, no schema evolution, and no clean way to keep a list or
+    a map without rewriting the whole blob every batch.
+
+    Spark 4.0 introduced **transformWithState** (Arbitrary State API v2,
+    SPARK-46815), with `transformWithStateInPandas` for Python. 4.1 added the
+    row-based Python `transformWithState` (SPARK-51814). 4.2 brings faster
+    initial state handling in Python (SPARK-54392), the **real-time mode**
+    trigger in PySpark (SPARK-54660), and **named streaming sources**
+    (SPARK-54909).
+
+    By the end of this lesson you will be able to:
+
+    - Write a `StatefulProcessor` with typed `ValueState`, `ListState` and
+      `MapState` variables
+    - Seed state from a batch DataFrame with `initialState`
+    - Read operator state from a checkpoint with the state data source
+    - Know when real-time mode applies, and name your sources
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Streaming state is memory that survives between micro-batches. Imagine
+    a running tab per customer: each new purchase adds to the tab, and the
+    tab is still there when the next purchase arrives, even if the job
+    restarts.
+
+    With `transformWithState`, you write a small class. Spark gives it one
+    group of rows at a time (all the new rows for one customer), plus
+    access to that customer's saved state. Your class updates the state and
+    yields output rows. Spark handles storage, checkpoints and recovery.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The StatefulProcessor
+
+    ```python
+    from pyspark.sql import Row
+    from pyspark.sql.streaming import StatefulProcessor, StatefulProcessorHandle
+
+    class SpendTracker(StatefulProcessor):
+        def init(self, handle: StatefulProcessorHandle) -> None:
+            self.total = handle.getValueState("total", "amount long")
+            self.history = handle.getListState("history", "amount long")
+
+        def handleInputRows(self, key, rows, timerValues):
+            (user,) = key
+            total = self.total.get()[0] if self.total.exists() else 0
+            for r in rows:
+                total += r.amount
+                self.history.appendValue((r.amount,))
+            self.total.update((total,))
+            yield Row(user=user, total=total)
+
+        def close(self) -> None:
+            pass
+
+    out = events.groupBy("user").transformWithState(
+        statefulProcessor=SpendTracker(),
+        outputStructType="user string, total long",
+        outputMode="Update",
+        timeMode="None",
+    )
+    ```
+
+    - **`init`** declares state variables, each with a name and a schema.
+      Values are tuples matching the schema.
+    - **`handleInputRows(key, rows, timerValues)`** is called per key per
+      micro-batch. `key` is a tuple of the grouping columns; `rows` is an
+      iterator of `Row` (or of pandas DataFrames for
+      `transformWithStateInPandas`).
+    - **State is per key.** `self.total.get()` returns the current key's
+      value; you never index by key yourself.
+
+    **Docs:** [transformWithState](https://spark.apache.org/docs/4.2.0/streaming/structured-streaming-transform-with-state.html)
+
+- Class: mult_question
+  Depth: all
+  Output: "Inside handleInputRows, how do you read the running total for the current key?"
+  AnswerChoices: "self.total.get(), because state variables are scoped to the current key;self.total.get(key);self.total[key];handle.getState(key, 'total')"
+  CorrectAnswer: "self.total.get(), because state variables are scoped to the current key"
+  Hint: "Spark sets the key context before calling your handler."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## State Variable Types
+
+    - **`ValueState`**: one value per key. `get`, `update`, `exists`, `clear`.
+    - **`ListState`**: an append-friendly list per key. `appendValue`,
+      `appendList`, `put`, `get` (an iterator), `clear`. Appending does not
+      rewrite the existing list, which is the big win over v1.
+    - **`MapState`**: a map per key. `getValue`, `updateValue`,
+      `containsKey`, `keys`, `values`, `iterator`, `removeKey`.
+
+    Every getter accepts an optional `ttlDurationMs`. With TTL, a value
+    expires that long after its last update and is evicted automatically,
+    which is how you bound state for keys that go quiet.
+
+    **Timers** replace v1 timeouts. Call
+    `self.handle.registerTimer(ms)` (keep the handle from `init`), and Spark
+    calls `handleExpiredTimer(key, timerValues, expiredTimerInfo)` when it
+    fires. Choose `timeMode="ProcessingTime"` or `"EventTime"` for timers;
+    `"None"` disables them.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Inside `init(self, handle)`, declare a `MapState` named `"by_merchant"`
+    whose user key schema is `"merchant string"` and value schema is
+    `"amount long"`, with a one-hour TTL. Assign it to `self.by_merchant`.
+  CorrectAnswer: |
+    self.by_merchant = handle.getMapState("by_merchant", "merchant string", "amount long", ttlDurationMs=3600000)
+  Hint: "getMapState(name, userKeySchema, valueSchema, ttlDurationMs=...)"
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Requirements and Gotchas
+
+    - **RocksDB state store is mandatory.** With the default HDFS-backed
+      provider the query fails with
+      `UNSUPPORTED_FEATURE.STORE_BACKEND_NOT_SUPPORTED_FOR_TWS`. Set
+      `spark.sql.streaming.stateStore.providerClass` to
+      `org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider`
+      when you build the session.
+    - **Output mode** is passed to `transformWithState` *and* set on the
+      writer; keep them consistent (`Update` or `Append`).
+    - **The memory sink appends** every emitted row even in update mode, so
+      a key that changes twice appears twice. Deduplicate when reading it,
+      or use `foreachBatch` with a MERGE for a real sink.
+    - **No output for keys without input.** A key that appears only in the
+      initial state produces no row until input arrives for it.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "A transformWithState query fails at start with STORE_BACKEND_NOT_SUPPORTED_FOR_TWS. What is the fix?"
+  AnswerChoices: "Set spark.sql.streaming.stateStore.providerClass to the RocksDB provider;Switch outputMode to Complete;Use transformWithStateInPandas instead;Delete the checkpoint"
+  CorrectAnswer: "Set spark.sql.streaming.stateStore.providerClass to the RocksDB provider"
+  Hint: "The error names the backend that is not supported."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Initial State
+
+    Migrating a running tally from another system, or backfilling from a
+    table? Pass a grouped batch DataFrame as `initialState`:
+
+    ```python
+    opening = spark.createDataFrame([("ann", 50)], "user string, opening_balance long")
+
+    events.groupBy("user").transformWithState(
+        SpendTracker(), "user string, total long", "Update", "None",
+        initialState=opening.groupBy("user"),
+    )
+
+    # in the processor
+    def handleInitialState(self, key, initialState, timerValues):
+        self.total.update((initialState.opening_balance,))
+    ```
+
+    `handleInitialState` runs only in the query's first batch, once per
+    initial-state row, before input rows for that key. The initial state
+    must be grouped by the same key columns. Restarting from a checkpoint
+    ignores it, because the state is already there.
+
+    4.2 reworked how initial state travels from the JVM to the Python
+    worker (SPARK-54392), which matters when you seed millions of keys.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Inspecting State From the Checkpoint
+
+    The **state data source** (4.0, SPARK-45511) reads operator state
+    directly from a checkpoint as a DataFrame, which is how you debug "why
+    did this key emit that":
+
+    ```python
+    (spark.read.format("statestore")
+         .option("stateVarName", "total")
+         .load("/path/to/checkpoint")
+         .select("key", "value")
+         .show())
+    ```
+
+    For `transformWithState` pass `stateVarName`; each state variable is
+    stored separately. It works on a stopped query's checkpoint, so you can
+    inspect production state offline.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Real-Time Mode and Named Sources (Spark 4.2)
+
+    **Real-time mode** (RTM) arrived for Scala stateless queries in 4.1
+    (SPARK-53736): instead of discrete micro-batches, long-running batches
+    process records as they arrive, for sub-second latency. 4.2 adds the
+    PySpark trigger:
+
+    ```python
+    query = df.writeStream.outputMode("update").trigger(realTime="5 seconds").start()
+    ```
+
+    The duration is how long each long-running batch lasts (minimum
+    `spark.sql.streaming.realTimeMode.minBatchDuration`, default 5 seconds).
+    RTM is narrow on purpose: in 4.2 the source must support it (Kafka),
+    sinks are limited to an allowlist (console, foreach, Kafka and a
+    memory sink), and the output mode must be `update`. Anything
+    else fails at start-up, for example
+    `STREAMING_REAL_TIME_MODE.INPUT_STREAM_NOT_SUPPORTED` for the rate
+    source.
+
+    **Named sources** make checkpoints survive query edits. Positional
+    source identity is why adding a second source to a query used to break
+    its checkpoint. 4.2 lets you name each source:
+
+    ```python
+    events = spark.readStream.schema(s).name("spend_events").json(path)
+    ```
+
+    In SQL the same idea is `STREAM t IDENTIFIED BY spend_events`. In 4.2.0
+    this is experimental and requires the internal flag
+    `spark.sql.streaming.queryEvolution.enableSourceEvolution=true`;
+    without it, `.name()` fails with `SOURCE_NAMING_NOT_SUPPORTED`. With it
+    on, **every** streaming source in the session's queries must be named
+    (`UNNAMED_STREAMING_SOURCES_WITH_ENFORCEMENT`).
+
+- Class: mult_question
+  Depth: all
+  Output: "Which query can run with trigger(realTime='5 seconds') in Spark 4.2?"
+  AnswerChoices: "A stateless Kafka-to-Kafka query in update mode;A rate source into a memory sink;A file source with an aggregation in complete mode;A transformWithState query reading JSON files"
+  CorrectAnswer: "A stateless Kafka-to-Kafka query in update mode"
+  Hint: "RTM checks the source, the operators, the sink and the output mode."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Design Notes
+
+    - **State schema evolution.** You can add state variables between runs,
+      and remove one by calling `handle.deleteIfExists(name)` in `init`.
+      Evolving the schema *inside* a variable (add, remove, widen or reorder
+      fields) requires `spark.sql.streaming.stateStore.encodingFormat=avro`;
+      renames and narrowing are not supported, and key schemas cannot
+      evolve.
+    - **`handleInputRows` must consume or ignore rows deliberately.** The
+      iterator can be large; do not `list()` it unless you need random
+      access.
+    - **Event-time timers** fire on watermark advance, so they need
+      `eventTimeColumnName` (or a watermark on the input) and
+      `timeMode="EventTime"`.
+    - **Sink naming.** 4.2's release notes add `.name()` for streaming
+      sinks (SPARK-56719); PySpark's `DataStreamWriter` in 4.2.0 does not
+      expose it, only `DataStreamReader.name()`.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: A Spend Tracker
+
+    Complete `SpendTracker` and `run_spend_tracker(spark, workdir)`:
+
+    1. In `init`, declare `ValueState` `total` and `ListState` `history`
+       (both `"amount long"`).
+    2. `handleInitialState` seeds `total` from `opening_balance`.
+    3. `handleInputRows` adds the batch's amounts, appends them to
+       `history`, updates `total`, and yields
+       `Row(user, total, events, flagged)` where `flagged = total > LIMIT`.
+    4. Wire it up: named file source, `transformWithState` with
+       `initialState`, a memory sink, `processAllAvailable()` per batch.
+    5. Read `total` back with the `statestore` reader, and probe RTM on a
+       rate source, capturing the error.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Set the source evolution flag before calling .name(). The rate source probe needs a .name() too, because the flag is session-wide."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - **transformWithState** (4.0; row-based Python API in 4.1) replaces
+      `mapGroupsWithState` with typed `ValueState`, `ListState` and
+      `MapState`, TTL, and timers.
+    - It **requires RocksDB** as the state store provider.
+    - **initialState** seeds state from a batch DataFrame in the first batch.
+    - The **statestore** reader exposes state from a checkpoint.
+    - **Real-time mode** (PySpark trigger in 4.2) is for stateless Kafka
+      pipelines in update mode.
+    - **Named sources** (`.name()`, 4.2, flag-gated) decouple checkpoints
+      from source order.
+
+    Next: CDC, NEAREST BY joins, time buckets and metric views.

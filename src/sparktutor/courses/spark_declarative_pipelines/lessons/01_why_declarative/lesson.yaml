@@ -1,0 +1,220 @@
+- Class: meta
+  Lesson: "Why Declarative Pipelines"
+  EstimatedMinutes: 25
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Welcome to Spark Declarative Pipelines
+
+    Spark Declarative Pipelines (SDP) shipped in Apache Spark 4.1 as the open
+    source version of the framework Databricks has run for years as Delta
+    Live Tables / Lakeflow Declarative Pipelines. Spark 4.2 extends it with
+    Auto CDC flows, which you will build in lesson 7.
+
+    This course uses the real API: `pyspark.pipelines` and the
+    `spark-pipelines` command line tool. Every exercise you submit is laid
+    out as a pipeline project and executed with `spark-pipelines run`, the
+    same way you would run it in production.
+
+    ## What You'll Learn
+
+    - The difference between imperative and declarative pipelines
+    - The three building blocks: datasets, flows and pipelines
+    - How to define your first materialized views with `@dp.materialized_view`
+    - Why you never call `.write`, `.collect()` or `.count()` inside a pipeline
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Imperative vs Declarative
+
+    An imperative Spark job tells Spark *how* to build each table, in order:
+
+    ```python
+    orders = spark.read.json("data/orders")
+    orders.write.mode("overwrite").saveAsTable("bronze_orders")
+
+    silver = spark.table("bronze_orders").where("quantity > 0")
+    silver.write.mode("overwrite").saveAsTable("silver_orders")
+    ```
+
+    You own the ordering, the write modes, the checkpoints for streaming,
+    the retry logic and the bookkeeping for what was already processed. Add
+    twenty tables and that orchestration code is most of your codebase.
+
+    A declarative pipeline only says *what* each table should contain:
+
+    ```python
+    from pyspark import pipelines as dp
+
+    @dp.materialized_view
+    def bronze_orders():
+        return spark.read.json("data/orders")
+
+    @dp.materialized_view
+    def silver_orders():
+        return spark.table("bronze_orders").where("quantity > 0")
+    ```
+
+    Each function returns a DataFrame. SDP reads the functions, notices that
+    `silver_orders` reads `bronze_orders`, builds a dependency graph, and then
+    decides the order, the parallelism, the write mode and the checkpoint
+    locations itself.
+
+- Class: mult_question
+  Depth: all
+  Output: "In a declarative pipeline, who decides the order in which tables are built?"
+  AnswerChoices: "The framework, from the dependencies between datasets;The order the functions appear in the file;Alphabetical order of table names;You, by calling run() on each table"
+  CorrectAnswer: "The framework, from the dependencies between datasets"
+  Hint: "silver_orders reads bronze_orders, so SDP knows bronze must exist first."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Datasets, Flows and Pipelines
+
+    SDP has three concepts, and everything else in this course builds on
+    them:
+
+    - **Dataset**: a queryable object the pipeline produces. There are three
+      kinds: a *materialized view* (a batch query precomputed into a table),
+      a *streaming table* (a table fed incrementally by streaming flows) and
+      a *temporary view* (an intermediate result that only exists during the
+      run).
+    - **Flow**: the query that reads a source and writes into a dataset.
+      When you decorate a function with `@dp.materialized_view`, SDP creates
+      the dataset *and* a flow for it. Lesson 2 shows how to attach several
+      flows to one streaming table.
+    - **Pipeline**: the unit you run. It is a set of source files (Python or
+      SQL) plus a spec file, `spark-pipeline.yml`, that says where the files
+      are and where to keep checkpoints.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    ## Your First Materialized View
+
+    ```python
+    from pyspark import pipelines as dp
+    from pyspark.sql import DataFrame, SparkSession
+
+    spark: SparkSession
+
+    @dp.materialized_view
+    def products() -> DataFrame:
+        return spark.read.option("header", True).csv("data/products.csv")
+    ```
+
+    Line by line:
+
+    - `from pyspark import pipelines as dp` is the import every pipeline file
+      needs; `dp` is the conventional alias.
+    - `spark: SparkSession` is only a type annotation. Since Spark 4.2 the
+      framework injects `spark` into every pipeline file before running it,
+      so you do not create a session yourself. The annotation keeps your
+      editor from flagging `spark` as undefined.
+    - The function name, `products`, becomes the table name.
+    - The function returns a DataFrame and does nothing else.
+
+    In this course, `data/` contains a small retail dataset: orders,
+    customers, products and customer change events.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Where `spark` Comes From
+
+    In Spark 4.1 every pipeline file had to start with
+    `spark = SparkSession.active()`. Spark 4.2 injects `spark` into each
+    module's namespace before executing it, so the assignment is optional.
+
+    If you do assign it, `SparkSession.active()` is the only supported way.
+    `SparkSession.builder.config(...).getOrCreate()` tries to mutate session
+    configuration, which SDP blocks: the pipeline owns the session, and
+    per-pipeline settings belong in the spec file's `configuration` block.
+
+    Pipelines always run on Spark Connect. The `spark-pipelines` CLI starts
+    a local Connect server when you do not pass `--remote`, which is why you
+    will see Connect-style errors in this course.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Evaluation Model
+
+    SDP imports your file to *register* graph elements, then resolves the
+    graph, then executes flows. Your function bodies can be called more than
+    once (during analysis and again during execution), so they must be pure
+    DataFrame definitions. Actions such as `collect()`, `count()`,
+    `toPandas()`, `save()`, `saveAsTable()`, `start()` and `toTable()` are
+    forbidden inside dataset code. Side effects at module scope run at
+    registration time, which is also why `SparkSession.builder` with
+    `.config()` is blocked.
+
+    Names resolve in the pipeline's default catalog and database
+    (`catalog` / `database` in the spec), so `spark.table("bronze_orders")`
+    finds the pipeline's own dataset before anything else in the catalog.
+
+- Class: mult_question
+  Depth: all
+  Output: "Why must a dataset function avoid calling .count() or .collect()?"
+  AnswerChoices: "SDP may call the function several times, and the function must only define a DataFrame;Those methods were removed in Spark 4;They only work on streaming DataFrames;They would make the table name wrong"
+  CorrectAnswer: "SDP may call the function several times, and the function must only define a DataFrame"
+  Hint: "The framework evaluates your definitions during planning as well as during the run."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write the import line that every Python pipeline file starts with,
+    using the conventional alias.
+  CorrectAnswer: "from pyspark import pipelines as dp"
+  Hint: "The module is pyspark.pipelines and the alias is dp."
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "In Spark 4.2, what is the supported way to get the session inside a pipeline file?"
+  AnswerChoices: "Use the injected spark variable (or SparkSession.active());SparkSession.builder.appName(...).getOrCreate();SparkContext.getOrCreate();Create a new session per function"
+  CorrectAnswer: "Use the injected spark variable (or SparkSession.active())"
+  Hint: "Building a session with .config() mutates session configuration, which SDP blocks."
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Two Materialized Views
+
+    Define two materialized views:
+
+    1. `products`: read `data/products.csv` with a header row and the schema
+       `product_id STRING, name STRING, category STRING, list_price DECIMAL(10,2)`.
+    2. `products_by_category`: read `products` from the pipeline and return
+       one row per `category` with `product_count` (number of products) and
+       `avg_list_price` (average `list_price`).
+
+    When you submit, the tutor runs your file with `spark-pipelines run`.
+    The check at the bottom of the starter file is itself a dataset; if it
+    fails, the run fails with its message. After a successful run you will
+    see the contents of every table the pipeline wrote.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  RequiresExecution: true
+  Validation:
+    - execution
+  Hint: "Use spark.read.option('header', True).schema(...).csv(...), then spark.table('products').groupBy('category').agg(...)."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - SDP lets you declare *what* each table contains; the framework decides
+      ordering, parallelism, write modes and checkpoints.
+    - A pipeline is made of datasets (materialized views, streaming tables,
+      temporary views) and the flows that fill them.
+    - `@dp.materialized_view` turns a function returning a DataFrame into a
+      table named after the function.
+    - Since Spark 4.2, `spark` is injected into pipeline files; never build
+      your own session or call actions inside dataset code.
+
+    Next: the other two dataset types, and how several flows can write into
+    one streaming table.

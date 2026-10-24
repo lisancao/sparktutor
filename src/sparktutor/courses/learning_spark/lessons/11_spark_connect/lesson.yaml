@@ -1,0 +1,313 @@
+- Class: meta
+  Lesson: Spark Connect
+  EstimatedMinutes: 30
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    Every lesson so far ran Spark in **Classic** mode: your Python process
+    and the Spark driver are joined at the hip through Py4J. Spark 4.x makes
+    a second architecture first-class: **Spark Connect**, where your program
+    is a thin client that talks to a remote Spark server.
+
+    By the end of this lesson you will be able to:
+
+    - Explain how Spark Connect works and why it exists
+    - Connect to a server with `remote()`, `SPARK_REMOTE`, or
+      `spark.api.mode`, and start a local server for testing
+    - Pick the right package (`pyspark[connect]` or `pyspark-client`)
+    - Know which APIs do not exist under Connect, and their replacements,
+      including the ones Spark 4.2 added
+    - Reason about UDFs, streaming, and MLlib when the driver is remote
+    - Write code that runs unchanged in both modes
+
+- Class: text
+  Depth: beginner
+  Output: |
+    In Classic mode your program is a cook standing in the kitchen: it can
+    reach every pot directly, but if it trips, the whole kitchen stops.
+
+    With Spark Connect your program is a customer in the dining room. It
+    writes an order (a query plan), the waiter (gRPC) carries it to the
+    kitchen (the Spark server), and the dish (Arrow-encoded results) comes
+    back. The customer cannot touch the pots, but it also cannot knock them
+    over, and the kitchen can serve many customers at once.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## How Spark Connect Works
+
+    The client library builds the same DataFrame and SQL plans you have been
+    writing, but as **unresolved logical plans** encoded with protocol
+    buffers. Nothing is analyzed on the client.
+
+    1. Your code builds a plan (`spark.read...`, `df.filter(...)`).
+    2. On an action (`collect`, `show`, `write`), the client sends the plan
+       to the server over **gRPC** (default port **15002**).
+    3. The server analyzes, optimizes, and executes it with the normal
+       Catalyst and scheduler machinery, exactly as in Classic mode.
+    4. Results stream back as **Apache Arrow** record batches.
+
+    Why it matters:
+    - **Stability**: a client that runs out of memory takes down only
+      itself, not the driver other users share.
+    - **Upgradability**: the server can be upgraded independently of
+      client applications.
+    - **Reach**: a client is a small library you can embed in an IDE, a
+      notebook, a web service, or another language.
+
+    **Docs:** [Spark Connect Overview](https://spark.apache.org/docs/4.2.0/spark-connect-overview.html) |
+    [Application Development with Spark Connect](https://spark.apache.org/docs/4.2.0/app-dev-spark-connect.html)
+
+- Class: mult_question
+  Depth: all
+  Output: "What does a Spark Connect client send to the server when you call an action?"
+  AnswerChoices: "An unresolved logical plan encoded as protocol buffers;Python bytecode for the whole script;The raw data to process;A compiled physical plan"
+  CorrectAnswer: "An unresolved logical plan encoded as protocol buffers"
+  Hint: "Analysis and optimization happen on the server. What is left for the client to produce?"
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Connecting
+
+    Start a server that ships with Spark:
+
+    ```bash
+    ./sbin/start-connect-server.sh
+    ```
+
+    Then point a client at it, in any of three ways:
+
+    ```python
+    from pyspark.sql import SparkSession
+
+    # 1. Explicit URL in code
+    spark = SparkSession.builder.remote("sc://localhost:15002").getOrCreate()
+
+    # 2. Environment variable, no code change at all
+    #    export SPARK_REMOTE="sc://spark.example.com:443/;use_ssl=true;token=..."
+    spark = SparkSession.builder.getOrCreate()
+
+    # 3. API mode: start a local Connect server and return a Connect session
+    spark = (SparkSession.builder
+        .master("local[*]")
+        .config("spark.api.mode", "connect")
+        .getOrCreate())
+    ```
+
+    For tests, `SparkSession.builder.remote("local[*]")` starts a local
+    Connect server inside the process. `remote()` only accepts `local*`
+    values for that purpose; `spark.api.mode=connect` also works with
+    cluster masters such as `spark://` and is the option that works under
+    `spark-submit`, which already sets a master.
+
+    The connection string takes parameters after `/;`: `token` (bearer
+    auth), `use_ssl`, `user_id`, `user_agent`, and `session_id`.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Create a Spark Connect session to a server at host `spark-gw`, port
+    `15002`, and store it in `spark`.
+  CorrectAnswer: |
+    from pyspark.sql import SparkSession
+
+    spark = SparkSession.builder.remote("sc://spark-gw:15002").getOrCreate()
+  Hint: "Connect URLs use the sc:// scheme and go into builder.remote()."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Which Package?
+
+    | Package | What you get | Use it when |
+    |---------|--------------|-------------|
+    | `pip install "pyspark[connect]==4.2.0"` | Full PySpark (with the JVM jars) plus the Connect client dependencies (grpcio, pandas, pyarrow, zstandard) | You want to run both Classic and Connect, or start local Connect servers |
+    | `pip install "pyspark-client==4.2.0"` | Only the pure-Python Connect client, no jars | Your code only ever talks to a remote server |
+
+    Keep the client version aligned with the server's Spark version. The
+    protocol is designed for compatibility, but new APIs (like the 4.2
+    additions below) need a server that implements them.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What Is Different Under Connect
+
+    The DataFrame, Column, SQL, Catalog, streaming, and `pyspark.ml` APIs
+    work the same. What is gone is everything that reaches into the driver
+    JVM or the cluster's execution layer:
+
+    | Classic-only | Under Connect |
+    |--------------|---------------|
+    | `spark.sparkContext`, `sc.setLogLevel` | `JVM_ATTRIBUTE_NOT_SUPPORTED` |
+    | `df.rdd`, `rdd.map`, `rdd.zipWithIndex` | `NOT_IMPLEMENTED`; use DataFrame APIs |
+    | `df._jdf`, `spark._jvm` | `JVM_ATTRIBUTE_NOT_SUPPORTED` |
+    | `spark.newSession()` | Not supported; each client session is already isolated |
+
+    Two behaviours change too:
+
+    - **Errors arrive later.** The client does not analyze plans, so a
+      misspelled column surfaces when the plan is analyzed (on an action,
+      or when you ask for `df.schema`), not when you write `df.typo`. Since
+      4.1/4.2 even `df["typo"]` and `df.typo` skip eager validation.
+    - **Configuration is per session.** `spark.conf.set` changes SQL
+      configs for your session only; cluster-level settings cannot be
+      changed from a client.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "In Spark 4.2, what is the Connect-compatible replacement for `df.rdd.zipWithIndex()`?"
+  AnswerChoices: "df.zipWithIndex();df.monotonically_increasing_id();spark.sparkContext.zipWithIndex(df);There is none"
+  CorrectAnswer: "df.zipWithIndex()"
+  Hint: "Spark 4.2 added DataFrame versions of a few popular RDD methods (SPARK-55229)."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Spark 4.2 Closes More Gaps
+
+    Spark 4.2 continues adding DataFrame equivalents for things people used
+    to drop to RDDs for (SPARK-55227), plus operational features:
+
+    - `DataFrame.zipWithIndex(indexColName="index")` appends consecutive
+      0-based indices (SPARK-55229).
+    - `DataFrame.toJSON()` works on the Python Connect client, returning a
+      DataFrame of JSON strings rather than an RDD (SPARK-55090).
+    - `spark.read.json()`, `.csv()`, and `.xml()` accept a DataFrame of
+      strings as input on Connect, the old `spark.read.json(rdd)` pattern
+      (SPARK-56253 to SPARK-56255).
+    - `head()`, `take()`, and `tail()` avoid full table scans
+      (SPARK-55887).
+    - A **GetStatus** RPC reports the status of running operations
+      (SPARK-55606, SPARK-55691).
+    - Setting `SPARK_CONNECT_RELEASE_SESSION_ON_EXIT=true` releases the
+      server-side session when the client process exits (SPARK-55326).
+    - The **Connect** tab in the Spark UI is available in the History
+      Server (SPARK-57601).
+
+    Session methods that started on Connect (3.5) and also work in Classic
+    since 4.0: `spark.addArtifacts("deps.zip", pyfile=True)` ships Python
+    files to the server, `spark.addTag("nightly")` /
+    `spark.interruptTag("nightly")` cancel groups of running operations, and
+    `spark.interruptAll()` cancels everything the session started.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## UDFs, Streaming, and ML When the Driver Is Remote
+
+    **Python UDFs** are serialized with cloudpickle on the client and run in
+    Python workers on the server's executors. The server therefore needs a
+    compatible Python and every library your function imports; ship pure
+    Python modules with `spark.addArtifacts(..., pyfile=True)`. In 4.2 these
+    UDFs are Arrow-optimized by default in both modes.
+
+    **Large local data**: `spark.createDataFrame(local_rows)` uploads the
+    rows inside the plan. Big local relations are cached on the server in
+    chunks and capped by `spark.sql.session.localRelationSizeLimit`; 4.2
+    also enforces a client-side limit (SPARK-55047). Load big inputs from
+    storage instead of from client memory.
+
+    **Streaming**: `readStream`/`writeStream` work. Functions you pass to
+    `foreachBatch` and `StreamingQueryListener` implementations run in a
+    Python process on the server, not in your client, so they cannot touch
+    client-side state.
+
+    **MLlib**: `pyspark.ml` runs on Connect since 4.0. `fit()` trains on the
+    server and returns a handle to a model kept in a per-session cache
+    (Lesson 10).
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Writing Code That Runs in Both Modes
+
+    A few habits make a codebase portable between Classic and Connect:
+
+    - Never use `_jdf`, `_jvm`, `sparkContext`, or RDDs in library code.
+    - Capture plans by redirecting stdout around `df.explain()`; it prints
+      in both modes.
+    - Count partitions with `df.select(f.spark_partition_id()).distinct()`
+      (non-empty partitions) instead of `df.rdd.getNumPartitions()`.
+    - Use `pyspark.sql.utils.is_remote()` when you truly need to branch.
+    - Run your tests in both modes: the same suite with `.master("local[2]")`
+      and with `.config("spark.api.mode", "connect")` catches accidental JVM
+      access early.
+
+    The solutions in Lessons 5, 6, and 7 already follow these rules, which
+    is why they use a `plan_text()` helper instead of the query execution
+    object.
+
+- Class: cmd_question
+  Depth: advanced
+  Output: |
+    Write a function `plan_text(df)` that returns the text `df.explain()`
+    prints, without using `df._jdf`, so it works under Spark Connect.
+  CorrectAnswer: |
+    import contextlib
+    import io
+
+    def plan_text(df):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            df.explain()
+        return buf.getvalue()
+  Hint: "explain() prints in both modes. contextlib.redirect_stdout with an io.StringIO captures what it prints."
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: A Connect-Safe Report
+
+    Implement `connect_report(spark)`. The harness starts a **local Spark
+    Connect server** with `spark.api.mode=connect`, so any JVM-only API you
+    reach for will fail.
+
+    1. Record the session mode with `is_remote()` (`"connect"` or
+       `"classic"`)
+    2. Parse `RAW_ORDERS`, a DataFrame of JSON strings, with
+       `spark.read.schema(ORDER_SCHEMA).json(raw_df)`
+    3. Aggregate revenue (`sum(amount)`) and order count per region,
+       highest revenue first
+    4. Number the rows with `zipWithIndex("rank")` (Spark 4.2)
+    5. Add a `tier` column with a Python UDF: `"gold"` when revenue is at
+       least 150, otherwise `"standard"`
+    6. Capture the plan with the provided `plan_text()` helper
+    7. Convert the report to JSON strings with `toJSON()`
+    8. Return everything in a dict
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "zipWithIndex numbers rows in the DataFrame's current order, so apply it after orderBy. The UDF can be @f.udf('string') on a plain Python function."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    In this lesson you learned:
+
+    - **Architecture**: the client builds unresolved plans, sends them over
+      gRPC, and gets Arrow batches back; the server does all analysis and
+      execution
+    - **Connecting**: `remote("sc://host:15002")`, `SPARK_REMOTE`, or
+      `spark.api.mode=connect`; `remote("local[*]")` for tests
+    - **Packages**: `pyspark[connect]` for both modes, `pyspark-client` for
+      a pure client
+    - **Gone under Connect**: `sparkContext`, RDDs, `_jdf`; errors surface
+      at analysis time; configs are per session
+    - **4.2 additions**: `zipWithIndex`, `toJSON`, DataFrame input to
+      `read.json/csv/xml`, GetStatus, release-on-exit, Connect tab in the
+      History Server
+    - **Remote execution**: UDFs, `foreachBatch`, listeners, and ML models
+      all live on the server
+    - **Portability**: avoid JVM handles, capture plans via stdout, test in
+      both modes
+
+    That completes Learning Spark for Spark 4.2. The Spark Declarative
+    Pipelines course builds on all of it, and its pipelines run over Spark
+    Connect too.

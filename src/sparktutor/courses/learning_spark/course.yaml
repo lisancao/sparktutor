@@ -1,13 +1,13 @@
 course:
   id: learning_spark
-  title: "Learning Spark: From Fundamentals to Production"
-  description: "Master Apache Spark from the ground up — DataFrames, SQL, streaming, optimization, and ML"
-  version: "1.0.0"
+  title: "Learning Spark 4.2: From Fundamentals to Production"
+  description: "Apache Spark 4.2 from the ground up: DataFrames, SQL (pipe syntax, QUALIFY, scripting), VARIANT, streaming with transformWithState and Real-Time Mode, optimization, joins, lakehouses and CDC, MLlib, and Spark Connect"
+  version: "2.0.0"
   requires_lakehouse: false
   prerequisites:
     - "Python 3.10+"
-    - "Java 17+ (included with most PySpark installs)"
-    - "pip install pyspark"
+    - "Java 17, 21, or 25 (Spark 4.2 no longer runs on Java 8 or 11)"
+    - "pip install \"pyspark[connect]==4.2.0\""
   lessons:
     - 01_getting_started
     - 02_dataframes_schemas
@@ -19,3 +19,4 @@ course:
     - 08_structured_streaming
     - 09_data_lakes
     - 10_mllib
+    - 11_spark_connect

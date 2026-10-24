@@ -1,0 +1,250 @@
+- Class: meta
+  Lesson: "Geospatial Types: GEOMETRY and GEOGRAPHY"
+  EstimatedMinutes: 25
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    Location data in Spark has always been an afterthought: latitude and
+    longitude as two doubles, or a WKB blob in a BINARY column that only a
+    third-party library understood. Spark 4.2 ships native **GEOMETRY** and
+    **GEOGRAPHY** types (SPIP SPARK-51658), enabled by default (SPARK-56771),
+    with Parquet read and write support (SPARK-55260, SPARK-55261).
+
+    By the end of this lesson you will be able to:
+
+    - Choose between GEOMETRY (planar) and GEOGRAPHY (on the sphere)
+    - Declare typed columns with an SRID: `GEOGRAPHY(4326)`, `GEOMETRY(ANY)`
+    - Build values from WKB in SQL and from Python objects
+    - Round-trip geo columns through Parquet
+    - Work within what 4.2 does and does not yet provide
+
+    Be clear on scope: 4.2 delivers the **types and their storage**. The
+    function library is deliberately small. There is no `ST_Distance` or
+    `ST_Contains` yet; this lesson shows how to work around that.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Two ideas to hold onto:
+
+    - **WKB (Well-Known Binary)** is the standard byte format for shapes.
+      A point is 21 bytes: one byte for byte order, four for the shape type,
+      then two 8-byte numbers for x and y. Spark stores geo values as WKB.
+    - **SRID (Spatial Reference ID)** says what the numbers mean. SRID 4326
+      means "longitude and latitude in degrees on the WGS 84 globe", the
+      coordinates your phone's GPS gives you. SRID 3857 means "metres on a
+      flat Web Mercator map", the projection most web maps draw.
+
+    The same pair of numbers means something completely different under a
+    different SRID, which is why Spark makes the SRID part of the type.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## GEOMETRY vs GEOGRAPHY
+
+    - **GEOMETRY** is Cartesian: a flat plane. Use it for projected or local
+      coordinates (Web Mercator `3857`, UTM zones, CAD drawings) and for
+      small areas where Earth's curvature does not matter. It accepts any
+      SRID in the registry, including `0` (unspecified).
+    - **GEOGRAPHY** is on the sphere, coordinates in degrees, edges
+      interpolated spherically. Use it for global data and anything where
+      distance or area must respect curvature. Only geographic SRIDs are
+      allowed (most commonly `4326`), and longitude must be in [-180, 180],
+      latitude in [-90, 90].
+
+    The docs' example: the shortest path from London to New York on the
+    sphere crosses Canada; a planar GEOMETRY line does not.
+
+    **Docs:** [Geospatial Types](https://spark.apache.org/docs/4.2.0/sql-ref-geospatial-types.html)
+
+- Class: mult_question
+  Depth: all
+  Output: "You store GPS readings from delivery vans across three continents. Which type fits?"
+  AnswerChoices: "GEOGRAPHY(4326);GEOMETRY(3857);GEOMETRY(0);Two DOUBLE columns, geo types are only for polygons"
+  CorrectAnswer: "GEOGRAPHY(4326)"
+  Hint: "Global extent, lon/lat degrees from GPS."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Types, SRIDs and Construction
+
+    In SQL the SRID is part of the type, and you must give one:
+
+    ```sql
+    CREATE TABLE places (id INT, loc GEOGRAPHY(4326)) USING parquet;
+    CREATE TABLE shapes (id INT, g GEOMETRY(ANY)) USING parquet;  -- mixed SRIDs
+    ```
+
+    The ST functions in 4.2:
+
+    - `ST_GeomFromWKB(wkb[, srid])` returns GEOMETRY (SRID `0` if omitted)
+    - `ST_GeogFromWKB(wkb)` returns GEOGRAPHY with SRID `4326`
+    - `ST_AsBinary(geo[, 'NDR' | 'XDR'])` returns WKB (little or big endian)
+    - `ST_Srid(geo)` returns the SRID
+    - `ST_SetSrid(geo, srid)` returns the value with a new SRID
+
+    ```sql
+    SELECT ST_Srid(ST_GeogFromWKB(X'0101000000000000000000F03F0000000000000040'));  -- 4326
+    SELECT typeof(ST_GeomFromWKB(X'0101000000000000000000F03F0000000000000040'));   -- geometry(0)
+    ```
+
+    In PySpark the types are `GeometryType(srid)` and `GeographyType(srid)`,
+    the values are `Geometry` and `Geography` objects, and the functions are
+    `sf.st_geomfromwkb`, `sf.st_geogfromwkb`, `sf.st_asbinary`, `sf.st_srid`
+    and `sf.st_setsrid`. The Python classes have existed since 4.1; 4.2 is the
+    release that enables the feature by default.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Given a DataFrame `df` with a BINARY column `wkb` holding Web Mercator
+    points, select a GEOMETRY column `geom` with SRID 3857 using the
+    PySpark functions API.
+  CorrectAnswer: |
+    df.select(sf.st_geomfromwkb("wkb", sf.lit(3857)).alias("geom"))
+  Hint: "st_geomfromwkb takes the WKB column and an optional SRID."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Building Points From Python
+
+    There is no `ST_Point(lon, lat)` constructor in 4.2, so build WKB
+    yourself. A 2D point in little-endian WKB is a fixed layout:
+
+    ```python
+    import struct
+    from pyspark.sql.types import StructType, StructField, StringType, GeographyType, Geography
+
+    def point_wkb(lon, lat):
+        return struct.pack("<BIdd", 1, 1, lon, lat)   # byte order, type=Point, x, y
+
+    schema = StructType([
+        StructField("store", StringType()),
+        StructField("loc", GeographyType(4326)),
+    ])
+    stores = spark.createDataFrame(
+        [("downtown", Geography.fromWKB(point_wkb(-123.1207, 49.2827), 4326))],
+        schema,
+    )
+    ```
+
+    Note the axis order: WKB is **x then y**, so longitude first. Swapping
+    them is the classic geo bug, and for GEOGRAPHY Spark rejects latitudes
+    outside [-90, 90] with `WKB_PARSE_ERROR`, which catches some of these.
+
+- Class: mult_question
+  Depth: all
+  Output: "In a WKB point for SRID 4326, which coordinate comes first?"
+  AnswerChoices: "Longitude (x);Latitude (y);Whichever the producer chose;Altitude"
+  CorrectAnswer: "Longitude (x)"
+  Hint: "WKB is defined in terms of x and y. Which of lon/lat is the x axis?"
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Errors You Will Meet
+
+    - **SRID mismatch on write.** Inserting a `GEOMETRY(0)` into a
+      `GEOMETRY(4326)` column fails with
+      `INCOMPATIBLE_DATA_FOR_TABLE.CANNOT_SAFELY_CAST`. Use `ST_SetSrid` to
+      label the value, or declare the column `GEOMETRY(ANY)`.
+    - **Invalid SRID for the type.** `ST_SetSrid(geog, 3857)` fails with
+      `ST_INVALID_SRID_VALUE`: 3857 is projected, not geographic.
+    - **No comparisons.** `g1 = g2` and `ORDER BY g` fail at analysis with
+      `INVALID_ORDERING_TYPE`, like VARIANT. `GROUP BY g` is worse: in 4.2.0
+      it passes analysis and then crashes the task with a `scala.MatchError`.
+      Group, join and compare on `ST_AsBinary(g)` (plus `ST_Srid(g)`) instead.
+    - **`show()` is unhelpful.** Classic `show()` prints an internal object
+      reference for geo columns. Display `hex(ST_AsBinary(g))` and
+      `ST_Srid(g)` instead; `collect()` returns proper `Geometry` objects.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Working Without ST_Distance
+
+    Because 4.2 has no measurement functions, you compute in a UDF over the
+    WKB bytes. For points that is a few lines of `struct.unpack` plus the
+    haversine formula:
+
+    ```python
+    @sf.udf(DoubleType())
+    def haversine_km(wkb_a, wkb_b):
+        lon1, lat1 = struct.unpack("<dd", bytes(wkb_a)[5:21])
+        lon2, lat2 = struct.unpack("<dd", bytes(wkb_b)[5:21])
+        ...
+    ```
+
+    Pass `st_asbinary(loc)` to it, so the UDF sees plain bytes in a known
+    byte order (`st_asbinary` defaults to little-endian NDR). With 4.2's
+    Arrow-optimized UDFs this is reasonably fast, but it is a stopgap: it
+    only handles points, and a UDF is opaque to the optimizer.
+
+    Lesson 8 shows `NEAREST BY`, the 4.2 top-K join, which pairs naturally
+    with a distance expression like this one.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Storage and Interop
+
+    Parquet support (4.2) writes geo columns using Parquet's GEOMETRY and
+    GEOGRAPHY logical types. Inspect a written file with `pyarrow` and you
+    see `binary g (Geography(crs=OGC:CRS84, algorithm=spherical))` for a
+    `GEOGRAPHY(4326)` column and `Geometry(crs=EPSG:3857)` for a
+    `GEOMETRY(3857)` one, so the SRID survives the round trip:
+    reading the files back yields `GeographyType(4326)`, not BINARY. That is
+    the real value of this release: geo columns become first-class in
+    tables, schemas and files, and other Parquet readers that understand
+    the logical types see them as geo data.
+
+    The SRID registry ships with PySpark (`pyspark/sql/srs_registry.csv`,
+    generated from the PROJ database), so the type system can validate that
+    an SRID is real, and geographic where GEOGRAPHY requires it.
+
+    The cost of the small function library is that heavy spatial joins
+    still belong in a dedicated library (Apache Sedona is the usual choice)
+    or in UDFs over WKB. Expect the ST function set to grow in later
+    releases; `SYSTEM_PATH` in the SQL path docs already mentions reserving
+    room for built-in geospatial functions.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: A Store Locator
+
+    Implement `build_store_locator(spark, workdir)`:
+
+    1. Build a `stores` DataFrame with a `GEOGRAPHY(4326)` column from
+       `Geography.fromWKB(point_wkb(lon, lat), 4326)` values.
+    2. Write it to Parquet under `workdir` and read it back.
+    3. Build `projected`: the same stores as `GEOMETRY(3857)` using
+       `st_geomfromwkb` on Web Mercator WKB (`to_web_mercator` is provided).
+    4. Find each customer's nearest store with a cross join, the provided
+       `haversine_km` UDF over `st_asbinary(...)`, and `QUALIFY`.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Register the UDF with spark.udf.register so you can call it from SQL, and use QUALIFY row_number() OVER (PARTITION BY customer ORDER BY km) = 1."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - **GEOMETRY and GEOGRAPHY (on by default in 4.2)** are native types with
+      the SRID in the type: `GEOGRAPHY(4326)`, `GEOMETRY(3857)`,
+      `GEOMETRY(ANY)`.
+    - Values are **WKB**, x before y (longitude first).
+    - 4.2's functions convert and label (`ST_GeomFromWKB`, `ST_GeogFromWKB`,
+      `ST_AsBinary`, `ST_Srid`, `ST_SetSrid`); measurement is not there yet.
+    - **Parquet I/O** preserves the types and SRIDs.
+    - Geo values cannot be compared, grouped or sorted directly; use
+      `ST_AsBinary` when you need a key.
+
+    Next: writing your own data sources in pure Python.

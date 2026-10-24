@@ -7,13 +7,19 @@ Implement the `build_pipeline` function that:
 3. Builds a Pipeline with StringIndexer, VectorAssembler, RandomForestRegressor
 4. Trains the pipeline on training data
 5. Evaluates RMSE and R2 on test predictions
-6. Returns a dict with the model, predictions, and metrics
+6. Maps the forest's featureImportances back to FEATURE_COLS
+7. Saves the model to model_path and loads it back
+8. Returns a dict with the model, predictions, metrics, importances,
+   and the loaded model
+
+The same code runs on Spark Classic and Spark Connect (pyspark.ml
+supports Connect since Spark 4.0).
 
 Adapted from the Learning Spark MLflow train.py example.
 """
 
 from pyspark.sql import SparkSession
-from pyspark.ml import Pipeline
+from pyspark.ml import Pipeline, PipelineModel
 from pyspark.ml.feature import StringIndexer, VectorAssembler
 from pyspark.ml.regression import RandomForestRegressor
 from pyspark.ml.evaluation import RegressionEvaluator
@@ -56,8 +62,11 @@ SCHEMA = StructType([
     StructField("price", DoubleType(), False),
 ])
 
+# Feature columns in the order the VectorAssembler combines them.
+FEATURE_COLS = ["neighborhoodIndex", "conditionIndex", "bedrooms", "sqft", "age"]
 
-def build_pipeline(spark):
+
+def build_pipeline(spark, model_path):
     """Build and evaluate an ML pipeline for housing price prediction."""
 
     housing_df = spark.createDataFrame(generate_housing_data(), SCHEMA)
@@ -71,8 +80,7 @@ def build_pipeline(spark):
     neighborhood_indexer = None  # Replace
     condition_indexer = None  # Replace
 
-    # TODO: Create VectorAssembler combining:
-    #       ["neighborhoodIndex", "conditionIndex", "bedrooms", "sqft", "age"]
+    # TODO: Create a VectorAssembler combining FEATURE_COLS
     #       into a column called "features"
     assembler = None  # Replace
 
@@ -92,14 +100,24 @@ def build_pipeline(spark):
 
     # TODO: Evaluate RMSE and R2
     evaluator = RegressionEvaluator(labelCol="price", predictionCol="prediction")
-    rmse = None  # Replace — use setMetricName("rmse").evaluate()
-    r2 = None  # Replace — use setMetricName("r2").evaluate()
+    rmse = None  # Replace: use setMetricName("rmse").evaluate()
+    r2 = None  # Replace: use setMetricName("r2").evaluate()
+
+    # TODO: Map the forest's featureImportances to FEATURE_COLS as a dict
+    #       {column name: importance}. The forest is the last pipeline stage.
+    importances = None  # Replace
+
+    # TODO: Save the fitted model to model_path (overwrite), then load it
+    #       back with PipelineModel.load
+    loaded_model = None  # Replace
 
     return {
         "model": model,
         "predictions": predictions,
         "rmse": rmse,
         "r2": r2,
+        "importances": importances,
+        "loaded_model": loaded_model,
         "train_count": trainDF.count(),
         "test_count": testDF.count(),
     }
@@ -112,7 +130,9 @@ if __name__ == "__main__":
         .master("local[*]")
         .getOrCreate())
 
-    result = build_pipeline(spark)
+    import os, shutil, tempfile
+    tmp = tempfile.mkdtemp()
+    result = build_pipeline(spark, os.path.join(tmp, "price_model"))
     assert result is not None, "Function returned None"
     assert result["model"] is not None, "Model is None"
     assert result["predictions"] is not None, "Predictions is None"
@@ -120,12 +140,28 @@ if __name__ == "__main__":
     assert result["r2"] is not None, "R2 is None"
     assert result["rmse"] > 0, f"RMSE should be positive, got {result['rmse']}"
     assert 0 < result["r2"] <= 1, f"R2 should be between 0 and 1, got {result['r2']}"
+
+    imp = result["importances"]
+    assert imp is not None and set(imp) == set(FEATURE_COLS), f"importances should cover FEATURE_COLS, got {imp}"
+    assert abs(sum(imp.values()) - 1.0) < 1e-6, "Random forest importances should sum to 1"
+    assert max(imp, key=imp.get) in ("sqft", "neighborhoodIndex"), \
+        f"sqft or neighborhood should matter most for price, got {imp}"
+
+    assert result["loaded_model"] is not None, "loaded_model is None"
+    sample = result["predictions"].select("neighborhood", "condition", "bedrooms", "sqft", "age", "price")
+    before = sorted(r["prediction"] for r in result["model"].transform(sample).collect())
+    after = sorted(r["prediction"] for r in result["loaded_model"].transform(sample).collect())
+    assert before == after, "The loaded model should predict exactly what the trained model predicts"
     print(f"Training samples: {result['train_count']}")
     print(f"Test samples: {result['test_count']}")
     print(f"RMSE: {result['rmse']:.2f}")
     print(f"R2: {result['r2']:.4f}")
+    print("Feature importances:")
+    for col_name, value in sorted(imp.items(), key=lambda kv: -kv[1]):
+        print(f"  {col_name:<18} {value:.3f}")
     print("\nSample predictions:")
     result["predictions"].select("neighborhood", "condition", "bedrooms",
                                   "sqft", "age", "price", "prediction").show(10)
     print("All tests passed!")
+    shutil.rmtree(tmp, ignore_errors=True)
     spark.stop()
