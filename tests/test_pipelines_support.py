@@ -18,6 +18,7 @@ from sparktutor.engine.executor import (
     requested_connectors,
     spark_env,
     write_pipeline_project,
+    write_script_project,
 )
 from sparktutor.engine.feedback import parse_stderr
 from sparktutor.engine.lesson_loader import Step, ValidationRule
@@ -66,6 +67,14 @@ class TestPipelineProject:
     def test_custom_storage_root(self, tmp_path):
         spec = write_pipeline_project(SDP_CODE, tmp_path, storage_root="file:///tmp/remote/storage")
         assert "storage: file:///tmp/remote/storage" in spec.read_text()
+
+
+class TestScriptProject:
+    def test_script_and_data(self, tmp_path):
+        script = write_script_project("print(1)\n", tmp_path)
+        assert script == tmp_path / "exercise.py"
+        assert script.read_text() == "print(1)\n"
+        assert (tmp_path / "data" / "messy" / "logs" / "access.log").is_file()
 
 
 class TestConnectors:

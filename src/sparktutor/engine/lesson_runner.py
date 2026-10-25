@@ -261,10 +261,19 @@ class LessonRunner:
         if step is None:
             return ""
 
+    def get_first_code_step_index(self) -> int:
+        """Index (in filtered steps) of the first code step, or -1 if none."""
+        if self.state is None:
+            return -1
+        for i, step in enumerate(self.state.filtered_steps):
+            if step.cls in ("cmd_question", "script"):
+                return i
+        return -1
+
     def get_first_starter_code(self) -> str:
         """Scan ahead for the first code step's starter code.
 
-        Used to pre-populate exercise.py when a lesson starts on a text step,
+        Used to pre-populate the first code step's file when a lesson starts on a text step,
         so the editor isn't empty.
         """
         if self.state is None:

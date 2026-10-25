@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from sparktutor.config.settings import ExecutionMode, Settings  # noqa: E402
 from sparktutor.engine.executor import Executor  # noqa: E402
-from sparktutor.engine.lesson_loader import load_course  # noqa: E402
+from sparktutor.engine.lesson_loader import load_course, load_lesson  # noqa: E402
 
 COURSES = ROOT / "src" / "sparktutor" / "courses"
 
@@ -29,13 +29,20 @@ def selected(filters: list[str]) -> list[Path]:
     for course_dir in sorted(p for p in COURSES.iterdir() if (p / "course.yaml").exists()):
         course = load_course(course_dir)
         for lesson_id in course.lessons:
-            solution = course_dir / "lessons" / lesson_id / "solution.py"
+            lesson_dir = course_dir / "lessons" / lesson_id
             key = f"{course.id}/{lesson_id}"
-            if not solution.exists():
-                continue
             if filters and not any(key == f or key.startswith(f + "/") for f in filters):
                 continue
-            solutions.append(solution)
+            # Every script step's solution (a lesson may have more than one)
+            files = ["solution.py"]
+            if (lesson_dir / "lesson.yaml").exists():
+                files = [
+                    step.solution_code for step in load_lesson(lesson_dir).steps
+                    if step.cls == "script" and step.solution_code
+                ] or files
+            for name in dict.fromkeys(files):
+                if (lesson_dir / name).exists():
+                    solutions.append(lesson_dir / name)
     return solutions
 
 
@@ -44,6 +51,8 @@ async def main(filters: list[str]) -> int:
     failures = []
     for solution in selected(filters):
         name = "/".join(solution.parts[-4:-1]).replace("/lessons", "")
+        if solution.name != "solution.py":
+            name += f" ({solution.name})"
         start = time.monotonic()
         result = await Executor(settings=settings).execute(solution.read_text())
         elapsed = time.monotonic() - start

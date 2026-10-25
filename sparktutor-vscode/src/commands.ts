@@ -384,7 +384,7 @@ async function openLesson(
     // If there's saved progress, ask whether to resume or start fresh
     if (result.currentIndex > 0 && !skipResumePrompt) {
       const choice = await vscode.window.showInformationMessage(
-        `"${result.lessonTitle}" — resume at step ${result.currentIndex + 1}/${result.totalSteps}?`,
+        `"${result.lessonTitle}": resume at step ${result.currentIndex + 1}/${result.totalSteps}?`,
         "Resume",
         "Start from Beginning"
       );
@@ -439,7 +439,9 @@ async function openLesson(
       );
     } else {
       // Non-code steps: open exercise file (pre-populated with first starter code if missing)
-      await workspace.openExerciseIfExists(courseId, result.lessonId, result.lessonTitle, result.firstStarterCode);
+      await workspace.openExerciseIfExists(
+        courseId, result.lessonId, result.firstStarterCode, result.firstCodeStepIndex
+      );
     }
 
     // THEN show the lesson panel (in Column Two) so it doesn't get displaced
@@ -584,7 +586,7 @@ async function loadStepUI(
       starterCode
     );
   } else if (currentCourseId && currentLessonId) {
-    await workspace.openExerciseIfExists(currentCourseId, currentLessonId, currentLessonTitle);
+    await workspace.openExerciseIfExists(currentCourseId, currentLessonId);
   }
 
   // THEN show lesson panel (Column Two) so it stays visible

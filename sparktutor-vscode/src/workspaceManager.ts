@@ -1,13 +1,14 @@
 /**
  * Exercise file management.
  *
- * Each course gets ONE main file (exercise.py) that accumulates code across
- * lessons and steps. When the user advances to a code step, any new starter
- * code is appended (with a comment separator) rather than overwriting.
- * Supplementary files (data, configs) live in per-lesson subdirectories.
+ * Each code step gets its own file, <course>/<lesson>/step_NN.py, holding
+ * that step's starter code and the learner's work on it. A submit sends only
+ * that file, so one exercise never runs another's code (pipeline lessons
+ * reuse dataset names, and every script has its own test harness).
+ * Supplementary files (solutions for diffing) live in the same lesson folder.
  *
- * Switching courses closes old tabs (configurable) and opens the new course's
- * exercise file.
+ * Switching courses closes old tabs (configurable) and opens the most recently
+ * edited exercise of the new course.
  */
 
 import * as fs from "fs";
@@ -31,12 +32,56 @@ export class WorkspaceManager {
   }
 
   /**
-   * Get the single exercise file path for a course (one main file per course).
+   * The file for one code step of a lesson.
    */
-  private getLessonFilePath(courseId: string, _lessonId: string): string {
-    const dir = path.join(this.baseDir, courseId);
+  private getStepFilePath(courseId: string, lessonId: string, stepIdx: number): string {
+    const dir = path.join(this.baseDir, courseId, lessonId);
     fs.mkdirSync(dir, { recursive: true });
-    return path.join(dir, "exercise.py");
+    return path.join(dir, `step_${String(stepIdx + 1).padStart(2, "0")}.py`);
+  }
+
+  /**
+   * The most recently modified exercise file under dir (searched recursively),
+   * ignoring solution files written for diffs.
+   */
+  private latestExerciseFile(dir: string): string | null {
+    if (!fs.existsSync(dir)) {
+      return null;
+    }
+    let latest: { file: string; mtime: number } | null = null;
+    const walk = (d: string) => {
+      for (const entry of fs.readdirSync(d, { withFileTypes: true })) {
+        const full = path.join(d, entry.name);
+        if (entry.isDirectory()) {
+          walk(full);
+        } else if (/^step_\d+\.py$/.test(entry.name)) {
+          const mtime = fs.statSync(full).mtimeMs;
+          if (!latest || mtime > latest.mtime) {
+            latest = { file: full, mtime };
+          }
+        }
+      }
+    };
+    walk(dir);
+    return latest ? (latest as { file: string; mtime: number }).file : null;
+  }
+
+  private async showFile(filePath: string, courseId: string): Promise<vscode.Uri> {
+    const uri = vscode.Uri.file(filePath);
+    const existingEditor = vscode.window.visibleTextEditors.find(
+      (e) => e.document.uri.fsPath === filePath
+    );
+    if (!existingEditor) {
+      const doc = await vscode.workspace.openTextDocument(uri);
+      await vscode.window.showTextDocument(doc, {
+        viewColumn: vscode.ViewColumn.One,
+        preserveFocus: false,
+        preview: false,
+      });
+    }
+    this.currentFile = uri;
+    this.currentCourseId = courseId;
+    return uri;
   }
 
   /**
@@ -74,20 +119,10 @@ export class WorkspaceManager {
 
     this.currentCourseId = newCourseId;
 
-    // Open the new course's exercise.py if it exists on disk
-    const newFilePath = path.join(this.baseDir, newCourseId, "exercise.py");
-    if (fs.existsSync(newFilePath)) {
-      const content = fs.readFileSync(newFilePath, "utf-8");
-      if (content.trim()) {
-        const uri = vscode.Uri.file(newFilePath);
-        const doc = await vscode.workspace.openTextDocument(uri);
-        await vscode.window.showTextDocument(doc, {
-          viewColumn: vscode.ViewColumn.One,
-          preserveFocus: false,
-          preview: false,
-        });
-        this.currentFile = uri;
-      }
+    // Open the new course's most recently edited exercise, if any
+    const latest = this.latestExerciseFile(path.join(this.baseDir, newCourseId));
+    if (latest) {
+      await this.showFile(latest, newCourseId);
     }
   }
 
@@ -149,13 +184,10 @@ export class WorkspaceManager {
   }
 
   /**
-   * Open the lesson's exercise file in the editor.
+   * Open a code step's exercise file in the editor.
    *
-   * - If restoredCode is provided (resuming a session), use that.
-   * - If the file already has content, keep it (user's accumulated work).
-   * - If the file is empty/missing and starterCode is given, write it.
-   * - If the file has content and new starterCode is given, append it
-   *   with a comment separator (so previous work is preserved).
+   * - A file that already has content is the learner's work: keep it.
+   * - Otherwise write restoredCode (resuming a session) or the starter code.
    */
   async openExercise(
     courseId: string,
@@ -164,53 +196,12 @@ export class WorkspaceManager {
     starterCode: string,
     restoredCode?: string
   ): Promise<vscode.Uri> {
-    const filePath = this.getLessonFilePath(courseId, lessonId);
-
-    if (restoredCode && !(fs.existsSync(filePath) && fs.readFileSync(filePath, "utf-8").trim())) {
-      // Resuming from a previous session AND no file on disk — write the restored code
-      fs.writeFileSync(filePath, restoredCode, "utf-8");
-    } else if (fs.existsSync(filePath)) {
-      const existing = fs.readFileSync(filePath, "utf-8");
-      if (existing.trim() && starterCode.trim()) {
-        // File has content AND new step has starter code → append
-        // But only if the starter code isn't already in the file
-        if (!existing.includes(starterCode.trim())) {
-          const separator = `\n\n# --- Step ${stepIdx + 1} ---\n`;
-          fs.writeFileSync(
-            filePath,
-            existing.trimEnd() + separator + starterCode,
-            "utf-8"
-          );
-        }
-        // else: starter code already present, don't duplicate
-      } else if (!existing.trim() && starterCode.trim()) {
-        // Empty file, write starter
-        fs.writeFileSync(filePath, starterCode, "utf-8");
-      }
-      // else: file has content but no new starter → keep as-is
-    } else {
-      // New file
-      fs.writeFileSync(filePath, starterCode || "", "utf-8");
+    const filePath = this.getStepFilePath(courseId, lessonId, stepIdx);
+    const existing = fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf-8") : "";
+    if (!existing.trim()) {
+      fs.writeFileSync(filePath, restoredCode || starterCode || "", "utf-8");
     }
-
-    const uri = vscode.Uri.file(filePath);
-
-    // Reuse existing editor tab if already open
-    const existingEditor = vscode.window.visibleTextEditors.find(
-      (e) => e.document.uri.fsPath === filePath
-    );
-    if (!existingEditor) {
-      const doc = await vscode.workspace.openTextDocument(uri);
-      await vscode.window.showTextDocument(doc, {
-        viewColumn: vscode.ViewColumn.One,
-        preserveFocus: false,
-        preview: false,
-      });
-    }
-
-    this.currentFile = uri;
-    this.currentCourseId = courseId;
-    return uri;
+    return this.showFile(filePath, courseId);
   }
 
   /**
@@ -220,43 +211,30 @@ export class WorkspaceManager {
    * - For text: returns empty (nothing to submit).
    */
   /**
-   * Open the exercise file if it already exists on disk (for non-code steps
-   * during resume, so the user's accumulated code stays visible).
+   * For non-code steps: keep an exercise of this lesson in view so the editor
+   * pane isn't empty. Shows the current file if it belongs to this lesson,
+   * else the lesson's most recent exercise, else seeds the first code step's
+   * file with its starter code (when the server says which step that is).
    */
   async openExerciseIfExists(
     courseId: string,
     lessonId: string,
-    lessonTitle?: string,
-    firstStarterCode?: string
+    firstStarterCode?: string,
+    firstCodeStepIndex?: number
   ): Promise<void> {
-    const filePath = this.getLessonFilePath(courseId, lessonId);
-
-    // If file doesn't exist or is empty, seed it so the editor pane is
-    // always populated (avoids blank screen / Copilot chat taking over).
-    // Prefer the first code step's starter code over a generic header.
-    if (!fs.existsSync(filePath) || !fs.readFileSync(filePath, "utf-8").trim()) {
-      const content = firstStarterCode?.trim()
-        ? firstStarterCode
-        : lessonTitle
-          ? `# ${lessonTitle}\n# Write your code below as you work through the lesson.\n`
-          : `# SparkTutor Exercise\n# Write your code below as you work through the lesson.\n`;
-      fs.writeFileSync(filePath, content, "utf-8");
+    const lessonDir = path.join(this.baseDir, courseId, lessonId);
+    if (this.currentFile && this.currentFile.fsPath.startsWith(lessonDir + path.sep)) {
+      await this.showFile(this.currentFile.fsPath, courseId);
+      return;
     }
-
-    const uri = vscode.Uri.file(filePath);
-    const existingEditor = vscode.window.visibleTextEditors.find(
-      (e) => e.document.uri.fsPath === filePath
-    );
-    if (!existingEditor) {
-      const doc = await vscode.workspace.openTextDocument(uri);
-      await vscode.window.showTextDocument(doc, {
-        viewColumn: vscode.ViewColumn.One,
-        preserveFocus: false,
-        preview: false,
-      });
+    const latest = this.latestExerciseFile(lessonDir);
+    if (latest) {
+      await this.showFile(latest, courseId);
+      return;
     }
-    this.currentFile = uri;
-    this.currentCourseId = courseId;
+    if (firstCodeStepIndex !== undefined && firstCodeStepIndex >= 0) {
+      await this.openExercise(courseId, lessonId, firstCodeStepIndex, firstStarterCode || "");
+    }
   }
 
   getCurrentCode(): string {
@@ -289,13 +267,20 @@ export class WorkspaceManager {
   }
 
   /**
-   * Delete the exercise file for a course (used by reset).
-   * Clears the course-level exercise.py file.
+   * Delete a lesson's exercise files (used by reset).
    */
-  deleteExerciseFile(courseId: string, _lessonId: string): void {
-    const filePath = path.join(this.baseDir, courseId, "exercise.py");
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
+  deleteExerciseFile(courseId: string, lessonId: string): void {
+    const lessonDir = path.join(this.baseDir, courseId, lessonId);
+    if (!fs.existsSync(lessonDir)) {
+      return;
+    }
+    for (const name of fs.readdirSync(lessonDir)) {
+      if (/^step_\d+\.py$/.test(name)) {
+        fs.unlinkSync(path.join(lessonDir, name));
+      }
+    }
+    if (this.currentFile && this.currentFile.fsPath.startsWith(lessonDir + path.sep)) {
+      this.currentFile = null;
     }
   }
 

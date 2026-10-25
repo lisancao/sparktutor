@@ -1,0 +1,134 @@
+2026-10-01 10:00:00,123 WARN [worker-0] order.Service - processed order=0 ms=340
+2026-10-01 10:01:00,123 INFO [worker-1] order.Service - processed order=1 ms=12
+2026-10-01 10:02:00,123 ERROR [worker-2] order.Service - processed order=2 ms=769
+java.lang.IllegalStateException: inventory negative for sku=P3
+	at order.Inventory.reserve(Inventory.java:88)
+	at order.Service.process(Service.java:41)
+2026-10-01 10:03:00,123 ERROR [worker-0] order.Service - processed order=3 ms=184
+java.lang.IllegalStateException: inventory negative for sku=P3
+	at order.Inventory.reserve(Inventory.java:88)
+	at order.Service.process(Service.java:41)
+2026-10-01 10:04:00,123 INFO [worker-1] order.Service - processed order=4 ms=394
+2026-10-01 10:05:00,123 INFO [worker-2] order.Service - processed order=5 ms=517
+2026-10-01 10:06:00,123 WARN [worker-0] order.Service - processed order=6 ms=78
+2026-10-01 10:07:00,123 ERROR [worker-1] order.Service - processed order=7 ms=887
+java.lang.IllegalStateException: inventory negative for sku=P3
+	at order.Inventory.reserve(Inventory.java:88)
+	at order.Service.process(Service.java:41)
+2026-10-01 10:08:00,123 INFO [worker-2] order.Service - processed order=8 ms=451
+2026-10-01 10:09:00,123 INFO [worker-0] order.Service - processed order=9 ms=475
+2026-10-01 10:10:00,123 INFO [worker-1] order.Service - processed order=10 ms=887
+2026-10-01 10:11:00,123 WARN [worker-2] order.Service - processed order=11 ms=594
+2026-10-01 10:12:00,123 ERROR [worker-0] order.Service - processed order=12 ms=592
+java.lang.IllegalStateException: inventory negative for sku=P3
+	at order.Inventory.reserve(Inventory.java:88)
+	at order.Service.process(Service.java:41)
+2026-10-01 10:13:00,123 ERROR [worker-1] order.Service - processed order=13 ms=731
+java.lang.IllegalStateException: inventory negative for sku=P3
+	at order.Inventory.reserve(Inventory.java:88)
+	at order.Service.process(Service.java:41)
+2026-10-01 10:14:00,123 ERROR [worker-2] order.Service - processed order=14 ms=301
+java.lang.IllegalStateException: inventory negative for sku=P3
+	at order.Inventory.reserve(Inventory.java:88)
+	at order.Service.process(Service.java:41)
+2026-10-01 10:15:00,123 INFO [worker-0] order.Service - processed order=15 ms=419
+2026-10-01 10:16:00,123 INFO [worker-1] order.Service - processed order=16 ms=337
+2026-10-01 10:17:00,123 INFO [worker-2] order.Service - processed order=17 ms=825
+2026-10-01 10:18:00,123 ERROR [worker-0] order.Service - processed order=18 ms=856
+java.lang.IllegalStateException: inventory negative for sku=P3
+	at order.Inventory.reserve(Inventory.java:88)
+	at order.Service.process(Service.java:41)
+2026-10-01 10:19:00,123 WARN [worker-1] order.Service - processed order=19 ms=95
+2026-10-01 10:20:00,123 ERROR [worker-2] order.Service - processed order=20 ms=869
+java.lang.IllegalStateException: inventory negative for sku=P3
+	at order.Inventory.reserve(Inventory.java:88)
+	at order.Service.process(Service.java:41)
+2026-10-01 10:21:00,123 INFO [worker-0] order.Service - processed order=21 ms=254
+2026-10-01 10:22:00,123 ERROR [worker-1] order.Service - processed order=22 ms=608
+java.lang.IllegalStateException: inventory negative for sku=P3
+	at order.Inventory.reserve(Inventory.java:88)
+	at order.Service.process(Service.java:41)
+2026-10-01 10:23:00,123 ERROR [worker-2] order.Service - processed order=23 ms=541
+java.lang.IllegalStateException: inventory negative for sku=P3
+	at order.Inventory.reserve(Inventory.java:88)
+	at order.Service.process(Service.java:41)
+2026-10-01 10:24:00,123 INFO [worker-0] order.Service - processed order=24 ms=410
+2026-10-01 10:25:00,123 WARN [worker-1] order.Service - processed order=25 ms=768
+2026-10-01 10:26:00,123 WARN [worker-2] order.Service - processed order=26 ms=231
+2026-10-01 10:27:00,123 WARN [worker-0] order.Service - processed order=27 ms=802
+2026-10-01 10:28:00,123 INFO [worker-1] order.Service - processed order=28 ms=83
+2026-10-01 10:29:00,123 INFO [worker-2] order.Service - processed order=29 ms=548
+2026-10-01 10:30:00,123 INFO [worker-0] order.Service - processed order=30 ms=799
+2026-10-01 10:31:00,123 WARN [worker-1] order.Service - processed order=31 ms=364
+2026-10-01 10:32:00,123 INFO [worker-2] order.Service - processed order=32 ms=246
+2026-10-01 10:33:00,123 INFO [worker-0] order.Service - processed order=33 ms=154
+2026-10-01 10:34:00,123 WARN [worker-1] order.Service - processed order=34 ms=207
+2026-10-01 10:35:00,123 INFO [worker-2] order.Service - processed order=35 ms=621
+2026-10-01 10:36:00,123 INFO [worker-0] order.Service - processed order=36 ms=783
+2026-10-01 10:37:00,123 INFO [worker-1] order.Service - processed order=37 ms=186
+2026-10-01 10:38:00,123 ERROR [worker-2] order.Service - processed order=38 ms=480
+java.lang.IllegalStateException: inventory negative for sku=P3
+	at order.Inventory.reserve(Inventory.java:88)
+	at order.Service.process(Service.java:41)
+2026-10-01 10:39:00,123 ERROR [worker-0] order.Service - processed order=39 ms=702
+java.lang.IllegalStateException: inventory negative for sku=P3
+	at order.Inventory.reserve(Inventory.java:88)
+	at order.Service.process(Service.java:41)
+2026-10-01 10:40:00,123 WARN [worker-1] order.Service - processed order=40 ms=889
+2026-10-01 10:41:00,123 WARN [worker-2] order.Service - processed order=41 ms=159
+2026-10-01 10:42:00,123 ERROR [worker-0] order.Service - processed order=42 ms=74
+java.lang.IllegalStateException: inventory negative for sku=P3
+	at order.Inventory.reserve(Inventory.java:88)
+	at order.Service.process(Service.java:41)
+2026-10-01 10:43:00,123 ERROR [worker-1] order.Service - processed order=43 ms=457
+java.lang.IllegalStateException: inventory negative for sku=P3
+	at order.Inventory.reserve(Inventory.java:88)
+	at order.Service.process(Service.java:41)
+2026-10-01 10:44:00,123 WARN [worker-2] order.Service - processed order=44 ms=820
+2026-10-01 10:45:00,123 WARN [worker-0] order.Service - processed order=45 ms=610
+2026-10-01 10:46:00,123 INFO [worker-1] order.Service - processed order=46 ms=365
+2026-10-01 10:47:00,123 INFO [worker-2] order.Service - processed order=47 ms=322
+2026-10-01 10:48:00,123 ERROR [worker-0] order.Service - processed order=48 ms=467
+java.lang.IllegalStateException: inventory negative for sku=P3
+	at order.Inventory.reserve(Inventory.java:88)
+	at order.Service.process(Service.java:41)
+2026-10-01 10:49:00,123 INFO [worker-1] order.Service - processed order=49 ms=63
+2026-10-01 10:50:00,123 WARN [worker-2] order.Service - processed order=50 ms=856
+2026-10-01 10:51:00,123 WARN [worker-0] order.Service - processed order=51 ms=83
+2026-10-01 10:52:00,123 INFO [worker-1] order.Service - processed order=52 ms=634
+2026-10-01 10:53:00,123 ERROR [worker-2] order.Service - processed order=53 ms=478
+java.lang.IllegalStateException: inventory negative for sku=P3
+	at order.Inventory.reserve(Inventory.java:88)
+	at order.Service.process(Service.java:41)
+2026-10-01 10:54:00,123 INFO [worker-0] order.Service - processed order=54 ms=465
+2026-10-01 10:55:00,123 INFO [worker-1] order.Service - processed order=55 ms=334
+2026-10-01 10:56:00,123 ERROR [worker-2] order.Service - processed order=56 ms=518
+java.lang.IllegalStateException: inventory negative for sku=P3
+	at order.Inventory.reserve(Inventory.java:88)
+	at order.Service.process(Service.java:41)
+2026-10-01 10:57:00,123 INFO [worker-0] order.Service - processed order=57 ms=68
+2026-10-01 10:58:00,123 ERROR [worker-1] order.Service - processed order=58 ms=110
+java.lang.IllegalStateException: inventory negative for sku=P3
+	at order.Inventory.reserve(Inventory.java:88)
+	at order.Service.process(Service.java:41)
+2026-10-01 10:59:00,123 WARN [worker-2] order.Service - processed order=59 ms=736
+{"ts": "2026-10-01T11:00:00Z", "level": "INFO", "logger": "order.Service", "msg": "processed", "order": 100, "ms": 91}
+{"ts": "2026-10-01T11:01:00Z", "level": "INFO", "logger": "order.Service", "msg": "processed", "order": 101, "ms": 521}
+{"ts": "2026-10-01T11:02:00Z", "level": "INFO", "logger": "order.Service", "msg": "processed", "order": 102, "ms": 666}
+{"ts": "2026-10-01T11:03:00Z", "level": "INFO", "logger": "order.Service", "msg": "processed", "order": 103, "ms": 181}
+{"ts": "2026-10-01T11:04:00Z", "level": "INFO", "logger": "order.Service", "msg": "processed", "order": 104, "ms": 45}
+{"ts": "2026-10-01T11:05:00Z", "level": "INFO", "logger": "order.Service", "msg": "processed", "order": 105, "ms": 258}
+{"ts": "2026-10-01T11:06:00Z", "level": "INFO", "logger": "order.Service", "msg": "processed", "order": 106, "ms": 729}
+{"ts": "2026-10-01T11:07:00Z", "level": "INFO", "logger": "order.Service", "msg": "processed", "order": 107, "ms": 453}
+{"ts": "2026-10-01T11:08:00Z", "level": "INFO", "logger": "order.Service", "msg": "processed", "order": 108, "ms": 454}
+{"ts": "2026-10-01T11:09:00Z", "level": "INFO", "logger": "order.Service", "msg": "processed", "order": 109, "ms": 541}
+{"ts": "2026-10-01T11:10:00Z", "level": "INFO", "logger": "order.Service", "msg": "processed", "order": 110, "ms": 540}
+{"ts": "2026-10-01T11:11:00Z", "level": "INFO", "logger": "order.Service", "msg": "processed", "order": 111, "ms": 629}
+{"ts": "2026-10-01T11:12:00Z", "level": "INFO", "logger": "order.Service", "msg": "processed", "order": 112, "ms": 167}
+{"ts": "2026-10-01T11:13:00Z", "level": "INFO", "logger": "order.Service", "msg": "processed", "order": 113, "ms": 377}
+{"ts": "2026-10-01T11:14:00Z", "level": "INFO", "logger": "order.Service", "msg": "processed", "order": 114, "ms": 386}
+{"ts": "2026-10-01T11:15:00Z", "level": "INFO", "logger": "order.Service", "msg": "processed", "order": 115, "ms": 294}
+{"ts": "2026-10-01T11:16:00Z", "level": "INFO", "logger": "order.Service", "msg": "processed", "order": 116, "ms": 401}
+{"ts": "2026-10-01T11:17:00Z", "level": "INFO", "logger": "order.Service", "msg": "processed", "order": 117, "ms": 423}
+{"ts": "2026-10-01T11:18:00Z", "level": "INFO", "logger": "order.Service", "msg": "processed", "order": 118, "ms": 798}
+{"ts": "2026-10-01T11:19:00Z", "level": "INFO", "logger": "order.Service", "msg": "processed", "order": 119, "ms": 351}

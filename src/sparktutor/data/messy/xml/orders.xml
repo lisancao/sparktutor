@@ -1,0 +1,12 @@
+<orders>
+  <order id="0" channel="store"><customer>C0</customer><items><item sku="P8"><qty>2</qty></item><item sku="P7"><qty>3</qty></item></items><coupon>SAVE0</coupon></order>
+  <order id="1" channel="web"><customer>C1</customer><items><item sku="P9"><qty>3</qty></item><item sku="P8"><qty>1</qty></item><item sku="P4"><qty>2</qty></item></items></order>
+  <order id="2" channel="store"><customer>C2</customer><items><item sku="P1"><qty>3</qty></item></items></order>
+  <order id="3" channel="web"><customer>C3</customer><items><item sku="P9"><qty>1</qty></item><item sku="P6"><qty>1</qty></item><item sku="P1"><qty>3</qty></item></items><coupon>SAVE3</coupon></order>
+  <order id="4" channel="store"><customer>C0</customer><items><item sku="P9"><qty>3</qty></item><item sku="P3"><qty>1</qty></item></items></order>
+  <order id="5" channel="web"><customer>C1</customer><items><item sku="P2"><qty>1</qty></item><item sku="P2"><qty>3</qty></item><item sku="P2"><qty>3</qty></item></items></order>
+  <order id="6" channel="store"><customer>C2</customer><items><item sku="P7"><qty>1</qty></item></items><coupon>SAVE6</coupon></order>
+  <order id="7" channel="web"><customer>C3</customer><items><item sku="P4"><qty>3</qty></item><item sku="P1"><qty>3</qty></item><item sku="P2"><qty>2</qty></item></items></order>
+  <order id="8" channel="store"><customer>C0</customer><items><item sku="P9"><qty>2</qty></item><item sku="P5"><qty>1</qty></item><item sku="P6"><qty>1</qty></item></items></order>
+  <order id="9" channel="web"><customer>C1</customer><items><item sku="P7"><qty>1</qty></item><item sku="P5"><qty>2</qty></item></items><coupon>SAVE9</coupon></order>
+</orders>

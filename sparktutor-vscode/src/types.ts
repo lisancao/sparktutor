@@ -71,6 +71,7 @@ export interface LoadLessonResult {
   restoredCode: string;
   starterCode: string;
   firstStarterCode?: string;
+  firstCodeStepIndex?: number;
   coursePrerequisites?: string[];
 }
 

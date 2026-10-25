@@ -192,6 +192,20 @@ def write_pipeline_project(code: str, root: Path, storage_root: str | None = Non
     return spec
 
 
+def write_script_project(code: str, root: Path) -> Path:
+    """Write a script exercise to root/exercise.py next to a copy of the sample data.
+
+    The script runs with root as its working directory, so it can read the
+    sample files with relative paths such as "data/messy/logs".
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    script = root / "exercise.py"
+    script.write_text(code)
+    if SAMPLE_DATA_DIR.is_dir():
+        shutil.copytree(SAMPLE_DATA_DIR, root / "data", dirs_exist_ok=True)
+    return script
+
+
 def pipeline_command(code: str) -> str:
     """The spark-pipelines subcommand an exercise asks for."""
     return "dry-run" if _SDP_DRY_RUN.search(code) else "run"
@@ -346,28 +360,24 @@ class Executor:
         except (OSError, ValueError) as e:
             return self._connector_error(ExecMode.LAKEHOUSE, e)
 
-        # Write code to a unique temp file to avoid collisions
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", prefix="sparktutor_", delete=False) as tmp:
-            tmp.write(code)
-            tmp_path = tmp.name
-        remote_path = f"/tmp/{Path(tmp_path).name}"
+        # A unique directory per run: the script plus the sample data
+        with tempfile.TemporaryDirectory(prefix="sparktutor_") as tmp:
+            local_root = Path(tmp)
+            remote_root = f"/tmp/{local_root.name}"
+            write_script_project(code, local_root)
+            cp_proc = await asyncio.create_subprocess_exec(
+                "docker", "cp", str(local_root), f"{container}:{remote_root}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await cp_proc.communicate()
 
-        # docker cp
-        cp_proc = await asyncio.create_subprocess_exec(
-            "docker", "cp", tmp_path, f"{container}:{remote_path}",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await cp_proc.communicate()
-        Path(tmp_path).unlink(missing_ok=True)
-
-        # docker exec spark-submit (no --jars flag!)
         proc = await asyncio.create_subprocess_exec(
-            "docker", "exec", container,
+            "docker", "exec", "-w", remote_root, container,
             "/opt/spark/bin/spark-submit",
             "--master", self.settings.docker.spark_master_url,
             *extra,
-            remote_path,
+            f"{remote_root}/exercise.py",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -486,22 +496,19 @@ class Executor:
         except (OSError, ValueError) as e:
             return self._connector_error(ExecMode.LOCAL, e)
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as tmp:
-            tmp.write(code)
-            tmp_path = tmp.name
-
-        proc = await asyncio.create_subprocess_exec(
-            spark_bin("spark-submit"),
-            *connector_args(names, [str(jar) for jar in jars], in_pipeline=False),
-            tmp_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=spark_env(),
-        )
-
-        result = await self._stream_process(proc, ExecMode.LOCAL, on_output)
-        Path(tmp_path).unlink(missing_ok=True)
-        return result
+        with tempfile.TemporaryDirectory(prefix="sparktutor_") as tmp:
+            root = Path(tmp)
+            script = write_script_project(code, root)
+            proc = await asyncio.create_subprocess_exec(
+                spark_bin("spark-submit"),
+                *connector_args(names, [str(jar) for jar in jars], in_pipeline=False),
+                str(script),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=spark_env(),
+                cwd=str(root),
+            )
+            return await self._stream_process(proc, ExecMode.LOCAL, on_output)
 
     async def _databricks_exec(
         self, code: str, on_output: Optional[Callable[[str], None]] = None,

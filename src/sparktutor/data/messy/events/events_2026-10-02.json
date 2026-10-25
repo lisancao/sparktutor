@@ -1,0 +1,20 @@
+{"event": "purchase", "user": {"id": 0, "plan": "pro"}, "amount": "32.83", "items": [{"sku": "P4", "qty": 3}, {"sku": "P2", "qty": 1}, {"sku": "P4", "qty": 2}], "ts": "2026-10-02T11:00:00"}
+{"event": "purchase", "user": {"id": 1, "plan": "free"}, "amount": 49.33, "items": [{"sku": "P7", "qty": 2}], "ts": "2026-10-02T11:01:00"}
+{"event": "purchase", "user": {"id": 2, "plan": "pro"}, "amount": 25.4, "items": [{"sku": "P6", "qty": 2}], "ts": "2026-10-02T11:02:00"}
+{"event": "purchase", "user": {"id": 3, "plan": "pro"}, "amount": 14.43, "items": [{"sku": "P2", "qty": 3}, {"sku": "P3", "qty": 3}, {"sku": "P4", "qty": 1}], "ts": "2026-10-02T11:03:00"}
+{"event": "purchase", "user": {"id": 4, "plan": "pro"}, "amount": "25.8", "items": [{"sku": "P9", "qty": 1}, {"sku": "P6", "qty": 1}, {"sku": "P4", "qty": 1}], "ts": "2026-10-02T11:04:00"}
+{"event": "purchase", "user": {"id": 0, "plan": "pro"}, "amount": 41.23, "items": [{"sku": "P2", "qty": 1}, {"sku": "P6", "qty": 1}], "ts": "2026-10-02T11:05:00"}
+{"event": "purchase", "user": {"id": 1, "plan": "pro"}, "amount": 34.49, "items": [{"sku": "P8", "qty": 1}, {"sku": "P5", "qty": 1}, {"sku": "P4", "qty": 3}], "ts": "2026-10-02T11:06:00"}
+{"event": "purchase", "user": {"id": 2, "plan": "pro"}, "amount": 30.26, "items": [{"sku": "P7", "qty": 3}, {"sku": "P7", "qty": 2}, {"sku": "P4", "qty": 1}], "ts": "2026-10-02T11:07:00"}
+{"event": "purchase", "user": {"id": 3, "plan": "free"}, "amount": "27.93", "items": [{"sku": "P2", "qty": 1}], "ts": "2026-10-02T11:08:00"}
+{"event": "purchase", "user": {"id": 4, "plan": "pro"}, "amount": 33.24, "items": [{"sku": "P2", "qty": 2}, {"sku": "P7", "qty": 3}, {"sku": "P8", "qty": 3}], "ts": "2026-10-02T11:09:00"}
+{"event": "purchase", "user": {"id": 0, "plan": "free"}, "amount": 16.31, "items": [{"sku": "P2", "qty": 3}, {"sku": "P9", "qty": 2}, {"sku": "P6", "qty": 1}], "ts": "2026-10-02T11:10:00"}
+{"event": "purchase", "user": {"id": 1, "plan": "free"}, "amount": 18.21, "items": [{"sku": "P1", "qty": 3}, {"sku": "P5", "qty": 3}], "ts": "2026-10-02T11:11:00"}
+{"event": "purchase", "user": {"id": 2, "plan": "free"}, "amount": "39.29", "items": [{"sku": "P5", "qty": 3}, {"sku": "P9", "qty": 3}, {"sku": "P4", "qty": 1}], "ts": "2026-10-02T11:12:00"}
+{"event": "purchase", "user": {"id": 3, "plan": "free"}, "amount": 21.83, "items": [{"sku": "P9", "qty": 1}, {"sku": "P6", "qty": 2}, {"sku": "P1", "qty": 1}], "ts": "2026-10-02T11:13:00"}
+{"event": "purchase", "user": {"id": 4, "plan": "pro"}, "amount": 46.81, "items": [{"sku": "P1", "qty": 1}], "ts": "2026-10-02T11:14:00"}
+{"event": "purchase", "user": {"id": 0, "plan": "free"}, "amount": 44.51, "items": [{"sku": "P8", "qty": 1}], "ts": "2026-10-02T11:15:00"}
+{"event": "purchase", "user": {"id": 1, "plan": "free"}, "amount": "49.01", "items": [{"sku": "P8", "qty": 3}], "ts": "2026-10-02T11:16:00"}
+{"event": "purchase", "user": {"id": 2, "plan": "pro"}, "amount": 12.43, "items": [{"sku": "P9", "qty": 3}], "ts": "2026-10-02T11:17:00"}
+{"event": "purchase", "user": {"id": 3, "plan": "pro"}, "amount": 36.04, "items": [{"sku": "P6", "qty": 2}, {"sku": "P9", "qty": 2}], "ts": "2026-10-02T11:18:00"}
+{"event": "purchase", "user": {"id": 4, "plan": "free"}, "amount": 10.45, "items": [{"sku": "P6", "qty": 1}], "ts": "2026-10-02T11:19:00"}

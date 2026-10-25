@@ -165,6 +165,7 @@ class ServerHandler:
             "restoredCode": restored_code,
             "starterCode": starter_code,
             "firstStarterCode": self._runner.get_first_starter_code(),
+            "firstCodeStepIndex": self._runner.get_first_code_step_index(),
         }
         if lesson_idx == 0 and course.prerequisites:
             result["coursePrerequisites"] = course.prerequisites
