@@ -49,8 +49,8 @@
     **Memory:**
     - `spark.executor.memory`: memory per executor (e.g., `4g`)
     - `spark.driver.memory`: memory for the driver
-    - `spark.memory.fraction`: fraction of heap used for execution and
-      storage (default: 0.6)
+    - `spark.memory.fraction`: fraction of the heap (minus 300MB reserved)
+      used for execution and storage (default: 0.6)
 
     **File reading:**
     - `spark.sql.files.maxPartitionBytes`: max size per partition when
@@ -264,10 +264,14 @@
       on wide rows.
 
     When you benchmark against a 3.x or 4.1 baseline, remember these
-    defaults moved. A regression after upgrading can be a UDF that relied on
-    the old pickled path (for example, nullable integer columns now arrive
-    in pandas UDFs as `Int64` extension dtype rather than `float64`); flip
-    the specific flag back to confirm before rewriting code.
+    defaults moved. A regression after upgrading can be a plain `@udf` that
+    used to run as `BatchEvalPython` (pickled rows) and now shows up as
+    `ArrowEvalPython` in the plan. Pass `useArrow=False` to that UDF, or set
+    `spark.sql.execution.pythonUDF.arrow.enabled` to `false`, to confirm
+    before rewriting code. Pandas UDFs always used Arrow, and nullable
+    integer columns still reach them as `float64` by default; 4.2.0 adds
+    `spark.sql.execution.pythonUDF.pandas.preferIntExtensionDtype` (default
+    `false`) to opt in to `Int64`-style extension dtypes instead.
 
 - Class: text
   Depth: advanced
@@ -312,8 +316,8 @@
     - **Initial vs. Final plan, side by side** for AQE queries
       (SPARK-55877), so you can see exactly which joins AQE switched and
       which shuffles it coalesced.
-    - **Job Timeline on the SQL execution page** (SPARK-55878) ties a query
-      to the jobs and stages it spawned.
+    - **Job Timeline on the SQL execution page** ties a query to the jobs
+      and stages it spawned.
     - **Copy plan text and share link** buttons on the SQL execution page
       (SPARK-56048), and sortable, paginated query lists on the SQL tab.
     - **Environment page** highlights configuration values that differ from
@@ -323,8 +327,8 @@
       toggle (SPARK-55766).
 
     In Spark Connect deployments, the **Connect** tab lists sessions and
-    the operations they ran; 4.2 makes it available in the History Server
-    as well (SPARK-57601).
+    the operations they ran, and it is fixed to appear in the History
+    Server (SPARK-57601, also backported to 4.1.3 and 4.0.4).
 
 - Class: text
   Depth: advanced

@@ -23,11 +23,13 @@
     - Compare Delta Lake, Apache Iceberg, and Apache Hudi
     - Describe ACID guarantees and why they matter
     - Use schema enforcement and schema evolution, including the
-      `WITH SCHEMA EVOLUTION` SQL that Spark 4.2 added
+      `INSERT WITH SCHEMA EVOLUTION` SQL that Spark 4.2 added
     - Query historical data with time travel
     - Upsert with `MERGE INTO` and the DataFrame `mergeInto` API (4.0)
-    - Read row-level changes with Spark 4.2's Change Data Capture API
-      (`changes()` and the `CHANGES` clause), and know where it works
+    - Read row-level changes with Delta Lake's change data feed, and know
+      where Spark 4.2's new Change Data Capture API (`changes()` and the
+      `CHANGES` clause) stands
+    - Add Delta Lake to Spark 4.2 yourself and use it from a real exercise
 
 - Class: text
   Depth: all
@@ -84,14 +86,62 @@
 
     All three provide ACID transactions, schema enforcement, time travel,
     and merge (upsert) operations. None of them ships inside Apache Spark:
-    each is a separate connector you add with `--packages` and session
-    extensions, and connector releases trail Spark releases, so check the
-    format's compatibility matrix for Spark 4.2 before you upgrade.
+    each is a separate connector you add to Spark, and connector releases
+    trail Spark releases. As of October 2026, Delta Lake 4.4.1 has a build
+    for Spark 4.2; Iceberg (1.12.0), Hudi and Paimon support Spark up to
+    4.1. Check the format's compatibility matrix before you upgrade Spark.
 
     **Docs:**
     [Delta Lake Quickstart](https://docs.delta.io/latest/quick-start.html) |
     [Iceberg Spark Guide](https://iceberg.apache.org/docs/latest/spark-getting-started/) |
     [Hudi Spark Guide](https://hudi.apache.org/docs/quick-start-guide)
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Adding Delta Lake to Spark 4.2
+
+    Delta needs its jars on Spark's classpath plus two settings: a SQL
+    extension (for `MERGE`, `DESCRIBE HISTORY`, `VACUUM` and friends) and a
+    catalog that understands Delta tables. Pick one of these.
+
+    **With spark-submit** (Spark downloads the jars from Maven Central on
+    the first run and caches them):
+
+    ```bash
+    spark-submit \
+      --packages io.delta:delta-spark_4.2_2.13:4.4.1 \
+      --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension \
+      --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog \
+      my_job.py
+    ```
+
+    **With pip**, for scripts you start with `python my_job.py`:
+
+    ```bash
+    pip install "delta-spark==4.4.1"
+    ```
+
+    ```python
+    from delta import configure_spark_with_delta_pip
+    from pyspark.sql import SparkSession
+
+    builder = (SparkSession.builder
+        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+        .config("spark.sql.catalog.spark_catalog",
+                "org.apache.spark.sql.delta.catalog.DeltaCatalog"))
+    spark = configure_spark_with_delta_pip(builder).getOrCreate()
+    ```
+
+    The artifact name carries the Spark version: `delta-spark_4.2_2.13` is
+    Delta for Spark 4.2 and Scala 2.13; always use the build that matches
+    your Spark version. In SparkTutor, the exercise's first line
+    `# spark-connectors: delta` does all of this for you.
+
+    If `--packages` fails with `download failed` for a jar that is plainly
+    on Maven Central, look in `~/.m2/repository`: an earlier Maven build can
+    leave a library's metadata there without its jar, and Spark's resolver
+    trusts it. Deleting that library's folder fixes it.
 
 - Class: mult_question
   Depth: all
@@ -153,7 +203,8 @@
     SELECT * FROM staged_events
     ```
 
-    `MERGE WITH SCHEMA EVOLUTION INTO ...` is the merge equivalent. The
+    `MERGE WITH SCHEMA EVOLUTION INTO ...` is the merge equivalent (it
+    has existed since Spark 4.0). The
     connector decides which changes it supports. Existing data is unchanged;
     new columns appear as `NULL` in old rows.
 
@@ -199,12 +250,12 @@
 - Class: cmd_question
   Depth: intermediate
   Output: |
-    Write a DataFrame `df` to a Delta table at `'/data/events'`, then
+    Write a DataFrame `df` to a Delta table at `'/tmp/events'`, then
     read back version 0 (the original) into a variable called `df_v0`.
   CorrectAnswer: |
-    df.write.format("delta").mode("overwrite").save("/data/events")
+    df.write.format("delta").mode("overwrite").save("/tmp/events")
 
-    df_v0 = spark.read.format("delta").option("versionAsOf", 0).load("/data/events")
+    df_v0 = spark.read.format("delta").option("versionAsOf", 0).load("/tmp/events")
   Hint: "Write with format('delta'), then read with option('versionAsOf', 0)."
 
 - Class: text
@@ -227,61 +278,118 @@
     Since Spark 4.0 the same thing is available from the DataFrame API:
 
     ```python
-    (updates_df.mergeInto("catalog.hr.employees", f.expr("t.id = s.id"))
+    (updates_df.alias("s")
+        .mergeInto("hr.employees", f.expr("employees.id = s.id"))
         .whenMatched().updateAll()
         .whenNotMatched().insertAll()
         .whenNotMatchedBySource().delete()
         .merge())
     ```
 
+    Alias the source DataFrame and refer to the target by its table name:
+    `mergeInto` has no way to alias the target.
+
     `withSchemaEvolution()` on the builder is the DataFrame form of
-    `MERGE WITH SCHEMA EVOLUTION`. Both need a target table whose connector
-    supports row-level operations (Delta, Iceberg, Hudi); plain
-    `spark_catalog` Parquet tables do not. For simple partition-scoped
-    replacement, 4.2 also adds `INSERT INTO ... REPLACE WHERE <condition>`
-    and `INSERT INTO ... REPLACE USING (cols)` (SPARK-56001), and DSv2 now
-    reports row counts for `UPDATE`, `DELETE`, `INSERT`, and `MERGE`
-    (SPARK-56524, SPARK-56551, SPARK-56680).
+    `MERGE WITH SCHEMA EVOLUTION`. Both need a table format that implements
+    `MERGE` (Delta, Iceberg, Hudi); plain Parquet tables do not. Delta
+    4.4.1 on Spark 4.2 runs both the SQL and the DataFrame form.
+
+    To replace a slice of a table in one atomic commit,
+    `INSERT INTO t REPLACE WHERE <predicate> SELECT ...` (since Spark 3.4)
+    deletes the rows that match the predicate and inserts the new ones; it
+    works on Delta. Spark 4.2 adds grammar for key-based
+    `INSERT INTO ... REPLACE ON <condition>` and `REPLACE USING (cols)`
+    (SPARK-56001), but in 4.2.0 no table supports them yet: they fail with
+    `UNSUPPORTED_FEATURE.TABLE_OPERATION`. DSv2 now also records row
+    metrics (updated, deleted, inserted, copied) for `UPDATE`, `DELETE`
+    and `INSERT`, shown in the SQL tab of the UI (SPARK-56524, SPARK-56551,
+    SPARK-56680); `MERGE` has had them since 4.1.
 
 - Class: text
   Depth: all
   Output: |
-    ## Change Data Capture in Spark 4.2
+    ## Change Data Capture: Reading What Changed
 
     Time travel answers "what did the table look like?". **Change data
-    capture (CDC)** answers "which rows changed between two versions?",
-    which is what incremental pipelines need. Each format used to expose
-    this its own way (Delta's change data feed, Iceberg's changelog views).
-    Spark 4.2 adds one engine-level API (SPARK-55668):
+    capture (CDC)** answers "which rows changed, and how?", which is what
+    incremental pipelines need: process only the new changes instead of
+    re-reading the whole table.
+
+    **Delta Lake's change data feed** is how you do this on Delta today.
+    Turn it on per table, then read changes in batch or as a stream:
+
+    ```sql
+    CREATE TABLE hr.employees (id INT, name STRING, salary DOUBLE)
+      USING delta
+      TBLPROPERTIES (delta.enableChangeDataFeed = true);
+    ```
 
     ```python
-    # Batch: changes between two versions
+    # Batch: every change from version 1 on (add endingVersion to stop early)
+    changes = (spark.read
+        .option("readChangeFeed", "true")
+        .option("startingVersion", 1)
+        .table("hr.employees"))
+
+    # Streaming: new changes as they are committed
+    stream = (spark.readStream
+        .option("readChangeFeed", "true")
+        .option("startingVersion", 1)
+        .table("hr.employees"))
+    ```
+
+    ```sql
+    SELECT * FROM table_changes('hr.employees', 1);
+    ```
+
+    Each change row has the table's columns plus:
+
+    - `_change_type`: `insert`, `delete`, or for an update two rows,
+      `update_preimage` (old values) and `update_postimage` (new values)
+    - `_commit_version`: the table version that made the change
+    - `_commit_timestamp`: when that version was committed
+
+    Changes are recorded only from the moment the feed is enabled, and only
+    for versions that `VACUUM` has not cleaned up.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Spark 4.2's Change Data Capture API
+
+    Each format has its own CDC syntax (Delta's `readChangeFeed` /
+    `table_changes`, Iceberg's changelog views). Spark 4.2 adds one
+    engine-level API that any table format can implement (SPARK-55668):
+
+    ```python
     changes = (spark.read
         .option("startingVersion", "10")
         .option("endingVersion", "20")
         .changes("catalog.db.orders"))
-
-    # Streaming: an open-ended change feed
-    stream = spark.readStream.changes("catalog.db.orders")
     ```
 
     ```sql
     SELECT * FROM catalog.db.orders CHANGES FROM VERSION 10 TO VERSION 20;
     SELECT * FROM catalog.db.orders
-      CHANGES FROM TIMESTAMP '2025-01-01 00:00:00'
+      CHANGES FROM VERSION 10
       WITH ('deduplicationMode' = 'netChanges');
     ```
 
-    Every change row carries the data columns plus `_change_type`
-    (`insert`, `delete`, `update_preimage`, `update_postimage`),
-    `_commit_version`, and `_commit_timestamp`.
+    The rows have the same `_change_type`, `_commit_version` and
+    `_commit_timestamp` columns as Delta's feed.
 
-    **Where it works**: only on DSv2 tables whose catalog implements
-    `TableCatalog.loadChangelog()`. Spark itself ships no such catalog. On
-    the built-in `spark_catalog` with Parquet tables, both forms fail with
+    **Where it works today**: only on tables whose catalog implements
+    `TableCatalog.loadChangelog()`. Spark ships no such catalog, so on
+    plain Parquet tables both forms fail with
     `UNSUPPORTED_FEATURE.CHANGE_DATA_CAPTURE` ("Catalog spark_catalog does
-    not support Change Data Capture"). You get CDC once your table format's
-    connector implements the new interface.
+    not support Change Data Capture"). Delta 4.4.1 contains an early
+    implementation that is off by default: it needs the internal setting
+    `spark.databricks.delta.changelogV2.enabled=true` and a table with
+    `delta.enableRowTracking = true`, answers batch queries only (a
+    streaming `readStream.changes()` fails), and reports updates as a
+    `delete` plus an `insert` unless you add `'computeUpdates' = 'true'`.
+    Treat it as a preview; for Delta tables, use the change data feed
+    above.
 
 - Class: mult_question
   Depth: all
@@ -297,8 +405,8 @@
 
     A raw changelog is noisy. Copy-on-write table formats rewrite whole
     files, so an update to one row can appear as a delete and re-insert of
-    every *other* row in that file (carry-over rows). The CDC API cleans
-    this up for you, controlled by options on `.option(...)` or the SQL
+    every *other* row in that file (carry-over rows). Spark 4.2's CDC
+    API cleans this up for you, controlled by options on `.option(...)` or the SQL
     `WITH (...)` clause:
 
     - `deduplicationMode`:
@@ -355,7 +463,7 @@
     needed by any retained version:
     ```python
     # Delta Lake
-    spark.sql("VACUUM delta.`/data/events` RETAIN 168 HOURS")
+    spark.sql("VACUUM delta.`/tmp/events` RETAIN 168 HOURS")
 
     # Iceberg
     spark.sql("CALL catalog.system.expire_snapshots('db.events', TIMESTAMP '2025-01-01 00:00:00')")
@@ -363,7 +471,7 @@
 
     **History**: view all operations:
     ```python
-    spark.sql("DESCRIBE HISTORY delta.`/data/events`")
+    spark.sql("DESCRIBE HISTORY delta.`/tmp/events`")
     ```
 
     Expiring snapshots also ends time travel and CDC to those versions.
@@ -381,32 +489,39 @@
 - Class: script
   Depth: all
   Output: |
-    ## Exercise: Lakehouse Simulation
+    ## Exercise: A Real Delta Table
 
-    This exercise runs on plain PySpark (no Delta or Iceberg JARs), so you
-    will simulate lakehouse concepts with versioned Parquet directories and
-    build the change feed yourself, in the same shape as Spark 4.2's CDC
-    API.
+    This exercise uses Delta Lake 4.4.1. Its first line,
+    `# spark-connectors: delta`, makes SparkTutor add the Delta jars and
+    settings from "Adding Delta Lake to Spark 4.2"; the first submit
+    downloads them (a few MB) once.
 
-    Implement `lakehouse_simulation(spark, base_path)`:
+    Implement `delta_lakehouse(spark, path)`:
 
-    1. Write the initial employees as version 0 (`v0/`)
-    2. Build version 1: the initial employees with Bob's raise applied
-       (`RAISES`), plus the new hires. Write it to `v1/`.
-    3. Read both versions back (time travel)
-    4. Verify the schemas match
-    5. Compute the changes from v0 to v1 with `exceptAll` in both
-       directions. Rows only in v1 are `insert`, rows only in v0 are
-       `delete`. Add `_change_type` and `_commit_version` (1) columns.
-    6. Return a dict with both versions, their counts, the schema check,
-       and the changes DataFrame
+    1. Write `INITIAL_DATA` to `path` in Delta format with the option
+       `delta.enableChangeDataFeed` set to `"true"`. That commit is
+       version 0.
+    2. Register `UPDATES` as a temp view `updates` and `MERGE` it into the
+       table (`{table}` in the starter is ``delta.`<path>` ``, the SQL name for
+       a Delta table stored at a path): update all columns when the id
+       matches, insert when it does not. Version 1.
+    3. Delete the employee with id 3. Version 2.
+    4. Read the current table, and version 0 with `versionAsOf`.
+    5. Collect `DESCRIBE HISTORY` as `(version, operation)` pairs, oldest
+       first.
+    6. Read the change data feed from version 1.
 
-    A changed row (Bob) shows up as a delete plus an insert, which is
-    exactly the shape `computeUpdates` turns into
-    `update_preimage`/`update_postimage`.
+    Look at the printed change feed: Bob's raise appears twice
+    (`update_preimage` with the old salary, `update_postimage` with the
+    new one), and each row tells you which commit made it.
+
+    Always read a Delta table with `format("delta")` (or by table name).
+    `spark.read.parquet(path)` on a Delta directory raises no error but
+    returns every data file ever written, including rows that were updated
+    or deleted since.
   StarterFile: starter.py
   SolutionFile: solution.py
-  Hint: "v1 = initial_df with salary replaced for ids in RAISES (f.when or a join), unioned with the new hires. Changes: v1.exceptAll(v0).withColumn('_change_type', f.lit('insert')) unioned with v0.exceptAll(v1) labelled 'delete'."
+  Hint: "Write with .write.format('delta').option('delta.enableChangeDataFeed', 'true').save(path). MERGE: WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *. Reads: spark.read.format('delta').option('versionAsOf', 0).load(path) and .option('readChangeFeed', 'true').option('startingVersion', 1)."
 
 - Class: text
   Depth: all
@@ -423,13 +538,15 @@
     - **ACID guarantees**: atomicity, consistency, isolation, durability
       prevent corruption from failures and concurrency
     - **Schema enforcement/evolution**: reject bad writes, safely add
-      columns; `INSERT/MERGE WITH SCHEMA EVOLUTION` in 4.2
+      columns; `INSERT WITH SCHEMA EVOLUTION` (4.2) and
+      `MERGE WITH SCHEMA EVOLUTION` (4.0)
     - **Time travel**: `VERSION AS OF` / `TIMESTAMP AS OF` for auditing,
       debugging, and reproducibility
     - **MERGE INTO** and `DataFrame.mergeInto` for upserts
-    - **CDC (4.2)**: `spark.read.changes()`, `readStream.changes()`, and
-      the `CHANGES` clause, with `_change_type`, `_commit_version`, and
-      dedup options; available once a DSv2 connector implements it
+    - **CDC**: Delta's change data feed (`readChangeFeed`,
+      `table_changes`) in batch and streaming; Spark 4.2's engine-level
+      `changes()` / `CHANGES` API works where a table format implements it
+      (not plain Parquet; a preview in Delta 4.4.1)
     - **Maintenance**: vacuum/expire old snapshots, compact small files
 
     You now understand the storage layer that production data platforms

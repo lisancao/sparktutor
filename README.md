@@ -57,8 +57,11 @@ The Codespace automatically installs all dependencies, builds the extension, and
 
 - VS Code 1.93+
 - Python 3.10+
-- Java 17+ (Java 21 and 25 also work)
+- A JDK: Java 17 or 21 (Java 25 also works). PySpark bundles Spark's jars but not Java;
+  check that `java -version` works in a terminal, or set `JAVA_HOME`.
 - Node.js 20+ (for building the extension)
+- Internet access the first time a lesson needs Delta Lake, Kafka or Spark's test catalog;
+  SparkTutor downloads those jars from Maven Central once (see "Connectors" below)
 
 #### Build and install
 
@@ -66,6 +69,10 @@ The Codespace automatically installs all dependencies, builds the extension, and
 # Clone the repo
 git clone https://github.com/lisancao/sparktutor.git
 cd sparktutor
+
+# Create a virtual environment in the repo (many systems block global pip installs)
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 
 # Install Python dependencies (PySpark 4.2.0 with Connect and Declarative Pipelines)
 pip install -e '.[spark]'
@@ -77,7 +84,8 @@ bash package-vsix.sh
 code --install-extension sparktutor-0.4.0.vsix
 ```
 
-Then reload VS Code (`Ctrl+Shift+P` → "Reload Window").
+Then reload VS Code (`Ctrl+Shift+P`, then "Reload Window"). The extension finds the `.venv`
+in the repo by itself; if you installed somewhere else, set `sparktutor.pythonPath`.
 
 ### Configure
 
@@ -88,7 +96,7 @@ Open VS Code settings (`Ctrl+,`) and search for "SparkTutor":
 | `sparktutor.aiProvider` | AI backend: `auto` (default), `anthropic`, or `copilot` |
 | `sparktutor.anthropicApiKey` | Anthropic API key (or set `ANTHROPIC_API_KEY` env var) |
 | `sparktutor.claudeModel` | Claude model for review/chat (default: `claude-opus-5-5`; also `claude-sonnet-5-5`, `claude-haiku-5-5`) |
-| `sparktutor.pythonPath` | Python interpreter path (default: `python3`) |
+| `sparktutor.pythonPath` | Python interpreter with pyspark installed (default: empty, which uses `.venv` in the repo or workspace, else `python3`) |
 | `sparktutor.projectPath` | Path to sparktutor repo root (auto-detected if installed via VSIX) |
 
 ### AI provider options
@@ -136,7 +144,7 @@ All solutions are verified against PySpark 4.2.0 with `scripts/verify_solutions.
 | 6 | Optimization & Tuning | caching, AQE, partitioning, Arrow UDF defaults, the 4.2 Web UI |
 | 7 | Join Strategies | broadcast, shuffle hash, sort-merge, skew, `NEAREST BY` (4.2) |
 | 8 | Structured Streaming | watermarks, `availableNow`, `transformWithState`, Real-Time Mode (4.2) |
-| 9 | Data Lakes & Lakehouses | Iceberg, time travel, `MERGE`, schema evolution, CDC (4.2) |
+| 9 | Data Lakes & Lakehouses | A real Delta Lake 4.4.1 table: `MERGE`, time travel, history, change data feed; Spark 4.2's CDC API |
 | 10 | Machine Learning with MLlib | pipelines, tuning, ML on Spark Connect |
 | 11 | Spark Connect | architecture, connection strings, Classic vs Connect differences, 4.2 additions |
 
@@ -152,7 +160,7 @@ Built on the real `pyspark.pipelines` API and the `spark-pipelines` CLI; every e
 | 4 | Bronze: Ingesting Raw Data | Append-only ingestion with explicit schemas and `_metadata` lineage |
 | 5 | Silver: Types, Duplicates and Quarantine | `try_cast`, window dedup, silver + quarantine split |
 | 6 | Gold: Aggregates for the Business | Running totals, ranks, shares, loop-generated datasets |
-| 7 | Auto CDC (Spark 4.2) | SCD Type 1 with `create_auto_cdc_flow` (validated with dry-run) |
+| 7 | Auto CDC (Spark 4.2) | SCD Type 1 with `create_auto_cdc_flow`, run against Spark's in-memory test catalog; Delta change feed and Kafka sources |
 | 8 | Capstone: Raw Files to Gold | The full pipeline, a JSON sink, and cross-layer reconciliation checks |
 | 9 | Under the Hood (optional) | A toy dependency-resolving pipeline runner in plain Python |
 
@@ -163,7 +171,7 @@ Built on the real `pyspark.pipelines` API and the `spark-pipelines` CLI; every e
 | 1 | Spark 4 at a Glance | ANSI default and error classes (4.0), Connect (4.0), Arrow UDFs by default (4.2) |
 | 2 | VARIANT | `parse_json`, `variant_get`, `:` paths (4.0/4.1) |
 | 3 | SQL Pipe Syntax and QUALIFY | `|>` (4.0), `|` alias and pipe aggregates, `QUALIFY` (4.2) |
-| 4 | SQL Scripting, SQL UDFs and the SQL Path | scripting (4.0/4.1), cursors and `SET PATH` (4.2) |
+| 4 | SQL Scripting, SQL UDFs and the SQL Path | scripting (4.0/4.1), `SET PATH` (4.2), cursors (4.2, behind an internal flag) |
 | 5 | Geospatial Types | `GEOMETRY` / `GEOGRAPHY` and `ST_*` functions (4.2) |
 | 6 | Python Data Sources | batch, filter pushdown (4.1), streaming admission control (4.2) |
 | 7 | Stateful Streaming with transformWithState | state variables, initial state, Real-Time Mode trigger (4.2) |
@@ -171,10 +179,21 @@ Built on the real `pyspark.pipelines` API and the `spark-pipelines` CLI; every e
 
 ### Known Spark 4.2.0 limitations covered in the lessons
 
-- Auto CDC targets need a table format with row-level operations (Iceberg); parquet and Delta targets are rejected, and no Iceberg runtime for Spark 4.2 is published yet, so the Auto CDC exercise runs as a dry run.
-- Several append flows into one parquet-backed streaming table can race on the file sink's commit log and lose rows.
-- `dropDuplicates([...])` and `.drop(...)` on a pipeline dataset fail at flow registration; the lessons use window functions and explicit selects.
-- CDC reads (`CHANGES`, `changes()`), source naming, SQL cursors and `SET PATH` need connectors or internal flags that local Spark does not enable by default; the lessons say so where they use them.
+Checked in October 2026 against PySpark 4.2.0, Delta Lake 4.4.1 and Iceberg 1.12.0:
+
+- Auto CDC targets need Spark's DSv2 row-level operations. Parquet and Delta 4.4.1 targets are
+  rejected, and no Iceberg release supports Spark 4.2 yet, so the Auto CDC exercise writes its
+  target into Spark's in-memory test catalog. Sources are not the problem: a Delta change data
+  feed and a Kafka topic both work as Auto CDC sources.
+- Spark 4.2's `CHANGES` / `changes()` API fails on plain tables. Delta 4.4.1 has a batch-only
+  preview behind an internal flag; for Delta, the lessons use its change data feed.
+- `spark-pipelines` does not make `--packages` jars visible to pipeline code; use `--jars`.
+- Several append flows into one parquet-backed streaming table can race on the file sink's commit
+  log and lose rows.
+- `drop(...)`, `dropDuplicates(...)` and `dropDuplicatesWithinWatermark(...)` on a pipeline
+  dataset fail at flow registration; the lessons use window functions and explicit selects.
+- SQL cursors, CONTINUE handlers, the TIME type and streaming source naming sit behind internal
+  flags that are off by default; the lessons say so where they mention them.
 
 ## How Evaluation Works
 
@@ -200,6 +219,28 @@ sample dataset in `data/`) and runs `spark-pipelines run`. A first line of
 `# spark-pipelines: dry-run` runs `spark-pipelines dry-run` instead. Exercises embed their checks
 as `check_*` materialized views that call `assert_true`, so a successful run means every check
 passed; after a run the tutor prints the contents of each table the pipeline wrote.
+
+### Connectors
+
+Delta Lake, Kafka and Spark's in-memory test catalog are not part of pyspark. An exercise that
+needs one starts with a line like `# spark-connectors: delta` (or `kafka`, `test-catalog`).
+SparkTutor then downloads the jars from Maven Central into `~/.sparktutor/jars` once and passes
+them with `--jars` (plus any settings the connector needs) to `spark-submit` or
+`spark-pipelines`. The lessons show the equivalent commands for running on your own.
+
+### Troubleshooting
+
+- **Declarative Pipelines exercises fail to start, or behave strangely.** `spark-pipelines`
+  starts a local Spark Connect server, and its client always connects to `localhost:15002`. If
+  another Spark Connect server (a Docker container, another notebook) already listens on that
+  port, stop it first.
+- **`--packages` fails with `download failed` for a jar that exists on Maven Central.** Spark's
+  resolver also reads `~/.m2/repository`, and an earlier Maven build can leave a library's
+  metadata there without its jar. Delete that library's folder under `~/.m2/repository`.
+- **Running a pipeline twice on your own fails with `LOCATION_ALREADY_EXISTS`.** The local
+  server's default catalog is in memory and forgets tables between runs. Start from a clean
+  project and pass `--conf spark.sql.catalogImplementation=hive` on every run. (SparkTutor runs
+  each exercise in a fresh directory, so this only matters outside the tutor.)
 
 ## Depth-Aware Scaffolding
 
@@ -229,7 +270,7 @@ spark = (SparkSession.builder
 
 **Advanced**: just the objective:
 ```python
-# Create a SparkSession with an Iceberg catalog named 'lakehouse'.
+# Create a SparkSession named 'PipelineApp' with shuffle partitions set to 8.
 ```
 
 ## Project Structure
@@ -262,6 +303,9 @@ sparktutor/
 ## Development
 
 ```bash
+# Install the test dependencies too
+pip install -e '.[spark,dev]'
+
 # Run tests
 PYTHONPATH=src python3 -m pytest tests/ -v
 

@@ -55,7 +55,7 @@ def orders_typed() -> DataFrame:
         .select(
             "order_id", "customer_id", "product_id", "quantity", "status",
             F.col("unit_price").try_cast("decimal(10,2)").alias("unit_price"),
-            F.to_timestamp("order_ts").alias("order_ts"),
+            F.try_to_timestamp("order_ts").alias("order_ts"),
         )
     )
 

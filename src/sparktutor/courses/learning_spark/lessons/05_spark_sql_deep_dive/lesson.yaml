@@ -86,12 +86,12 @@
     mode this has a visible side effect: `SELECT 1/0` fails during
     optimization, before any data is read.
 
-    **Join reordering**: with cost-based optimization enabled
-    (`spark.sql.cbo.enabled`, off by default) and table statistics
-    collected, Catalyst can rearrange multi-way joins to minimize
-    intermediate result sizes.
+    **Join reordering**: with both `spark.sql.cbo.enabled` and
+    `spark.sql.cbo.joinReorder.enabled` set to `true` (both are off by
+    default) and table statistics collected with `ANALYZE TABLE`, Catalyst
+    can rearrange multi-way joins to minimize intermediate result sizes.
 
-    These optimizations happen automatically. You get them for free by using
+    The other optimizations happen automatically. You get them for free by using
     the DataFrame API or SQL.
 
     **Docs:** [Spark SQL Programming Guide](https://spark.apache.org/docs/4.2.0/sql-programming-guide.html) |
@@ -320,11 +320,13 @@
     ```
 
     Available constructs include `IF`/`ELSEIF`/`ELSE`, `CASE`, `WHILE`,
-    `REPEAT`, `LOOP`, `FOR`, `LEAVE`/`ITERATE`, and `DECLARE ... HANDLER`
-    for exceptions. Spark 4.2 adds cursors (SPARK-54759). Scripting is for
-    orchestration glue that belongs next to the data (conditional DDL,
-    small loops over metadata); row-by-row loops over large tables are
-    still a job for set-based SQL.
+    `REPEAT`, `LOOP`, `FOR`, `LEAVE`/`ITERATE`, and `DECLARE EXIT HANDLER`
+    for exceptions (CONTINUE handlers are not enabled in 4.2.0). Cursor
+    support (SPARK-54759) is in the 4.2 codebase but sits behind an
+    internal flag that is off by default, so `DECLARE ... CURSOR` fails on
+    a stock build. Scripting is for orchestration glue that belongs next to
+    the data (conditional DDL, small loops over metadata); row-by-row loops
+    over large tables are still a job for set-based SQL.
 
     **Docs:** [SQL Scripting](https://spark.apache.org/docs/4.2.0/sql-ref-scripting.html)
 

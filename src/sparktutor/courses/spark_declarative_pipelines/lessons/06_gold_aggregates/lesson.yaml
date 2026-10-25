@@ -36,8 +36,8 @@
 - Class: mult_question
   Depth: all
   Output: "Why does the 'cancelled orders do not count' rule live in gold rather than silver?"
-  AnswerChoices: "Cancelled orders are valid events; excluding them is a business decision about revenue;Silver cannot filter rows;Gold tables are streaming tables;Cancelled orders are malformed"
-  CorrectAnswer: "Cancelled orders are valid events; excluding them is a business decision about revenue"
+  AnswerChoices: "Cancelled orders are valid events, and excluding them is a business decision about revenue;Silver cannot filter rows;Gold tables are streaming tables;Cancelled orders are malformed"
+  CorrectAnswer: "Cancelled orders are valid events, and excluding them is a business decision about revenue"
   Hint: "Silver promises clean, valid data, not business interpretations."
 
 - Class: text
@@ -115,16 +115,19 @@
 
     - `name=` gives each dataset a distinct name; the function name is the
       same every iteration.
-    - `category: str = category` binds the *current* value. Without the
-      default argument every function would see the loop variable's final
-      value, because SDP calls the functions after the loop has finished.
+    - `category: str = category` binds the *current* value. Open source
+      Spark 4.2 calls each function immediately, while the decorator
+      registers it, so the loop works even without the default argument.
+      Keep it anyway: environments that call the functions later (such as
+      Databricks) would otherwise give every table the loop variable's
+      final value, because Python closures capture variables, not values.
 
 - Class: mult_question
   Depth: all
-  Output: "Without `category: str = category`, what would every gold_revenue_<category> table contain?"
-  AnswerChoices: "The last category in the list, because the functions run after the loop ends;Each table's own category;Nothing, the pipeline fails to register;All categories combined"
-  CorrectAnswer: "The last category in the list, because the functions run after the loop ends"
-  Hint: "Python closures capture variables, not values."
+  Output: "In an environment that calls dataset functions after the loop ends, what would every gold_revenue_<category> table contain without `category: str = category`?"
+  AnswerChoices: "The last category in the list, because the closure reads the loop variable when it runs;Each table's own category;Nothing, the pipeline fails to register;All categories combined"
+  CorrectAnswer: "The last category in the list, because the closure reads the loop variable when it runs"
+  Hint: "Python closures capture variables, not values. (Open source Spark 4.2 calls the function during the loop, so it happens to work there.)"
 
 - Class: text
   Depth: advanced
@@ -132,8 +135,10 @@
     ## Rules for Loop-Generated Datasets
 
     The SDP guide warns that the list driving the loop must only ever grow.
-    Removing a value removes the dataset from the graph, and you will not
-    get its data back. Generating the list from a query at registration
+    Removing a value removes the dataset from the graph: SDP stops
+    refreshing it (its files stay on disk, going stale), and anything
+    downstream that still reads it fails with `TABLE_OR_VIEW_NOT_FOUND`.
+    Keep the list additive. Generating the list from a query at registration
     time (`collect()` at module scope) works, but it runs on every
     registration and couples your graph's shape to data; prefer a static
     list or configuration.
@@ -141,8 +146,10 @@
     Materialized views are recomputed each run. When a gold table becomes
     expensive, the options are to partition or cluster it
     (`partition_cols` / `cluster_by`), to pre-aggregate in a streaming
-    table, or, in Spark 4.2, to define the aggregate once as a metric view
-    (`CREATE VIEW ... WITH METRICS`) that dashboards query by dimension.
+    table, or, in Spark 4.2, to define a metric view over the gold table
+    (`CREATE VIEW ... WITH METRICS LANGUAGE YAML AS $$ ... $$`, new in
+    4.2) that dashboards query by dimension. Pipeline SQL files cannot
+    declare metric views, so create it outside the pipeline.
 
 - Class: script
   Depth: all

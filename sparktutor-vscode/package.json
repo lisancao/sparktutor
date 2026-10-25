@@ -113,8 +113,8 @@
       "properties": {
         "sparktutor.pythonPath": {
           "type": "string",
-          "default": "python3",
-          "description": "Path to the Python interpreter with sparktutor installed"
+          "default": "",
+          "description": "Path to the Python interpreter with pyspark installed. Leave empty to use .venv in the sparktutor repo or workspace, else python3."
         },
         "sparktutor.projectPath": {
           "type": "string",

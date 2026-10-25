@@ -16,7 +16,7 @@
     By the end of this lesson you will be able to:
 
     - Choose between GEOMETRY (planar) and GEOGRAPHY (on the sphere)
-    - Declare typed columns with an SRID: `GEOGRAPHY(4326)`, `GEOMETRY(ANY)`
+    - Declare typed columns with an SRID: `GEOGRAPHY(4326)`, `GEOMETRY(3857)`
     - Build values from WKB in SQL and from Python objects
     - Round-trip geo columns through Parquet
     - Work within what 4.2 does and does not yet provide
@@ -77,8 +77,14 @@
 
     ```sql
     CREATE TABLE places (id INT, loc GEOGRAPHY(4326)) USING parquet;
-    CREATE TABLE shapes (id INT, g GEOMETRY(ANY)) USING parquet;  -- mixed SRIDs
+    CREATE TABLE tiles (id INT, g GEOMETRY(3857)) USING parquet;
     ```
+
+    `GEOMETRY(ANY)` is a valid type for expressions that mix SRIDs (a
+    `UNION` of SRID 4326 and 3857 values has type `geometry(any)`), but in
+    4.2.0 a Parquet table column cannot store it; `CREATE TABLE` fails with
+    `UNSUPPORTED_DATA_TYPE_FOR_DATASOURCE`. The same goes for
+    `GEOGRAPHY(ANY)`. Give each table column a fixed SRID.
 
     The ST functions in 4.2:
 
@@ -153,7 +159,7 @@
     - **SRID mismatch on write.** Inserting a `GEOMETRY(0)` into a
       `GEOMETRY(4326)` column fails with
       `INCOMPATIBLE_DATA_FOR_TABLE.CANNOT_SAFELY_CAST`. Use `ST_SetSrid` to
-      label the value, or declare the column `GEOMETRY(ANY)`.
+      label the value.
     - **Invalid SRID for the type.** `ST_SetSrid(geog, 3857)` fails with
       `ST_INVALID_SRID_VALUE`: 3857 is projected, not geographic.
     - **No comparisons.** `g1 = g2` and `ORDER BY g` fail at analysis with
@@ -204,7 +210,8 @@
     tables, schemas and files, and other Parquet readers that understand
     the logical types see them as geo data.
 
-    The SRID registry ships with PySpark (`pyspark/sql/srs_registry.csv`,
+    The SRID registry ships inside Spark's SQL API jar
+    (`org/apache/spark/sql/srs_registry.csv` in `spark-sql-api_*.jar`,
     generated from the PROJ database), so the type system can validate that
     an SRID is real, and geographic where GEOGRAPHY requires it.
 
@@ -238,8 +245,8 @@
     ## Summary
 
     - **GEOMETRY and GEOGRAPHY (on by default in 4.2)** are native types with
-      the SRID in the type: `GEOGRAPHY(4326)`, `GEOMETRY(3857)`,
-      `GEOMETRY(ANY)`.
+      the SRID in the type: `GEOGRAPHY(4326)`, `GEOMETRY(3857)`;
+      `GEOMETRY(ANY)` exists for expressions but not Parquet columns.
     - Values are **WKB**, x before y (longitude first).
     - 4.2's functions convert and label (`ST_GeomFromWKB`, `ST_GeogFromWKB`,
       `ST_AsBinary`, `ST_Srid`, `ST_SetSrid`); measurement is not there yet.

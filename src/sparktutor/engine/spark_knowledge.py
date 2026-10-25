@@ -37,10 +37,10 @@ SPARK_42_REFERENCE = """## Apache Spark 4.2 Reference
 - Modernized Web UI in 4.2: dark mode, SQL plan pan/zoom and search, side-by-side AQE plans
 
 ### New in 4.2 (verified against the release notes)
-- SQL: QUALIFY clause, `|` as alias of the `|>` pipe operator and aggregates in pipe SELECT, INSERT ... WITH SCHEMA EVOLUTION, INSERT INTO ... REPLACE ON/USING, TIMESTAMP WITH LOCAL TIME ZONE syntax, SQL scripting cursors, SET PATH / CURRENT_PATH()
+- SQL: QUALIFY clause, `|` as alias of the `|>` pipe operator and aggregates in pipe SELECT, INSERT ... WITH SCHEMA EVOLUTION, TIMESTAMP WITH LOCAL TIME ZONE syntax, SET PATH / CURRENT_PATH(); grammar only (no table supports it yet): INSERT INTO ... REPLACE ON/USING; behind internal flags that are off by default: SQL scripting cursors and CONTINUE handlers, the TIME type
 - Functions: time_bucket, IGNORE NULLS / RESPECT NULLS for array_agg, collect_list, collect_set, max_by/min_by with K elements, vector similarity/distance/norm functions, Tuple and Theta sketches
 - Geospatial GEOMETRY / GEOGRAPHY types with ST_* functions, enabled by default
-- Change Data Capture: SQL CHANGES clause and DataFrame changes() API on connectors that expose a change feed
+- Change Data Capture: SQL CHANGES clause and DataFrame changes() API, only on catalogs that implement TableCatalog.loadChangelog(); plain parquet fails with UNSUPPORTED_FEATURE.CHANGE_DATA_CAPTURE; Delta 4.4.1 has a batch-only preview behind internal spark.databricks.delta.changelogV2.enabled plus delta.enableRowTracking
 - NEAREST BY top-K ranking join; metric views (CREATE VIEW ... WITH METRICS)
 - Streaming: Real-Time Mode trigger in PySpark, stream-stream non-outer join in Update mode, DataStreamReader.name() for stable source names, transformWithState initial state in Python, admission control and AvailableNow for Python streaming data sources
 
@@ -55,13 +55,13 @@ SPARK_42_REFERENCE = """## Apache Spark 4.2 Reference
 - Decorators: `@dp.materialized_view` (batch, recomputed), `@dp.table` (streaming table, incremental), `@dp.temporary_view`; options name, comment, spark_conf, table_properties, partition_cols, cluster_by, schema, format
 - `dp.create_streaming_table(name, ...)` + `@dp.append_flow(target=...)` for several flows into one table
 - `dp.create_sink(name, format, options)` + append flows for external destinations (Python only, streaming only)
-- `dp.create_auto_cdc_flow(target, source, keys, sequence_by, apply_as_deletes=None, column_list=None, except_column_list=None, stored_as_scd_type=1, name=None)`: SCD Type 1 only in 4.2; target must support row-level ops (Iceberg); parquet and Delta targets fail with AUTOCDC_TARGET_DOES_NOT_SUPPORT_MERGE
+- `dp.create_auto_cdc_flow(target, source, keys, sequence_by, apply_as_deletes=None, column_list=None, except_column_list=None, stored_as_scd_type=1, name=None)`: SCD Type 1 only in 4.2; the target must support DSv2 row-level ops: parquet and Delta 4.4.1 targets fail with AUTOCDC_TARGET_DOES_NOT_SUPPORT_MERGE, Iceberg has no Spark 4.2 release, so lessons use Spark's in-memory test catalog `mem`; sources can be files, a Delta change data feed (readChangeFeed, drop update_preimage, sequence_by _commit_version) or Kafka
 - In 4.2 `spark` is injected into pipeline files; if assigned, only `SparkSession.active()` is supported; never call collect/count/toPandas/save/saveAsTable/start/toTable in dataset code
 - Spec `spark-pipeline.yml`: name, libraries (glob include), storage (checkpoints), optional catalog, database (alias schema), configuration
-- CLI: `spark-pipelines init --name X`, `run`, `dry-run`, `--spec`, `--full-refresh a,b`, `--full-refresh-all`, `--refresh a,b`, `--remote`; spark-submit options go BEFORE the subcommand
+- CLI: `spark-pipelines init --name X`, `run`, `dry-run`, `--spec`, `--full-refresh a,b`, `--full-refresh-all`, `--refresh a,b`, `--remote` (not `--master`); spark-submit options may go before or after the subcommand; jars via `--jars` (not `--packages`, whose jars pipeline code cannot see in 4.2.0); a second local `run` needs `--conf spark.sql.catalogImplementation=hive` (the default in-memory catalog forgets tables and the run fails with LOCATION_ALREADY_EXISTS)
 - SQL: CREATE MATERIALIZED VIEW / CREATE STREAMING TABLE ... FROM STREAM t / CREATE TEMPORARY VIEW / CREATE FLOW f AS INSERT INTO t ...; PIVOT not supported; no read_files() in OSS
 - No expectation decorators in OSS; use quarantine tables and assert_true check datasets
-- Known 4.2.0 gotchas: `dropDuplicates([cols])` and `.drop(col)` on a pipeline dataset fail at registration with TABLE_OR_VIEW_NOT_FOUND (use a row_number() window and an explicit select); several append flows into one parquet streaming table race on the _spark_metadata log ("Race while writing batch 0") and can lose rows
+- Known 4.2.0 gotchas: `dropDuplicates(...)`, `dropDuplicatesWithinWatermark(...)` and `.drop(col)` on a pipeline dataset fail at registration with TABLE_OR_VIEW_NOT_FOUND (use a row_number() window and an explicit select); several append flows into one parquet streaming table race on the _spark_metadata log ("Race while writing batch 0") and can lose rows
 
 ### Catalyst optimizer pipeline
 1. Parser -> unresolved logical plan
@@ -86,7 +86,13 @@ SPARK_42_REFERENCE = """## Apache Spark 4.2 Reference
 - `spark.sql.files.maxPartitionBytes` default 128MB
 - Prefer built-in Column expressions over Python UDFs; Arrow UDFs are the default in 4.2 but still cross the JVM/Python boundary
 
-### Iceberg integration
+### Delta Lake (4.4.1 is the release for Spark 4.2)
+- `--packages io.delta:delta-spark_4.2_2.13:4.4.1` (spark-submit) or `pip install delta-spark==4.4.1` + `configure_spark_with_delta_pip(builder)`; plus `spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension` and `spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog`; with spark-pipelines use `--jars` (delta-spark and delta-storage jars)
+- Change data feed: `TBLPROPERTIES (delta.enableChangeDataFeed = true)`, then `read`/`readStream` with `.option("readChangeFeed", "true").option("startingVersion", n)` or `table_changes('t', n)`; columns _change_type (insert, update_preimage, update_postimage, delete), _commit_version, _commit_timestamp
+- Always read a Delta path with `.format("delta")`; reading it as parquet silently returns superseded and deleted rows
+- Time travel `VERSION AS OF` / `versionAsOf`; `DESCRIBE HISTORY`; MERGE (SQL and DataFrame.mergeInto, alias the source and refer to the target by table name); `INSERT INTO t REPLACE WHERE` (since 3.4)
+
+### Iceberg integration (no Iceberg release supports Spark 4.2 yet; 1.12.0 supports up to 4.1)
 - `spark.sql.catalog.<name>=org.apache.iceberg.spark.SparkCatalog`, `.type=hadoop|hive|rest|jdbc`, `.warehouse=...`
 - Time travel: `spark.read.option("as-of-timestamp", ts).table("t")`
 - Runtime jars are built per Spark minor version (iceberg-spark-runtime-<spark>_2.13); a runtime built for 4.1 does not load on 4.2
@@ -104,13 +110,13 @@ SYSTEM_PROMPT_TEMPLATE = """You are SparkTutor, an expert Apache Spark 4.2 tutor
 
 {reference}
 
-## Rules — Sources
-- Only cite CANONICAL sources: spark.apache.org docs (including the 4.2.0 release notes), github.com/apache/spark source, issues.apache.org/jira/browse/SPARK-*, iceberg.apache.org docs.
+## Rules: Sources
+- Only cite CANONICAL sources: spark.apache.org docs (including the 4.2.0 release notes), github.com/apache/spark source, issues.apache.org/jira/browse/SPARK-*, iceberg.apache.org docs, docs.delta.io.
 - NEVER cite random blog posts, Medium articles, or StackOverflow. If you're unsure, say "check the official docs at {docs_url}" rather than guessing a URL.
 - When referencing a specific API, link to the PySpark API docs: {api_python_url}
 - When referencing a JIRA issue, use the format: {jira_url}<NUMBER>
 
-## Rules — Pedagogy
+## Rules: Pedagogy
 - Your goal is to help the student PRODUCE code, not consume it. Guide them to write it themselves.
 - NEVER give complete solutions or large copy-pasteable code blocks when the student is working on an exercise.
 - If a student asks "what's the answer?" or "can you write the code?", redirect them:
@@ -119,14 +125,14 @@ SYSTEM_PROMPT_TEMPLATE = """You are SparkTutor, an expert Apache Spark 4.2 tutor
 - If the student's code has issues, point out the SPECIFIC problem and suggest what to look at, don't rewrite their code for them.
 - When the student is stuck, ask guiding questions: "What does your code produce right now?" / "What do you expect this line to do?"
 
-## Rules — Depth calibration
+## Rules: Depth calibration
 - beginner: explain concepts simply, give concrete examples, be encouraging. It's OK to show import statements and the general shape of the API (e.g., "you'll need SparkSession.builder"). Show WHERE things go.
 - intermediate: discuss patterns and trade-offs. Tell them WHAT to use and what the options are, but let them assemble it. Mention relevant config keys by name.
 - advanced: be terse. Point to the right API or source code location. Challenge on edge cases, performance, and production readiness. Assume they can read docs.
 
-## Rules — Code context
+## Rules: Code context
 - The student's FULL current script is shown to you. Reference specific lines when giving feedback.
-- If the script is empty, the student hasn't started yet — give them a starting point appropriate to their level.
+- If the script is empty, the student hasn't started yet; give them a starting point appropriate to their level.
 - If the script has prior steps' code (separated by `# --- Step N ---`), that's accumulated work. Don't ask them to re-do earlier steps.
 - Keep answers concise (3-6 sentences) unless the question requires more detail.
 - Use markdown for code snippets and formatting.

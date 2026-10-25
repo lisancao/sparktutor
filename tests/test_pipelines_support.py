@@ -7,11 +7,16 @@ import pytest
 
 from sparktutor.engine.evaluator import Evaluator
 from sparktutor.engine.executor import (
+    CONNECTORS,
     ExecMode,
     ExecResult,
     Executor,
+    connector_args,
+    fetch_jars,
     is_pipeline_source,
     pipeline_command,
+    requested_connectors,
+    spark_env,
     write_pipeline_project,
 )
 from sparktutor.engine.feedback import parse_stderr
@@ -61,6 +66,44 @@ class TestPipelineProject:
     def test_custom_storage_root(self, tmp_path):
         spec = write_pipeline_project(SDP_CODE, tmp_path, storage_root="file:///tmp/remote/storage")
         assert "storage: file:///tmp/remote/storage" in spec.read_text()
+
+
+class TestConnectors:
+    def test_directive_parsing(self):
+        code = "# spark-connectors: delta, kafka\n# spark-connectors: delta test-catalog\nx = 1\n"
+        assert requested_connectors(code) == ["delta", "kafka", "test-catalog"]
+
+    def test_no_directive(self):
+        assert requested_connectors(SDP_CODE) == []
+
+    def test_args_use_jars_not_packages(self):
+        args = connector_args(["delta"], ["/j/a.jar", "/j/b.jar"], in_pipeline=False)
+        assert args[:2] == ["--jars", "/j/a.jar,/j/b.jar"]
+        assert "--packages" not in args
+        assert "spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension" in args
+
+    def test_session_conf_goes_to_spec_for_pipelines(self, tmp_path):
+        code = "# spark-connectors: test-catalog\n" + SDP_CODE
+        assert "--conf" not in connector_args(["test-catalog"], ["/j/t.jar"], in_pipeline=True)
+        assert any("spark.sql.catalog.mem=" in a
+                   for a in connector_args(["test-catalog"], ["/j/t.jar"], in_pipeline=False))
+        spec = write_pipeline_project(code, tmp_path).read_text()
+        assert "spark.sql.catalog.mem:" in spec
+
+    def test_fetch_uses_cache(self, tmp_path):
+        for maven_path in CONNECTORS["kafka"].jars:
+            (tmp_path / maven_path.rsplit("/", 1)[1]).write_text("cached")
+        jars = fetch_jars(["kafka"], tmp_path)
+        assert len(jars) == len(CONNECTORS["kafka"].jars)
+        assert all(j.read_text() == "cached" for j in jars)
+
+    def test_unknown_connector(self, tmp_path):
+        with pytest.raises(ValueError, match="Unknown connector 'iceberg'"):
+            fetch_jars(["iceberg"], tmp_path)
+
+    def test_launchers_use_this_interpreter(self, monkeypatch):
+        monkeypatch.delenv("PYSPARK_PYTHON", raising=False)
+        assert spark_env()["PYSPARK_PYTHON"] == sys.executable
 
 
 class TestExecutionValidation:

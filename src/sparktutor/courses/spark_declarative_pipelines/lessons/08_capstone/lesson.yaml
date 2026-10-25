@@ -48,8 +48,25 @@
     ```
 
     For Kafka, use `format="kafka"` with `kafka.bootstrap.servers` and
-    `topic` options, and produce `key`/`value` columns (for example
-    `to_json(struct("*"))` as the value).
+    `topic` options, and produce a string or binary `value` column (and
+    optionally `key`), for example `to_json(struct("*"))` as the value:
+
+    ```python
+    dp.create_sink(
+        name="shipping_topic",
+        format="kafka",
+        options={"kafka.bootstrap.servers": "localhost:9092", "topic": "shipping"},
+    )
+
+    @dp.append_flow(target="shipping_topic")
+    def shipped_orders_to_kafka():
+        return (spark.readStream.table("bronze_orders")
+                .where("status = 'shipped'")
+                .select(F.col("order_id").alias("key"),
+                        F.to_json(F.struct("*")).alias("value")))
+    ```
+
+    The Kafka sink needs the same jars as the Kafka source (lesson 4).
 
     A full refresh resets a sink flow's checkpoint but cannot un-send what
     was already delivered: downstream consumers must tolerate replays.
@@ -107,10 +124,21 @@
     # replace the example files with retail.py and copy data/ next to the spec
     cd retail
     spark-pipelines dry-run
-    spark-pipelines run
-    spark-pipelines run                         # second run: no new files, bronze appends nothing
-    spark-pipelines run --full-refresh-all      # rebuild everything from the raw files
+    spark-pipelines --conf spark.sql.catalogImplementation=hive run
+    # second run: no new files, so bronze appends nothing
+    spark-pipelines --conf spark.sql.catalogImplementation=hive run
+    # rebuild everything from the raw files
+    spark-pipelines --conf spark.sql.catalogImplementation=hive run --full-refresh-all
     ```
+
+    The `--conf` setting matters once you run more than once. With a pip
+    install the local server otherwise uses an in-memory catalog that
+    forgets the tables after each run while their files stay in
+    `spark-warehouse/`, so the second run fails with
+    `LOCATION_ALREADY_EXISTS`. With it, the catalog lives in a local Derby
+    database (`metastore_db/` and `derby.log` in the project directory).
+    Start from a fresh project; if you already ran it without the flag,
+    delete `spark-warehouse/` and the `storage` directory first.
 
     Add a new file to `data/orders/` between runs and watch only that file
     flow through bronze, while every materialized view recomputes.
@@ -120,12 +148,17 @@
   Output: |
     ## Taking It to Production
 
-    - **Catalog**: set `catalog`/`database` in the spec and configure an
-      Iceberg catalog in `configuration`, so tables are transactional and
-      visible to other engines. This is also what lets lesson 7's Auto CDC
-      flows run.
-    - **Cluster**: `spark-pipelines --master spark://host:7077 run` or
-      `--remote sc://host:15002`; spark-submit options before `run`.
+    - **Catalog**: set `catalog`/`database` in the spec and use a
+      transactional table format, configured in `configuration`. For
+      Spark 4.2 that is Delta Lake 4.4.1; there is no Iceberg release for
+      Spark 4.2 yet. Auto CDC flows need a catalog that supports them;
+      lesson 7 shows them against Spark's in-memory test catalog.
+    - **Cluster**: `--master` is rejected, because the CLI always talks to
+      a Spark Connect server. Start a Connect server on the cluster (with a
+      full Spark download: `sbin/start-connect-server.sh --master
+      spark://host:7077`) and point the CLI at it with
+      `spark-pipelines --remote sc://host:15002 run`. Other spark-submit
+      options can go before or after `run`.
     - **Scheduling**: a pipeline run is a batch job with available-now
       streaming semantics, so any scheduler (Airflow, cron, Kubernetes
       CronJob) can trigger `spark-pipelines run`.

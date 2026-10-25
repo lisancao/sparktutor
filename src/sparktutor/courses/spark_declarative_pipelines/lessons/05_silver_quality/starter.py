@@ -49,7 +49,7 @@ def silver_customers() -> DataFrame:
 # TODO: @dp.temporary_view
 def orders_typed() -> DataFrame:
     # TODO: one row per order_id (latest _ingested_at wins) using row_number() over a window,
-    #       unit_price via try_cast to DECIMAL(10,2), order_ts via to_timestamp.
+    #       unit_price via try_cast to DECIMAL(10,2), order_ts via try_to_timestamp.
     #       Use an explicit select, not .drop() or .dropDuplicates([...]).
     pass
 

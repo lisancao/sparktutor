@@ -213,9 +213,11 @@
 
     Gotchas: parameters are not constants, so `LIMIT n` with a parameter
     fails (`INVALID_LIMIT_LIKE_EXPRESSION.IS_UNFOLDABLE`); filter with
-    `WHERE` instead. And you cannot shadow a built-in name: creating a SQL
-    function called `upper` fails with
-    `CANNOT_REPLACE_NON_SQL_UDF_WITH_SQL_UDF`.
+    `WHERE` instead. And you cannot shadow a built-in name.
+    `CREATE OR REPLACE TEMPORARY FUNCTION upper ...` fails with
+    `USER_DEFINED_FUNCTIONS.CANNOT_REPLACE_NON_SQL_UDF_WITH_SQL_UDF`.
+    A plain `CREATE [TEMPORARY] FUNCTION upper ...` succeeds, but an unqualified
+    `upper(...)` never calls it, because `system.builtin` is searched first.
 
     **Docs:** [CREATE FUNCTION (SQL)](https://spark.apache.org/docs/4.2.0/sql-ref-syntax-ddl-create-sql-function.html)
 
@@ -255,7 +257,10 @@
     ```
 
     Fetching past the end raises `CURSOR_NO_MORE_ROWS` (SQLSTATE `02000`),
-    which the `NOT FOUND` handler turns into `done = true`.
+    which the `NOT FOUND` handler turns into `done = true`. Without a
+    handler, that `FETCH` is a silent no-op (`02xxx` is a no-data
+    condition, not an error), so `done` never flips and the loop never
+    ends. Always declare a `NOT FOUND` handler.
 
     In 4.2.0 cursors ship disabled. Both of these internal flags must be on,
     otherwise you get `UNSUPPORTED_FEATURE.SQL_CURSOR` or

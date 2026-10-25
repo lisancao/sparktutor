@@ -21,8 +21,10 @@
     One honest caveat up front: CDC is an **API and a connector contract**.
     The tables Spark ships with (the built-in session catalog) do not
     produce changelogs, so you cannot run `CHANGES` against a local Parquet
-    table. This lesson shows the exact error, teaches the contract, and
-    builds a runnable approximation with the same output shape.
+    table, and table formats are only starting to implement it (Delta Lake
+    4.4.1 has an off-by-default preview). This lesson shows the exact
+    error, teaches the contract, shows where Delta stands, and builds a
+    runnable approximation with the same output shape.
 
 - Class: text
   Depth: beginner
@@ -32,10 +34,11 @@
     feed of changes: this row was inserted, that one deleted, this one
     updated from 100 to 90.
 
-    Every incremental pipeline needs this, and before 4.2 each table format
-    had its own way to ask (Delta's `table_changes`, Iceberg's changelog
-    views). 4.2 gives Spark one standard way to ask, and each table format
-    plugs into it.
+    Every incremental pipeline needs this. Each table format has its own
+    way to ask (Delta's change data feed, read with `readChangeFeed` or
+    `table_changes`; Iceberg's changelog views), and those remain the way
+    to do it today. 4.2 gives Spark one standard way to ask, which each
+    table format can plug into.
 
 - Class: text
   Depth: all
@@ -88,6 +91,28 @@
     (a table format's catalog) supplies the raw changes through the
     `Changelog` interface. In the Spark source tree, the only implementation
     is the test-only `InMemoryChangelogCatalog`.
+
+    **Delta Lake 4.4.1** (the Delta release for Spark 4.2) ships an early
+    implementation that is off by default. With the Delta jars loaded,
+    `CHANGES` on a Delta table still fails with the same
+    `UNSUPPORTED_FEATURE.CHANGE_DATA_CAPTURE` until you set the internal
+    flag `spark.databricks.delta.changelogV2.enabled=true`; then it also
+    requires `TBLPROPERTIES (delta.enableRowTracking = true)` on the table
+    (otherwise `DELTA_CHANGELOG_REQUIRES_ROW_TRACKING`). With both, batch
+    reads work, updates come back as a `delete` plus an `insert` unless you
+    add `'computeUpdates' = 'true'`, and `netChanges` collapses them. A
+    streaming `readStream.changes()` fails with
+    `DATA_SOURCE_MICRO_BATCH_SCAN_NOT_SUPPORTED`. For real work on Delta,
+    use its change data feed:
+
+    ```python
+    spark.read.option("readChangeFeed", "true").option("startingVersion", 1).table("inventory")
+    ```
+
+    It works in batch and streaming on a table created with
+    `TBLPROPERTIES (delta.enableChangeDataFeed = true)`, with the same
+    `_change_type`, `_commit_version` and `_commit_timestamp` columns
+    (updates as `update_preimage` / `update_postimage`).
 
     The exercise catches this error by condition, then builds the same
     changelog shape by diffing two snapshots, which is what you would do
@@ -151,9 +176,9 @@
     - `k` is 1 to 100000, default 1.
     - Only `INNER` (default) and `LEFT OUTER` are allowed; `FULL OUTER`
       fails with `NEAREST_BY_JOIN.UNSUPPORTED_JOIN_TYPE`.
-    - `EXACT` forces brute force and requires a deterministic expression;
-      `APPROX` allows index-backed strategies, which are planned but not
-      implemented yet, so today both evaluate the full cross product.
+    - `EXACT` forces brute force; `APPROX` allows index-backed strategies,
+      which are planned but not implemented yet, so today both evaluate
+      the full cross product.
 
     The DataFrame API is `nearestByJoin`:
 
@@ -275,11 +300,12 @@
 
     - **Always wrap measures in `measure()`.** `SELECT total_qty FROM
       order_metrics` without `measure()` fails with an `INTERNAL_ERROR` at
-      planning in 4.2.0, not a friendly message.
+      planning in 4.2.0, not a friendly message. With a `GROUP BY`, the
+      same mistake gives `MISSING_AGGREGATION` instead.
     - **Persistent only.** `CREATE TEMP VIEW ... WITH METRICS` is a parse
-      error. You need a catalog: the local session catalog works (the view
-      lives in the warehouse directory), and 4.2 also supports metric views
-      on DSv2 catalogs.
+      error. A plain pip `pyspark` session defaults to the in-memory
+      catalog, so the view works but lasts only for that session; use a
+      Hive metastore or a DSv2 catalog to keep it.
     - **`DESCRIBE TABLE EXTENDED`** shows `Type: METRIC_VIEW`, the YAML text,
       and the source and filter as table properties.
     - Dimensions can be expressions (`upper(region)`), and `WHERE` on a
@@ -317,7 +343,9 @@
     - **CDC (4.2):** `CHANGES FROM VERSION ...` and `read.changes()` return
       rows with `_change_type`, `_commit_version`, `_commit_timestamp`. It
       needs a connector whose catalog implements `loadChangelog()`; the
-      built-in catalog raises `UNSUPPORTED_FEATURE.CHANGE_DATA_CAPTURE`.
+      built-in catalog raises `UNSUPPORTED_FEATURE.CHANGE_DATA_CAPTURE`,
+      and Delta 4.4.1 only has an off-by-default batch preview, so use
+      Delta's `readChangeFeed` for now.
     - **NEAREST BY (4.2):** a top-K join with `DISTANCE` or `SIMILARITY`,
       brute force today, `INNER` or `LEFT OUTER` only.
     - **time_bucket (4.2):** arbitrary fixed-size buckets with an origin.

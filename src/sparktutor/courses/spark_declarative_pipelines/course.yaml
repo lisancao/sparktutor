@@ -8,7 +8,7 @@ course:
     - "Python 3.10+"
     - "Java 17+ (Java 21 or 25 also work)"
     - 'pip install "pyspark[pipelines]==4.2.0" "pandas<3"'
-    - "Lakehouse Stack mode (optional): an Iceberg catalog, needed to run Auto CDC flows for real"
+    - "Internet access the first time a lesson uses Kafka or Spark's test catalog: SparkTutor downloads those jars from Maven Central once"
   lessons:
     - 01_why_declarative
     - 02_datasets_and_flows

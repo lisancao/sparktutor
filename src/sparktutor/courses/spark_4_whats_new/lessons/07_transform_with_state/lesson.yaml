@@ -134,7 +134,10 @@
       `UNSUPPORTED_FEATURE.STORE_BACKEND_NOT_SUPPORTED_FOR_TWS`. Set
       `spark.sql.streaming.stateStore.providerClass` to
       `org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider`
-      when you build the session.
+      when you build the session. Note that `start()` returns normally; the
+      error arrives from `awaitTermination()` or `processAllAvailable()` as
+      a `StreamingQueryException` whose `getCondition()` is
+      `STREAM_FAILED`, with the specific condition in the message.
     - **Output mode** is passed to `transformWithState` *and* set on the
       writer; keep them consistent (`Update` or `Append`).
     - **The memory sink appends** every emitted row even in update mode, so
@@ -145,7 +148,7 @@
 
 - Class: mult_question
   Depth: intermediate
-  Output: "A transformWithState query fails at start with STORE_BACKEND_NOT_SUPPORTED_FOR_TWS. What is the fix?"
+  Output: "A transformWithState query fails (STREAM_FAILED, from awaitTermination) with STORE_BACKEND_NOT_SUPPORTED_FOR_TWS in the message. What is the fix?"
   AnswerChoices: "Set spark.sql.streaming.stateStore.providerClass to the RocksDB provider;Switch outputMode to Complete;Use transformWithStateInPandas instead;Delete the checkpoint"
   CorrectAnswer: "Set spark.sql.streaming.stateStore.providerClass to the RocksDB provider"
   Hint: "The error names the backend that is not supported."
@@ -217,11 +220,15 @@
     The duration is how long each long-running batch lasts (minimum
     `spark.sql.streaming.realTimeMode.minBatchDuration`, default 5 seconds).
     RTM is narrow on purpose: in 4.2 the source must support it (Kafka),
-    sinks are limited to an allowlist (console, foreach, Kafka and a
-    memory sink), and the output mode must be `update`. Anything
-    else fails at start-up, for example
-    `STREAMING_REAL_TIME_MODE.INPUT_STREAM_NOT_SUPPORTED` for the rate
-    source.
+    sinks are limited to an allowlist (console, foreach and Kafka, plus an
+    internal continuous memory sink), and the output mode must be
+    `update`. The regular `format("memory")` sink is rejected by `start()`
+    with `STREAMING_REAL_TIME_MODE.OPERATOR_OR_SINK_NOT_IN_ALLOWLIST`. An
+    unsupported source is caught later: `start()` returns, and
+    `awaitTermination()` or `processAllAvailable()` raises a
+    `StreamingQueryException` with condition `STREAM_FAILED` whose message
+    names `STREAMING_REAL_TIME_MODE.INPUT_STREAM_NOT_SUPPORTED` (for the
+    rate source, for example).
 
     **Named sources** make checkpoints survive query edits. Positional
     source identity is why adding a second source to a query used to break

@@ -86,6 +86,12 @@
     rate = spark.readStream.format("rate").option("rowsPerSecond", 10).load()
     ```
 
+    To try the Kafka source, add the connector when you launch, with
+    `spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.13:4.2.0 app.py`
+    (it pulls in the Kafka client libraries too), and run a broker, for
+    example `docker run -d --name kafka -p 9092:9092 apache/kafka:3.9.1`,
+    which listens at `localhost:9092`.
+
     **Important**: file sources **require** an explicit schema by default.
     Inference would need the whole (unbounded) dataset, so it is off unless
     you set `spark.sql.streaming.schemaInference`.
@@ -227,18 +233,28 @@
     boundary:
 
     ```python
+    kafka_df = (spark.readStream
+        .format("kafka")
+        .option("kafka.bootstrap.servers", "localhost:9092")
+        .option("subscribe", "events")
+        .load())
+
     query = (kafka_df
-        .selectExpr("CAST(key AS STRING) AS k", "CAST(value AS STRING) AS v")
-        .where("v IS NOT NULL")
+        .selectExpr("CAST(key AS STRING) AS key", "CAST(value AS STRING) AS value")
+        .where("value IS NOT NULL")
         .writeStream
         .format("kafka")
-        .option("kafka.bootstrap.servers", "broker:9092")
+        .option("kafka.bootstrap.servers", "localhost:9092")
         .option("topic", "clean-events")
         .option("checkpointLocation", "/checkpoints/rtm")
         .outputMode("update")
         .trigger(realTime="5 seconds")
         .start())
     ```
+
+    The Kafka sink writes the column named `value` (and `key`, if present),
+    so the names matter. Running this needs the Kafka connector package and
+    a broker, set up as in "Reading a Stream" above.
 
     The constraints in 4.2.0, from the source:
 
@@ -263,6 +279,7 @@
     Group events into time-based windows:
 
     ```python
+    from pyspark.sql import functions as f
     from pyspark.sql.functions import window
 
     # Tumbling windows (non-overlapping, 10-minute buckets)
@@ -370,8 +387,9 @@
     ```
 
     Spark 4.2 adds `update` output mode for non-outer stream-stream joins
-    (SPARK-56384) and integrates a new state format for stream-stream
-    joins (V4, SPARK-55628).
+    (SPARK-56384) and lays groundwork for a new join state format (V4,
+    SPARK-55628). That format is still under development and for testing
+    only in 4.2.0; the default stays version 2.
 
 - Class: text
   Depth: advanced
@@ -380,8 +398,9 @@
 
     Built-in aggregations cover counts and sums. For anything else (alerts,
     sessionization with custom rules, deduplication with expiry) you write
-    a **stateful processor**. `transformWithState` replaces the older
-    `applyInPandasWithState` / `flatMapGroupsWithState` APIs. In Python
+    a **stateful processor**. `transformWithState` is the newer, more
+    capable successor to the `applyInPandasWithState` /
+    `flatMapGroupsWithState` APIs (which still work). In Python
     there are two flavours: `transformWithStateInPandas` (4.0, pandas
     DataFrames in and out) and `transformWithState` (4.1, `Row` objects in
     and out).
@@ -466,6 +485,10 @@
 
     You can inspect a checkpoint's state as a table with the state data
     source: `spark.read.format("statestore").load("/checkpoints/my_query")`.
+    This only works for a query with a stateful operator (on a stateless
+    checkpoint it fails with `STDS_FAILED_TO_READ_STATE_SCHEMA`). For
+    `transformWithState`, also pass `.option("stateVarName", "<name>")` to
+    pick which state variable to read.
 
 - Class: text
   Depth: advanced
@@ -486,8 +509,10 @@
     The SQL form is `IDENTIFIED BY`. Two caveats from the 4.2.0 source:
     the API is marked experimental, and it only works with the
     `enableSourceEvolution` config switched on (an internal flag, off by
-    default). Without the flag, `.name()` fails with
-    `SOURCE_NAMING_NOT_SUPPORTED`; with it, *every* source in the query
+    default). Without the flag, a named source fails at `.load()` (or, in
+    SQL, at `IDENTIFIED BY`) with
+    `STREAMING_QUERY_EVOLUTION_ERROR.SOURCE_NAMING_NOT_SUPPORTED`; with it,
+    *every* source in the query
     must be named. Names may contain only ASCII letters, digits, and
     underscores. Treat it as something to try on new queries, not to
     retrofit onto production ones yet.

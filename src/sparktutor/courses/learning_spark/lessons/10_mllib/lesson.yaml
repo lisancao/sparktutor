@@ -184,9 +184,11 @@
 
     For classification, swap to `LogisticRegression`,
     `RandomForestClassifier`, `GBTClassifier`, etc. Same API, same Pipeline.
-    Tree ensembles expose `featureImportances`, a vector aligned with the
-    assembler's `inputCols`, which is the first thing to check when a model
-    behaves oddly.
+    Tree ensembles expose `featureImportances`, a vector with one entry per
+    slot of the assembled `features` vector. It lines up with the
+    assembler's `inputCols` only when every input is a single numeric
+    column (a one-hot vector expands to several slots). It is the first
+    thing to check when a model behaves oddly.
 
 - Class: text
   Depth: all

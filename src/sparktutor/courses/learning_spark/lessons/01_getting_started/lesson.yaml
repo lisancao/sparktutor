@@ -111,15 +111,22 @@
       (`toPandas`, `createDataFrame` from pandas) and Arrow-optimized Python
       UDFs are on by default (SPARK-54555).
 
-    Install the version this course targets:
+    Install the version this course targets. First install a JDK (Java 17
+    or 21, for example Eclipse Temurin) and check that `java -version` works
+    or that `JAVA_HOME` is set. Then install PySpark in a virtual
+    environment, since many systems block global `pip` installs:
 
     ```bash
+    python3 -m venv .venv
+    source .venv/bin/activate
     pip install "pyspark[connect]==4.2.0"
     ```
 
+    The `pyspark` package bundles the Spark jars and runs them on that JDK.
     The `connect` extra pulls in the gRPC, pandas, and PyArrow dependencies
-    Spark Connect needs. For a pure client with no bundled JVM, there is a
-    separate `pyspark-client` package.
+    Spark Connect needs. The separate `pyspark-client` package is a
+    Connect-only client that needs no Java; use it when you only talk to a
+    remote Spark Connect server.
 
     **Docs:** [Spark 4.2.0 overview](https://spark.apache.org/docs/4.2.0/) |
     [ANSI compliance](https://spark.apache.org/docs/4.2.0/sql-ref-ansi-compliance.html)
@@ -241,8 +248,8 @@
     **Lazy Evaluation:**
     Transformations build up a logical plan. Only actions trigger execution.
     This lets Spark's Catalyst optimizer analyze the entire pipeline and
-    rewrite it before generating code; predicate pushdown, column pruning,
-    and join reordering all happen transparently.
+    rewrite it before generating code; predicate pushdown and column
+    pruning both happen transparently.
 
     With Adaptive Query Execution (on by default since 3.2), planning does
     not stop when the job starts. At each shuffle boundary Spark looks at the
@@ -384,9 +391,11 @@
   Output: |
     ## Why inferSchema Costs You
 
-    When you set `inferSchema=true` on CSV or JSON, Spark makes an extra
-    pass over the data to infer types before it actually loads it. For large
-    files that pass can cost as much as the read itself.
+    When you set `inferSchema=true` on CSV, Spark makes an extra pass over
+    the data to infer types before it actually loads it. JSON has no
+    `inferSchema` option; it always infers a schema unless you pass one, so
+    it pays the same extra pass. For large files that pass can cost as much
+    as the read itself.
 
     In production, define schemas explicitly with `StructType` or a DDL
     string such as `"State STRING, Color STRING, Count INT"`. You will learn

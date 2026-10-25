@@ -88,6 +88,7 @@
     **Adding several columns in one step** (one projection in the plan
     instead of one per call):
     ```python
+    from pyspark.sql import functions as f
     df.withColumns({
         "Double_Hits": col("Hits") * 2,
         "Full_Name": f.concat_ws(" ", "First", "Last"),
@@ -238,22 +239,26 @@
     ```
 
     A `TIME` type (time of day without a date) exists in the 4.2 codebase
-    but sits behind an internal flag that is off by default, so `TIME`
-    literals fail with `UNSUPPORTED_TIME_TYPE` on a stock 4.2.0 build. Treat
-    it as not yet available.
+    but sits behind an internal flag (`spark.sql.timeType.enabled`) that is
+    off by default. On a stock 4.2.0 build a bare literal such as
+    `SELECT TIME '12:00:00'` works, but `CAST(... AS TIME)`, `to_time`,
+    `TIME` arithmetic, and `TIME` table columns fail with
+    `UNSUPPORTED_TIME_TYPE`. Treat it as not yet available.
 
 - Class: text
   Depth: intermediate
   Output: |
     ## Schema Inference vs. Explicit Schemas
 
-    When reading CSV or JSON, Spark can infer the schema:
+    When reading CSV or JSON, Spark can infer the schema. CSV infers types
+    only when you set `inferSchema`; JSON always infers a schema unless you
+    pass one:
 
     ```python
     df = spark.read.option("inferSchema", "true").csv("data.csv")
     ```
 
-    However, **inferSchema scans the data an extra time** to determine
+    However, **schema inference scans the data an extra time** to determine
     types before loading it. For production workloads, define schemas
     explicitly:
 

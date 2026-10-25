@@ -37,21 +37,30 @@
       - glob:
           include: transformations/**
     storage: file:///abs/path/retail/pipeline-storage
-    catalog: lake             # optional default catalog
+    # catalog: lake           # optional; must name a configured catalog
     database: retail          # optional default database (alias: schema)
     configuration:            # optional Spark confs for the pipeline session
       spark.sql.shuffle.partitions: "8"
     ```
 
-    - `name`, `libraries` and `storage` are required.
+    - `name` and `storage` are required. Without `libraries` nothing is
+      loaded and the run fails with `RUN_EMPTY_PIPELINE`. The allowed keys
+      are `name`, `storage`, `catalog`, `database` (or `schema`),
+      `configuration` and `libraries`; any other key fails with
+      `PIPELINE_SPEC_UNEXPECTED_FIELD`.
     - `libraries` globs are resolved relative to the spec file; every
-      matching `.py` and `.sql` file is loaded.
+      matching `.py` and `.sql` file is loaded. Paths inside your queries
+      (like `data/orders`) and `spark-warehouse/` are relative to the
+      directory you launch from, so run the CLI from the project root.
     - `storage` holds streaming checkpoints. Lose it and every streaming
-      table starts over.
+      flow re-reads its whole source and appends it again, duplicating
+      rows, unless you also run with `--full-refresh`.
     - `catalog` and `database` decide where unqualified dataset names live.
-    - `configuration` is where session settings go. This is also the
-      reliable place for catalog plugins such as
-      `spark.sql.catalog.lake: org.apache.iceberg.spark.SparkCatalog`.
+      `catalog` must name a catalog that is configured; the default is
+      `spark_catalog`.
+    - `configuration` is where session settings go, including the
+      settings that register a catalog plugin, so they stay with the
+      project.
 
     Every exercise in this course is run by writing exactly such a project
     (your file becomes `transformations/exercise.py`, and the sample data is
@@ -62,7 +71,7 @@
   Output: "Which spec field holds the checkpoints that make streaming tables incremental?"
   AnswerChoices: "storage;libraries;configuration;database"
   CorrectAnswer: "storage"
-  Hint: "It is required, and losing it resets every streaming table."
+  Hint: "It is required, and losing it makes every streaming flow start over."
 
 - Class: text
   Depth: all
@@ -107,27 +116,26 @@
 - Class: text
   Depth: advanced
   Output: |
-    ## spark-submit Arguments Go Before the Subcommand
+    ## spark-submit Arguments
 
     `spark-pipelines` is a thin wrapper over `spark-submit` (it launches
     `org.apache.spark.deploy.SparkPipelines`, which forces
     `spark.api.mode=connect` and starts a local Connect server unless you
     pass `--remote`). It accepts every `spark-submit` option except
-    `--class`, but its argument parser stops at the first non-option, so
-    `spark-submit` options must come *before* `run`:
+    `--class`, and it sorts the arguments for you: `run`, `dry-run`,
+    `init`, `--spec`, `--full-refresh`, `--full-refresh-all`, `--refresh`
+    and `--name` go to the pipeline CLI, and everything else goes to
+    `spark-submit`, wherever it appears. These two are the same:
 
     ```bash
-    # correct: --driver-memory reaches spark-submit
     spark-pipelines --driver-memory 4g run --spec spark-pipeline.yml
-
-    # wrong: everything after `run` is handed to the pipeline CLI instead
     spark-pipelines run --spec spark-pipeline.yml --driver-memory 4g
     ```
 
-    Extra jars are a second trap: with the default local Connect server,
-    classes from `--packages` were not visible to session extensions in
-    our 4.2.0 tests, while `--driver-class-path` worked. Put catalog
-    settings in the spec's `configuration` block rather than `--conf`.
+    Extra jars are a trap: in our 4.2.0 tests, jars from `--packages` were
+    not visible to pipeline code. Use `--jars` instead, with local paths
+    or https Maven URLs. Catalog settings work with `--conf`, but putting
+    them in the spec's `configuration` block keeps them with the project.
 
 - Class: text
   Depth: all
@@ -215,7 +223,7 @@
       part of your edit loop and your CI.
     - `--full-refresh` resets datasets (data and checkpoints);
       `--refresh` updates selected datasets incrementally.
-    - `spark-submit` options go before the subcommand; catalog settings go
-      in the spec's `configuration`.
+    - `spark-submit` options can go before or after the subcommand; keep
+      catalog settings in the spec's `configuration`.
 
     Next: the bronze layer, ingesting raw files into streaming tables.

@@ -158,13 +158,24 @@
     - **A window function is required** somewhere in the `SELECT` list or the
       `QUALIFY` condition. `SELECT region FROM sales QUALIFY region = 'east'`
       fails with `QUALIFY_REQUIRES_WINDOW_FUNCTION`.
-    - **No bare aggregates in the condition.** `QUALIFY sum(amt) > 10` is
-      rejected; use `HAVING` for that. Aggregates *inside* a window over a
-      grouped query are fine:
-      `... GROUP BY region QUALIFY rank() OVER (ORDER BY sum(amt) DESC) = 1`.
+    - **No bare aggregates in the condition.** Without `GROUP BY`,
+      `QUALIFY sum(amt) > 10` fails with `QUALIFY_AGGREGATE_NOT_ALLOWED`;
+      use `HAVING` for that. To rank groups by an aggregate, alias the
+      aggregate in `SELECT` and rank by the alias:
+
+      ```sql
+      SELECT region, sum(amt) AS s FROM sales GROUP BY region
+      QUALIFY rank() OVER (ORDER BY s DESC) = 1
+      ```
+
+      Or define the window in `SELECT`
+      (`rank() OVER (ORDER BY sum(amt) DESC) AS rk`) and write
+      `QUALIFY rk = 1`. Repeating `sum(amt)` inside a window in `QUALIFY`
+      fails with `UNRESOLVED_COLUMN.WITH_SUGGESTION`.
     - **Name collisions.** If a `SELECT` alias matches an input column name,
-      the input column wins inside `QUALIFY`. Give window aliases distinct
-      names (`rk`, `rn`) to avoid surprises.
+      the docs say the input column takes precedence inside `QUALIFY`, but
+      in 4.2.0 the alias is used in practice. Avoid the ambiguity: give
+      window aliases distinct names (`rk`, `rn`).
     - **Ties.** `row_number()` picks one row arbitrarily among ties; use
       `rank()` if you want all tied rows, and add a tiebreaker to `ORDER BY`
       if you want determinism.
@@ -188,7 +199,7 @@
 
     Note the `EXTEND` after `AGGREGATE`: a window over aggregated results
     without a nested subquery, which in regular SQL needs either a subquery
-    or `QUALIFY` with the aggregate repeated inside the window.
+    or `QUALIFY` over an aliased aggregate.
 
     Pipe syntax is also valid inside views, CTEs and subqueries, and you can
     append pipe operators to any regular query

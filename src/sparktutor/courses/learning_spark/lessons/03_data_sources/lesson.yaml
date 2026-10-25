@@ -186,11 +186,25 @@
     **Avro** is a **row-based** format, better suited for write-heavy
     workloads and schema evolution. It is commonly used as a serialization
     format with Kafka. The `avro` source ships with Spark as the external
-    `spark-avro` module, so add it to the classpath before reading:
+    `spark-avro` module, so add it to the classpath before reading. With
+    `spark-submit`:
+
+    ```bash
+    spark-submit --packages org.apache.spark:spark-avro_2.13:4.2.0 app.py
+    ```
+
+    When you start from plain `python`, set it on the builder instead (the
+    package downloads on first run):
 
     ```python
+    spark = (SparkSession.builder
+        .config("spark.jars.packages", "org.apache.spark:spark-avro_2.13:4.2.0")
+        .getOrCreate())
     df = spark.read.format("avro").load("/data/events.avro")
     ```
+
+    Without it, the read fails with
+    `AnalysisException: Failed to find data source: avro`.
 
     **XML** became a **built-in** source in Spark 4.0 (it used to require
     the separate spark-xml package). `rowTag` names the element that
@@ -308,9 +322,9 @@
 
     This creates a directory structure like:
     ```
-    /output/data/year=2025/month=01/part-00000.parquet
-    /output/data/year=2025/month=02/part-00000.parquet
-    /output/data/year=2024/month=12/part-00000.parquet
+    /output/data/year=2025/month=1/part-00000-<uuid>.c000.snappy.parquet
+    /output/data/year=2025/month=2/part-00000-<uuid>.c000.snappy.parquet
+    /output/data/year=2024/month=12/part-00000-<uuid>.c000.snappy.parquet
     ```
 
     **Partition pruning**: when you filter on a partitioned column, Spark

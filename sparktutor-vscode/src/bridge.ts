@@ -32,7 +32,33 @@ export class Bridge extends EventEmitter {
     this.pythonPath =
       vscode.workspace
         .getConfiguration("sparktutor")
-        .get<string>("pythonPath") || "python3";
+        .get<string>("pythonPath") || "";
+  }
+
+  /**
+   * The interpreter to run the server with: the pythonPath setting, else a
+   * .venv in the project or an open workspace folder, else python3.
+   */
+  private resolvePython(projectPath: string): string {
+    if (this.pythonPath) {
+      return this.pythonPath;
+    }
+    const roots = [
+      projectPath,
+      path.resolve(this.extensionDir, ".."),
+      ...(vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath),
+    ].filter(Boolean);
+    const venvPython =
+      process.platform === "win32"
+        ? path.join(".venv", "Scripts", "python.exe")
+        : path.join(".venv", "bin", "python");
+    for (const root of roots) {
+      const candidate = path.join(root, venvPython);
+      if (fs.existsSync(candidate)) {
+        return candidate;
+      }
+    }
+    return "python3";
   }
 
   async start(): Promise<void> {
@@ -100,7 +126,7 @@ export class Bridge extends EventEmitter {
         env.SPARKTUTOR_DATABRICKS_PROFILE = dbProfile;
       }
 
-      this.proc = spawn(this.pythonPath, ["-m", "sparktutor.server"], {
+      this.proc = spawn(this.resolvePython(projectPath), ["-m", "sparktutor.server"], {
         stdio: ["pipe", "pipe", "pipe"],
         env,
       });

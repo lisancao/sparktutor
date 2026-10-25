@@ -34,8 +34,8 @@
 - Class: mult_question
   Depth: all
   Output: "The orders feed contains a duplicate event. Where should it be removed?"
-  AnswerChoices: "In silver; bronze keeps exactly what arrived;In bronze, before writing;In gold;Nowhere, duplicates are harmless"
-  CorrectAnswer: "In silver; bronze keeps exactly what arrived"
+  AnswerChoices: "In silver, because bronze keeps exactly what arrived;In bronze, before writing;In gold;Nowhere, duplicates are harmless"
+  CorrectAnswer: "In silver, because bronze keeps exactly what arrived"
   Hint: "Bronze is a faithful record of the source."
 
 - Class: text
@@ -133,9 +133,29 @@
     Keep the payload as a string (or binary) in bronze and parse it with
     `from_json` in silver: a schema change upstream then breaks silver
     loudly instead of silently dropping fields at ingestion.
-    `topic`/`partition`/`offset` are your lineage. The Kafka source needs
-    the `spark-sql-kafka-0-10_2.13` package matching your Spark version;
-    the lakehouse execution mode has it preinstalled.
+    `topic`/`partition`/`offset` are your lineage.
+
+    Kafka support is not part of pyspark. For Spark 4.2.0 it is four jars
+    from Maven Central, passed with `--jars` (`spark-pipelines` in 4.2.0
+    does not make `--packages` jars visible to pipeline code):
+
+    ```bash
+    M=https://repo1.maven.org/maven2
+    spark-pipelines --jars \
+    $M/org/apache/spark/spark-sql-kafka-0-10_2.13/4.2.0/spark-sql-kafka-0-10_2.13-4.2.0.jar,\
+    $M/org/apache/spark/spark-token-provider-kafka-0-10_2.13/4.2.0/spark-token-provider-kafka-0-10_2.13-4.2.0.jar,\
+    $M/org/apache/kafka/kafka-clients/3.9.2/kafka-clients-3.9.2.jar,\
+    $M/org/apache/commons/commons-pool2/2.13.1/commons-pool2-2.13.1.jar \
+      dry-run
+    ```
+
+    In a SparkTutor exercise, the first line `# spark-connectors: kafka`
+    does the same. `dry-run` validates a Kafka source without a broker
+    (its schema is fixed); `run` needs one. To try it locally with Docker:
+
+    ```bash
+    docker run -d --name kafka -p 9092:9092 apache/kafka:3.9.1
+    ```
 
 - Class: cmd_question
   Depth: all

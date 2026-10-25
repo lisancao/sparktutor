@@ -87,7 +87,9 @@
     without reprocessing the others. (Read the known issue below before you
     point several flows at a parquet table.) The SQL equivalent is
     `CREATE STREAMING TABLE orders_raw;` followed by
-    `CREATE FLOW backfill AS INSERT INTO orders_raw SELECT * FROM STREAM(...)`.
+    `CREATE FLOW backfill AS INSERT INTO orders_raw BY NAME SELECT * FROM STREAM(...)`.
+    (`BY NAME` is required; SDP only supports `INSERT INTO ... BY NAME`
+    flows.)
 
 - Class: mult_question
   Depth: all
@@ -117,10 +119,12 @@
     def bronze_orders(): ...
     ```
 
-    `dp.create_streaming_table` takes the same options, plus `name` as its
-    first argument. `@dp.append_flow` accepts `target`, `name` and
-    `spark_conf`. `@dp.temporary_view` accepts `name`, `comment` and
-    `spark_conf` (it is never stored, so storage options do not apply).
+    `dp.create_streaming_table` takes the same options except `spark_conf`,
+    with `name` as its first argument; it has no flow of its own, so
+    per-flow configuration goes on `@dp.append_flow(spark_conf=...)`.
+    `@dp.append_flow` accepts `target`, `name` and `spark_conf`.
+    `@dp.temporary_view` accepts `name`, `comment` and `spark_conf` (it is
+    never stored, so storage options do not apply).
 
 - Class: cmd_question
   Depth: intermediate
@@ -145,6 +149,19 @@
     then stop. Run twice without new files and the second run appends
     nothing.
 
+    One catch when you try this on your own (the tutor's exercises always
+    start from a fresh project, so they never hit it): with a pip install,
+    the local server keeps table definitions in an in-memory catalog. It
+    forgets the tables when the run ends, but their files stay in
+    `spark-warehouse/`, so a second `spark-pipelines run` in the same
+    project fails with `LOCATION_ALREADY_EXISTS`. To keep tables between
+    runs, start from a fresh project and run every time with
+    `spark-pipelines --conf spark.sql.catalogImplementation=hive run`. That
+    keeps the catalog in a local Derby database (`metastore_db/` and
+    `derby.log` in the directory you run from). If you already ran the
+    project once without the flag, delete `spark-warehouse/` and the
+    `storage` directory first.
+
     Consequences worth internalizing:
 
     - Renaming a flow abandons its checkpoint; the renamed flow starts from
@@ -157,7 +174,7 @@
 
 - Class: mult_question
   Depth: advanced
-  Output: "You rename an append flow from `live` to `live_feed` and rerun. What happens?"
+  Output: "Running with the Hive catalog setting above, you rename an append flow from `live` to `live_feed` and rerun. What happens?"
   AnswerChoices: "The new flow has no checkpoint, so it re-reads and re-appends all source data;Nothing changes;SDP migrates the checkpoint automatically;The pipeline refuses to run"
   CorrectAnswer: "The new flow has no checkpoint, so it re-reads and re-appends all source data"
   Hint: "Checkpoints are keyed by flow name."
@@ -178,8 +195,9 @@
     The API is right; the default parquet file sink is the problem, because
     it keeps a single commit log per table. Until that is fixed, treat
     multi-flow targets as something to run on a table format with real
-    transactional commits (Iceberg, through a catalog in the spec), and
-    always put a row-count check downstream of them. The exercise below
+    transactional commits (for Spark 4.2 that means Delta Lake 4.4.1; there
+    is no Iceberg release for Spark 4.2 yet), and always put a row-count
+    check downstream of them. The exercise below
     uses one append flow, which is safe on parquet.
 
 - Class: script

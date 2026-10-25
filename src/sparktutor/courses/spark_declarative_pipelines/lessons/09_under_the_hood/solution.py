@@ -34,11 +34,10 @@ class Pipeline:
         Returns: list of node names in execution order
         Raises ValueError if a cycle is detected.
         """
-        in_degree = {n: 0 for n in graph}
-        for node, deps in graph.items():
-            for dep in deps:
-                if dep in in_degree:
-                    in_degree[node] += 1
+        # count each table once (a self-join reads it twice) and ignore
+        # tables that are not steps, such as an existing catalog table
+        graph = {n: set(d for d in deps if d in graph) for n, deps in graph.items()}
+        in_degree = {n: len(deps) for n, deps in graph.items()}
 
         queue = deque(n for n, d in in_degree.items() if d == 0)
         order = []

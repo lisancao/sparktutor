@@ -74,11 +74,22 @@
   Output: |
     ## Connecting
 
-    Start a server that ships with Spark:
+    Start a server. In the full Spark download there is a script for it:
 
     ```bash
     ./sbin/start-connect-server.sh
     ```
+
+    A `pip install pyspark` does not include that script. Start the server
+    with `spark-submit` instead; it listens on port 15002 and Ctrl-C stops
+    it:
+
+    ```bash
+    spark-submit --class org.apache.spark.sql.connect.service.SparkConnectServer
+    ```
+
+    Or skip the separate server: option 3 below (`spark.api.mode`), or
+    `SparkSession.builder.remote("local[*]")`, starts one for you.
 
     Then point a client at it, in any of three ways:
 
@@ -187,8 +198,8 @@
       (SPARK-55606, SPARK-55691).
     - Setting `SPARK_CONNECT_RELEASE_SESSION_ON_EXIT=true` releases the
       server-side session when the client process exits (SPARK-55326).
-    - The **Connect** tab in the Spark UI is available in the History
-      Server (SPARK-57601).
+    - The **Connect** tab in the Spark UI is fixed to appear in the
+      History Server (SPARK-57601; also backported to 4.1.3 and 4.0.4).
 
     Session methods that started on Connect (3.5) and also work in Classic
     since 4.0: `spark.addArtifacts("deps.zip", pyfile=True)` ships Python

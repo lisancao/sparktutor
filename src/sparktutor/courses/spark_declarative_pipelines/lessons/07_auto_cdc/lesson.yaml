@@ -12,6 +12,8 @@
     - SCD Type 1 with `dp.create_auto_cdc_flow`, new in Spark 4.2
     - How `keys`, `sequence_by` and `apply_as_deletes` turn a stream of
       changes into a current-state table
+    - Feeding Auto CDC from a real change feed: Delta Lake's change data
+      feed or a Kafka topic
     - What the target table must support, and the state of that support in
       open source today
 
@@ -20,9 +22,10 @@
   Output: |
     ## The Problem
 
-    Operational databases change rows in place. A CDC tool (Debezium, a
-    database's change feed, Spark 4.2's own `CHANGES` clause on supporting
-    tables) turns those changes into events:
+    Operational databases change rows in place. Change data capture (CDC)
+    turns those changes into a stream of events: a tool like Debezium
+    publishing to Kafka, or a table format's change feed such as Delta
+    Lake's. Either way you get rows like these:
 
     | customer_id | city | op | seq |
     |---|---|---|---|
@@ -104,34 +107,150 @@
     ## What the Target Must Support
 
     Auto CDC writes with row-level operations (`MERGE`, `UPDATE`,
-    `DELETE`), so the target's table format must implement Spark's Data
-    Source V2 `SupportsRowLevelOperations`. When it does not, the flow
-    fails at start with `AUTOCDC_TARGET_DOES_NOT_SUPPORT_MERGE`.
+    `DELETE`), so the target must be a table whose connector implements
+    Spark's Data Source V2 row-level interface
+    (`SupportsRowLevelOperations`). When it does not, the flow fails at
+    start with `AUTOCDC_TARGET_DOES_NOT_SUPPORT_MERGE`. The *source* has no
+    such requirement: any streaming DataFrame of change events works.
 
-    What we found on stock Spark 4.2.0 while building this lesson:
+    Where open source stands for Spark 4.2.0 targets (checked October 2026):
 
-    - The default parquet `spark_catalog` target is rejected.
-    - Delta Lake (`delta-spark_4.2_2.13` 4.4.1) loads, but its tables are
-      rejected too: Delta does not implement the DSv2 row-level interface.
-    - Apache Iceberg implements it, and is the format the feature was
-      tested against. At the time of writing there is no released
-      `iceberg-spark-runtime-4.2` artifact, and the 4.1 runtime fails on
-      4.2 with `SparkView can not implement ... View, because it is not an
-      interface` (Spark 4.2 changed `View` into a class).
+    | Target | Works as an Auto CDC target? |
+    |---|---|
+    | Default tables (parquet) | No: rejected |
+    | Delta Lake 4.4.1 | No: rejected. Delta runs `MERGE` through its own SQL extension, not through the DSv2 interface Auto CDC needs |
+    | Apache Iceberg | Implements the interface, but the newest release (1.12.0) supports Spark up to 4.1, and its 4.1 runtime fails to load on 4.2 |
+    | Apache Paimon, Apache Hudi | No Spark 4.2 builds published yet |
 
-    So the exercise runs as a **dry run**, which fully validates the flow
-    (source, keys, sequencing column, column lists) without writing. To run
-    it for real, point the spec's `catalog` at an Iceberg catalog built for
-    Spark 4.2 (the lakehouse execution mode), for example:
+    So that you can still watch Auto CDC work, the exercise writes its
+    target into **Spark's own test catalog**, an in-memory catalog with
+    `MERGE` support that Spark uses to test this feature. It ships in the
+    `spark-catalyst_2.13-4.2.0-tests.jar` artifact on Maven Central. The
+    first line of the exercise, `# spark-connectors: test-catalog`, tells
+    SparkTutor to download that jar and register the catalog as `mem`,
+    which is why the target is named `mem.crm.customers_current`.
+
+    Two things to know about it:
+
+    - It is in memory. The table disappears when the run ends, so the
+      exercise copies it into `customers_current_preview` (a normal table)
+      for you to look at.
+    - It is a test fixture, not a storage format. Use it to learn and to
+      test pipeline logic, never for data you want to keep.
+
+    Outside SparkTutor, the same setup is a spec entry plus a jar:
 
     ```yaml
-    catalog: lake
-    database: crm
+    # spark-pipeline.yml
     configuration:
-      spark.sql.catalog.lake: org.apache.iceberg.spark.SparkCatalog
-      spark.sql.catalog.lake.type: hadoop
-      spark.sql.catalog.lake.warehouse: file:///abs/path/warehouse
+      spark.sql.catalog.mem: org.apache.spark.sql.connector.catalog.SharedTablesInMemoryRowLevelOperationTableCatalog
     ```
+
+    ```bash
+    spark-pipelines \
+      --jars https://repo1.maven.org/maven2/org/apache/spark/spark-catalyst_2.13/4.2.0/spark-catalyst_2.13-4.2.0-tests.jar \
+      run
+    ```
+
+    Use the `SharedTables...` variant. Streaming micro-batches run in
+    cloned Spark sessions, and the plain
+    `InMemoryRowLevelOperationTableCatalog` gives every session its own
+    empty set of tables, so Auto CDC fails to find its own state table. When a
+    format with a Spark 4.2 build supports row-level operations, point the
+    target at that catalog instead; the flow definition stays the same.
+
+- Class: mult_question
+  Depth: all
+  Output: "Your Auto CDC flow fails with AUTOCDC_TARGET_DOES_NOT_SUPPORT_MERGE. What do you change?"
+  AnswerChoices: "The target table's catalog or format;The source stream;The sequence_by column;The keys"
+  CorrectAnswer: "The target table's catalog or format"
+  Hint: "The error is about where Auto CDC writes, not what it reads."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Feeding Auto CDC from a Real Change Feed
+
+    The exercise reads change events from JSON files. In production the
+    events usually come from a Delta table's change data feed or a Kafka
+    topic. Both work as Auto CDC sources in Spark 4.2.0; only the source
+    view changes.
+
+    **From a Delta table's change data feed.** Delta records row-level
+    changes for tables created with
+    `TBLPROPERTIES (delta.enableChangeDataFeed = true)`. Each change row
+    carries `_change_type` (`insert`, `update_preimage`,
+    `update_postimage`, `delete`), `_commit_version` and
+    `_commit_timestamp`:
+
+    ```python
+    @dp.temporary_view
+    def customer_changes() -> DataFrame:
+        return (
+            spark.readStream.format("delta")
+            .option("readChangeFeed", "true")
+            .option("startingVersion", 1)
+            .load("/data/crm/customers")          # or .table("crm.customers")
+            .where("_change_type <> 'update_preimage'")   # keep the new value only
+        )
+
+    dp.create_auto_cdc_flow(
+        target="mem.crm.customers_current",
+        source="customer_changes",
+        keys=["customer_id"],
+        sequence_by="_commit_version",
+        apply_as_deletes=F.expr("_change_type = 'delete'"),
+        except_column_list=["_change_type", "_commit_version", "_commit_timestamp"],
+        stored_as_scd_type=1,
+    )
+    ```
+
+    Keep `.format("delta")` when you load by path. Without it Spark reads
+    the directory as plain parquet: no error, no change columns, and every
+    superseded and deleted row comes back.
+
+    Delta is not part of pyspark, so add its jars when you launch. Use
+    `--jars`: in Spark 4.2.0, `spark-pipelines` does not make `--packages`
+    jars visible to pipeline code, and the run fails with
+    `DATA_SOURCE_NOT_FOUND`.
+
+    ```bash
+    spark-pipelines \
+      --jars https://repo1.maven.org/maven2/io/delta/delta-spark_4.2_2.13/4.4.1/delta-spark_4.2_2.13-4.4.1.jar,https://repo1.maven.org/maven2/io/delta/delta-storage/4.4.1/delta-storage-4.4.1.jar \
+      --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension \
+      --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog \
+      run
+    ```
+
+    You will see a `UserWarning: Failed to set spark.sql.extensions`. It is
+    harmless: the extension took effect when the local server started; the
+    Connect client then re-applies every `spark.sql.*` option to its
+    session, and a static option cannot change at that point.
+
+    **From Kafka.** Parse the message value into columns, then use your own
+    sequence column:
+
+    ```python
+    CHANGE_SCHEMA = "customer_id STRING, name STRING, city STRING, op STRING, seq INT"
+
+    @dp.temporary_view
+    def customer_changes() -> DataFrame:
+        return (
+            spark.readStream.format("kafka")
+            .option("kafka.bootstrap.servers", "localhost:9092")
+            .option("subscribe", "customer_changes")
+            .option("startingOffsets", "earliest")
+            .load()
+            .select(F.from_json(F.col("value").cast("string"), CHANGE_SCHEMA).alias("e"))
+            .select("e.*")
+        )
+    ```
+
+    The Auto CDC flow is then exactly the exercise's, with
+    `except_column_list=["op", "seq"]`. Lesson 4 lists the jars the Kafka
+    source needs. Do not sequence by the Kafka `offset`: offsets are only
+    ordered within one partition, and they record when an event arrived,
+    not when the change happened.
 
 - Class: text
   Depth: advanced
@@ -142,34 +261,43 @@
     Auto CDC uses to track per-key sequencing. A user-specified target
     schema therefore has to account for it. Deletes are
     remembered as tombstones so that a late upsert with an older sequence
-    value does not resurrect a deleted row. Because that bookkeeping lives
-    next to the target, the target's catalog must be durable: an in-memory
-    catalog loses it on restart.
+    value does not resurrect a deleted row. That bookkeeping lives in an
+    auxiliary table next to the target
+    (`__spark_autocdc_aux_state_<target>`), so the target's catalog must be
+    durable: the in-memory test catalog loses it, and the target, when the
+    run ends. That is fine for an exercise and wrong for anything else.
+
+    You can see the metadata column if you read the target with
+    `select("*")`: it is a struct holding the winning sequence value per
+    key. Downstream datasets should select the columns they need, as
+    `customers_current_preview` does.
 
     Auto CDC complements Spark 4.2's other CDC feature: the SQL `CHANGES`
     clause and DataFrame `changes()` API *read* a change feed from tables
-    whose connector exposes one, while `create_auto_cdc_flow` *applies* a
-    change feed to a target.
+    whose connector implements it, while `create_auto_cdc_flow` *applies*
+    a change feed to a target.
 
 - Class: script
   Depth: all
   Output: |
     ## Exercise: Current Customers from a Change Feed
 
-    The starter has the bronze change feed. Its first line,
-    `# spark-pipelines: dry-run`, validates without writing (see "What the
-    Target Must Support" above for why).
+    The starter has the bronze change feed and `TARGET`, the target's name
+    in the test catalog. The first submit downloads the test catalog jar
+    (about 8 MB) once.
 
-    1. Declare the streaming table `customers_current`.
+    1. Declare the streaming table `TARGET`.
     2. Add an Auto CDC flow into it from `bronze_customer_changes`, keyed by
        `customer_id`, sequenced by `seq`, treating `op = 'DELETE'` as
        deletes, SCD Type 1, and excluding `op`, `seq`, `_source_file` and
        `_ingested_at` from the output.
     3. Add a materialized view `customers_by_city` with `city` and
-       `customer_count` read from `customers_current`.
+       `customer_count` read from `TARGET`.
 
-    Try breaking it on purpose (key on a column that does not exist) and
-    submit again to see dry-run catch it.
+    The checks at the bottom pass when c-01 ends up in Hanoi and c-02 is
+    gone. Then try breaking it on purpose: change `sequence_by` to a column
+    that does not exist, add `# spark-pipelines: dry-run` as the first
+    line, and submit to see dry-run catch it without running anything.
   StarterFile: starter.py
   SolutionFile: solution.py
   RequiresExecution: true
@@ -178,7 +306,7 @@
     - "ast_contains(call='create_streaming_table')"
     - "ast_contains(function='customers_by_city')"
     - execution
-  Hint: "dp.create_streaming_table('customers_current'), then dp.create_auto_cdc_flow(target=..., source=..., keys=[...], sequence_by=..., apply_as_deletes=..., except_column_list=[...], stored_as_scd_type=1)."
+  Hint: "dp.create_streaming_table(TARGET), then dp.create_auto_cdc_flow(target=TARGET, source='bronze_customer_changes', keys=[...], sequence_by=..., apply_as_deletes=..., except_column_list=[...], stored_as_scd_type=1)."
 
 - Class: text
   Depth: all
@@ -189,7 +317,11 @@
       it declaratively with `dp.create_auto_cdc_flow`.
     - `keys` identify rows, `sequence_by` orders changes per key,
       `apply_as_deletes` marks deletes; 4.2 supports SCD Type 1.
-    - The target must support row-level operations (Iceberg); parquet and
-      Delta targets are rejected.
+    - Sources are flexible: files, a Delta change data feed
+      (`readChangeFeed`, filtering out `update_preimage`), or Kafka.
+    - The target must support Spark's row-level operations. On Spark 4.2.0
+      no open-source format does yet (parquet and Delta are rejected; no
+      Iceberg build for 4.2), so learn and test with the in-memory test
+      catalog.
 
     Next: the capstone, a complete pipeline from raw files to gold.

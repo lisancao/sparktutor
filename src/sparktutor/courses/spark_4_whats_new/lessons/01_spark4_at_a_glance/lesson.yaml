@@ -136,8 +136,8 @@
       Cast to BIGINT before multiplying.
     - **Implicit string to number comparisons.** `WHERE int_col = '1x'` used
       to compare as NULL; now the cast fails.
-    - **Pandas API on Spark** also enabled ANSI by default in 4.1
-      (SPARK-53295).
+    - **Pandas API on Spark** works under ANSI mode since 4.1, when
+      `compute.ansi_mode_support` is `True` (the default) (SPARK-53295).
 
     If you must ship a legacy job unchanged, set
     `spark.sql.ansi.enabled=false` for that job only, and treat it as debt.
@@ -156,7 +156,8 @@
     - message parameters you can read programmatically
 
     SQLSTATE became mandatory for engine errors in 4.0 (SPARK-45581). In
-    PySpark every error derives from `pyspark.errors.PySparkException`:
+    PySpark most engine errors surface as subclasses of
+    `pyspark.errors.PySparkException`:
 
     ```python
     from pyspark.errors import PySparkException
@@ -171,6 +172,13 @@
 
     Match on the condition, never on message text: messages get reworded
     between releases, conditions do not.
+
+    In Spark Classic a few errors still arrive as
+    `py4j.protocol.Py4JJavaError` instead: some runtime `SparkException`s
+    (such as `parse_json` raising `MALFORMED_RECORD_IN_PARSING`), SQL
+    scripting errors, and internal errors. Catch both when you need to be
+    exhaustive. In Connect they all arrive as `PySparkException`
+    subclasses.
 
     **New in 4.2 (SPARK-54532):** errors raised by PySpark itself, before
     anything reaches the JVM, now carry a SQLSTATE as well. Passing a plain
@@ -279,16 +287,18 @@
   Output: |
     ## Python UDFs and Arrow in 4.2
 
-    Spark 4.2 flips two defaults (SPARK-54555):
+    Spark 4.2 flips three defaults (SPARK-54555):
 
     - `spark.sql.execution.pythonUDF.arrow.enabled` is `true`: plain `@udf`
       functions run through Arrow batches (`ArrowEvalPython` in the plan)
       instead of pickled rows (`BatchEvalPython`).
+    - `spark.sql.execution.pythonUDTF.arrow.enabled` is `true`: regular
+      Python UDTFs are Arrow-optimized.
     - `spark.sql.execution.arrow.pyspark.enabled` is `true`: `toPandas()`
       and `createDataFrame(pandas_df)` use Arrow.
 
-    Python UDTFs are Arrow-optimized by default too. Opt a single UDF out
-    with `@udf(returnType, useArrow=False)`.
+    Set any of them to `false` to restore the legacy behavior. Opt a single
+    UDF out with `@udf(returnType, useArrow=False)`.
 
     Related 4.2 changes from the PySpark migration guide: the minimum
     PyArrow is now 18.0.0, PyPy is no longer supported, and a pandas UDF
@@ -322,7 +332,7 @@
       **Java 25** (SPARK-51167), and the Kubernetes image moved to a
       `25-jre` base.
     - **Scala 2.13 only.** Scala 2.12 builds are gone since 4.0.
-    - **Python 3.10+** for PySpark 4.x.
+    - **Python 3.9+** for PySpark 4.0, **3.10+** since 4.1.
 
     If you pin a container image, check the Java version first: a Spark 4
     job on a Java 11 image fails at JVM startup, not at your code.

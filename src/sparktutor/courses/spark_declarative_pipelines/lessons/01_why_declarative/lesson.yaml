@@ -129,10 +129,15 @@
     `spark = SparkSession.active()`. Spark 4.2 injects `spark` into each
     module's namespace before executing it, so the assignment is optional.
 
-    If you do assign it, `SparkSession.active()` is the only supported way.
-    `SparkSession.builder.config(...).getOrCreate()` tries to mutate session
-    configuration, which SDP blocks: the pipeline owns the session, and
-    per-pipeline settings belong in the spec file's `configuration` block.
+    If you do assign it, use `SparkSession.active()`. The pipeline owns the
+    session, so code that tries to change it is blocked: `spark.conf.set(...)`
+    fails with `SESSION_MUTATION_IN_DECLARATIVE_PIPELINE`, and so do
+    `setCurrentCatalog`, `setCurrentDatabase`, creating or dropping temp
+    views and registering UDFs. `SparkSession.builder.config(...)` is not
+    blocked, but it is a trap: `getOrCreate()` quietly returns the
+    pipeline's session with your setting applied to it. Use the injected
+    `spark`, and put settings in the spec file's `configuration` block or
+    a decorator's `spark_conf`.
 
     Pipelines always run on Spark Connect. The `spark-pipelines` CLI starts
     a local Connect server when you do not pass `--remote`, which is why you
@@ -144,13 +149,14 @@
     ## Evaluation Model
 
     SDP imports your file to *register* graph elements, then resolves the
-    graph, then executes flows. Your function bodies can be called more than
-    once (during analysis and again during execution), so they must be pure
-    DataFrame definitions. Actions such as `collect()`, `count()`,
-    `toPandas()`, `save()`, `saveAsTable()`, `start()` and `toTable()` are
-    forbidden inside dataset code. Side effects at module scope run at
-    registration time, which is also why `SparkSession.builder` with
-    `.config()` is blocked.
+    graph, then executes flows. Open source Spark 4.2 calls each function
+    once, at registration, to capture its query plan; other implementations
+    may call it more than once. Either way, a function must only build and
+    return a DataFrame. Actions such as `collect()`, `count()`,
+    `toPandas()`, `save()`, `saveAsTable()`, `start()` and `toTable()`
+    fail inside it with `ATTEMPT_ANALYSIS_IN_PIPELINE_QUERY_FUNCTION`.
+    Side effects at module scope run at registration time, which is also
+    why session changes such as `spark.conf.set(...)` are blocked there.
 
     Names resolve in the pipeline's default catalog and database
     (`catalog` / `database` in the spec), so `spark.table("bronze_orders")`
@@ -159,9 +165,9 @@
 - Class: mult_question
   Depth: all
   Output: "Why must a dataset function avoid calling .count() or .collect()?"
-  AnswerChoices: "SDP may call the function several times, and the function must only define a DataFrame;Those methods were removed in Spark 4;They only work on streaming DataFrames;They would make the table name wrong"
-  CorrectAnswer: "SDP may call the function several times, and the function must only define a DataFrame"
-  Hint: "The framework evaluates your definitions during planning as well as during the run."
+  AnswerChoices: "SDP calls the function to capture a query plan, so it must only build and return a DataFrame;Those methods were removed in Spark 4;They only work on streaming DataFrames;They would make the table name wrong"
+  CorrectAnswer: "SDP calls the function to capture a query plan, so it must only build and return a DataFrame"
+  Hint: "The framework calls your function at registration to get a plan; actions there fail with ATTEMPT_ANALYSIS_IN_PIPELINE_QUERY_FUNCTION."
 
 - Class: cmd_question
   Depth: all
@@ -176,7 +182,7 @@
   Output: "In Spark 4.2, what is the supported way to get the session inside a pipeline file?"
   AnswerChoices: "Use the injected spark variable (or SparkSession.active());SparkSession.builder.appName(...).getOrCreate();SparkContext.getOrCreate();Create a new session per function"
   CorrectAnswer: "Use the injected spark variable (or SparkSession.active())"
-  Hint: "Building a session with .config() mutates session configuration, which SDP blocks."
+  Hint: "The pipeline owns the session; a builder just hands back that same session, so use the one SDP gives you."
 
 - Class: script
   Depth: all

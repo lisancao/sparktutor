@@ -1,26 +1,24 @@
+# spark-connectors: delta
 """
 Data Lakes & Lakehouses - Starter Code
 
-Implement the `lakehouse_simulation` function that simulates lakehouse
-concepts using Parquet + versioned directories:
-1. Creates initial employee data and writes it as "version 0"
-2. Applies a raise and adds new employees, writing "version 1"
-3. Reads both versions to demonstrate "time travel"
-4. Verifies schema consistency between versions
-5. Builds a change feed (inserts and deletes) between the versions, in the
-   same shape as Spark 4.2's CDC rows (_change_type, _commit_version)
-6. Returns a dict with both versions, schema info, and the changes
+Implement `delta_lakehouse(spark, path)` with a real Delta Lake table:
+1. Write INITIAL_DATA to `path` as a Delta table with the change data feed
+   enabled (version 0)
+2. MERGE UPDATES into it: update matching ids, insert new ones (version 1)
+3. DELETE the employee with id 3 (version 2)
+4. Read the current table, and version 0 with time travel
+5. Collect DESCRIBE HISTORY as (version, operation) pairs
+6. Read the change data feed starting at version 1
 
-Runs on plain PySpark; no Delta/Iceberg JARs required. In production, a
-table format gives you real ACID commits, and its connector can serve
-spark.read.changes() directly.
+The first line asks SparkTutor to add Delta Lake 4.4.1 to Spark (see the
+lesson for doing the same yourself).
 """
 
 from pyspark.sql import SparkSession, functions as f
 from pyspark.sql.types import (
     StructType, StructField, StringType, IntegerType, DoubleType
 )
-import os
 
 
 INITIAL_DATA = [
@@ -29,13 +27,12 @@ INITIAL_DATA = [
     (3, "Charlie", "Sales", 55000.0),
 ]
 
-NEW_EMPLOYEES = [
+# Applied in one MERGE: Bob's raise plus two new hires
+UPDATES = [
+    (2, "Bob", "Marketing", 72000.0),
     (4, "Diana", "Engineering", 92000.0),
     (5, "Eve", "Marketing", 70000.0),
 ]
-
-# Salary changes applied in version 1: {employee id: new salary}
-RAISES = {2: 72000.0}
 
 SCHEMA = StructType([
     StructField("id", IntegerType(), False),
@@ -45,86 +42,79 @@ SCHEMA = StructType([
 ])
 
 
-def lakehouse_simulation(spark, base_path):
-    """Simulate lakehouse versioning and a change feed with Parquet directories."""
+def delta_lakehouse(spark, path):
+    """Create, change and inspect a Delta table stored at `path`."""
+    table = f"delta.`{path}`"
 
-    v0_path = os.path.join(base_path, "v0")
-    v1_path = os.path.join(base_path, "v1")
+    # TODO 1 (version 0): write INITIAL_DATA (with SCHEMA) to path in Delta
+    #   format, with the option delta.enableChangeDataFeed set to "true"
 
-    # TODO: Create the initial DataFrame and write it to v0_path as Parquet
-    initial_df = None  # Replace
-    # Write to v0_path here
+    # TODO 2 (version 1): register UPDATES as a temp view named "updates",
+    #   then MERGE INTO {table} t USING updates s ON t.id = s.id,
+    #   updating all columns when matched and inserting when not matched
 
-    # TODO: Build version 1:
-    #       - apply RAISES to initial_df (replace salary where id is in RAISES;
-    #         f.when(...).otherwise(...) or a small join both work)
-    #       - union the new hires (NEW_EMPLOYEES)
-    #       - write the result to v1_path as Parquet
-    new_df = None  # Replace
-    combined_df = None  # Replace
-    # Write to v1_path here
+    # TODO 3 (version 2): DELETE FROM {table} WHERE id = 3
 
-    # TODO: Read back both versions (simulating time travel)
-    version_0 = None  # Replace: read from v0_path
-    version_1 = None  # Replace: read from v1_path
-
-    # TODO: Verify schema consistency
-    schemas_match = None  # Replace: compare version_0.schema == version_1.schema
-
-    # TODO: Build the change feed from v0 to v1:
-    #       rows in v1 but not v0 -> _change_type "insert"
-    #       rows in v0 but not v1 -> _change_type "delete"
-    #       add _commit_version = 1 to every row (use exceptAll and unionByName)
-    changes = None  # Replace
+    current = None    # TODO 4: read the current table (format "delta")
+    version_0 = None  # TODO 4: read version 0 (option versionAsOf)
+    history = None    # TODO 5: [(version, operation), ...] from DESCRIBE HISTORY, oldest first
+    changes = None    # TODO 6: the change data feed (option readChangeFeed) from version 1
 
     return {
+        "current": current,
         "version_0": version_0,
-        "version_1": version_1,
-        "v0_count": version_0.count(),
-        "v1_count": version_1.count(),
-        "schemas_match": schemas_match,
+        "history": history,
         "changes": changes,
     }
 
 
-# ---- Test harness (do not modify below this line) ----
+# ---- Test harness ----
 if __name__ == "__main__":
-    import tempfile, shutil
+    import os, tempfile, shutil
 
     spark = (SparkSession.builder
         .appName("LakehouseTest")
         .master("local[*]")
         .getOrCreate())
+    spark.sparkContext.setLogLevel("ERROR")
 
     tmp = tempfile.mkdtemp()
-    base = os.path.join(tmp, "lakehouse")
+    path = os.path.join(tmp, "employees")
 
     try:
-        result = lakehouse_simulation(spark, base)
+        result = delta_lakehouse(spark, path)
         assert result is not None, "Function returned None"
-        assert result["v0_count"] == 3, f"Version 0 should have 3 rows, got {result['v0_count']}"
-        assert result["v1_count"] == 5, f"Version 1 should have 5 rows, got {result['v1_count']}"
-        assert result["schemas_match"] == True, "Schemas should match between versions"
+        assert os.path.isdir(os.path.join(path, "_delta_log")), "No _delta_log: write with format('delta')"
 
-        bob_v1 = result["version_1"].filter(f.col("id") == 2).first()
-        assert bob_v1["salary"] == 72000.0, f"Bob's raise is missing from version 1: {bob_v1}"
+        current = sorted((r["id"], r["salary"]) for r in result["current"].collect())
+        assert current == [(1, 85000.0), (2, 72000.0), (4, 92000.0), (5, 70000.0)], (
+            f"Current table should have Alice, Bob at 72000, Diana and Eve; got {current}")
+
+        v0 = sorted((r["id"], r["salary"]) for r in result["version_0"].collect())
+        assert v0 == [(1, 85000.0), (2, 65000.0), (3, 55000.0)], f"Version 0 should be the initial rows, got {v0}"
+
+        ops = [op for _, op in result["history"]]
+        assert ops == ["WRITE", "MERGE", "DELETE"], f"Expected history WRITE, MERGE, DELETE; got {ops}"
 
         changes = result["changes"]
-        assert changes is not None, "changes is None"
-        for col_name in ["_change_type", "_commit_version"]:
-            assert col_name in changes.columns, f"changes is missing {col_name}"
-        got = sorted((r["id"], r["_change_type"]) for r in changes.collect())
-        expected = [(2, "delete"), (2, "insert"), (4, "insert"), (5, "insert")]
+        for col_name in ["_change_type", "_commit_version", "_commit_timestamp"]:
+            assert col_name in changes.columns, (
+                f"changes is missing {col_name}: read with format('delta') and readChangeFeed")
+        got = sorted((r["id"], r["_change_type"], r["_commit_version"]) for r in changes.collect())
+        expected = [
+            (2, "update_postimage", 1), (2, "update_preimage", 1),
+            (3, "delete", 2), (4, "insert", 1), (5, "insert", 1),
+        ]
         assert got == expected, f"Expected changes {expected}, got {got}"
-        assert {r["_commit_version"] for r in changes.collect()} == {1}, "_commit_version should be 1"
 
-        print("Version 0 (initial):")
+        print("Current table:")
+        result["current"].orderBy("id").show()
+        print("Version 0 (time travel):")
         result["version_0"].orderBy("id").show()
-        print("Version 1 (raise + new hires):")
-        result["version_1"].orderBy("id").show()
-        print(f"Schemas match: {result['schemas_match']}")
-        print("Change feed v0 -> v1 (same shape as Spark 4.2 CDC rows):")
-        changes.orderBy("id", "_change_type").show()
+        print("History:", result["history"])
+        print("Change data feed from version 1:")
+        (changes.select("id", "name", "salary", "_change_type", "_commit_version")
+            .orderBy("_commit_version", "id", "_change_type").show())
         print("All tests passed!")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

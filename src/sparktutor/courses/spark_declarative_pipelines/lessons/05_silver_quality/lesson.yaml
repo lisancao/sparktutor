@@ -8,8 +8,8 @@
     ## What You'll Learn
 
     - Turning bronze strings into real types safely with `try_cast`
-    - Deduplicating with a window, and why `dropDuplicates(["col"])` fails
-      inside a Spark 4.2 pipeline
+    - Deduplicating with a window, and why `dropDuplicates` fails on
+      pipeline datasets in Spark 4.2
     - The quarantine pattern: every bronze row ends up in exactly one of
       silver or quarantine, with a reason
     - Data quality checks in open source SDP
@@ -44,7 +44,7 @@
     ```python
     F.expr("try_cast(unit_price AS DECIMAL(10,2))").alias("unit_price")
     F.col("unit_price").try_cast("decimal(10,2)")          # Column API, Spark 4.0+
-    F.to_timestamp("order_ts").alias("order_ts")
+    F.try_to_timestamp("order_ts").alias("order_ts")      # to_timestamp raises on bad input
     ```
 
     A NULL from `try_cast` where the input was not NULL means "malformed",
@@ -66,13 +66,15 @@
     In Spark 4.2.0 that fails while the pipeline is *registering* the
     dataset, with `TABLE_OR_VIEW_NOT_FOUND` for `bronze_orders`, even
     though `bronze_orders` is defined. The same happens with
-    `.drop("some_column")`.
+    `dropDuplicates()` with no columns, `dropDuplicatesWithinWatermark`,
+    and `.drop(...)` (by name or by Column), whenever the input is a
+    dataset defined in the pipeline.
 
-    The cause is in the Spark Connect planner: for those two operations it
-    resolves column names against the input eagerly, at registration time,
-    before the pipeline's own datasets exist in the catalog. Operations
-    such as `select`, `where`, `withColumn`, `join` and window functions
-    are resolved later and work fine.
+    The cause is in the Spark Connect planner: for those operations it
+    resolves the input eagerly, at registration time, before the
+    pipeline's own datasets exist in the catalog. Operations such as
+    `select`, `where`, `withColumn`, `join` and window functions are
+    resolved later and work fine.
 
     The window pattern avoids it, and it is more explicit about *which*
     duplicate wins:
@@ -93,7 +95,7 @@
   Output: "Inside a Spark 4.2.0 pipeline, which of these fails at registration with TABLE_OR_VIEW_NOT_FOUND?"
   AnswerChoices: "spark.table('bronze_orders').dropDuplicates(['order_id']);spark.table('bronze_orders').where('quantity > 0');spark.table('bronze_orders').withColumn('x', F.lit(1));spark.table('bronze_orders').select('order_id')"
   CorrectAnswer: "spark.table('bronze_orders').dropDuplicates(['order_id'])"
-  Hint: "Deduplicate-by-name and drop-by-name are resolved eagerly by the Connect planner."
+  Hint: "dropDuplicates and drop on a pipeline dataset are resolved eagerly by the Connect planner."
 
 - Class: text
   Depth: all
@@ -166,10 +168,11 @@
     would make silver a streaming table that reads
     `spark.readStream.table("bronze_orders")`. Then:
 
-    - deduplication needs bounded state:
-      `withWatermark("order_ts", "1 day")` plus
-      `dropDuplicatesWithinWatermark(["order_id"])` (Spark 3.5+), keeping
-      the registration-time caveat above in mind;
+    - deduplication needs bounded state: `withWatermark("order_ts",
+      "1 day")` plus `dropDuplicatesWithinWatermark(["order_id"])`. Because
+      of the registration bug above, apply them where bronze reads the
+      files (`spark.readStream.schema(...).json(...)`, with `order_ts`
+      typed as a timestamp), not to `spark.readStream.table(...)`;
     - stream-static joins against a materialized view dimension see the
       dimension as of each micro-batch;
     - late corrections to already-written rows need a CDC flow (lesson 7)
@@ -211,7 +214,8 @@
     - Cast with `try_cast` so malformed values become NULL instead of
       failing the run under ANSI mode.
     - Deduplicate with `row_number()` over a window; in 4.2.0 pipelines,
-      avoid `dropDuplicates([...])` and `.drop(...)` on pipeline datasets.
+      `dropDuplicates`, `dropDuplicatesWithinWatermark` and `.drop(...)`
+      fail on pipeline datasets (they work on a direct source read).
     - Split rows into silver and quarantine from one checked view, so every
       input row is accounted for.
     - OSS SDP has no expectation decorators; use quarantine tables and

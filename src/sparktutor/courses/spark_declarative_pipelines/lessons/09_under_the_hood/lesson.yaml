@@ -132,7 +132,8 @@
     where every function runs after its dependencies. We use Kahn's
     algorithm:
 
-    1. Compute **in-degree** (number of dependencies) for each node
+    1. Compute **in-degree** (number of distinct dependencies that are
+       steps in the pipeline) for each node
     2. Start with nodes that have in-degree 0 (no dependencies)
     3. Process each node, decrementing in-degree of its dependents
     4. Repeat until all nodes are processed
@@ -142,10 +143,10 @@
     from collections import deque
 
     def _topo_sort(self, graph):
-        in_degree = {n: 0 for n in graph}
-        for node, deps in graph.items():
-            for dep in deps:
-                in_degree[node] += 1
+        # count each table once (a self-join reads it twice) and ignore
+        # tables that are not steps, such as an existing catalog table
+        graph = {n: set(d for d in deps if d in graph) for n, deps in graph.items()}
+        in_degree = {n: len(deps) for n, deps in graph.items()}
 
         queue = deque(n for n, d in in_degree.items() if d == 0)
         order = []
@@ -221,8 +222,8 @@
     - `_topo_sort(graph)`: Kahn's algorithm
     - `run()`: build graph, sort, execute
 
-    The test harness registers three functions (bronze → silver → gold)
-    and verifies they execute in the correct order.
+    The test harness registers two functions (bronze → silver) and
+    verifies they execute in the correct order.
   StarterFile: starter.py
   SolutionFile: solution.py
   Hint: "Implement all four methods. See the lesson text for reference code."
