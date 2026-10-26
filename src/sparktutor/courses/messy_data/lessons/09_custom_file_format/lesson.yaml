@@ -1,0 +1,574 @@
+- Class: meta
+  Lesson: "Reading a Custom File Format, in Parallel"
+  EstimatedMinutes: 45
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    In lesson 8 the counter source made up its data. Real sources read
+    something that already exists. This lesson builds `docs`, a data
+    source that reads a folder of mixed files (logs, JSON, e-mails, PDFs,
+    PNGs, WAVs) and returns one row per file, with metadata from the file
+    system and a few fields parsed from each file's own header bytes:
+    the size of a PNG, the duration of a WAV.
+
+    `docs` is the source the rest of the course grows. Lesson 14 pushes
+    filters into it so unwanted files are never opened, lesson 15 adds a
+    writer, lesson 16 streams new files from an inbox folder, lesson 17
+    packages it, and the capstone parses every kind of file into rows.
+    So this lesson pays attention to the shape of the code as well as to
+    what it returns.
+
+    By the end of this lesson you will be able to:
+
+    - List files on the driver and turn them into partitions that carry
+      only paths
+    - Balance partitions by bytes rather than by file count
+    - Parse binary headers inside `read()` without loading whole files
+    - Resolve paths and validate options while planning, with clear
+      errors
+    - Honour a user-supplied schema and skip work it does not need, and
+      know that `select()` alone does not prune columns for a Python
+      source
+    - Handle the empty folder, invalid files and timestamps correctly
+    - Test listing, planning and parsing as plain Python
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Why a Data Source and Not binaryFile Plus a UDF?
+
+    Lessons 1, 6 and 7 read folders with `binaryFile` and parsed the
+    bytes with built-in functions and UDFs. That works, and for many jobs it is the right
+    choice. A data source becomes worth it when you want to control the
+    reading itself:
+
+    - **Choose what to open.** `binaryFile` gives you either no content
+      or the whole content of every file: to learn a PNG's width you
+      load the entire file into a row. `docs` answers "how many PDFs,
+      how big?" from the file system alone, and reads only the first 24
+      bytes of a PNG when it needs the size.
+    - **Plan the work.** You decide which files go to which task, so one
+      huge log does not land in the same task as half the folder.
+    - **One name for everyone.** `spark.read.format("docs")` and SQL
+      `USING docs` hide the parsing from the people who use the data.
+    - **Room to grow.** Filters, streaming and writing (later lessons)
+      plug into the same classes.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Picture a library cart. Listing the folder is writing the titles on
+    index cards. Planning partitions is dealing the cards to several
+    helpers so that each gets about the same number of pages to carry,
+    not the same number of books. Each helper then fetches only their
+    books and fills in a form for each one. The cards (paths) are light;
+    the books (file contents) never go back to the front desk.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Two Sides of a File Source
+
+    The split between planning and reading from lesson 8 is the key to
+    the whole design:
+
+    | Planning (`reader.__init__`, `partitions()`) | Reading (`read(partition)`) |
+    |----------------------------------------------|-----------------------------|
+    | runs at a DataFrame's first action (later actions reuse the plan), in a Python worker on the driver side | runs once per partition, in parallel, in executor Python workers |
+    | validates options, resolves the folder, lists files | opens files and parses them |
+    | returns small `InputPartition`s: lists of paths | yields one row per file |
+
+    Only the partitions travel from planning to the tasks, inside the
+    query plan. Put **paths** in them, never file contents: a partition
+    holding a whole file would be serialized into the plan and copied
+    around before any task even starts.
+
+    ```python
+    from pyspark.sql.datasource import InputPartition
+
+    class FilesPartition(InputPartition):
+        def __init__(self, files):
+            self.files = files
+    ```
+
+    One assumption hides here: the tasks must be able to open the paths
+    the planner listed. In local mode they share your disk, so that is
+    automatic. On a cluster the folder must be on storage that every
+    executor can reach (a shared file system or an object store). For
+    object stores, `pyarrow.fs` (installed with PySpark) can list and
+    open S3 and Google Cloud Storage paths with the same planning and
+    reading split.
+
+    **Gotcha: relative paths depend on where planning runs.** A
+    relative `path` option is resolved by the Python worker that plans
+    the query, not by your script. Under `spark-submit` in local mode the
+    workers start in your directory, so `"data/messy"` works. On Spark
+    Connect, even with a local server, the workers run in a per-session
+    folder under the server's temporary directory, so the same option
+    fails with your "must be an existing folder" error. Make paths
+    absolute in the client before passing them:
+
+    ```python
+    import os
+
+    folder = os.path.abspath("data/messy")
+    ```
+
+    The built-in file sources do not have this problem because the
+    server resolves their paths in the JVM. In your own source, treat
+    every path option as "absolute, please" and say so in its
+    documentation.
+
+- Class: mult_question
+  Depth: all
+  Output: "With Spark Connect, spark.read.format('docs').option('path', 'data/messy').load().count() fails with \"option 'path' must be an existing folder\", although the folder exists next to your script. Why?"
+  AnswerChoices: "The Python worker that plans the query runs in a different working directory, so the relative path points elsewhere;Spark Connect does not support Python data sources;Options are lowercased, so the path changes;The docs source needs a trailing slash"
+  CorrectAnswer: "The Python worker that plans the query runs in a different working directory, so the relative path points elsewhere"
+  Hint: "Relative paths are resolved by the process that uses them. Pass os.path.abspath(...)."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Listing Files
+
+    ```python
+    from pathlib import Path
+
+    def list_files(root, pattern):
+        return sorted((str(p.resolve()), p.stat().st_size)
+                      for p in Path(root).glob(pattern) if p.is_file())
+
+    files = list_files("data/messy", "**/*")
+    print(len(files), files[0][0].endswith("audio/silence.wav"), files[0][1])
+    ```
+
+    ```
+    26 True 8044
+    ```
+
+    - `Path.glob("**/*")` walks subfolders; a `glob` option lets users
+      narrow it (`"**/*.png"`).
+    - `resolve()` makes every listed path absolute, so the tasks do not
+      depend on their own current directory (see the gotcha above).
+    - `sorted(...)` makes the listing, and therefore the partitions,
+      the same on every run. Deterministic plans make bugs reproducible
+      and tests possible.
+    - The size comes from `stat()`, which reads file-system metadata and
+      not the file.
+
+    Kinds come from the extension, which costs nothing:
+
+    ```python
+    import os
+
+    KINDS = {".png": "image", ".wav": "audio", ".pdf": "pdf", ".eml": "email", ".md": "text",
+             ".txt": "text", ".log": "log", ".json": "json", ".xml": "xml"}
+
+    def kind_of(path):
+        return KINDS.get(os.path.splitext(path)[1].lower(), "other")
+
+    print(kind_of("a/b/Photo.PNG"), kind_of("notes"))
+    ```
+
+    ```
+    image other
+    ```
+
+    Lesson 1 showed that extensions can lie (a `.png` that is not a
+    PNG). Here the extension decides the *kind*, which says which parser
+    to try, and the parser checks the magic bytes before trusting
+    anything. Deciding kinds without opening files is what lets lesson 14
+    skip whole groups of files.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Balancing Partitions by Bytes
+
+    The sample folder has 26 files, but they are far from equal:
+    `access.log` is 21,213 bytes, about a third of the total, while
+    `readme.txt` is 13 bytes. Dealing files out in turn (round robin)
+    gives each task the same *number* of files and very different
+    amounts of work. A stage finishes when its slowest task finishes, so
+    that wastes the other cores.
+
+    A simple, good rule: take the files largest first and give each one
+    to the group with the smallest total so far.
+
+    ```python
+    def plan_files(files, n):
+        groups = [[] for _ in range(max(n, 1))]
+        totals = [0] * len(groups)
+        for path, size in sorted(files, key=lambda f: (-f[1], f[0])):
+            i = totals.index(min(totals))
+            groups[i].append(path)
+            totals[i] += size
+        return [g for g in groups if g]
+
+    print(plan_files([("a", 5), ("b", 4), ("c", 3), ("d", 3)], 2))
+
+    groups = plan_files(files, 3)
+    sizes = dict(files)
+    print([(len(g), sum(sizes[p] for p in g)) for g in groups])
+    ```
+
+    ```
+    [['a', 'd'], ['b', 'c']]
+    [(3, 21266), (12, 21261), (11, 21248)]
+    ```
+
+    Three tasks with almost the same number of bytes: one gets the big
+    log and two tiny files, the others share the many small files. The
+    greedy rule guarantees that no group exceeds another by more than the
+    largest single file, which is the best you can do without splitting
+    files.
+
+    How many partitions? A few per core is a good start. One partition
+    per file sounds natural but backfires with thousands of small files:
+    each task has a fixed start-up cost, and every partition is part of
+    the plan. Cap the number of partitions with an option, and never plan
+    more partitions than files (`plan_files` drops empty groups).
+
+- Class: mult_question
+  Depth: all
+  Output: "A folder holds one 10 GB file and 99 files of 10 MB each. You plan 4 partitions by dealing files out in turn (round robin). What is the problem?"
+  AnswerChoices: "One task gets the 10 GB file plus about 24 others while the rest finish early, so the job waits on one slow task;Spark rejects partitions of different sizes;Round robin reads every file twice;Nothing: Spark rebalances the rows after reading"
+  CorrectAnswer: "One task gets the 10 GB file plus about 24 others while the rest finish early, so the job waits on one slow task"
+  Hint: "Partitions are the unit of parallel work, and a stage ends when its slowest task ends."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Parsing Headers, Not Whole Files
+
+    The custom part of this format is reading facts out of the files'
+    own bytes. Both formats here put what we need at the very start:
+
+    - **PNG**: 8 signature bytes, then the `IHDR` chunk, whose data
+      starts with the width and height as 4-byte big-endian integers.
+      24 bytes are enough.
+    - **WAV**: the `fmt ` and `data` chunk headers hold the sample rate
+      and the number of frames. `wave.open(path)` reads the header and
+      stops; it does not load the samples until you ask for them.
+
+    ```python
+    import struct, wave
+
+    def png_size(head):
+        if head[:8] == b"\x89PNG\r\n\x1a\n" and head[12:16] == b"IHDR" and len(head) >= 24:
+            return struct.unpack(">II", head[16:24])
+        return None, None
+
+    def wav_seconds(path):
+        try:
+            with wave.open(path) as w:
+                return w.getnframes() / w.getframerate()
+        except (wave.Error, EOFError, ZeroDivisionError):
+            return None
+
+    with open("data/messy/images/products/red_16x8.png", "rb") as f:
+        print(png_size(f.read(24)))
+    with open("data/messy/images/scans/corrupt.png", "rb") as f:
+        print(png_size(f.read(24)))
+    print(wav_seconds("data/messy/audio/silence.wav"), wav_seconds("data/messy/mail/ticket_0.eml"))
+    ```
+
+    ```
+    (16, 8)
+    (None, None)
+    0.5 None
+    ```
+
+    Both parsers are forgiving: a file that is not what its name says
+    gives `None`, not an exception. As in lesson 6, one bad file must not
+    fail the read of a whole folder. Use `with open(...)` so the file is
+    closed in the task that opened it.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Do Only the Work the Schema Asks For
+
+    Opening files is the expensive part, so `read()` opens a file only
+    when a column that needs its bytes was asked for:
+
+    ```python
+    import datetime
+
+    HEADER_COLUMNS = {"width", "height", "seconds"}
+
+    def describe(path, wanted):
+        st = os.stat(path)
+        row = {"path": path, "name": os.path.basename(path), "kind": kind_of(path),
+               "size": st.st_size,
+               "modified": datetime.datetime.fromtimestamp(st.st_mtime, tz=datetime.timezone.utc),
+               "width": None, "height": None, "seconds": None}
+        if wanted & HEADER_COLUMNS:
+            if row["kind"] == "image":
+                with open(path, "rb") as f:
+                    row["width"], row["height"] = png_size(f.read(24))
+            elif row["kind"] == "audio":
+                row["seconds"] = wav_seconds(path)
+        return row
+
+    print(describe(os.path.abspath("data/messy/pdf/invoice_1002.pdf"), {"kind", "size"})["size"])
+    ```
+
+    ```
+    603
+    ```
+
+    `read()` builds each row from the schema's column names, exactly as
+    the counter source did, so a user schema such as
+    `"path string, kind string, size long"` never touches file contents.
+
+    **Gotcha: `select()` does not prune columns for a Python source.**
+    With built-in file sources, `df.select("path")` makes Spark read only
+    that column. A Python data source in 4.2.0 always receives the full
+    schema in `reader(schema)`, even when the query selects one column;
+    the plan shows every column in the `BatchScan`. The only way for a
+    user to ask your source for less is `.schema(...)` on the reader.
+    That is a good reason to document which columns are cheap.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Timestamps From Python
+
+    `os.stat` gives the modification time as seconds since the epoch.
+    `datetime.fromtimestamp(t, tz=datetime.timezone.utc)` turns it into a
+    timezone-aware `datetime`, which Spark stores as the right instant
+    for a `timestamp` column. A *naive* `datetime` (one without
+    `tzinfo`) is read as local time of the Python worker. That is why
+    `datetime.utcfromtimestamp(t)`, which returns a naive value meaning
+    UTC, comes out shifted by the worker's offset (seven hours on a
+    machine set to Pacific time in October). Workers on a cluster may
+    have any time zone, so return aware datetimes from data sources,
+    UDFs and UDTFs alike.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Reader
+
+    Planning and reading put together, with options checked up front:
+
+    ```python
+    from pyspark.sql.datasource import DataSource, DataSourceReader
+
+    SCHEMA = ("path string, name string, kind string, size long, modified timestamp, "
+              "width int, height int, seconds double")
+
+    class DocsDataSource(DataSource):
+        @classmethod
+        def name(cls):
+            return "docs"
+
+        def schema(self):
+            return SCHEMA
+
+        def reader(self, schema):
+            return DocsReader(self.options, schema)
+
+    class DocsReader(DataSourceReader):
+        def __init__(self, options, schema):
+            if "path" not in options:
+                raise ValueError("option 'path' is required: the folder to read")
+            self.root = os.path.abspath(options["path"])
+            if not os.path.isdir(self.root):
+                raise ValueError(f"option 'path' must be an existing folder, got {options['path']!r}")
+            self.pattern = options.get("glob", "**/*")
+            self.max_partitions = int(options.get("partitions", "2"))
+            self.columns = [f.name for f in schema.fields]
+
+        def partitions(self):
+            files = list_files(self.root, self.pattern)
+            return [FilesPartition(g) for g in plan_files(files, self.max_partitions)]
+
+        def read(self, partition):
+            if not isinstance(partition, FilesPartition):
+                return
+            wanted = set(self.columns)
+            for path in partition.files:
+                row = describe(path, wanted)
+                yield tuple(row[c] for c in self.columns)
+
+    spark.dataSource.register(DocsDataSource)
+
+    docs = spark.read.format("docs").option("path", folder).option("partitions", 3).load()
+    (docs.groupBy("kind")
+         .agg(F.count("*").alias("files"), F.sum("size").alias("bytes"))
+         .orderBy("kind").show())
+    ```
+
+    ```
+    +-----+-----+-----+
+    | kind|files|bytes|
+    +-----+-----+-----+
+    |audio|    3|16132|
+    |email|    4| 1007|
+    |image|    5| 2066|
+    | json|    3| 8907|
+    |  log|    2|31285|
+    |  pdf|    2| 1481|
+    | text|    6| 1228|
+    |  xml|    1| 1669|
+    +-----+-----+-----+
+    ```
+
+    Things to notice:
+
+    - The `isinstance` check in `read()` handles the empty folder: no
+      files means no partitions, and Spark then calls `read()` once with
+      `InputPartition(None)` (lesson 8).
+    - Every option problem raises `ValueError` in `__init__`, so the user
+      sees `PYTHON_DATA_SOURCE_ERROR` with your message at the first
+      action, before any task runs.
+    - The helpers (`list_files`, `plan_files`, `describe`) are module
+      functions. They are pickled along with the reader because your
+      script is `__main__`, and you can test each one alone.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    `DocsDataSource` is registered and `images = os.path.abspath("data/messy/images")`.
+    Read that folder with the `docs` source using only the columns
+    `name string, size long` (so no file is opened), into a DataFrame
+    called `sizes`.
+  CorrectAnswer: |
+    sizes = spark.read.format("docs").schema("name string, size long").option("path", images).load()
+  Hint: "Pass the DDL string to .schema(...) before .load(), and the folder with .option('path', images)."
+
+- Class: mult_question
+  Depth: all
+  Output: "You run spark.read.format('docs').option('path', p).load().select('name').count(). Which columns does DocsReader produce in Spark 4.2.0?"
+  AnswerChoices: "All columns of its schema, because Python sources get the full schema unless the user passes .schema(...);Only name, because Spark prunes columns;No columns, because count() needs none;Only path, the first column"
+  CorrectAnswer: "All columns of its schema, because Python sources get the full schema unless the user passes .schema(...)"
+  Hint: "Look at the schema passed to reader(): select() does not change it for a Python data source."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Testing It Without Spark
+
+    The same habit as lesson 8, now with real files: create the reader
+    with a `CaseInsensitiveDict` and a `StructType`, and call it the way
+    Spark would.
+
+    ```python
+    import pickle
+    from pyspark.sql.datasource import CaseInsensitiveDict
+    from pyspark.sql.types import (DoubleType, IntegerType, LongType, StringType,
+                                   StructField, StructType, TimestampType)
+
+    SCHEMA_STRUCT = StructType([
+        StructField("path", StringType()), StructField("name", StringType()),
+        StructField("kind", StringType()), StructField("size", LongType()),
+        StructField("modified", TimestampType()), StructField("width", IntegerType()),
+        StructField("height", IntegerType()), StructField("seconds", DoubleType()),
+    ])
+
+    reader = DocsReader(CaseInsensitiveDict({"path": "data/messy/audio"}), SCHEMA_STRUCT)
+    parts = reader.partitions()
+    print([[os.path.basename(f) for f in p.files] for p in parts])
+    print(sorted((r[1], r[7]) for p in parts for r in reader.read(p)))
+    pickle.dumps(parts)
+    ```
+
+    ```
+    [['silence.wav'], ['tone_440.wav', 'tone_880_quiet.wav']]
+    [('silence.wav', 0.5), ('tone_440.wav', 0.25), ('tone_880_quiet.wav', 0.25)]
+    ```
+
+    Planning put the 8 KB recording alone and the two 4 KB tones
+    together, which you can check by eye. Unit tests like this catch
+    most bugs in a fraction of a second; keep one end-to-end read through
+    Spark to catch type problems.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## When Files Change Under You
+
+    The plan is made at the first action, and later actions on the
+    same DataFrame reuse it. Between planning and
+    reading, files can disappear or grow. `docs` reports the size that
+    `os.stat` sees in the task, so a grown file shows its new size; a
+    deleted file makes `os.stat` raise `FileNotFoundError` inside
+    `read()`, which fails the task with `PYTHON_EXCEPTION`. Whether that
+    should fail the job or produce a row with an error column is a design
+    choice: for a catalog of a busy upload folder, skipping vanished files
+    (and counting them) is usually friendlier. Lesson 16 deals with files
+    that keep arriving.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: The docs Source
+
+    Build the `docs` source. `kind_of`, `list_files`, `png_size`,
+    `wav_seconds`, `describe` and `FilesPartition` are written for you;
+    you write the planning and the data source. The harness tests your
+    code as plain Python first, before any Spark session exists.
+
+    1. `plan_files(files, n)`: assign `(path, size)` pairs, largest
+       first (ties by path), each to the group with the smallest total so
+       far (ties to the lowest group number); drop empty groups.
+    2. `DocsDataSource`: `name()` returns `"docs"`, `schema()` returns
+       `SCHEMA`, `reader(schema)` returns a `DocsReader`.
+    3. `DocsReader.__init__`: require `path` and make it absolute; fail
+       if it is not a folder; read `glob` (default `"**/*"`) and
+       `partitions` (default `"2"`, a whole number of at least 1); keep
+       the schema's column names and reject unknown ones. Every failure
+       is a `ValueError` whose message names the option.
+    4. `partitions()`: list the files and return one `FilesPartition`
+       per group from `plan_files`.
+    5. `read(partition)`: yield nothing unless it is a `FilesPartition`;
+       otherwise one tuple per file from `describe`, in the schema's
+       column order.
+
+    The harness checks the planner, the header parsers and a plain
+    Python read of the audio folder, then through Spark: one row per
+    file, 3 balanced partitions, kinds, PNG sizes and WAV durations,
+    absolute paths, a user schema, the `glob` option, an empty folder,
+    and the error messages for bad options.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "plan_files: groups = [[] for _ in range(max(n, 1))]; totals = [0] * len(groups); for each (path, size) sorted by (-size, path): i = totals.index(min(totals)). read(): row = describe(path, set(self.columns)); yield tuple(row[c] for c in self.columns)."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    In this lesson you learned:
+
+    - **Planning lists, tasks read**: `partitions()` lists files once and
+      returns partitions holding only paths; `read()` opens files in
+      parallel
+    - **Absolute, sorted listings** made while planning, on storage that
+      every executor can reach
+    - **Balance by bytes**: largest file first into the lightest group;
+      cap the partition count and never plan empty partitions
+    - **Header parsing** with `struct` and `wave` reads only the first
+      bytes of each file, and returns `None` for files that do not parse
+    - **Do only what the schema asks**: build rows from the schema's
+      columns and skip opening files when no byte-derived column is
+      requested
+    - **No column pruning** for Python sources in 4.2.0: `select()` does
+      not shrink the schema your reader gets; `.schema(...)` does
+    - **Aware UTC datetimes** for timestamp columns, the empty-folder
+      case, and `ValueError`s with clear messages for every option
+    - **Plain Python tests** for listing, planning, parsing and pickling
+
+    This completes Part 1. You can now read a folder of mixed, messy
+    files with built-in sources, parse what is inside with functions,
+    UDFs, UDTFs and Arrow, and write your own parallel data source when
+    nothing built in fits.
+
+    Next: **VARIANT Shredding and Performance**, the first lesson of
+    Part 2, where you look inside the files Spark writes and make
+    semi-structured data fast.

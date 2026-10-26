@@ -1,0 +1,486 @@
+- Class: meta
+  Lesson: "JSON Drift and Quarantine"
+  EstimatedMinutes: 45
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    JSON is self-describing, which sounds like it should make it easy.
+    The catch is that nothing stops the description from changing.
+    Producers add fields, rename them, nest them, and change a number
+    into a string or an object, usually without telling the people who
+    read the data. This is called **schema drift**, and it is the normal
+    state of JSON in production.
+
+    By the end of this lesson you will be able to:
+
+    - Predict what schema inference does when types and shapes drift
+    - Choose between the `PERMISSIVE`, `DROPMALFORMED` and `FAILFAST`
+      parse modes, and know when each one fails
+    - Capture malformed records with `columnNameOfCorruptRecord`, and
+      avoid the `QUERY_ONLY_CORRUPT_RECORD_COLUMN` error
+    - Write one explicit schema that absorbs drift, then unify renamed and
+      moved fields with `coalesce`
+    - Explode nested arrays without losing rows (`explode_outer`,
+      `inline_outer`)
+    - Parse JSON that sits inside a text column with `from_json` and
+      `schema_of_json`
+
+    Prerequisites: JSON basics from `learning_spark` lesson 3, and the
+    quarantine idea from the previous lesson.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Three Days of Drift
+
+    `data/messy/events/` holds one file per day of order events, one JSON
+    object per line (the "JSON Lines" layout that `spark.read.json`
+    expects by default):
+
+    ```
+    day 1: {"event": "view", "user_id": 0, "amount": 6.13, "ts": "2026-10-01T10:00:00"}
+    day 2: {"event": "purchase", "user": {"id": 0, "plan": "pro"}, "amount": "32.83",
+            "items": [{"sku": "P4", "qty": 3}, ...], "ts": "2026-10-02T11:00:00"}
+    day 3: {"event_type": "purchase", "user": {"id": 0, "plan": "pro", "geo": {"country": "US"}},
+            "amount": {"value": 29.93, "currency": "CAD"}, "items": [{"sku": "P4", "qty": 1}],
+            "ts": "2026-10-03T12:00:00"}
+           {"event_type": "purchase", "user": {"id": 9           <- truncated line
+    ```
+
+    Every kind of drift is here:
+
+    | Change | Example |
+    |--------|---------|
+    | type change | `amount`: number, then sometimes a string, then an object |
+    | move | `user_id` becomes `user.id` |
+    | rename | `event` becomes `event_type` |
+    | new fields | `items`, `user.plan`, `user.geo.country` |
+    | broken record | the last line of day 3 is cut off |
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What Inference Does
+
+    ```python
+    df = spark.read.json("data/messy/events")
+    df.printSchema()
+    ```
+
+    ```
+    root
+     |-- _corrupt_record: string (nullable = true)
+     |-- amount: string (nullable = true)
+     |-- event: string (nullable = true)
+     |-- event_type: string (nullable = true)
+     |-- items: array (nullable = true)
+     |    |-- element: struct (containsNull = true)
+     |    |    |-- qty: long (nullable = true)
+     |    |    |-- sku: string (nullable = true)
+     |-- ts: string (nullable = true)
+     |-- user: struct (nullable = true)
+     |    |-- geo: struct (nullable = true)
+     |    |    |-- country: string (nullable = true)
+     |    |-- id: long (nullable = true)
+     |    |-- plan: string (nullable = true)
+     |-- user_id: long (nullable = true)
+    ```
+
+    Read it carefully:
+
+    - **Fields are unioned.** `event` and `event_type`, `user_id` and
+      `user` all appear. Each row fills the ones it has; the rest are
+      NULL.
+    - **Conflicting types widen to string.** `amount` was a number, a
+      string and an object, so inference gives up and makes it `string`.
+      Numbers become text such as `"6.13"`, and objects become their raw
+      JSON text such as `{"value": 29.93, "currency": "CAD"}`.
+    - **Timestamps stay strings.** `ts` is `string` because JSON
+      inference does not try timestamps unless you set
+      `option("inferTimestamp", True)`.
+    - **A broken line adds `_corrupt_record`**, a column that exists only
+      because some line could not be parsed.
+    - **Fields sort alphabetically**, not in file order.
+
+    Inference also costs a full extra pass over the data before your
+    query even starts (`samplingRatio` reduces it, at the risk of
+    missing rare shapes). And the schema you get depends on which files
+    are in the folder today: tomorrow's file can change it.
+
+- Class: mult_question
+  Depth: all
+  Output: "A JSON field is a number in most files and a JSON object in one. What type does spark.read.json infer for it?"
+  AnswerChoices: "string;double;struct;variant"
+  CorrectAnswer: "string"
+  Hint: "When types conflict, inference falls back to the one type that can hold anything as text."
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Think of schema inference as someone reading every form in a pile
+    and drawing one blank form that fits them all. If one form wrote the
+    price as "12.50" and another as "twelve fifty", the only box that fits
+    both is "write anything here". That is what `string` means in the
+    inferred schema: Spark kept the value but stopped understanding it.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Parse Modes
+
+    The `mode` option decides what happens to a line that cannot be
+    parsed:
+
+    | mode | Malformed line becomes | On these files |
+    |------|------------------------|----------------|
+    | `PERMISSIVE` (default) | a row of NULLs, with the raw text in the corrupt record column if there is one | 61 rows |
+    | `DROPMALFORMED` | nothing: the row is silently dropped | 60 rows |
+    | `FAILFAST` | an error | fails |
+
+    `FAILFAST` fails earlier than you might expect: when the schema is
+    inferred, the error comes from `spark.read...json(path)` itself,
+    before any action, as
+    `MALFORMED_RECORD_IN_PARSING.WITHOUT_SUGGESTION` ("Malformed records
+    are detected in record parsing"). With an explicit schema it fails at
+    the first action instead, as a `FAILED_READ_FILE.NO_HINT` error
+    caused by the same `MALFORMED_RECORD_IN_PARSING` error; and with an
+    explicit schema, a value of the wrong type (a string where you
+    declared a `DOUBLE`) counts as malformed too.
+
+    `DROPMALFORMED` is tempting and dangerous: it loses data and tells
+    nobody. `FAILFAST` is right for inputs that must be perfect (a
+    reference table you control). For everything else, use `PERMISSIVE`
+    with a corrupt record column, and quarantine.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Corrupt Record Column
+
+    In `PERMISSIVE` mode, Spark can keep the raw text of every line it
+    could not parse in a string column. With inference, it is called
+    `_corrupt_record` and appears automatically. With an explicit schema
+    you must declare it yourself, as a `STRING` field, and name it with
+    `columnNameOfCorruptRecord`:
+
+    ```python
+    raw = (spark.read
+        .schema("event STRING, amount DOUBLE, ts TIMESTAMP, _corrupt STRING")
+        .option("columnNameOfCorruptRecord", "_corrupt")
+        .json("data/messy/events"))
+    ```
+
+    Leave the column out and nothing records the failure: the malformed
+    line still becomes a row, but every field is NULL and you cannot tell
+    it from a record that really had no values. With the schema
+    `event STRING, amount DOUBLE` these files give 61 rows, 26 of them
+    with a NULL `amount`, and no way to see why.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The QUERY_ONLY_CORRUPT_RECORD_COLUMN Trap
+
+    The obvious way to look at bad records fails:
+
+    ```python
+    raw.filter(F.col("_corrupt").isNotNull()).count()
+    ```
+
+    ```
+    [UNSUPPORTED_FEATURE.QUERY_ONLY_CORRUPT_RECORD_COLUMN] The feature is
+    not supported: Queries from raw JSON/CSV/XML files are disallowed when
+    the referenced columns only include the internal corrupt record column
+    (named `_corrupt_record` by default).
+    ```
+
+    The corrupt column is filled as a side effect of parsing the *other*
+    columns. A query that needs only the corrupt column would let Spark
+    skip parsing, and then the column would always be NULL, so Spark
+    refuses it. Selecting `_metadata.file_name` alongside does not help:
+    it is file metadata, not parsed data.
+
+    Two fixes:
+
+    - **Cache first.** `raw = raw.cache()`; queries on the cached data
+      see every column already parsed. This is the usual choice when you
+      split one read into "good" and "quarantine" outputs.
+    - **Reference a data column too**, for example
+      `raw.filter("_corrupt IS NOT NULL").select("_corrupt", "ts")`.
+
+- Class: mult_question
+  Depth: all
+  Output: "`spark.read.schema(s).json(path).filter('_corrupt_record IS NOT NULL').count()` fails with QUERY_ONLY_CORRUPT_RECORD_COLUMN. What is a correct fix?"
+  AnswerChoices: "Cache the DataFrame before filtering on the corrupt column;Switch to mode DROPMALFORMED;Remove the corrupt column from the schema;Use FAILFAST mode"
+  CorrectAnswer: "Cache the DataFrame before filtering on the corrupt column"
+  Hint: "Spark needs to parse the other columns for the corrupt column to be filled in."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Explicit Schemas: Strict Types Quarantine Too Much
+
+    An explicit schema fixes the cost and the instability of inference.
+    The natural first attempt declares what the data "should" be:
+
+    ```python
+    strict = """event STRING, event_type STRING, user_id BIGINT,
+                user STRUCT<id BIGINT, plan STRING>, amount DOUBLE,
+                ts TIMESTAMP, _bad STRING"""
+    s = (spark.read.schema(strict)
+         .option("columnNameOfCorruptRecord", "_bad")
+         .json("data/messy/events"))
+    ```
+
+    ```
+    +----------------------+---+---------+---+
+    |file                  |n  |amount_ok|bad|
+    +----------------------+---+---------+---+
+    |events_2026-10-01.json|20 |20       |0  |
+    |events_2026-10-02.json|20 |15       |5  |
+    |events_2026-10-03.json|21 |0        |21 |
+    +----------------------+---+---------+---+
+    ```
+
+    Day 2's five string amounts and every one of day 3's object amounts
+    now count as malformed. Two details matter:
+
+    - A record is flagged as a whole: `_bad` holds the entire raw line,
+      even though only `amount` failed.
+    - The fields that did parse are still filled in. Those day 3 rows
+      still have their `event_type`, `user` and `ts`; only `amount` is
+      NULL. So a flagged row is not empty, and code that keeps "rows where
+      `_bad` is NULL" throws away good data along with the bad field.
+
+    Strict types are the right choice when a type change really is an
+    error you want to catch. For data you know drifts, there is a better
+    way.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "With `amount DOUBLE` in the schema and a corrupt record column, a line has a valid user and ts but amount is the string `\"abc\"`. What does its row contain?"
+  AnswerChoices: "user and ts filled in, amount NULL, and the whole raw line in the corrupt column;Every field NULL and the raw line in the corrupt column;amount NULL and the corrupt column NULL;Nothing, the row is dropped"
+  CorrectAnswer: "user and ts filled in, amount NULL, and the whole raw line in the corrupt column"
+  Hint: "PERMISSIVE mode keeps the fields that parsed and flags the record."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Absorbing Drift: STRING for the Fields That Change
+
+    Declare the drifting field as `STRING`. When the schema says string,
+    the JSON reader keeps whatever is there **as text**: a number such as
+    `6.13`, a string such as `"32.83"`, or a whole object as its raw
+    JSON `{"value": 29.93, "currency": "CAD"}`. Nothing is flagged, so
+    only truly broken lines reach the corrupt column:
+
+    ```python
+    EVENT_SCHEMA = """
+        event STRING, event_type STRING, user_id BIGINT,
+        user STRUCT<id: BIGINT, plan: STRING, geo: STRUCT<country: STRING>>,
+        amount STRING,
+        items ARRAY<STRUCT<sku: STRING, qty: INT>>,
+        ts TIMESTAMP,
+        _corrupt STRING
+    """
+    ```
+
+    Now one quarantined line in three files, and you decide how to read
+    `amount`, trying each shape in turn:
+
+    ```python
+    amount = F.coalesce(
+        F.col("amount").try_cast("double"),                          # 12.5 or "12.5"
+        F.get_json_object("amount", "$.value").try_cast("double"))  # {"value": 12.5}
+    ```
+
+    `try_cast` (4.0 as a `Column` method) returns NULL where a plain
+    `cast` would fail under ANSI mode, and `get_json_object` reads one
+    path out of a JSON string. `coalesce` returns the first non-NULL
+    reading.
+
+    The same schema covers the other kinds of drift. A field that is
+    missing from a record is simply NULL (no error), so renames and moves
+    become `coalesce` calls too:
+
+    ```python
+    F.coalesce("event_type", "event")              # renamed
+    F.coalesce(F.col("user.id"), F.col("user_id"))  # moved into an object
+    ```
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    `raw` was read with `EVENT_SCHEMA`. Assign to `users` a DataFrame
+    with a single column `user_id` that takes `user.id` when present and
+    falls back to the old top-level `user_id`.
+  CorrectAnswer: |
+    users = raw.select(F.coalesce(F.col("user.id"), F.col("user_id")).alias("user_id"))
+  Hint: "coalesce returns its first non-NULL argument; put the new location first."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Is the Union Schema Always the Answer?
+
+    One wide schema with `coalesce` works well while the versions are a
+    handful of field changes. When shapes diverge further, other designs
+    scale better:
+
+    - **Version field**: if producers add `"schema_version": 3`, read
+      each version with its own schema and union the normalized outputs.
+    - **VARIANT**: keep each record as one semi-structured value and
+      pull fields out at query time. The next lesson does exactly this on
+      the same files, with no schema at all.
+    - **A contract at the source**: a schema registry or JSON Schema
+      check where the data is produced stops drift before it reaches
+      you.
+
+    Databricks has a `rescuedDataColumn` option that collects fields that
+    did not fit the schema. It is not part of Apache Spark (there is no
+    such option in the 4.2.0 source); in OSS Spark, the STRING-and-parse
+    pattern above, or VARIANT, fills that role.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Nested Arrays: explode Versus explode_outer
+
+    Day 2 and day 3 events carry an `items` array; day 1 events have
+    none. Turning items into rows is a job for the generator functions:
+
+    | Function | Input row with NULL or empty array | Output columns |
+    |----------|------------------------------------|----------------|
+    | `explode(items)` | dropped | one column, `col`, holding each struct |
+    | `explode_outer(items)` | one row with NULL | `col` |
+    | `inline(items)` | dropped | one column per struct field (`sku`, `qty`) |
+    | `inline_outer(items)` | one row of NULLs | `sku`, `qty` |
+
+    On the 61 records read with `EVENT_SCHEMA`, `explode` gives 61 rows
+    (one per item) and `inline_outer` gives 82 (one per item plus one for
+    each of the 21 records without items). The difference matters as
+    soon as you join or count: with `explode`, every day 1 event vanishes
+    from the result, and nothing warns you.
+
+    ```python
+    items = silver.select("ts", "user_id", F.inline_outer("items"))
+    ```
+
+    Use the `_outer` forms by default, then filter out the NULL rows
+    explicitly when you really mean "only events with items". The
+    decision is then visible in your code.
+
+- Class: mult_question
+  Depth: all
+  Output: "You explode an array column with `explode` and 20 of your 60 events disappear. What happened?"
+  AnswerChoices: "Those events had a NULL or empty array, and explode drops such rows;explode only keeps the first 40 rows;The array elements were structs;explode removes duplicate events"
+  CorrectAnswer: "Those events had a NULL or empty array, and explode drops such rows"
+  Hint: "Compare explode with explode_outer in the table."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## JSON Inside a Text Column
+
+    JSON also turns up inside other data: a log line, a CSV cell, a Kafka
+    message value. `app.log` from the last lesson ends with 20 JSON lines.
+    `from_json` parses a string column with a schema, and
+    `schema_of_json` infers that schema from one example:
+
+    ```python
+    lines = spark.read.text("data/messy/logs/app.log").filter(F.col("value").startswith("{"))
+    sample = lines.first()["value"]
+    ddl = spark.range(1).select(F.schema_of_json(F.lit(sample))).first()[0]
+    # STRUCT<level: STRING, logger: STRING, ms: BIGINT, msg: STRING, order: BIGINT, ts: STRING>
+
+    parsed = lines.select(F.from_json("value", ddl).alias("j")).select("j.*")
+    ```
+
+    Things that trip people up:
+
+    - **`schema_of_json` wants a literal**, not a column. A plain string
+      argument is taken as JSON text, so `F.schema_of_json("value")`
+      tries to parse the word `value` and fails with a Jackson
+      `JsonParseException` ("Unrecognized token 'value'"). Pass
+      `F.lit(sample)`, as above.
+    - **Malformed input gives a struct of NULLs, not NULL.** For
+      `'{"a": 1'` with schema `a INT`, `from_json` returns `{NULL}`, so
+      `j IS NULL` is false. Add a corrupt column to the schema and the
+      option to capture the raw text:
+
+      ```python
+      F.from_json("s", "a INT, _corrupt_record STRING",
+                  {"columnNameOfCorruptRecord": "_corrupt_record"})
+      ```
+
+    - **Only two modes.** `from_json` accepts `PERMISSIVE` and
+      `FAILFAST`; `DROPMALFORMED` fails with `PARSE_MODE_UNSUPPORTED`.
+    - **For one or two fields**, `get_json_object(col, "$.level")` or
+      `json_tuple(col, "order", "ms")` read values without any schema
+      (as strings).
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: One Silver Table From Three Shapes
+
+    Build the clean layer for the drifting events. `EVENT_SCHEMA` is
+    given in the starter (it is the one from this lesson).
+
+    1. `read_events(spark, path)`: read with `EVENT_SCHEMA` in
+       `PERMISSIVE` mode with `_corrupt` as the corrupt record column, add
+       `file` from `_metadata.file_name`, and cache.
+    2. `silver_and_quarantine(raw)` returns `(silver, quarantine)`:
+       - `silver`, for records that parsed: `event_type` (new or old
+         name), `user_id` (new or old place), `plan`, `country`, `amount`
+         as a double for every shape, `ts`, `items`, `file`
+       - `quarantine`: `file` and `_corrupt` for the rest
+    3. `items_long(silver)`: one row per item with `ts`, `user_id`,
+       `sku`, `qty`, keeping events without items as a row of NULLs.
+    4. `qty_per_sku(items)`: total `qty` per `sku`, sorted by sku.
+    5. `parse_embedded(spark, path)`: the JSON lines inside `app.log`,
+       parsed with `from_json` and a schema from `schema_of_json`.
+
+    The harness computes every expected number from the files with
+    Python's `json` module, then checks: parsed and quarantined counts
+    per file, no rows lost, the truncated line quarantined with its raw
+    text, no NULL event type, user or amount in silver, the sum of all
+    amounts, item rows and quantities per SKU, and 20 embedded JSON
+    records with `bigint` fields.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "read: spark.read.schema(EVENT_SCHEMA).option('columnNameOfCorruptRecord', '_corrupt').json(path).withColumn('file', F.col('_metadata.file_name')).cache(). amount: F.coalesce(F.col('amount').try_cast('double'), F.get_json_object('amount', '$.value').try_cast('double')). Items: silver.select('ts', 'user_id', F.inline_outer('items'))."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    In this lesson you learned:
+
+    - **Inference unions fields and widens conflicting types to
+      string**, leaves timestamps as strings unless `inferTimestamp` is
+      set, costs an extra pass, and changes when the files change.
+    - **Parse modes**: `PERMISSIVE` (default) keeps every line,
+      `DROPMALFORMED` silently drops, `FAILFAST` fails (at `read` time
+      when inferring, with `MALFORMED_RECORD_IN_PARSING.WITHOUT_SUGGESTION`).
+    - **The corrupt record column** must be declared in an explicit
+      schema and named with `columnNameOfCorruptRecord`. Querying it
+      alone raises `UNSUPPORTED_FEATURE.QUERY_ONLY_CORRUPT_RECORD_COLUMN`;
+      cache first.
+    - **Strict types flag whole records** but keep the fields that
+      parsed. Declare drifting fields as `STRING` and read every shape
+      with `coalesce`, `try_cast` and `get_json_object`.
+    - **Renames and moves** are `coalesce` over the old and new names.
+    - **`explode` and `inline` drop rows** with NULL or empty arrays;
+      the `_outer` forms keep them.
+    - **JSON in text columns**: `from_json` with a DDL from
+      `schema_of_json(F.lit(sample))`; malformed input gives a struct of
+      NULLs; only `PERMISSIVE` and `FAILFAST` are supported.
+
+    Next: **VARIANT Basics: Profiling and Nested Data**, which loads the
+    same drifting events without any schema and still queries every
+    shape.

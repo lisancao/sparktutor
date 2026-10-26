@@ -1,0 +1,730 @@
+- Class: meta
+  Lesson: "Documents to Rows"
+  EstimatedMinutes: 45
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    Support tickets arrive as e-mails, invoices as PDFs, policies as
+    Markdown files. None of them is a table, but every question you want
+    to ask ("which tickets mention an order?", "what did invoice 1001
+    total?", "which policy talks about shipping?") is a query over rows.
+    This lesson turns documents into rows you can query.
+
+    By the end of this lesson you will be able to:
+
+    - Read documents as bytes with their file metadata, and keep that
+      metadata attached to every row you derive
+    - Parse e-mails with Python's standard `email` package inside a UDF
+      that returns a struct
+    - Create UDFs at the right moment so Spark 4.2 runs them through
+      Arrow, and write parsers you can test without Spark
+    - Split one file into many rows (PDF pages) with a Python UDTF and
+      `lateralJoin`, and avoid the left-join trap
+    - Split Markdown into paragraphs with built-in functions only, and
+      chunk long text for search
+    - Combine different kinds of documents into one table with a common
+      shape
+    - Decide when a built-in function is enough, when you need a UDF or
+      UDTF, and when you need a real parser library
+
+- Class: text
+  Depth: all
+  Output: |
+    ## One File, Many Rows
+
+    A document is a container. Before you can analyze it, decide what one
+    row should be:
+
+    | Document | Natural row | Files to rows |
+    |----------|-------------|---------------|
+    | E-mail (`.eml`) | one message | one to one |
+    | PDF | one page | one to many |
+    | Markdown or long text | one paragraph or chunk | one to many |
+
+    Whatever the row is, it must carry where it came from: the file name,
+    and the page or chunk number inside the file. Without that, a search
+    hit or a wrong number cannot be traced back to its source.
+
+    The plan for every document type is the same:
+
+    1. Read the files as bytes with `binaryFile` (lesson 1), or as whole
+       text files with `text(..., wholetext=True)` (lesson 2).
+    2. Take the file name from `_metadata` right away.
+    3. Parse the bytes into fields with the cheapest tool that works:
+       built-in functions first, then a Python UDF (one row in, one value
+       out), then a Python UDTF (one row in, many rows out).
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Think of a document as a parcel. `binaryFile` hands you the parcel
+    with its shipping label (path, size, modification time). Parsing is
+    opening it and sorting the contents onto shelves. A UDF takes one
+    parcel and puts one item on the shelf; a UDTF can take one parcel and
+    put many items on the shelf, each with a note saying which parcel it
+    came from.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Step 1: Bytes and File Names
+
+    ```python
+    from pyspark.sql import functions as F
+
+    mail = (spark.read.format("binaryFile")
+            .option("pathGlobFilter", "*.eml")
+            .load("data/messy/mail"))
+
+    raw = mail.select(F.col("_metadata.file_name").alias("file"), "content")
+    raw.show(truncate=40)
+    ```
+
+    ```
+    +------------+----------------------------------------+
+    |        file|                                 content|
+    +------------+----------------------------------------+
+    |ticket_2.eml|[46 72 6F 6D 3A 20 63 75 73 74 6F 6D ...|
+    ...
+    ```
+
+    In Spark 4.1 and later a `binary` column arrives in Python (UDFs,
+    UDTFs, `collect()`) as `bytes`; older versions gave `bytearray` in
+    some paths.
+
+    **Gotcha: views hide `_metadata`.** `_metadata` is a hidden column
+    of the file scan. If you register the raw DataFrame as a temporary
+    view and query `_metadata` through the view, the query fails with
+    `UNRESOLVED_COLUMN.WITH_SUGGESTION`, because a view exposes only the
+    visible columns. Select `_metadata.file_name` (or the whole
+    `_metadata` struct) into a normal column first, then create the view:
+
+    ```python
+    # Fails: the view has only path, modificationTime, length, content
+    mail.createOrReplaceTempView("mail_raw")
+    spark.sql("SELECT _metadata.file_name FROM mail_raw").show()
+    ```
+
+    ```python
+    # Works: the file name is now a normal column
+    raw.createOrReplaceTempView("mail_raw")
+    spark.sql("SELECT file, length(content) AS bytes FROM mail_raw").show()
+    ```
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Parsing E-mail With the Standard Library
+
+    An `.eml` file looks like text you could split with a regular
+    expression:
+
+    ```
+    From: customer2@example.com
+    To: support@example.com
+    Subject: Where is my order?
+    Date: Sat, 03 Oct 2026 09:00:00 +0000
+    Content-Type: text/plain; charset="utf-8"
+    ...
+
+    Hello, order 1002 has a problem. Please help.
+    ```
+
+    Real e-mail is harder than it looks: headers can be folded over
+    several lines, subjects can be encoded (`=?utf-8?b?...?=`), bodies
+    can be base64 or quoted-printable, and a message can have plain text,
+    HTML and attachments in nested MIME parts. Python's `email` package
+    handles all of that, and it ships with Python, so every executor has
+    it.
+
+    Write the parser as a plain Python function first:
+
+    ```python
+    def parse_eml_bytes(content):
+        from email import policy
+        from email.parser import BytesParser
+
+        if content is None:
+            return None
+        msg = BytesParser(policy=policy.default).parsebytes(content)
+        date = msg["Date"]
+        body = msg.get_body(preferencelist=("plain",))
+        return (
+            str(msg["From"]) if msg["From"] else None,
+            str(msg["Subject"]) if msg["Subject"] else None,
+            date.datetime if date is not None and date.datetime is not None else None,
+            body.get_content().strip() if body is not None else None,
+        )
+
+    sample = open("data/messy/mail/ticket_2.eml", "rb").read()
+    print(parse_eml_bytes(sample))
+    ```
+
+    With `policy.default`, `msg["Date"]` is a header object whose
+    `.datetime` is a timezone-aware `datetime`, and `get_body()` picks
+    the best plain-text part for you. The imports are inside the
+    function on purpose: the function is pickled and run on executors,
+    and imports inside it run where it runs.
+
+    Then wrap it as a UDF that returns a struct, and expand the struct
+    with `"m.*"`:
+
+    ```python
+    EMAIL_TYPE = "struct<sender:string, subject:string, sent:timestamp, body:string>"
+    parse_eml = F.udf(parse_eml_bytes, EMAIL_TYPE)
+
+    emails = (raw.select("file", parse_eml("content").alias("m"))
+                 .select("file", "m.*"))
+    emails.show(truncate=False)
+    ```
+
+    ```
+    +------------+---------------------+------------------+-------------------+---------------------------------------------+
+    |file        |sender               |subject           |sent               |body                                         |
+    +------------+---------------------+------------------+-------------------+---------------------------------------------+
+    |ticket_2.eml|customer2@example.com|Where is my order?|2026-10-03 09:00:00|Hello, order 1002 has a problem. Please help.|
+    ...
+    ```
+
+    Returning one struct (instead of four separate UDFs) parses each
+    message once. A timezone-aware `datetime` returned for a `timestamp`
+    field is converted correctly; `show()` displays it in the session
+    time zone (UTC in these exercises).
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Timestamps Coming Back to Python
+
+    `show()` and SQL functions such as `date_format` use the session time
+    zone (`spark.sql.session.timeZone`). `collect()` is different: it
+    hands back a naive Python `datetime` in the time zone of the machine
+    running the driver. On a laptop set to Pacific time, the 09:00 UTC
+    ticket above collects as `02:00`. When you test a timestamp column,
+    compare formatted strings or epoch seconds computed in Spark:
+
+    ```python
+    (emails.filter("file = 'ticket_2.eml'")
+           .select(F.date_format("sent", "yyyy-MM-dd HH:mm").alias("sent_utc"))
+           .show())
+    ```
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Create UDFs After the Session Exists
+
+    Spark 4.2 runs regular Python UDFs through Arrow by default
+    (`spark.sql.execution.pythonUDF.arrow.enabled` is now `true`,
+    SPARK-54555): rows travel to Python in columnar batches instead of
+    being pickled one at a time. The plan shows `ArrowEvalPython` instead
+    of `BatchEvalPython`.
+
+    Two details of `udf()` make the moment you create a UDF matter:
+
+    - A return type given as a DDL string (`"string"`, `"struct<...>"`)
+      is parsed by Spark, so it needs an active session. Calling
+      `F.udf(f, "string")` at import time, before `getOrCreate()`, fails
+      with `SESSION_OR_CONTEXT_NOT_EXISTS`.
+    - The Arrow default is read from the active session when the UDF is
+      created. A UDF created before any session exists (for example with
+      a `StringType()` object) silently becomes a classic pickled UDF.
+
+    ```python
+    import contextlib, io
+
+    def python_nodes(df):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            df.explain()
+        return [line.strip()[:40] for line in buf.getvalue().splitlines()
+                if "EvalPython" in line]
+
+    print(python_nodes(raw.select(parse_eml("content"))))
+    ```
+
+    ```
+    ['+- ArrowEvalPython [parse_eml_bytes(cont']
+    ```
+
+    The pattern this course uses: keep the parsing logic in a plain
+    function at module level (easy to test), and create the UDF inside
+    the function that builds the DataFrame, after the session exists.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Make Parsers Forgiving
+
+    A folder of documents always contains a surprise: an empty file, a
+    message with no `Date`, a file that is not an e-mail at all. If your
+    parser raises, the task fails and the whole job stops with
+    `PYTHON_EXCEPTION` and your Python traceback:
+
+    ```python
+    def strict(content):
+        raise ValueError("cannot parse this file")
+
+    raw.select(F.udf(strict, "string")("content")).collect()
+    ```
+
+    ```
+    PythonException: [PYTHON_EXCEPTION] An exception was thrown from the
+    Python worker: ... ValueError: cannot parse this file
+    ```
+
+    One bad file out of a million should not cost you the other 999,999.
+    Return `None` for fields you cannot read (as `parse_eml_bytes` does),
+    and when you need to know why, return an error field too and
+    quarantine those rows, the same idea as lesson 3's corrupt-record
+    column:
+
+    ```python
+    def parse_or_explain(content):
+        try:
+            sender, subject, sent, body = parse_eml_bytes(content)
+            if sent is None:
+                return (sender, subject, sent, body, "missing Date header")
+            return (sender, subject, sent, body, None)
+        except Exception as e:
+            return (None, None, None, None, f"{type(e).__name__}: {e}")
+
+    safe = F.udf(parse_or_explain,
+                 "struct<sender:string, subject:string, sent:timestamp, "
+                 "body:string, error:string>")
+
+    junk = spark.createDataFrame([("note.eml", b"just some bytes")],
+                                 "file string, content binary")
+    (raw.unionByName(junk)
+        .select("file", safe("content").alias("m"))
+        .select("file", "m.subject", "m.error")
+        .show(truncate=False))
+    ```
+
+    Because `parse_eml_bytes` is plain Python, you can also test it
+    without starting Spark at all: `parse_eml_bytes(b"junk")` returns a
+    tuple of `None`s instead of raising. Lesson 8 uses the same idea to
+    test a data source.
+
+- Class: mult_question
+  Depth: all
+  Output: "You create `F.udf(parse, 'string')` at the top of your script, before `SparkSession.builder...getOrCreate()`. What happens in Spark 4.2?"
+  AnswerChoices: "It fails with SESSION_OR_CONTEXT_NOT_EXISTS because the DDL return type needs a session;It works and runs through Arrow;It works but the UDF returns NULL for every row;It fails later with PYTHON_EXCEPTION when the query runs"
+  CorrectAnswer: "It fails with SESSION_OR_CONTEXT_NOT_EXISTS because the DDL return type needs a session"
+  Hint: "A DDL string such as 'string' or 'struct<...>' is parsed by Spark itself."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## PDFs: Pages Are the Rows
+
+    A PDF is a set of numbered objects. Each page object points to a
+    *content stream*: drawing instructions for that page. In the sample
+    invoices the streams are uncompressed and each page draws one string:
+
+    ```
+    4 0 obj
+    << /Length 59 >>
+    stream
+    BT /F1 12 Tf 72 720 Td (Invoice 1001 total 42.50 CAD) Tj ET
+    endstream
+    endobj
+    ```
+
+    `BT ... ET` is a text block and `(...) Tj` shows a string. For these
+    toy files a regular expression over the bytes finds the text of each
+    page in order:
+
+    ```python
+    import re
+
+    pdf_bytes = open("data/messy/pdf/invoice_1001.pdf", "rb").read()
+    print(re.findall(rb"BT .*?\((.*?)\) Tj ET", pdf_bytes, re.S))
+    ```
+
+    ```
+    [b'Invoice 1001 total 42.50 CAD', b'Thank you for shopping']
+    ```
+
+    **Be honest about the limits.** This works only because we generated
+    the PDFs. Real PDFs compress their streams (`/FlateDecode`), split
+    text into many small pieces with positioning in between, use font
+    encodings that do not map bytes to letters directly, and store pages
+    in any order. For real files use a parser library. `pypdf` is pure
+    Python (BSD licence) and is not installed with SparkTutor; if you
+    install it, the page loop becomes:
+
+    ```
+    import io
+    from pypdf import PdfReader
+
+    reader = PdfReader(io.BytesIO(content))
+    for number, page in enumerate(reader.pages, start=1):
+        yield number, page.extract_text()
+    ```
+
+    Scanned PDFs contain images, not text; getting text out of them needs
+    OCR, which is outside Spark.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## One Row In, Many Rows Out: Python UDTFs
+
+    A UDF returns exactly one value per input row, so it cannot turn one
+    PDF into three pages. A **Python user-defined table function** (UDTF,
+    Spark 3.5) can: it is a class whose `eval` method `yield`s as many
+    output rows as it likes.
+
+    ```python
+    class PdfPages:
+        def eval(self, content):
+            import re
+            if content is None:
+                return
+            for number, raw_text in enumerate(
+                    re.findall(rb"BT .*?\((.*?)\) Tj ET", content, re.S), start=1):
+                yield number, raw_text.decode("latin-1")
+
+    pdf_pages_udtf = F.udtf(PdfPages, returnType="page int, text string")
+
+    pdfs = (spark.read.format("binaryFile")
+            .option("pathGlobFilter", "*.pdf")
+            .load("data/messy/pdf")
+            .select(F.col("_metadata.file_name").alias("file"), "content"))
+
+    pages = (pdfs
+             .lateralJoin(pdf_pages_udtf(F.col("content").outer()))
+             .drop("content"))
+    pages.orderBy("file", "page").show(truncate=False)
+    ```
+
+    ```
+    +----------------+----+----------------------------+
+    |file            |page|text                        |
+    +----------------+----+----------------------------+
+    |invoice_1001.pdf|1   |Invoice 1001 total 42.50 CAD|
+    |invoice_1001.pdf|2   |Thank you for shopping      |
+    |invoice_1002.pdf|1   |Invoice 1002 total 17.00 CAD|
+    +----------------+----+----------------------------+
+    ```
+
+    How the pieces fit:
+
+    - `F.udtf(PdfPages, returnType=...)` turns the class into a table
+      function. Create it after the session exists, for the same reasons
+      as a UDF. In 4.2 UDTFs are Arrow-optimized by default too
+      (`spark.sql.execution.pythonUDTF.arrow.enabled`, SPARK-54555); the
+      plan shows `ArrowEvalPythonUDTF`.
+    - `DataFrame.lateralJoin` (Spark 4.0) calls the table function once
+      per row of `pdfs` and joins each output row back to the row that
+      produced it, so `file` travels along.
+    - `.outer()` marks `content` as a column of the outer DataFrame. Pass
+      `F.col("content")` without it and the analyzer looks for `content`
+      inside the function's own output and fails with
+      `UNRESOLVED_COLUMN.WITHOUT_SUGGESTION`.
+    - `latin-1` maps every byte to a character, so decoding never fails;
+      it is right for these ASCII strings and a safe fallback for unknown
+      bytes.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Same UDTF From SQL
+
+    Register the UDTF to call it from SQL with `LATERAL`:
+
+    ```python
+    spark.udtf.register("pdf_pages", pdf_pages_udtf)
+    pdfs.createOrReplaceTempView("pdfs")
+
+    spark.sql("""
+        SELECT file, p.page, p.text
+        FROM pdfs, LATERAL pdf_pages(content) p
+        ORDER BY file, page
+    """).show(truncate=False)
+    ```
+
+    Note that `pdfs` already has `file` as a normal column, so the view
+    works (remember the `_metadata` gotcha above).
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    `pdf_pages_udtf` is a UDTF created with `F.udtf(...)`. Register it
+    so that SQL queries can call it as `pdf_pages(content)`.
+  CorrectAnswer: |
+    spark.udtf.register("pdf_pages", pdf_pages_udtf)
+  Hint: "UDTFs have their own registry next to spark.udf: spark.udtf.register(name, function)."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## The Left Lateral Join Trap
+
+    A file that yields no pages (not really a PDF, or a scan with no text)
+    produces no rows in an inner lateral join, so it disappears from the
+    result. To keep it with `NULL` page columns you want a left join. In
+    Spark 4.2.0 the join condition matters:
+
+    ```python
+    mixed = spark.createDataFrame(
+        [("invoice_1002.pdf", open("data/messy/pdf/invoice_1002.pdf", "rb").read()),
+         ("scan.pdf", b"%PDF-1.4 image only")],
+        "file string, content binary")
+
+    # how="left" alone: scan.pdf is still dropped
+    print(mixed.lateralJoin(pdf_pages_udtf(F.col("content").outer()),
+                            how="left").select("file", "page").collect())
+
+    # how="left" with an explicit always-true condition: scan.pdf is kept
+    print(mixed.lateralJoin(pdf_pages_udtf(F.col("content").outer()),
+                            on=F.lit(True), how="left").select("file", "page").collect())
+    ```
+
+    ```
+    [Row(file='invoice_1002.pdf', page=1)]
+    [Row(file='invoice_1002.pdf', page=1), Row(file='scan.pdf', page=None)]
+    ```
+
+    SQL behaves the same: `LEFT JOIN LATERAL pdf_pages(content) p` drops
+    the file, `LEFT JOIN LATERAL pdf_pages(content) p ON true` keeps it.
+    Always write the condition, and count files before and after the join
+    when you need every file accounted for.
+
+- Class: mult_question
+  Depth: all
+  Output: "Why does the PDF exercise use a UDTF instead of a UDF?"
+  AnswerChoices: "A UDF returns exactly one value per input row, but one PDF must become one row per page;UDTFs can read files and UDFs cannot;UDFs cannot take binary input;UDTFs run on the driver, which is faster for small files"
+  CorrectAnswer: "A UDF returns exactly one value per input row, but one PDF must become one row per page"
+  Hint: "Count rows in and rows out."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Markdown: Built-in Functions Are Enough
+
+    Markdown is plain text with light structure: `# ` starts a heading,
+    a blank line separates paragraphs. No Python is needed. Read each file
+    as one row (remember from lesson 2: pass `wholetext=True` as the
+    keyword, not as an `.option`), pull the title out with a regular
+    expression, split on blank lines and explode:
+
+    ```python
+    docs = spark.read.text("data/messy/docs/*.md", wholetext=True)
+
+    ws = F.lit(" \t\r\n")
+    paragraphs = F.filter(
+        F.split("value", r"\n\s*\n"),
+        lambda p: (F.trim(p, ws) != "") & ~F.trim(p, ws).startswith("#"),
+    )
+
+    chunks = (docs
+        .select(F.col("_metadata.file_name").alias("file"),
+                F.regexp_extract("value", r"(?m)^# (.+)$", 1).alias("title"),
+                F.posexplode(paragraphs).alias("pos", "text"))
+        .select("file", "title", (F.col("pos") + 1).alias("chunk"),
+                F.trim("text", ws).alias("text")))
+    chunks.filter("file = 'shipping.md'").show(truncate=50)
+    ```
+
+    ```
+    +-----------+---------------+-----+--------------------------------------------------+
+    |       file|          title|chunk|                                              text|
+    +-----------+---------------+-----+--------------------------------------------------+
+    |shipping.md|Shipping policy|    1|Standard shipping takes 3 to 5 business days. E...|
+    |shipping.md|Shipping policy|    2|Standard shipping takes 3 to 5 business days. E...|
+    |shipping.md|Shipping policy|    3|Standard shipping takes 3 to 5 business days. E...|
+    +-----------+---------------+-----+--------------------------------------------------+
+    ```
+
+    What each piece does:
+
+    - `split(value, '\n\s*\n')` cuts the file at blank lines.
+    - `filter(array, lambda)` (a higher-order function) drops the heading
+      and empty pieces before exploding, so chunk numbers stay
+      consecutive.
+    - `posexplode` gives each paragraph its position as well as its text.
+    - `(?m)` makes `^` and `$` match at line boundaries, so the title
+      regex finds the heading line inside the whole file.
+
+    **Gotcha: `trim` strips spaces only.** `trim(col)` removes the space
+    character and nothing else, so the last paragraph keeps its trailing
+    newline. Spark 4.0 added a second argument to the Python `trim`: the
+    characters to strip. `F.trim(col, F.lit(" \t\r\n"))` removes all
+    four.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Chunking Long Text
+
+    Paragraphs are a good unit for short policies. For long documents
+    (contracts, manuals, transcripts) search and retrieval systems usually
+    want chunks of a bounded size, with a small overlap so a sentence cut
+    at a boundary still appears whole in one of the chunks. That is
+    another one-to-many job for a UDTF:
+
+    ```python
+    class Chunks:
+        def eval(self, text, size, overlap):
+            words = text.split()
+            step = size - overlap
+            for n, start in enumerate(range(0, max(len(words) - overlap, 1), step), start=1):
+                yield n, " ".join(words[start:start + size])
+
+    chunks_udtf = F.udtf(Chunks, returnType="chunk int, text string")
+
+    (spark.read.text("data/messy/docs/shipping.md", wholetext=True)
+        .lateralJoin(chunks_udtf(F.col("value").outer(), F.lit(20), F.lit(5)))
+        .select("chunk", "text")
+        .show(truncate=False))
+    ```
+
+    Each chunk has at most 20 words and repeats the last 5 words of the
+    one before. Real systems count tokens rather than words and try to
+    cut at sentence or heading boundaries, but the shape of the code is
+    the same. Lesson 11 searches over rows like these.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## One Table for All Documents
+
+    E-mails, pages and paragraphs now have different columns. To search
+    or count them together, map each to one common shape and union:
+
+    ```python
+    docs_table = (
+        emails.select(F.col("file").alias("doc"), F.lit(1).alias("part"),
+                      F.lit("email").alias("kind"),
+                      F.col("subject").alias("title"), F.col("body").alias("text"))
+        .unionByName(pages.select(F.col("file").alias("doc"), F.col("page").alias("part"),
+                                  F.lit("pdf").alias("kind"),
+                                  F.lit(None).cast("string").alias("title"), "text"))
+        .unionByName(chunks.select(F.col("file").alias("doc"), F.col("chunk").alias("part"),
+                                   F.lit("markdown").alias("kind"), "title", "text")))
+    docs_table.groupBy("kind").count().show()
+    ```
+
+    `(doc, part)` identifies every row, and `kind` says how to interpret
+    it. `unionByName` matches columns by name. The `NULL` title of a PDF
+    page gets an explicit `cast("string")`, because a bare `F.lit(None)`
+    has type `void` and you want the column's type to be clear.
+
+    Documents repeat themselves. Each sample policy says the same thing
+    three times, and real tickets quote earlier replies. A content hash
+    finds exact repeats cheaply:
+
+    ```python
+    (docs_table.groupBy("doc", F.sha2("text", 256).alias("h"))
+               .count()
+               .filter("count > 1")
+               .show(truncate=20))
+    ```
+
+    Near-duplicates (the same text with small edits) need something
+    smarter; lesson 11 uses MinHash for that.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Choosing the Tool
+
+    | Situation | Tool | Example here |
+    |-----------|------|--------------|
+    | Text with simple, regular structure | Built-in functions (`split`, `regexp_extract`, `posexplode`) | Markdown paragraphs |
+    | One row in, one parsed value out, logic needs Python | Python UDF returning a struct | E-mail headers and body |
+    | One row in, many rows out | Python UDTF with `lateralJoin` or SQL `LATERAL` | PDF pages, chunks |
+    | Real-world binary formats | A parser library inside the UDF or UDTF | `pypdf` for real PDFs |
+    | The file format itself should be a source (`format("docs")`) | A Python data source | Lessons 8 and 9 |
+
+    Built-in functions run inside the JVM and are the fastest. Python
+    UDFs and UDTFs cost a trip to a Python worker, made cheaper in 4.2 by
+    Arrow batches, and they let you use any Python library. A data source
+    goes one step further: it owns listing and reading the files, which
+    you will build in lessons 8 and 9.
+
+- Class: mult_question
+  Depth: all
+  Output: "You split Markdown with `posexplode(split(value, '\\n\\s*\\n'))` and the last paragraph of each file still ends with a newline after `trim(text)`. Why?"
+  AnswerChoices: "trim removes only the space character unless you pass the characters to strip;split keeps the separator at the end of each piece;wholetext adds a newline to the last line;posexplode appends a line break"
+  CorrectAnswer: "trim removes only the space character unless you pass the characters to strip"
+  Hint: "Look at what trim(col) strips by default, and at the second argument added in Spark 4.0."
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "Some files in your PDF folder yield no pages. You use `pdfs.lateralJoin(pages_udtf(F.col('content').outer()), how='left')` and those files are missing. What fixes it in Spark 4.2.0?"
+  AnswerChoices: "Add on=F.lit(True) to the lateralJoin call;Remove .outer() from the column;Use how='inner' instead;Cache pdfs before the join"
+  CorrectAnswer: "Add on=F.lit(True) to the lateralJoin call"
+  Hint: "The SQL form behaves the same way: compare LEFT JOIN LATERAL ... with and without ON true."
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Documents to Rows
+
+    Turn the sample e-mails, PDFs and Markdown policies into rows. The
+    parsing helpers are written for you as plain Python
+    (`parse_eml_bytes` and the `PdfPages` UDTF class), so you can focus
+    on wiring them into Spark.
+
+    1. `parse_emails(spark, folder)`: read `*.eml` with `binaryFile`,
+       create a UDF from `parse_eml_bytes` with `EMAIL_TYPE`, and return
+       `file, sender, subject, sent, body, order_id`, where `order_id`
+       is the number after "order " in the body, as an `int`
+       (`regexp_extract` then `try_cast("int")`).
+    2. `pdf_pages(spark, folder)`: read `*.pdf`, create a UDTF from
+       `PdfPages` with return type `page int, text string`, and return
+       `file, page, text` using `lateralJoin` and `.outer()`.
+    3. `markdown_chunks(spark, folder)`: read `*.md` with
+       `text(..., wholetext=True)` and return `file, title, chunk, text`:
+       one row per paragraph, heading excluded, chunks numbered from 1,
+       text trimmed of spaces and newlines.
+    4. `documents(emails, pages, chunks)`: union the three into
+       `doc, part, kind, title, text` with kinds `email`, `pdf` and
+       `markdown` (an e-mail is part 1 and its title is the subject; a
+       PDF page has no title).
+
+    The harness checks the subjects, the UTC send time of ticket 2, the
+    order ids, every PDF page, three chunks per policy, the row count per
+    kind, and that only 11 distinct texts remain after hashing.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "E-mail: F.udf(parse_eml_bytes, EMAIL_TYPE), select(F.col('_metadata.file_name').alias('file'), parse('content').alias('m')).select('file', 'm.*'). PDF: F.udtf(PdfPages, returnType='page int, text string'), then .lateralJoin(pages(F.col('content').outer())).drop('content'). Markdown: F.filter(F.split('value', r'\\n\\s*\\n'), lambda p: ...) then F.posexplode(...).alias('pos', 'text')."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    In this lesson you learned:
+
+    - **Decide what a row is** (message, page, paragraph) and carry the
+      file name and part number on every row
+    - **`binaryFile` plus `_metadata.file_name`**, selected into a normal
+      column before you create a view (views hide `_metadata`)
+    - **E-mail** with the standard `email` package in a UDF that returns
+      a struct; timezone-aware datetimes become correct timestamps
+    - **Create UDFs and UDTFs after the session exists**: DDL return
+      types need a session, and the 4.2 Arrow defaults (SPARK-54555) are
+      read when the function is created
+    - **Forgiving parsers** return `None` or an error field instead of
+      failing the job with `PYTHON_EXCEPTION`, and plain-Python parsers
+      can be tested without Spark
+    - **Python UDTFs** for one-to-many parsing, called with
+      `lateralJoin(... .outer())` (4.0) or SQL `LATERAL`; a left lateral
+      join needs an explicit `on=F.lit(True)` to keep files with no
+      output
+    - **Built-in functions** for Markdown: `split`, `filter`,
+      `posexplode`, `regexp_extract`, and `trim` with explicit characters
+    - **Chunking** with overlap, a common shape for all documents, and
+      hashing to find exact repeats
+    - The regex PDF reader works only for the generated files; real PDFs
+      need a library such as `pypdf`
+
+    Next: **Images and Audio**, where the bytes are pixels and samples
+    instead of text.

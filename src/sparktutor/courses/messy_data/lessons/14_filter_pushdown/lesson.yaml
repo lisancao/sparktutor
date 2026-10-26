@@ -1,0 +1,428 @@
+- Class: meta
+  Lesson: Filter Pushdown
+  EstimatedMinutes: 40
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    A query like `df.filter(kind == "image")` on your data source makes
+    the reader produce **every** row, and then Spark throws most of them
+    away. For a folder of files that means opening every file to keep a
+    handful; for an API it means downloading every page. **Filter
+    pushdown** lets Spark tell your reader what the query wants, so the
+    reader can skip the work.
+
+    In "Reading a Custom File Format, in Parallel" your reader listed
+    files on the driver and handed them to tasks. This lesson puts the
+    query's filters into that listing.
+
+    By the end of this lesson you will be able to:
+
+    - Implement `pushFilters` and know which filters Spark sends
+      (`EqualTo`, `In`, `StringEndsWith`, comparisons, ...)
+    - Decide which filters to take over and return the rest to Spark
+    - Apply pushed filters before opening files, and prove it with an
+      audit log and the query plan
+    - Turn on the flag that 4.2.0 needs, and recognize
+      `DATA_SOURCE_PUSHDOWN_DISABLED`
+    - Avoid the 4.2.0 traps: a reused DataFrame that keeps an old filter,
+      relative paths on Spark Connect, and a broken error message
+
+- Class: text
+  Depth: all
+  Output: |
+    ## How Pushdown Works
+
+    Filter pushdown for Python data sources arrived in Spark 4.1
+    (SPARK-51271). When a query has filters, Spark's optimizer:
+
+    1. Splits the `WHERE` condition into parts joined by `AND`.
+    2. Converts each part it can express into a filter object from
+       `pyspark.sql.datasource` (parts it cannot express are kept back).
+    3. Calls your reader's `pushFilters(filters)` once, during planning,
+       before `partitions()`.
+    4. Keeps evaluating, in its own `Filter` node, every filter that
+       `pushFilters` **returns** (yields). The ones you do not return are
+       your job from now on.
+
+    ```python
+    from pyspark.sql.datasource import EqualTo
+
+    class FilesReader(DataSourceReader):
+        def pushFilters(self, filters):
+            for f in filters:
+                if isinstance(f, EqualTo) and f.attribute == ("kind",):
+                    self.kinds = {f.value}     # handled here, Spark stops checking it
+                else:
+                    yield f                    # Spark keeps checking this one
+    ```
+
+    `pushFilters` may change `self`: the reader object, with whatever you
+    saved, is what `partitions()` and `read()` run on afterwards. It must
+    stay picklable.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Think of a librarian fetching books for you. Without pushdown you say
+    "bring me everything", and you sort through the pile at your desk.
+    With pushdown you say "I want images and anything over 4 KB"; the
+    librarian checks the catalog and only walks to the shelves that
+    match.
+
+    The librarian can refuse part of the request ("I can't tell how wide
+    a picture is without opening it"). Then you still check that part
+    yourself. That is what returning a filter from `pushFilters` means.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Filters Spark Sends
+
+    Each filter has an `attribute`, the column as a tuple of names
+    (`("kind",)`, or `("a", "b")` for a nested field `a.b`), and usually
+    a `value` as a plain Python object. What arrived in the exercise's
+    `pushFilters` for some conditions (4.2.0):
+
+    | Condition | Filters passed to `pushFilters` |
+    |---|---|
+    | `kind = 'image' AND width > 12` | `IsNotNull(kind)`, `IsNotNull(width)`, `EqualTo(kind, 'image')`, `GreaterThan(width, 12)` |
+    | `kind IN ('a', 'b')` | `In(kind, ['a', 'b'])` |
+    | `name LIKE '%.eml'` or `endswith(".eml")` | `IsNotNull(name)`, `StringEndsWith(name, '.eml')` |
+    | `name LIKE 'tone%'` | `IsNotNull(name)`, `StringStartsWith(name, 'tone')` |
+    | `name LIKE '%one%'` | `IsNotNull(name)`, `StringContains(name, 'one')` |
+    | `kind <> 'image'` | `IsNotNull(kind)`, `Not(EqualTo(kind, 'image'))` |
+    | `size BETWEEN 10 AND 100` | `IsNotNull(size)`, `GreaterThanOrEqual(size, 10)`, `LessThanOrEqual(size, 100)` |
+    | `width IS NULL` | `IsNull(width)` |
+    | `lower(kind) = 'image'` | `IsNotNull(kind)` only |
+    | `kind = 'audio' OR size < 100` | nothing: `pushFilters` is not called |
+    | `kind = 'image' AND (size < 50 OR size > 1000)` | `IsNotNull(kind)`, `EqualTo(kind, 'image')` |
+
+    The full list of classes: `EqualTo`, `EqualNullSafe`, `GreaterThan`,
+    `GreaterThanOrEqual`, `LessThan`, `LessThanOrEqual`, `In`, `IsNull`,
+    `IsNotNull`, `Not`, `StringStartsWith`, `StringEndsWith` and
+    `StringContains`. Notice what never arrives:
+
+    - **OR** across conditions (the `OR` part is simply not pushed; an
+      `AND` beside it still is)
+    - functions of a column (`lower(kind)`), arithmetic (`size % 2 = 1`),
+      comparisons between two columns
+    - Spark adds `IsNotNull` for the columns of a comparison, because
+      `kind = 'image'` can only be true when `kind` is not NULL
+
+- Class: mult_question
+  Depth: all
+  Output: "A query filters `(kind = 'image') OR (size > 100)` on your source. Which filters reach pushFilters?"
+  AnswerChoices: "None, an OR across conditions is not pushed;EqualTo(kind) and GreaterThan(size);Only EqualTo(kind);A single Or filter"
+  CorrectAnswer: "None, an OR across conditions is not pushed"
+  Hint: "Spark only pushes parts joined by AND, and there is no Or filter class for Python data sources."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Contract: Take Over Only What You Apply
+
+    When you do not return a filter, **Spark stops checking it**. If your
+    reader then ignores it, the query returns wrong results, with no
+    error. A reader whose `pushFilters` returns nothing and filters
+    nothing answers `kind = 'image'` with all 26 files of the sample
+    folder.
+
+    So take over a filter only when you can apply it **exactly**:
+
+    - **Pushed into planning.** `kind` comes from the file extension and
+      `size` from `os.stat`, so `partitions()` can decide both without
+      opening a file. The files that fail never reach a task.
+    - **Applied in `read()`.** For a filter on a value you only know
+      after parsing (the PNG `width`), you could check it in `read()`
+      and drop rows, but that saves no I/O. Usually it is simpler to
+      return it and let Spark do it.
+    - **Not at all.** Return it. Spark evaluates it after your rows
+      arrive. This is always correct.
+
+    A filter can also be pushed **and** returned: if an API only filters
+    by day but your filter is by hour, ask the API for the day and return
+    the filter, so Spark trims the rest.
+
+    One more rule from the docstring: every filter you return must be one
+    of the objects you were given, **by reference**. Do not build new
+    ones.
+
+- Class: mult_question
+  Depth: all
+  Output: "Your pushFilters stores EqualTo(kind, 'image') and does not yield it, but partitions() forgets to use it. What does the query return?"
+  AnswerChoices: "Every row, because Spark no longer checks that filter;Only images, because Spark re-checks all filters;An error at planning;No rows"
+  CorrectAnswer: "Every row, because Spark no longer checks that filter"
+  Hint: "Spark only evaluates the filters you yield back."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Exercise Source: Files by Metadata
+
+    The exercise's `files` source lists `data/messy` and returns one row
+    per file: `path`, `name`, `kind` (from the extension), `size`, and the
+    `width` and `height` read from a PNG header. The pushdown parts:
+
+    ```python
+    def pushFilters(self, filters):
+        for f in filters:
+            if isinstance(f, EqualTo) and f.attribute == ("kind",):
+                self.kinds = {f.value}
+            elif isinstance(f, In) and f.attribute == ("kind",):
+                self.kinds = set(f.value)
+            elif isinstance(f, StringEndsWith) and f.attribute == ("name",):
+                self.suffixes.append(f.value)
+            elif isinstance(f, (GreaterThan, GreaterThanOrEqual, LessThan,
+                                LessThanOrEqual)) and f.attribute == ("size",):
+                self.size_tests.append((type(f).__name__, f.value))
+            else:
+                yield f
+
+    def partitions(self):
+        files = [p for p, size in list_files(self.root) if self.matches(p, size)]
+        ...
+    ```
+
+    `width > 12` is returned: the width is in the file's bytes, so the
+    file has to be opened anyway. `IsNotNull(kind)` is returned too;
+    harmless, since Spark then checks a condition that is always true.
+    (A reader that knows a column is never NULL may take `IsNotNull`
+    over as well.)
+
+    To **prove** that files are skipped, `read()` writes every path it
+    opens to an audit file in a directory given by the `audit_dir`
+    option. With `kind = 'image'`, the audit lists the 5 PNGs and nothing
+    else, out of 26 files.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Seeing Pushdown in the Plan
+
+    `df.explain()` shows what Spark still evaluates itself. For
+    `kind = 'image' AND width > 12`:
+
+    ```text
+    +- *(1) Filter ((isnotnull(kind#106) AND isnotnull(width#108)) AND (width#108 > 12))
+       +- BatchScan files[path#104, name#105, kind#106, size#107L, width#108, height#109] (Python) RuntimeFilters: []
+    ```
+
+    `kind = 'image'` is gone from the `Filter`: the reader took it over.
+    `explain("formatted")` also lists what was pushed:
+
+    ```text
+    (1) BatchScan files
+    Output [6]: [path#0, name#1, kind#2, size#3L, width#4, height#5]
+    PushedFilters: [EqualTo(kind,image)]
+    ReadSchema: struct<path:string,name:string,kind:string,size:bigint,width:int,height:int>
+    ```
+
+    Note the `ReadSchema`: it is always the full schema. Python data
+    sources get no column pruning in 4.2, so `read()` must produce every
+    column even when the query selects one.
+
+    Capture the plan in a test with `contextlib.redirect_stdout`, which
+    works on Spark Connect too (`df._jdf` only exists in classic
+    sessions):
+
+    ```python
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        df.explain()
+    filters = [l for l in buf.getvalue().splitlines() if "Filter" in l and "Scan" not in l]
+    ```
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    `df` reads your Python data source with filter pushdown enabled.
+    Print the formatted plan of the rows where `kind` is `"pdf"`, so you
+    can see the `PushedFilters` line.
+  CorrectAnswer: |
+    df.filter(sf.col("kind") == "pdf").explain("formatted")
+  Hint: "explain() takes a mode string; 'formatted' prints each node's details, including PushedFilters."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Flag, and the Error When It Is Off
+
+    In 4.2.0 pushdown is switched off by default, behind an internal
+    setting (since 4.1):
+
+    ```python
+    spark.conf.set("spark.sql.python.filterPushdown.enabled", "true")
+    ```
+
+    With the flag off, a reader that **implements** `pushFilters` is not
+    quietly read without pushdown. The first action fails (not `load()`,
+    which succeeds):
+
+    ```text
+    [PYTHON_DATA_SOURCE_ERROR] Failed to initialize Python data source reader: ...
+    PySparkAssertionError: [DATA_SOURCE_PUSHDOWN_DISABLED] FilesReader implements
+    pushFilters() but filter pushdown is disabled because configuration
+    'spark.sql.python.filterPushdown.enabled' is false. Set it to true to
+    enable filter pushdown.
+    ```
+
+    This happens for **every** query on the source, even one with no
+    filter at all. It is a deliberate guard against silently slow reads;
+    SPARK-55087 (open) asks Spark to skip `pushFilters` instead. Until
+    that changes, a reader you ship should document the flag.
+
+- Class: mult_question
+  Depth: all
+  Output: "The flag spark.sql.python.filterPushdown.enabled is false and your reader implements pushFilters. You run spark.read.format(\"files\").load().count(), with no filter. What happens?"
+  AnswerChoices: "It fails with DATA_SOURCE_PUSHDOWN_DISABLED;It returns all rows, since there is no filter to push;load() fails before count() runs;Spark ignores pushFilters and logs a warning"
+  CorrectAnswer: "It fails with DATA_SOURCE_PUSHDOWN_DISABLED"
+  Hint: "The check is whether the reader overrides pushFilters, not whether the query has filters."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Trap: Reusing a DataFrame After a Pushed Query (4.2.0)
+
+    Testing this lesson turned up a behaviour that returns **wrong
+    results** silently, in both classic and Spark Connect sessions:
+
+    ```python
+    df = spark.read.format("files").option("path", root).load()
+    df.count()                                  # 26
+    df.filter(sf.col("kind") == "image").count()  # 5
+    df.count()                                  # 5, not 26
+    df.filter("kind = 'audio' OR size < 100").count()  # computed over the 5 images only
+    ```
+
+    This is the plan reuse you saw in "Reading from an API"; with
+    pushdown it becomes a correctness bug. The cause is in
+    `PythonDataSourceV2` (4.2.0): the planned read (the
+    reader and its partitions) is kept on the DataFrame's relation and
+    reused by later queries. A query with pushable filters replaces it
+    with the filtered plan. A later query whose filters cannot be pushed
+    (none, or only an `OR`) never calls `pushFilters`, so it reuses the
+    **filtered** plan. A temporary view over the source behaves the same
+    way, because every query on the view shares the relation. A query
+    with new pushable filters gets a fresh plan and is correct.
+
+    Spark's master branch has already fixed this (as part of
+    SPARK-58551, which keeps the planned read on each scan instead of
+    on the relation), but 4.2.0 and the 4.3 branch still have it. On
+    those versions, when pushdown is on:
+
+    - call `load()` again for each query instead of reusing a DataFrame
+      or a temporary view
+    - or write the source's output to a table once and query the table
+
+    The exercise builds a fresh DataFrame for every query, and prints the
+    stale count so you can see it happen.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "With pushdown on, you run df.filter(\"kind = 'image'\").count() and then df.count() on the same DataFrame in Spark 4.2.0. What does the second count return?"
+  AnswerChoices: "The number of images, because the filtered plan is reused;The number of all files;An error;A random subset"
+  CorrectAnswer: "The number of images, because the filtered plan is reused"
+  Hint: "The unfiltered query never calls pushFilters, so it reuses the plan the previous query left on the relation."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Two More 4.2.0 Surprises
+
+    **Relative paths on Spark Connect.** In a classic session the Python
+    workers run in the directory you started from, so `data/messy` works.
+    On Spark Connect they run in a per-session directory of the server
+    (something like `/tmp/spark-.../userFiles-.../<session id>`), so a
+    relative path finds nothing, and a reader that lists a folder returns
+    **zero rows without an error**. Pass absolute paths to Python data
+    sources (`os.path.abspath(path)` on the client), as the exercise
+    harness does. Spark's own readers (`spark.read.json(...)`) are not
+    affected; they resolve paths in the server's JVM.
+
+    **The extraneous filter error is broken.** If `pushFilters` yields a
+    filter that is not one of its inputs (for example a new `EqualTo` it
+    built), PySpark tries to raise `DATA_SOURCE_EXTRANEOUS_FILTERS`, but
+    the call passes message parameters the template does not have. What
+    you get is `PYTHON_DATA_SOURCE_ERROR` wrapping
+    `AssertionError: Undefined error message parameter for error class:
+    DATA_SOURCE_EXTRANEOUS_FILTERS`. That is SPARK-59909 (affects 4.0 to
+    4.2, fixed in 4.3.0). If you see it, you returned a filter you did
+    not receive.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Designing Pushdown for Real Sources
+
+    - **Databases and APIs.** Translate filters into the backend's query
+      language (`WHERE kind = ?`, `?status=open`), with parameters, never
+      by pasting values into strings. Return what the backend cannot do.
+    - **Types of values.** `value` is a Python object of the column's
+      type: `int`, `float`, `str`, `bool`, `datetime.datetime` (for
+      timestamps), lists for arrays. Compare it with values of the same
+      type.
+    - **Combining filters.** Several pushed filters on one column are
+      AND-ed: `kind IN ('a','b') AND kind = 'a'` must keep only `a`
+      (intersect the sets, as the exercise does).
+    - **`Not`.** `Not(EqualTo(...))` arrives for `<>`. Handle it only if
+      you handle what is inside; mind NULLs (`kind <> 'image'` is not
+      true for a NULL kind).
+    - **Planning cost.** With the flag on, `pushFilters` runs in a Python
+      worker during planning, and the same worker then plans the
+      partitions, so it costs one worker call, not two.
+    - **Streaming.** `pushFilters` belongs to the batch
+      `DataSourceReader`; streaming readers do not receive filters in
+      4.2.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Skip Files You Do Not Need
+
+    The `files` source lists `data/messy`, and `read()` already writes the
+    audit log and parses PNG headers. Complete:
+
+    1. `FilesReader.pushFilters(filters)`: take over `EqualTo` and `In`
+       on `kind`, `StringEndsWith` on `name`, and the four comparisons on
+       `size`; yield everything else unchanged.
+    2. `FilesReader.matches(path, size)`: apply what you took over.
+       `partitions()` already calls it for every listed file.
+
+    The harness checks the `DATA_SOURCE_PUSHDOWN_DISABLED` error with the
+    flag off, then, with it on, for `kind = 'image'`, `kind IN (...)`,
+    a name suffix and `size > 4000`: the right rows, an audit log that
+    lists only the matching files, and a plan in which Spark no longer
+    evaluates the pushed condition. It also checks that `width > 12`
+    stays in Spark's `Filter` and that an `OR` still gives the right
+    answer.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Compare f.attribute with a tuple such as ('kind',), not a string. In matches(), test os.path.basename(path).endswith(suffix) for each suffix and compare size with each saved (operator, value) pair."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - `pushFilters(filters)` (4.1, SPARK-51271) receives the AND-ed parts
+      of a query's condition that Spark can express, as `EqualTo`, `In`,
+      `StringEndsWith`, comparisons and friends; `attribute` is a tuple
+      of names. OR and functions of columns are never pushed.
+    - Yield back what you do not apply; Spark only evaluates the filters
+      you return, so a filter you keep and ignore gives **wrong results**.
+    - Apply metadata filters in `partitions()` so unmatched files are
+      never opened; prove it with an audit log and with `explain()` and
+      `explain("formatted")` (`PushedFilters`).
+    - In 4.2.0 set `spark.sql.python.filterPushdown.enabled=true`;
+      otherwise a reader with `pushFilters` fails every query with
+      `DATA_SOURCE_PUSHDOWN_DISABLED` at the first action.
+    - 4.2.0 traps: a reused DataFrame or view keeps the plan of the last
+      pushed query (call `load()` per query); relative paths silently
+      find nothing on Spark Connect; a returned filter you built yourself
+      triggers a broken error message (SPARK-59909).
+
+    Next: **Writers**, where your data source learns to write: per-task
+    files, a commit on the driver, save modes and Arrow writers.

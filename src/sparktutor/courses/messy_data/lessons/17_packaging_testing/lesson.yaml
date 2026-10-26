@@ -1,0 +1,410 @@
+- Class: meta
+  Lesson: "Packaging, Registration, Testing and Debugging"
+  EstimatedMinutes: 40
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    Until now every data source lived inside the exercise file and was
+    registered by hand. That is fine for learning, but a source your
+    team relies on needs to be installable, tested without starting
+    Spark, and debuggable when it fails on an executor you cannot see.
+
+    By the end of this lesson you will be able to:
+
+    - Package a source so that `format("mailbox")` works after
+      `pip install`, with no `register()` call, through the `pyspark_*`
+      auto-registration convention
+    - Explain registration rules: replacing a source, case-insensitive
+      names, and why a source named `json` is refused
+    - Unit test a reader as plain Python, with the same checks Spark
+      applies, and no SparkSession
+    - Tell the two error surfaces apart (planning versus execution) and
+      name the error condition in Classic and Connect
+    - Read your reader's log lines back with `python_worker_logs()`
+      (4.1), and poll for them because they arrive asynchronously
+
+    The source in this lesson reads e-mails, as in "Documents to Rows":
+    one row per `.eml` file with sender, subject and body.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## A Source as a Package
+
+    Spark finds Python data sources in installed packages by a naming
+    convention. When a session first needs a Python data source, Spark
+    starts a Python worker that imports **every top-level module whose
+    name starts with `pyspark_`**, and registers the `DefaultSource`
+    class of each one that has it (the code is in
+    `pyspark/sql/worker/lookup_data_sources.py`). The source is
+    registered under its own `name()`, not the module name.
+
+    A minimal layout:
+
+    ```text
+    pyspark-mailbox/
+      pyproject.toml
+      src/pyspark_mailbox/__init__.py
+      src/pyspark_mailbox/source.py      # MailboxDataSource and its reader
+      tests/test_reader.py
+    ```
+
+    ```toml
+    [build-system]
+    requires = ["setuptools>=68"]
+    build-backend = "setuptools.build_meta"
+
+    [project]
+    name = "pyspark-mailbox"
+    version = "0.1.0"
+    requires-python = ">=3.10"
+    dependencies = ["pyspark>=4.0"]
+
+    [tool.setuptools.packages.find]
+    where = ["src"]
+    ```
+
+    ```python
+    # src/pyspark_mailbox/__init__.py
+    from pyspark_mailbox.source import MailboxDataSource
+
+    # Spark looks for this name in every top-level module called pyspark_*
+    DefaultSource = MailboxDataSource
+    ```
+
+    Install it and use it, with no `register()` anywhere:
+
+    ```bash
+    pip install -e ./pyspark-mailbox
+    ```
+
+    ```python
+    df = spark.read.format("mailbox").load("data/messy/mail")
+    df.count()   # 4
+    ```
+
+    `pip install -e` (editable) links the package to your source folder,
+    so code changes take effect the next time you start Spark, without
+    reinstalling. Build a wheel for everyone else.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Where the Package Must Be Installed
+
+    The lookup and every `read()` run in **Spark's Python workers**, not
+    necessarily in the Python you typed `pip install` into. Workers use
+    the interpreter named by `PYSPARK_PYTHON` (or the
+    `spark.pyspark.python` setting), and `python3` from the `PATH` if
+    neither is set.
+
+    With the package installed in one virtual environment but the
+    workers pointed at another, two things happened in testing:
+
+    - `format("mailbox")` failed with `DATA_SOURCE_NOT_FOUND`, because
+      the lookup ran in the other Python and found nothing
+    - registering the class by hand from the driver
+      (`from pyspark_mailbox import MailboxDataSource`) got further, but
+      the read failed with `PYTHON_DATA_SOURCE_ERROR` caused by
+      `ModuleNotFoundError: No module named 'pyspark_mailbox'`
+
+    The second case shows a pickling rule worth remembering. A class
+    defined in your script's `__main__` is pickled **by value** (its code
+    travels with it), which is why every exercise in this course works
+    without installing anything. A class imported from an installed
+    module is pickled **by reference** ("import `pyspark_mailbox` and use
+    `MailboxDataSource`"), so that module must be importable on every
+    worker. On a cluster, install the package on the driver and on every
+    executor. On Spark Connect, install it where the Connect server runs.
+
+    Two more details from the lookup code:
+
+    - It runs once per Spark application. A package installed after the
+      session started is not seen until you restart it.
+    - If importing any `pyspark_*` module raises an error, Spark logs
+      "Skipping the lookup of Python Data Sources due to the failure"
+      and registers none of them, so one broken package hides all the
+      others.
+
+- Class: mult_question
+  Depth: all
+  Output: "You pip install pyspark_mailbox into your project venv, but PYSPARK_PYTHON points to a different Python. What does spark.read.format('mailbox').load(path) do?"
+  AnswerChoices: "Fails with DATA_SOURCE_NOT_FOUND;Works, because the driver can import the package;Fails with DATA_SOURCE_ALREADY_EXISTS;Works, but only in local mode"
+  CorrectAnswer: "Fails with DATA_SOURCE_NOT_FOUND"
+  Hint: "Which Python process imports the pyspark_* modules during the lookup?"
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Registration Rules
+
+    `spark.dataSource.register(cls)` registers a class for the current
+    session, under `cls.name()`:
+
+    - **Names are case-insensitive.** After registering `mailbox`,
+      `format("MailBox")` finds it.
+    - **Registering a name again replaces the source.** A second
+      `register()` with the same name wins (Spark logs a warning), and
+      the same applies to a source that was auto-registered from a
+      package: since 4.1 you can override a statically registered
+      source with `register()` (SPARK-51919). This is handy for testing
+      a fix without reinstalling.
+    - **Built-in and JVM source names are refused.** Registering a
+      Python source called `json` fails at `register()`:
+
+    ```text
+    [DATA_SOURCE_ALREADY_EXISTS] Data source 'json' already exists.
+    Please choose a different name for the new data source. SQLSTATE: 42710
+    ```
+
+    Spark checks whether the name already resolves to a non-Python
+    source (`json`, `parquet`, `csv`, `text`, `rate`, and any connector
+    on the classpath) and refuses it, so a Python source can never
+    shadow one. Pick distinctive names.
+
+    - **An unknown name** fails when the DataFrame is created:
+      `[DATA_SOURCE_NOT_FOUND] Failed to find the data source: mailbox.`
+
+- Class: mult_question
+  Depth: all
+  Output: "Which registration fails?"
+  AnswerChoices: "A Python source whose name() returns 'parquet';Registering a source named 'mailbox' twice;Registering 'MailBox' and reading format('mailbox');Overriding an auto-registered source with register()"
+  CorrectAnswer: "A Python source whose name() returns 'parquet'"
+  Hint: "Python sources may replace each other, but never a built-in source."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Unit Tests Without Spark
+
+    A reader is a plain Python object. You can create it, plan its
+    partitions and call `read()` without a SparkSession, which makes
+    tests fast and errors easy to read. The useful trick is to apply
+    **the same checks Spark applies**, so a test fails for the reasons a
+    real query would:
+
+    | Spark checks | In a real query you would see |
+    |---|---|
+    | `partitions()` returns a `list` | `DATA_SOURCE_TYPE_MISMATCH`: Expected 'partitions' to return a list, but got 'generator'. |
+    | every partition is an `InputPartition` | `DATA_SOURCE_TYPE_MISMATCH`: Expected elements in 'partitions' to be of type 'InputPartition', but got 'int', 'int'. |
+    | each row has one value per column | `DATA_SOURCE_RETURN_SCHEMA_MISMATCH`: Expected: 2 columns, Found: 1 columns. |
+    | the reader and partitions pickle | a pickling error before any task starts |
+
+    Spark pickles with cloudpickle, which `pyspark` ships as
+    `pyspark.cloudpickle`; using it in tests catches the same problems
+    (an open file, socket or lock stored on `self`).
+
+    A pytest file for the packaged source can be this small:
+
+    ```python
+    import pytest
+    from pyspark_mailbox import MailboxDataSource
+
+    def read_all(options):
+        reader = MailboxDataSource(options).reader(None)
+        return [row for p in reader.partitions() for row in reader.read(p)]
+
+    def test_one_row_per_email():
+        assert len(read_all({"path": "data/messy/mail", "partitions": "3"})) == 4
+
+    def test_missing_path_is_a_clear_error():
+        with pytest.raises(ValueError, match="needs a folder"):
+            MailboxDataSource({}).reader(None)
+    ```
+
+    `python -m pytest` runs it in a fraction of a second. The rules from
+    "Your First Python Data Source" still apply: option values are
+    strings (`{"partitions": "3"}`, not `3`), and schemas are built from
+    `StructType` objects, not DDL strings. A plain dict is fine here
+    because every key is already lowercase; use a `CaseInsensitiveDict`
+    when a test passes mixed-case keys.
+
+    Then keep a few integration tests that run a real local session, to
+    catch what plain Python cannot: registration, type conversion on the
+    Spark side, and pushdown.
+
+- Class: cmd_question
+  Depth: intermediate
+  Output: |
+    Without starting Spark, collect every row the `mailbox` reader
+    produces for the folder `data/messy/mail` with 3 partitions into a
+    list called `rows`. Pass `None` as the schema (this reader ignores
+    it).
+  CorrectAnswer: |
+    reader = MailboxDataSource({"path": "data/messy/mail", "partitions": "3"}).reader(None)
+    rows = [row for p in reader.partitions() for row in reader.read(p)]
+  Hint: "Create the DataSource with an options dict, call reader(), then read() each partition."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Two Error Surfaces
+
+    Errors from a Python data source reach you at two different
+    moments, with two different conditions:
+
+    - **At the first action** (`collect()`, `count()`, `show()` and
+      friends): Spark creates your reader and calls `partitions()`
+      on the driver. An exception there, such as the `ValueError` for a
+      missing `path`, surfaces as `PYTHON_DATA_SOURCE_ERROR` ("Failed to
+      initialize Python data source reader"), with your traceback in the
+      message. `load()` alone only calls `schema()` (on Spark Connect,
+      not even that until something needs the schema, as in "Reading
+      from an API"), so `df.columns` still works on a DataFrame that
+      will fail later.
+    - **When a task runs**: an exception inside `read()` fails the task
+      as `PYTHON_EXCEPTION` ("An exception was thrown from the Python
+      worker"), again with your traceback. Spark checks of `read()`'s
+      output, such as `DATA_SOURCE_RETURN_SCHEMA_MISMATCH`, appear inside
+      it.
+
+    To branch on an error in code, ask for its condition with
+    `e.getCondition()`. It is not always filled in on the Python side,
+    and the gaps differ by mode (from testing on 4.2.0):
+
+    | Error | Classic | Connect |
+    |---|---|---|
+    | `DATA_SOURCE_NOT_FOUND` | `Py4JJavaError`, no condition | condition set |
+    | `PYTHON_EXCEPTION` from `read()` | condition set | `getCondition()` is `None` |
+    | `PYTHON_DATA_SOURCE_ERROR`, `DATA_SOURCE_ALREADY_EXISTS` | condition set | condition set |
+
+    Every message still starts with or contains `[CONDITION_NAME]`, so a
+    robust helper uses `getCondition()` and falls back to the first
+    bracketed name in `str(e)`. You write that helper in the exercise.
+
+- Class: mult_question
+  Depth: all
+  Output: "A reader's read() raises ValueError for a corrupt file. When does the error appear?"
+  AnswerChoices: "At the first action, as PYTHON_EXCEPTION from the task;At load(), as PYTHON_DATA_SOURCE_ERROR;At register(), as DATA_SOURCE_TYPE_MISMATCH;Never, Spark skips the file"
+  CorrectAnswer: "At the first action, as PYTHON_EXCEPTION from the task"
+  Hint: "read() runs inside a task on an executor."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Debugging with Worker Logs (4.1)
+
+    `read()` runs in a Python worker on an executor. A `print()` there
+    does not show up in your notebook or terminal, and on a cluster it
+    lands in a log file on a machine you may not be able to reach.
+    Spark 4.1 added a way to collect those logs into a table:
+
+    ```python
+    spark.conf.set("spark.sql.pyspark.worker.logging.enabled", "true")
+
+    spark.read.format("mailbox").load("data/messy/mail").collect()
+
+    spark.tvf.python_worker_logs() \
+        .filter("logger = 'mailbox'") \
+        .select("ts", "level", "msg", "context").show(truncate=False)
+    ```
+
+    The setting defaults to `false`. The table has the columns `ts`,
+    `level`, `msg`, `context` (a map with the calling function), an
+    `exception` struct for logged exceptions, and `logger`. It collects
+    `logging` calls from UDFs, UDTFs and data source readers, and also
+    `print()` output, under the logger name `stdout` at level `INFO`.
+
+    Three things surprised us:
+
+    - **Levels follow Python's rules.** `log.info(...)` is dropped
+      unless the logger's level allows it, because the default level
+      is `WARNING`. Call `logging.getLogger("mailbox").setLevel(logging.INFO)`
+      in `read()`, or log warnings.
+    - **`print("parsed", name)` becomes two rows**, one per argument,
+      because `print` writes its pieces separately. Use one f-string or
+      `logging` with a format string.
+    - **Logs arrive asynchronously.** In one run the first query right
+      after an action returned fewer rows than a later one. SPARK-59547
+      (open) proposes flushing worker logs before a task completes. Until
+      then, poll: read the table again for a few seconds until the
+      lines you expect are there, and never assert on a single read.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## A Checklist Before You Ship a Source
+
+    - Name it something no built-in or connector uses.
+    - Validate required options in `DataSource.__init__` (they fail
+      when the plan is analyzed, as in "Reading from an API") and the
+      rest in the reader's constructor; both surface before any task
+      runs.
+    - Keep `__init__` free of open connections and file handles; open
+      them in `read()`. Readers are pickled.
+    - Import third-party libraries inside `read()` so the module loads
+      even where only the driver has them, and list them as package
+      dependencies so executors get them too.
+    - Unit test `partitions()` and `read()` with Spark's own checks;
+      keep a small integration test with a local session.
+    - Log with `logging` under a logger named after the source.
+    - Know the 4.2.0 limits: filter pushdown needs
+      `spark.sql.python.filterPushdown.enabled` (default `false`), and
+      Python data sources inside Declarative Pipelines make
+      `spark-pipelines` exit with status 1 even when the run completes
+      (SPARK-59135, fixed in 4.4.0). The capstone works around the
+      second one.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Test, Register and Debug a Source
+
+    The starter has the finished `mailbox` source (one row per `.eml`
+    file; it logs `parsed <folder>/<file>` at `INFO` for each file and
+    raises `ValueError` for a file without a `From` header). Write the
+    three tools around it:
+
+    1. `read_without_spark(source_cls, options, schema)`: create the
+       reader, check it pickles with `cloudpickle`, check that
+       `partitions()` returns a list of `InputPartition`, read every
+       partition, check each row's length against the schema, and
+       return the rows.
+    2. `error_condition(action)`: run `action()` and return `None`, or
+       the error's condition (`getCondition()`, else the first
+       `[NAME]` in the message).
+    3. `wait_for_worker_logs(spark, logger, prefix, expected)`: poll
+       `spark.tvf.python_worker_logs()` until `expected` messages from
+       `logger` starting with `prefix` arrive, or the timeout passes.
+
+    The harness runs the reader without Spark first (no session exists
+    yet), then starts a session with worker logging on and checks:
+    `DATA_SOURCE_NOT_FOUND` before registration, identical rows from
+    Spark and from your unit test, `DATA_SOURCE_ALREADY_EXISTS` for a
+    source named `json`, replacement by a second `register()`, the two
+    error surfaces, and one log line per ticket.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "error_condition: get = getattr(e, 'getCondition', None); name = get() if get else None; return name or the regex match. wait_for_worker_logs: a while True loop with time.monotonic() and time.sleep(0.5)."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - Name a top-level module `pyspark_<something>`, export
+      `DefaultSource`, and `pip install` it: Spark registers the source
+      automatically, once per application, in the Python its workers
+      use.
+    - Classes from `__main__` are pickled by value; classes from an
+      installed module by reference, so install the package on every
+      node (or on the Connect server).
+    - `register()` replaces Python sources (including auto-registered
+      ones, since 4.1) and refuses built-in names with
+      `DATA_SOURCE_ALREADY_EXISTS`; names are case-insensitive.
+    - Unit test readers as plain Python with Spark's checks: a list of
+      `InputPartition`, picklable objects, one value per column. Build
+      test schemas with `StructType`.
+    - Planning errors surface as `PYTHON_DATA_SOURCE_ERROR`, task errors
+      as `PYTHON_EXCEPTION`; read conditions with `getCondition()` and a
+      fallback on the message.
+    - `spark.sql.pyspark.worker.logging.enabled` plus
+      `python_worker_logs()` (4.1) bring worker logs to the driver; set
+      log levels deliberately and poll, because logs arrive
+      asynchronously.
+
+    Next: **Capstone: An Unstructured Ingestion Source and a Catalog
+    Pipeline**, which puts the whole course together.

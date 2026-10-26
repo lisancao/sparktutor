@@ -1,0 +1,438 @@
+- Class: meta
+  Lesson: "Writers"
+  EstimatedMinutes: 40
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    Every data source so far in this course has been a reader. Spark can
+    also hand rows to your Python code to write them somewhere: a custom
+    file layout, an API that accepts uploads, a search index, a registry
+    of what was ingested. The writer half of the Python Data Source API
+    has been in Spark since 4.0 (SPARK-44076), and it has a small but
+    strict contract that decides whether a failed job leaves garbage
+    behind.
+
+    By the end of this lesson you will be able to:
+
+    - Explain who runs what: `writer()` and `commit()` on the driver,
+      `write()` once per task on the executors
+    - Return commit messages from tasks and use them in `commit()`
+    - Use the two save modes a Python writer accepts (`append` and
+      `overwrite`) and know what `overwrite` does *not* do for you
+    - Clean up after a failed job in `abort()`, using a staging folder
+      and a job id shared by the driver and the tasks
+    - Publish a write in one step with a manifest file
+    - Write Arrow record batches with `DataSourceArrowWriter` (4.0)
+
+    You need the reader basics from "Your First Python Data Source". The
+    exercise writes the web server log from "Text and Logs" into a tiny
+    file format of your own, with a manifest that says which files
+    belong to the table.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## When a Custom Writer Makes Sense
+
+    Spark already writes Parquet, JSON, CSV, ORC, text and (through
+    connectors) Delta, Iceberg and JDBC tables. Use those whenever they
+    fit; they are faster and better tested than anything you will write
+    in an afternoon.
+
+    A Python writer earns its place when the destination is something
+    Spark does not know about:
+
+    - A service with an HTTP API (a ticket system, a vector store, a
+      search index) that takes batches of records
+    - A file layout another tool expects, such as one JSON file per
+      document plus an index file
+    - A side effect per batch: a manifest, a notification, a row in an
+      audit table
+
+    The API is the same in each case. What changes is the code inside
+    `write()`.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Write Path: Who Runs What
+
+    A write is one Spark job. It has three kinds of steps, and they run
+    in different places:
+
+    | Step | Runs | How many times |
+    |---|---|---|
+    | `DataSource.writer(schema, overwrite)` | driver side, in a Python worker | once |
+    | `DataSourceWriter.write(rows)` | executors | once per task (one task per partition of the DataFrame) |
+    | `DataSourceWriter.commit(messages)` | driver side, in a Python worker | once, if every task succeeded |
+    | `DataSourceWriter.abort(messages)` | driver side, in a Python worker | once, if any task failed |
+
+    "Driver side" means a Python worker next to the driver, not your
+    script's process (as in "Your First Python Data Source"): `commit()`
+    cannot see your script's variables, and its `print` output does not
+    reach your console.
+
+    Spark creates the writer on the driver, pickles it, and sends a copy
+    to every task. Each task calls `write()` with an iterator over its
+    rows and returns a **commit message**. Spark collects the messages
+    from all tasks and passes them, in task order, to `commit()`.
+
+    Here is the smallest useful writer. It writes one text file per task
+    and, in `commit()`, records how many rows each task wrote:
+
+    ```python
+    import json
+    import os
+    from pyspark.sql.datasource import DataSource, DataSourceWriter, WriterCommitMessage
+
+    class RowCount(WriterCommitMessage):
+        def __init__(self, task, rows):
+            self.task, self.rows = task, rows
+
+    class CountingSink(DataSource):
+        @classmethod
+        def name(cls):
+            return "countingsink"
+
+        def writer(self, schema, overwrite):
+            return CountingWriter(self.options["path"])
+
+    class CountingWriter(DataSourceWriter):
+        def __init__(self, path):              # on the driver
+            self.path = path
+
+        def write(self, rows):                 # once per task, on an executor
+            from pyspark import TaskContext
+            task = TaskContext.get().partitionId()
+            os.makedirs(self.path, exist_ok=True)
+            n = 0
+            with open(os.path.join(self.path, f"part-{task}.txt"), "w") as f:
+                for row in rows:
+                    f.write(f"{row.id}\n")
+                    n += 1
+            return RowCount(task, n)
+
+        def commit(self, messages):            # once, on the driver
+            with open(os.path.join(self.path, "_COMMITTED"), "w") as f:
+                json.dump({m.task: m.rows for m in messages}, f)
+
+    spark.dataSource.register(CountingSink)
+    spark.range(10).repartition(3).write.format("countingsink").mode("append").save("/tmp/counting")
+    print(open("/tmp/counting/_COMMITTED").read())
+    ```
+
+    The folder ends up with `part-0.txt`, `part-1.txt`, `part-2.txt` and
+    `_COMMITTED`, which maps each of the three tasks to its row count
+    (the counts add up to 10).
+
+    A source that only writes does not need `schema()` or `reader()`.
+    The `schema` argument of `writer()` is the schema of the DataFrame
+    being written, so you can validate it before any task starts.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Think of a write as a group project with a coordinator. The
+    coordinator (the driver) hands each person (a task) a stack of rows.
+    Each person does their part and hands back a slip of paper saying
+    what they did (the commit message). Only when every slip is in does
+    the coordinator announce the result (`commit`). If anyone drops out,
+    the coordinator calls the whole thing off (`abort`) and has to tidy
+    up whatever was already done.
+
+- Class: mult_question
+  Depth: all
+  Output: "A DataFrame with 8 partitions is written with a Python data source. How many times are write() and commit() called if every task succeeds?"
+  AnswerChoices: "write() 8 times on executors, commit() once on the driver;write() once on the driver, commit() 8 times on executors;write() 8 times and commit() 8 times, both on executors;write() once and commit() once, both on the driver"
+  CorrectAnswer: "write() 8 times on executors, commit() once on the driver"
+  Hint: "One task per partition calls write(). The driver collects the messages and commits once."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Commit Messages
+
+    `write()` must return an instance of `WriterCommitMessage` (or a
+    subclass). Forget the `return`, and every task fails with:
+
+    ```text
+    [DATA_SOURCE_TYPE_MISMATCH] Expected 'WriterCommitMessage' as the
+    return type of the `write` method, but got NoneType.
+    ```
+
+    The same error appears if you return a plain object that does not
+    inherit from `WriterCommitMessage`. The message travels from the
+    executor back to the driver by pickling, so keep it small and
+    picklable: file names, row counts, byte counts, an upload id. Never
+    put the rows themselves in it; the driver would have to hold the
+    whole dataset in memory.
+
+    The messages are the only thing the driver learns about what the
+    tasks did. Design them around what `commit()` needs to publish the
+    result.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Save Modes: Only Append and Overwrite
+
+    A Python writer accepts two save modes. Spark's default mode for
+    `DataFrameWriter` is `errorifexists`, so a write without `.mode(...)`
+    fails before any task runs:
+
+    ```text
+    [UNSUPPORTED_DATA_SOURCE_SAVE_MODE] The data source "countingsink"
+    cannot be written in the "ErrorIfExists" mode. Please use either the
+    "Append" or "Overwrite" mode instead. SQLSTATE: 0A000
+    ```
+
+    `mode("error")` and `mode("ignore")` fail the same way. Always write
+    `.mode("append")` or `.mode("overwrite")`.
+
+    `overwrite` reaches your code only as the boolean `overwrite`
+    argument of `writer(schema, overwrite)`. **Spark deletes nothing.**
+    If your writer ignores the flag, an overwrite behaves exactly like
+    an append. Deciding what "replace the old data" means (delete the
+    old files, truncate a remote table, start a new index version) is
+    your job, and the safest place to do it is `commit()`, after the
+    new data is complete.
+
+    Two details about options:
+
+    - `.save(path)` puts the path into the options as `path`, so
+      `.save("/tmp/x")` and `.option("path", "/tmp/x").save()` are the
+      same to your writer.
+    - Options are case-insensitive: `.option("Path", ...)` and
+      `.option("path", ...)` reach you as the same key, stored in
+      lower case.
+
+- Class: mult_question
+  Depth: all
+  Output: "Your writer ignores the overwrite argument. What happens when someone writes with mode('overwrite')?"
+  AnswerChoices: "The new rows are added next to the old ones, exactly like an append;Spark deletes the old files before calling write();Spark refuses the write with UNSUPPORTED_DATA_SOURCE_SAVE_MODE;Spark deletes the old files after commit()"
+  CorrectAnswer: "The new rows are added next to the old ones, exactly like an append"
+  Hint: "For a Python writer, overwrite is just a flag passed to writer(). Who acts on it?"
+
+- Class: text
+  Depth: all
+  Output: |
+    ## When a Task Fails: abort()
+
+    If any task fails, Spark cancels the others and calls
+    `abort(messages)` on the driver instead of `commit()`. The list has
+    one entry per task, and the entry is `None` for every task that did
+    not finish successfully, including the ones Spark cancelled.
+
+    Here is what happened when one task raised an error in the middle of
+    a three-task write that wrote straight into the output folder:
+
+    - `abort()` received `[None, None, None]`
+    - the folder still held three half-written `part-*.jsonl` files
+
+    So the messages cannot tell `abort()` what to clean up. Two habits
+    fix this:
+
+    1. **Stage, then publish.** Tasks write into a staging folder, and
+       only `commit()` moves files to where readers look.
+    2. **A job id created on the driver.** Generate it in the writer's
+       `__init__`. Spark pickles that writer object for every task, so
+       the tasks, `commit()` and `abort()` all see the same id, and
+       `abort()` can delete `_staging/<job id>` without knowing which
+       tasks got how far.
+
+    ```python
+    class JsonLogWriter(DataSourceWriter):
+        def __init__(self, options, overwrite):
+            self.root = options["path"]
+            self.overwrite = overwrite
+            self.job = uuid.uuid4().hex[:8]          # same value in every task
+            self.staging = os.path.join(self.root, "_staging", self.job)
+
+        def abort(self, messages):
+            shutil.rmtree(self.staging, ignore_errors=True)
+    ```
+
+    Folder and file names that start with `_` or `.` are hidden from
+    Spark's file readers, so `spark.read.json(root)` never sees
+    `_staging/` or `_MANIFEST.json`.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Publishing in One Step: a Manifest
+
+    Moving files one by one in `commit()` still leaves a moment where a
+    reader could see some new files and not others. Table formats solve
+    this with a **manifest**: a single file that lists exactly which
+    data files make up the table. Readers trust the manifest, not the
+    folder listing, and a write becomes visible the moment the new
+    manifest replaces the old one.
+
+    Replacing a file in one step on a local disk is `os.replace`:
+    write the new manifest to a temporary name in the same folder, then
+    rename it over the old one.
+
+    ```python
+    def write_manifest(root, manifest):
+        tmp = os.path.join(root, f".{MANIFEST}.{uuid.uuid4().hex}")
+        with open(tmp, "w") as f:
+            json.dump(manifest, f, indent=1)
+        os.replace(tmp, os.path.join(root, MANIFEST))
+    ```
+
+    The order inside `commit()` matters:
+
+    1. Move the staged files into the folder (readers still use the old
+       manifest, so nobody sees them yet).
+    2. Write the new manifest (now they are visible).
+    3. Only then, on overwrite, delete the files the old manifest
+       listed.
+    4. Remove the staging folder.
+
+    If the driver dies between steps, you end up with extra files that
+    no manifest mentions, which is untidy but harmless. Deleting first
+    would risk a table with no data.
+
+    This is a toy. It has no protection against two jobs committing at
+    the same time (the second manifest silently wins), and on object
+    stores such as S3 a rename is a copy, not an atomic step. Delta Lake
+    and Apache Iceberg exist to solve exactly these problems; the
+    exercise is here so you know what they are doing for you.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    The `jsonlog` source from this lesson is registered. Replace the
+    data at `/tmp/requests` with the DataFrame `df`.
+  CorrectAnswer: |
+    df.write.format("jsonlog").mode("overwrite").save("/tmp/requests")
+  Hint: "Choose the format, then the one save mode that replaces data, then save to the path."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Arrow Writers (4.0)
+
+    A plain `DataSourceWriter` receives `Row` objects. Spark ships the
+    data to the Python worker as Arrow batches anyway, and then builds a
+    Python `Row` for every record, which is slow for large writes.
+    `DataSourceArrowWriter` (4.0, SPARK-50471) skips that step: its
+    `write()` receives an iterator of `pyarrow.RecordBatch`.
+
+    ```python
+    class ArrowParquetWriter(DataSourceArrowWriter):
+        def __init__(self, options):
+            self.root = options["path"]
+
+        def write(self, batches):
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+            from pyspark import TaskContext
+
+            batches = list(batches)
+            rows = sum(b.num_rows for b in batches)
+            if not batches:
+                return FileWritten(None, 0)
+            os.makedirs(self.root, exist_ok=True)
+            name = f"part-{TaskContext.get().partitionId():05d}.parquet"
+            pq.write_table(pa.Table.from_batches(batches), os.path.join(self.root, name))
+            return FileWritten(name, rows)
+    ```
+
+    Everything else (`commit`, `abort`, commit messages, save modes) is
+    the same as for a row writer; `DataSourceArrowWriter` is a subclass
+    of `DataSourceWriter`. Use it when the destination speaks Arrow or
+    columnar data (Parquet, an Arrow Flight server, pandas), or when you
+    write many rows.
+
+    Batch size follows `spark.sql.execution.arrow.maxRecordsPerBatch`
+    (default 10000). With it set to 50, a task holding 67 rows received
+    two batches of 50 and 17 rows. Batches keep Spark's types:
+    an `int` column arrives as Arrow `int32`, a `long` as `int64`.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "What does the write() method of a DataSourceArrowWriter receive?"
+  AnswerChoices: "An iterator of pyarrow.RecordBatch;An iterator of pyspark.sql.Row;A pandas DataFrame with all of the task's rows;The whole DataFrame being written"
+  CorrectAnswer: "An iterator of pyarrow.RecordBatch"
+  Hint: "The point of the Arrow writer is to skip building one Python object per row."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Writer Gotchas Worth Knowing
+
+    - **No `writer()`, no write.** A source with only a reader fails at
+      `.save()` with `PYTHON_DATA_SOURCE_ERROR` ("Failed to initialize
+      Python data source writer") wrapping `[NOT_IMPLEMENTED] writer is
+      not implemented.`
+    - **Errors in `write()`** fail the task as `PYTHON_EXCEPTION`, with
+      your Python traceback inside. Errors in `commit()` or `abort()`
+      surface on the driver as `PYTHON_DATA_SOURCE_ERROR` ("Failed to
+      commit or abort Python data source write").
+    - **File count equals task count.** Every partition becomes a task
+      and every task calls `write()`, even one with no rows. Use
+      `repartition(n)` or `coalesce(n)` before writing to control how
+      many files you produce.
+    - **The writer object is shared state only at the start.** Each
+      task gets its own unpickled copy, so changing `self.something` in
+      `write()` is invisible to other tasks and to `commit()`. Anything
+      the driver needs must travel in the commit message.
+    - **Imports inside `write()`.** Import libraries such as `pyarrow`
+      and `TaskContext` inside the method, as with readers, so the code
+      runs wherever the task lands.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: A Committed JSON Lines Table
+
+    The starter parses `data/messy/logs/access.log` into 200 requests
+    (`ip`, `path`, `status`, `bytes`) spread over 3 tasks, and gives you
+    `read_manifest`, `write_manifest` and the `FileWritten` commit
+    message. Complete the writers:
+
+    1. `JsonLogWriter.write(rows)`: write the task's rows as JSON lines
+       into `self.staging` and return `FileWritten(name, count)`.
+    2. `JsonLogWriter.commit(messages)`: move the staged files into the
+       table folder, write the new manifest (append adds to the old
+       file list and row count, overwrite replaces them), delete the
+       old manifest's files on overwrite, and remove the staging
+       folder.
+    3. `JsonLogWriter.abort(messages)`: delete the staging folder.
+    4. `ArrowParquetWriter.write(batches)`: write the task's Arrow
+       batches as one Parquet file.
+
+    The harness appends twice (400 rows), overwrites (back to 200 rows
+    and 3 files), runs a write that fails on purpose and checks that the
+    table did not change, checks that the default save mode is refused,
+    and reads the Arrow writer's Parquet back with Spark.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "In commit(): files = new_files if self.overwrite else old['files'] + new_files (rows the same way), write_manifest(...), then on overwrite os.remove each old file, then shutil.rmtree(self.staging). In the Arrow writer, pa.Table.from_batches(list_of_batches) turns the batches into one table."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - A Python writer (4.0) has three parts: `writer()` and `commit()`
+      on the driver, and `write()` once per task on the executors.
+    - `write()` must return a `WriterCommitMessage`; anything else fails
+      with `DATA_SOURCE_TYPE_MISMATCH`. Keep messages small.
+    - Only `append` and `overwrite` are accepted; the default
+      `errorifexists` fails with `UNSUPPORTED_DATA_SOURCE_SAVE_MODE`.
+      Overwrite is a flag, and deleting old data is your code's job.
+    - `abort()` gets `None` for every failed or cancelled task, so stage
+      files under a job id created in the writer's `__init__` and
+      delete the staging folder in `abort()`.
+    - A manifest replaced with one rename publishes a write in one step;
+      real table formats add conflict detection on top.
+    - `DataSourceArrowWriter` (4.0) receives `pyarrow.RecordBatch`
+      objects instead of rows.
+
+    Next: **Streaming Readers and Writers**, where offsets, checkpoints and
+    a batch id turn these ideas into an incremental pipeline.

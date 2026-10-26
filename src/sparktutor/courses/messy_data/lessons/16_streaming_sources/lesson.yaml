@@ -1,0 +1,432 @@
+- Class: meta
+  Lesson: "Streaming Readers and Writers"
+  EstimatedMinutes: 45
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    Files rarely arrive all at once. Scans land in a folder through the
+    day, a mail gateway drops `.eml` files every few minutes, a partner
+    uploads invoices at night. A streaming query processes each new
+    file once, in small micro-batches, and remembers how far it got so
+    a restart picks up where it stopped.
+
+    In this lesson you give a Python data source both streaming halves:
+    a **stream reader** that turns new files in a folder into rows, and
+    a **stream writer** that publishes each micro-batch exactly once,
+    even when Spark replays a batch.
+
+    By the end you will be able to:
+
+    - Explain the micro-batch loop and which reader method Spark calls
+      at each step
+    - Design offsets for a growing folder, and know why "the number of
+      files seen" is a bad offset
+    - Cap batch size with admission control: `getDefaultReadLimit()`
+      and `latestOffset(start, limit)` (4.2)
+    - Support `trigger(availableNow=True)` with
+      `SupportsTriggerAvailableNow` (4.2), and know what happens
+      without it
+    - Restart a query from its checkpoint and read only new files
+    - Write a stream writer whose `commit(messages, batchId)` is
+      idempotent, and prove it by replaying a batch
+
+    This lesson builds on "Writers" (commit messages, staging, abort)
+    and on the streaming reader preview in the Spark 4 What's New
+    course, if you took it.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Micro-Batch Loop
+
+    A streaming query is a loop. For each micro-batch, Spark asks the
+    source how far to read, records that decision in the checkpoint,
+    reads the data, hands it to the sink, and records that the batch is
+    done:
+
+    | Step | Reader or writer method | Checkpoint |
+    |---|---|---|
+    | Where does a new query start? | `initialOffset()` (first run only) | |
+    | How far should this batch go? | `latestOffset(start, limit)` | writes `offsets/<batchId>` |
+    | Split the batch into tasks | `partitions(start, end)` | |
+    | Produce the rows (executors) | `read(partition)` | |
+    | Write the rows (executors) | stream writer `write(rows)` | |
+    | Publish the batch (driver) | stream writer `commit(messages, batchId)` | writes `commits/<batchId>` |
+    | Tell the source it may forget old data | `commit(end)` | |
+
+    An **offset** is a dict of JSON-friendly values (numbers, strings,
+    booleans, nested dicts) that you design. Spark never looks inside
+    it; it stores it in the checkpoint and gives it back to you as the
+    `start` of the next batch. If `latestOffset` returns `start`
+    unchanged, there is nothing new and Spark runs no batch.
+
+    A checkpoint after two batches looks like this:
+
+    ```text
+    checkpoint/metadata
+    checkpoint/offsets/0   checkpoint/offsets/1
+    checkpoint/commits/0   checkpoint/commits/1
+    ```
+
+    The last line of `offsets/1` is your own offset, exactly as you
+    returned it:
+
+    ```text
+    {"v": 1, "mtime_ns": 1790000003000000000, "name": "ticket_3.eml"}
+    ```
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Think of a bookmark in a book that keeps getting new pages glued to
+    the end. The offset is the bookmark. Each micro-batch reads from the
+    bookmark to a new spot, then moves the bookmark. The checkpoint is a
+    notebook where Spark writes down every bookmark position *before*
+    reading, and "done" *after* writing, so after a crash it knows
+    exactly which pages to read again.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Offsets for a Growing Folder
+
+    The offset must answer one question: "which files have I already
+    read?" Some tempting answers break:
+
+    - **How many files I have seen.** Sort the names, read from index
+      `n`. A new file whose name sorts before the old ones (`a.eml`
+      after `ticket_3.eml`) shifts every index, so one old file is read
+      twice and the new one is skipped.
+    - **The last file name.** Read names greater than the last one. A
+      new file with a smaller name is never read.
+    - **Every file name seen.** Correct, but the offset grows forever
+      and is copied into every `offsets/` file.
+
+    This lesson uses the key `(modification time in nanoseconds, name)`
+    of the last file read, stored as
+    `{"v": 1, "mtime_ns": ..., "name": ...}`. New files almost always
+    have a newer modification time, and the name breaks ties between
+    files written in the same instant. The `"v": 1` is a format version:
+    offsets live in checkpoints for months, and the day you change their
+    shape you will want to tell old ones apart.
+
+    The key still has a blind spot worth knowing: a tool that preserves
+    old modification times when it copies (`cp -p`, `rsync -t`,
+    unzipping an archive) can drop a file whose key is older than the
+    bookmark, and it is never read. Spark's built-in file source avoids
+    this by remembering every file it has seen in a log inside the
+    checkpoint. For your own sources, choose the offset to match how
+    files really arrive.
+
+    `partitions(start, end)` returns one partition per file with
+    `start < key <= end`, and `read()` turns a file into rows. The
+    folder is listed again in `partitions()`, which is fine because the
+    `end` offset, not the listing, decides which files belong to the
+    batch.
+
+- Class: mult_question
+  Depth: all
+  Output: "A stream reader uses 'number of files seen, sorted by name' as its offset. After reading 4 files, a file named a.eml arrives. What happens on the next batch?"
+  AnswerChoices: "One already-read file is read again and a.eml is skipped;a.eml is read correctly;The query fails with an offset error;Spark detects the new file and resets the offset"
+  CorrectAnswer: "One already-read file is read again and a.eml is skipped"
+  Hint: "a.eml sorts first, so every old file moves one position to the right. What is at index 4 now?"
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Admission Control: Limits per Batch (4.2)
+
+    Spark 4.2 changed `latestOffset` to take the batch's `start` offset
+    and a **read limit** (SPARK-55304). The source reports its preferred
+    limit in `getDefaultReadLimit()`, usually from an option, and must
+    respect whatever limit Spark passes in:
+
+    ```python
+    from pyspark.sql.streaming.datasource import ReadAllAvailable, ReadMaxFiles
+
+    def getDefaultReadLimit(self):
+        return ReadMaxFiles(self.max_files)
+
+    def latestOffset(self, start, limit):
+        new = [k for k in list_inbox(self.root) if k > key_of(start)]
+        if self.target is not None:
+            new = [k for k in new if k <= self.target]
+        if not isinstance(limit, ReadAllAvailable):
+            new = new[:limit.max_files]
+        if not new:
+            return start          # nothing new: no batch
+        return offset_of(new[-1])
+    ```
+
+    The built-in limits are `ReadAllAvailable`, `ReadMaxFiles`,
+    `ReadMaxRows`, `ReadMinRows` and `ReadMaxBytes`, all in
+    `pyspark.sql.streaming.datasource`. They are dataclasses with
+    snake-case fields: `limit.max_files`, `limit.max_rows`. As of 4.2.0
+    only these built-in limits are supported.
+
+    Spark may pass `ReadAllAvailable` even if your default is a limit,
+    and then your source must ignore its own option. With
+    `maxFilesPerTrigger` set to 3 and 4 files waiting, a `processingTime`
+    trigger runs two batches of 3 and 1 files.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Trigger.AvailableNow (4.2)
+
+    `trigger(availableNow=True)` means: process everything that is
+    there now, in batches that respect the read limit, then stop. It is
+    the right trigger for a job that a scheduler starts every hour.
+
+    A Python source opts in by mixing in `SupportsTriggerAvailableNow`
+    (4.2, SPARK-55304) and implementing one method:
+
+    ```python
+    class InboxStreamReader(DataSourceStreamReader, SupportsTriggerAvailableNow):
+        def prepareForTriggerAvailableNow(self):
+            keys = list_inbox(self.root)
+            self.target = keys[-1] if keys else (0, "")
+    ```
+
+    Spark calls it once when the query starts. From then on,
+    `latestOffset` must never go past `self.target`, so files that
+    arrive during the run wait for the next one, and the query ends
+    once `latestOffset` returns `start` unchanged.
+
+    What happens **without** the mixin? The query still runs and still
+    stops, but Spark calls `latestOffset` with `ReadAllAvailable` and
+    reads everything in one batch. With 8 files and
+    `maxFilesPerTrigger` 3, the run with the mixin made batches of 3, 1,
+    3 and 1 files across two runs; a reader without it made a single
+    batch of 8. On a large backlog that single batch is exactly what the
+    limit was meant to prevent.
+
+- Class: mult_question
+  Depth: all
+  Output: "Your stream reader returns ReadMaxFiles(3) as its default limit but does not mix in SupportsTriggerAvailableNow. 10 files are waiting. What does trigger(availableNow=True) do?"
+  AnswerChoices: "Reads all 10 files in one batch and stops;Reads 3 files and stops;Runs batches of 3, 3, 3 and 1 files and stops;Fails because the reader does not support AvailableNow"
+  CorrectAnswer: "Reads all 10 files in one batch and stops"
+  Hint: "Without the mixin, Spark has no way to freeze a target, so it asks for everything available."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Restarting from a Checkpoint
+
+    Start the same query again with the same `checkpointLocation`, and
+    Spark reads the last offset from `offsets/`, passes it to
+    `latestOffset` as `start`, and continues with the next batch id. In
+    the exercise the second run starts at batch 2 and reads only the
+    four files that arrived after the first run.
+
+    The checkpoint belongs to one query. Change the source's offset
+    format, the sink, or the query's shape, and old checkpoints may not
+    work anymore. Start a fresh checkpoint when you change the query.
+
+    Not every sink can restart. The memory sink, handy in notebooks,
+    refuses an existing checkpoint in append mode:
+
+    ```text
+    [_LEGACY_ERROR_TEMP_1299] This query does not support recovering
+    from checkpoint location. Delete .../offsets to start over.
+    ```
+
+    Use a file sink (Parquet, JSON) or your own stream writer when you
+    want to test restarts.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    The `inbox` source is registered. Start a query that reads the
+    folder `/data/inbox` at most 3 files per batch and writes Parquet to
+    `/data/out` with the checkpoint `/data/ckpt`, processing what is
+    available now and then stopping. Store the query in `q`.
+  CorrectAnswer: |
+    q = (spark.readStream.format("inbox")
+         .option("path", "/data/inbox")
+         .option("maxFilesPerTrigger", 3)
+         .load()
+         .writeStream.format("parquet")
+         .option("path", "/data/out")
+         .option("checkpointLocation", "/data/ckpt")
+         .trigger(availableNow=True)
+         .start())
+  Hint: "readStream.format(...).option(...).load(), then writeStream.format('parquet') with path and checkpointLocation options, trigger(availableNow=True), start()."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Stream Writers (4.0)
+
+    A stream writer is a batch writer with a batch id. The source's
+    `streamWriter(schema, overwrite)` returns a `DataSourceStreamWriter`
+    with three methods:
+
+    - `write(rows)`: once per task of a micro-batch, on an executor;
+      returns a `WriterCommitMessage`, exactly as in "Writers"
+    - `commit(messages, batchId)`: once per micro-batch, on the driver,
+      when every task succeeded
+    - `abort(messages, batchId)`: once per micro-batch, on the driver,
+      when a task failed
+
+    `DataSourceStreamArrowWriter` (4.1, SPARK-53030) is the Arrow
+    version: its `write()` receives `pyarrow.RecordBatch` objects, like
+    the batch Arrow writer.
+
+    The same class can be a source and a sink: `InboxDataSource` in the
+    exercise implements both `streamReader()` and `streamWriter()`, and
+    the query reads `format("inbox")` and writes `format("inbox")` with
+    different paths.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Replays and Idempotent Commits
+
+    Look again at the loop: the offsets for batch N are written
+    *before* the batch runs, and `commits/N` is written *after* the
+    sink's `commit()`. If the driver dies in between, the sink has
+    published batch N but the checkpoint does not know it. On restart
+    Spark finds `offsets/N` without `commits/N` and **runs batch N
+    again**, with the same offsets and the same batch id.
+
+    So a sink that wants each row exactly once must make
+    `commit(messages, batchId)` idempotent: committing the same batch id
+    twice has the same effect as committing it once. The batch id is
+    the key:
+
+    ```python
+    def commit(self, messages, batchId):
+        target = os.path.join(self.root, f"batch={batchId:05d}")
+        summary = os.path.join(target, "_SUMMARY.json")
+        if os.path.exists(summary):
+            # A replay of a batch we already published: drop the new copy.
+            for m in messages:
+                os.remove(os.path.join(self.staging, m.file))
+            with open(os.path.join(self.root, "_replays.log"), "a") as f:
+                f.write(f"{batchId}\n")
+            return
+        ...
+    ```
+
+    Tasks stage their files under random names, and `commit()` moves
+    them into `batch=<id>/` and writes `_SUMMARY.json` last. A replay
+    finds the summary and throws its copy away.
+
+    You can watch a replay happen: stop the query, delete the newest
+    file in `checkpoint/commits/` (and its `.crc` file), and start the
+    query again. Spark re-runs that batch id. The exercise does this to
+    prove the sink writes no duplicates. Do it only in a test; editing a
+    production checkpoint is a good way to lose or duplicate data.
+
+    For remote systems the same idea applies: send the batch id along
+    (as an idempotency key, a version number, or part of a primary key)
+    so the destination can recognise a repeat.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "Why can Spark call a stream writer's commit() twice for the same batchId?"
+  AnswerChoices: "The driver can fail after the sink commits but before commits/N is written, so the batch is re-run on restart;Spark always commits every batch twice for safety;Each executor calls commit() once;commit() is retried whenever a batch has more than one task"
+  CorrectAnswer: "The driver can fail after the sink commits but before commits/N is written, so the batch is re-run on restart"
+  Hint: "Compare when offsets/N and commits/N are written with when the sink's commit() runs."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Watching Progress
+
+    Each finished micro-batch adds a `StreamingQueryProgress` to
+    `query.recentProgress` (and `query.lastProgress`). Read its fields as
+    attributes:
+
+    ```python
+    [(p.batchId, p.numInputRows) for p in query.recentProgress]
+    ```
+
+    The dictionary form `p["numInputRows"]` also works in Classic mode,
+    but on Spark Connect it returns `None`, because the progress JSON
+    sent to a Connect client has no top-level `numInputRows` key. The
+    attribute works in both.
+
+    Spark 4.2 also added `reportLatestOffset()` to stream readers:
+    return the newest offset available upstream (or `None`) and Spark
+    shows it in the query's progress, which lets you watch how far
+    behind the query is.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Stream Reader Gotchas
+
+    - **`read()` must be stateless.** It runs on executors, possibly in
+      a different process for every batch. Put everything it needs in
+      the partition object.
+    - **`latestOffset` runs on the driver for every trigger.** Listing a
+      folder with millions of files each time is slow. Real file sources
+      keep a log of seen files or rely on a notification service.
+    - **`commit(end)` is where a source may clean up**: move processed
+      files to an archive folder, or delete them. Do it there and not in
+      `read()`, because a batch can be re-run until it is committed.
+    - **`SimpleDataSourceStreamReader`** is the alternative for sources
+      that cannot be split into partitions (one cursor over an API). Its
+      single `read(start)` returns rows and the next offset; in 4.2 a
+      `read()` that returns rows without advancing the offset fails with
+      `SIMPLE_STREAM_READER_OFFSET_DID_NOT_ADVANCE`.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: An Inbox That Publishes Each Batch Once
+
+    The starter has `InboxDataSource` with a stream reader and a stream
+    writer, plus the helpers `list_inbox(root)` (every file as a
+    `(mtime_ns, name)` key, oldest first), `key_of(offset)` and
+    `offset_of(key)`. Complete:
+
+    1. `prepareForTriggerAvailableNow()`: freeze the newest key as
+       `self.target`.
+    2. `latestOffset(start, limit)`: the new keys after `start`, capped
+       by the target and by `limit.max_files` unless the limit is
+       `ReadAllAvailable`; return `start` when nothing is new.
+    3. `partitions(start, end)`: one `FilePartition` per file with
+       `start < key <= end`.
+    4. `BatchFolderWriter.commit(messages, batchId)`: publish the staged
+       files into `batch=<id>/` with a `_SUMMARY.json`, or, if the
+       summary already exists, discard the copy and log the replay.
+
+    The harness drops four e-mails into an inbox and runs the query
+    with `availableNow` (batches of 3 and 1), adds four more files and
+    restarts with a `processingTime` trigger (batches 2 and 3, new
+    files only), then deletes `commits/3` to force a replay and checks
+    that the sink still holds each file exactly once.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "latestOffset: new = [k for k in list_inbox(self.root) if k > key_of(start)], then filter by self.target, then new[:limit.max_files] unless isinstance(limit, ReadAllAvailable). commit: check os.path.exists(summary) first."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - A stream reader's offset is your own JSON-friendly dict; Spark
+      stores it in `offsets/<batchId>` before each batch. Version it,
+      and choose a key that matches how files arrive (here
+      `(mtime_ns, name)`).
+    - `latestOffset(start, limit)` and `getDefaultReadLimit()` (4.2)
+      cap batch size; always honour `ReadAllAvailable`.
+    - `SupportsTriggerAvailableNow` (4.2) gives `availableNow` runs
+      rate-limited batches; without it the whole backlog is one batch.
+    - Restarting with the same checkpoint continues at the next batch id
+      and reads only new data. The memory sink cannot restart.
+    - Stream writers commit once per micro-batch with a `batchId`.
+      Batches can be replayed with the same id, so make
+      `commit(messages, batchId)` idempotent.
+    - Read progress with attributes (`p.numInputRows`), which work in
+      Classic and Connect.
+
+    Next: **Packaging, Registration, Testing and Debugging**, where the
+    source leaves the exercise file and becomes something you can
+    install, test and debug.

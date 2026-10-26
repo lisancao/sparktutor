@@ -1,0 +1,30 @@
+course:
+  id: messy_data
+  title: "Messy Data and Python Data Sources in Spark 4.2"
+  description: "Semi-structured, unstructured and multimodal data with Spark 4.2: files as bytes, logs, drifting JSON, VARIANT, XML, documents, images and audio, then your own Python data sources, from a first reader to streaming, pushdown, writers and packaging"
+  version: "1.0.0"
+  requires_lakehouse: false
+  prerequisites:
+    - "Python 3.10+"
+    - "Java 17 or 21 (Java 25 also works)"
+    - 'pip install "pyspark[connect,pipelines]==4.2.0" "pandas<3" (SparkTutor installs both)'
+    - "DataFrames, Spark SQL and UDFs (learning_spark lessons 1 to 5); the capstone also uses Declarative Pipelines (spark_declarative_pipelines lessons 4 to 6)"
+  lessons:
+    - 01_files_as_files
+    - 02_text_and_logs
+    - 03_json_drift
+    - 04_variant_basics
+    - 05_xml
+    - 06_documents_to_rows
+    - 07_images_and_audio
+    - 08_first_python_data_source
+    - 09_custom_file_format
+    - 10_variant_shredding
+    - 11_text_analytics
+    - 12_api_source
+    - 13_arrow_performance
+    - 14_filter_pushdown
+    - 15_writers
+    - 16_streaming_sources
+    - 17_packaging_testing
+    - 18_capstone

@@ -1,0 +1,438 @@
+- Class: meta
+  Lesson: Reading from an API
+  EstimatedMinutes: 40
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    A lot of messy data does not live in files. Support tickets, payments,
+    events from a SaaS tool: you get them from a REST API, one page of
+    JSON at a time, and the shape of each record is whatever the vendor
+    shipped this month.
+
+    In "Your First Python Data Source" you wrote a reader and saw where
+    each method runs; in "Reading a Custom File Format, in Parallel" you
+    planned partitions from a list of files. This lesson applies the same
+    ideas to an API, where the network adds its own problems: pages,
+    timeouts, flaky servers, and calls that cost money or count against a
+    rate limit.
+
+    By the end of this lesson you will be able to:
+
+    - Turn page-numbered pagination into partitions, and recognize when
+      an API cannot be read in parallel
+    - Keep every network call inside `read()`, with a timeout
+    - Retry server errors inside the reader, and know why Spark's own
+      task retries are not enough (and do not exist in local mode)
+    - Return the loose part of each record as VARIANT
+    - Validate options so a mistake fails at load time
+    - Know how many API calls each action makes, and when to cache
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Why Not Just Call the API on the Driver?
+
+    The first version everyone writes looks like this:
+
+    ```python
+    import json, urllib.request
+    rows = []
+    for page in range(5):
+        with urllib.request.urlopen(f"{url}?page={page}") as r:
+            rows += json.load(r)["items"]
+    df = spark.createDataFrame(rows)
+    ```
+
+    On a good day it works for five pages. (Against the exercise API it
+    stops at the flaky page 3 with `urllib.error.HTTPError: HTTP Error
+    503`.) Even when it works, it fails in the ways that matter later: the
+    driver fetches every page one after another, holds everything in
+    memory, and infers the schema from whatever the first records look
+    like. Nothing is reusable, and nothing can become a stream.
+
+    A Python data source splits the same work the Spark way:
+
+    | Method | Runs | Here it does |
+    |---|---|---|
+    | `DataSource.__init__`, `schema()` | when the plan is analyzed | check options, declare columns |
+    | `reader()`, `partitions()` | once per DataFrame, before the first tasks | ask page 0 how many pages exist |
+    | `read(partition)` | in a task, in parallel | fetch one page, yield its rows |
+
+    The pages are fetched in parallel by tasks, rows stream out without
+    collecting on the driver, and the schema is yours, not inferred.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Picture a library with a catalog of 95 index cards in 5 drawers. The
+    driver-only approach is one person carrying every drawer to their
+    desk. The data source approach is one person who checks how many
+    drawers there are (planning) and then hands one drawer to each of
+    five helpers (tasks), who copy their cards at the same time.
+
+    The helpers never share a desk with the planner. Anything the planner
+    gives them (which drawer to read, the address of the library) has to
+    be written on a note they can carry, which is why partitions and
+    readers must be picklable and why each helper opens their own
+    connection.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Pagination Decides Your Partitions
+
+    How an API pages its results decides whether you can read it in
+    parallel:
+
+    - **Page numbers or offsets** (`?page=3`, `?offset=60&limit=20`): you
+      can compute every page's address up front, so each page can be a
+      partition. Ask once for the total (most APIs return it on every
+      page) and plan `ceil(total / page_size)` partitions.
+    - **Cursors or next links** (`?cursor=eyJpZCI6...`, a `next` URL in
+      each response): page 4's address is only known after reading
+      page 3. The pages are a chain, and a chain is one partition. You
+      can still parallelize on another dimension the API filters by, for
+      example one partition per day (`?since=...&until=...`), each
+      following its own chain of cursors.
+
+    ```python
+    class PagePartition(InputPartition):
+        def __init__(self, page):
+            self.page = page
+
+    def partitions(self):
+        first = fetch_json(self.page_url(0), self.timeout, self.retries)
+        pages = math.ceil(first["total"] / self.page_size)
+        return [PagePartition(p) for p in range(pages)]
+    ```
+
+    The partition object carries only the page number: a small, plain
+    value that pickles. The reader object, with the URL and settings, is
+    pickled and sent to every task too.
+
+- Class: mult_question
+  Depth: all
+  Output: "An API returns 100 records per page and a `next` link to the following page, with no page numbers and no other field to split on. How many partitions can a reader for one query use?"
+  AnswerChoices: "One, because each page's address comes from the previous page;One per page, planned up front;One per executor core;As many as the total divided by 100"
+  CorrectAnswer: "One, because each page's address comes from the previous page"
+  Hint: "To plan partitions, you need every partition's address before any task runs."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## A Local API for the Exercise
+
+    The exercise starts its own API: a standard-library
+    `ThreadingHTTPServer` on `127.0.0.1` with port `0` (the operating
+    system picks a free port), running in a background thread of the
+    driver. No internet connection, no API key, and the same responses
+    every run.
+
+    ```python
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_port}/tickets"
+    ```
+
+    `GET /tickets?page=N&page_size=M` returns
+
+    ```json
+    {"items": [{"id": 0, "status": "open", "subject": "Where is my order?",
+                "meta": {"tags": [], "priority": "high",
+                         "customer": {"id": "C0", "tier": "gold"}}}, ...],
+     "page": 0, "page_size": 20, "total": 95}
+    ```
+
+    `meta` is the messy part: `tags` is always there, `priority` and
+    `customer` only sometimes. And page 3 is flaky on purpose: every other
+    request to it gets an HTTP 503.
+
+    In local mode the Python workers that run `read()` are processes on
+    the same machine, so `127.0.0.1` reaches the server. On a real
+    cluster, executors run on other machines: the API must be reachable
+    from every executor, and `127.0.0.1` would mean the executor itself.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Network Calls Belong in `read()`, With a Timeout
+
+    Open connections inside `read()`, never in `__init__` or
+    `partitions()`: sockets and HTTP sessions do not pickle, and an open
+    connection made on the driver means nothing on an executor. Import
+    inside the method too, so the code works wherever the task lands.
+
+    ```python
+    def read(self, partition):
+        import json
+        from pyspark.sql.types import VariantVal
+
+        body = fetch_json(self.page_url(partition.page), self.timeout, self.retries)
+        for item in body["items"]:
+            yield (item["id"], item["status"], item["subject"],
+                   VariantVal.parseJson(json.dumps(item["meta"])))
+    ```
+
+    Always pass a timeout. `urllib.request.urlopen(url)` without one uses
+    the global socket default, which is no timeout at all: a server that
+    accepts the connection and never answers leaves the task hanging
+    forever, and the job with it. `urlopen(url, timeout=10)` raises
+    instead, and the error tells you which page stalled.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Retries: Yours, Not Spark's
+
+    Real APIs fail now and then: a 503 during a deploy, a dropped
+    connection, a 429 when you go too fast. Spark can retry a failed
+    task, but:
+
+    - **In local mode it does not.** `local[*]` allows exactly one attempt
+      per task (`MAX_LOCAL_TASK_FAILURES = 1` in `SparkContext`). Use the
+      master `local[4, 3]` (4 threads, up to 3 attempts) if you want
+      task retries locally.
+    - **On a cluster** a task gets `spark.task.maxFailures` attempts
+      (default 4), but a retry re-runs the whole partition, possibly on
+      another machine, with no pause in between. A flaky server gets hit
+      again immediately.
+
+    Retry inside the reader instead, only for errors that can succeed
+    later, with a growing pause:
+
+    ```python
+    def fetch_json(url, timeout, retries):
+        import json, time
+        from urllib.error import HTTPError, URLError
+        from urllib.request import urlopen
+
+        for attempt in range(retries + 1):
+            try:
+                with urlopen(url, timeout=timeout) as response:
+                    return json.load(response)
+            except HTTPError as e:
+                if e.code < 500 or attempt == retries:
+                    raise          # 4xx: our request is wrong, retrying won't help
+            except URLError:
+                if attempt == retries:
+                    raise          # network error: give up after the last try
+            time.sleep(0.1 * 2 ** attempt)
+    ```
+
+    `HTTPError` is a subclass of `URLError`, so it must be caught first.
+    For a 429, real code should also read the `Retry-After` header and
+    wait that long. Retrying is only safe because a `GET` of a page has no
+    side effects; never blindly retry a call that creates something.
+
+    When the retries run out, the task fails and the job reports
+    `PYTHON_EXCEPTION` with your Python traceback, including
+    `urllib.error.HTTPError: HTTP Error 503: Service Unavailable`.
+
+- Class: mult_question
+  Depth: all
+  Output: "Your API reader runs under master local[*]. One request to page 3 returns HTTP 503 and read() does not catch it. What happens?"
+  AnswerChoices: "The job fails, because local mode makes one attempt per task;Spark retries the task up to 4 times;Spark skips page 3 and returns the other rows;The driver retries the HTTP request"
+  CorrectAnswer: "The job fails, because local mode makes one attempt per task"
+  Hint: "spark.task.maxFailures applies to clusters. local[N] uses a fixed limit of 1 attempt; local[N, F] changes it."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Loose Part as VARIANT
+
+    The stable fields (`id`, `status`, `subject`) get real columns. The
+    part that changes from record to record (`meta`) is exactly what
+    VARIANT is for:
+
+    ```python
+    def schema(self):
+        return "id int, status string, subject string, meta variant"
+    ```
+
+    For a VARIANT column, `read()` must yield a
+    `pyspark.sql.types.VariantVal`, built from JSON text with
+    `VariantVal.parseJson(json.dumps(value))` (4.1). Yielding the dict
+    itself, or the JSON string, fails in the task with
+    `PySparkValueError: [MALFORMED_VARIANT] Variant binary is malformed`,
+    which says nothing about dicts; remember this one.
+
+    Downstream, query `meta` as in "VARIANT Basics: Profiling and Nested
+    Data":
+
+    ```python
+    df.select(sf.explode(sf.try_variant_get("meta", "$.tags", "array<string>")).alias("tag")) \
+        .groupBy("tag").count().show()
+
+    df.filter(sf.try_variant_get("meta", "$.customer.tier", "string") == "gold").count()
+    ```
+
+    A record without `customer` simply gives NULL; nothing fails when the
+    vendor adds or drops a key.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "Your schema declares `meta variant` and read() yields `(1, {\"tags\": []})`. What happens?"
+  AnswerChoices: "The task fails with MALFORMED_VARIANT;Spark converts the dict to VARIANT;The column is NULL;Spark stores the dict as a JSON string"
+  CorrectAnswer: "The task fails with MALFORMED_VARIANT"
+  Hint: "A VARIANT column needs a VariantVal. VariantVal.parseJson(json.dumps(...)) builds one."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Validate Options Early
+
+    Options arrive as strings in a case-insensitive dictionary, so
+    convert them yourself (`int(options.get("page_size", 20))`) and check
+    the required ones where they fail fastest:
+
+    ```python
+    class TicketsDataSource(DataSource):
+        def __init__(self, options):
+            super().__init__(options)
+            if "url" not in options:
+                raise ValueError("option 'url' is required")
+    ```
+
+    Spark creates the `DataSource` while analyzing the plan, to ask for
+    its schema. In a `spark-submit` script that is `load()` itself; on
+    Spark Connect, where `load()` is lazy, it is the first call that
+    needs the schema (`.columns`, `.printSchema()`, or an action). Either
+    way it happens before any task runs, and the error is
+
+    ```text
+    [PYTHON_DATA_SOURCE_ERROR] Failed to create Python data source instance:
+    ...
+    ValueError: option 'url' is required
+    ```
+
+    A check in the reader's `__init__` still works, but only fires when
+    the first action plans partitions. One catch: if the user passes
+    `.schema(...)` to the reader, Spark has no reason to create the data
+    source at analysis, and even the `__init__` check waits for the first
+    action.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    The class `TicketsDataSource` (whose `name()` is `"tickets"`) is
+    defined. Register it and create `df` reading the API at the URL in
+    the variable `url`, with 50 tickets per page and 2 retries (options
+    `page_size` and `retries`).
+  CorrectAnswer: |
+    spark.dataSource.register(TicketsDataSource)
+    df = spark.read.format("tickets").option("url", url).option("page_size", 50).option("retries", 2).load()
+  Hint: "spark.dataSource.register(...), then spark.read.format('tickets') with three .option(...) calls and .load()."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## How Many Calls Does a Query Make?
+
+    APIs are slow and often metered, so count the calls. With the request
+    log of the exercise server:
+
+    - `load()` makes **no** request. Neither does `explain()`.
+    - The **first action** on a DataFrame calls `partitions()` (one
+      request for page 0), then runs one task per page (five requests,
+      plus a retry of page 3).
+    - **Later actions on the same DataFrame** reuse the planned
+      partitions, but every task runs `read()` again: five more page
+      requests per action (plus page 3's retry). `count()`, then `groupBy("status").count()`, then a
+      filter is three full passes over the API.
+    - After `df.cache()` and one action to fill the cache, queries on
+      `df` make **no** requests at all.
+
+    The reuse of partitions comes from Spark keeping the planned read
+    (`PythonDataSourceV2.getOrCreateReadInfo` in the 4.2.0 source) on the
+    DataFrame's relation. It has a side effect: pages that appear in the
+    API after the first action are not planned for that DataFrame. Call
+    `load()` again for a fresh plan.
+
+    For anything beyond exploration, land the API data in a table once
+    (a bronze table) and query the table. That also gives you a record of
+    what the API returned, which you will want the day it changes.
+
+- Class: mult_question
+  Depth: all
+  Output: "You run df.count() and then df.groupBy(\"status\").count() on an uncached API DataFrame with 5 pages. Roughly how many page requests does the second query make?"
+  AnswerChoices: "5, because every action re-runs read() for each page;0, because the first query already fetched the data;1, only for the total;6, because it plans the partitions again"
+  CorrectAnswer: "5, because every action re-runs read() for each page"
+  Hint: "The planned partitions are reused; the rows are not, unless you cache."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Being a Good API Citizen
+
+    - **Concurrency is your partition count.** With one partition per page
+      and `local[*]` on an 8-core laptop, up to 8 requests run at once; on
+      a cluster it can be hundreds. If the API has a rate limit, cap the
+      parallelism: give each partition a range of pages (for example a
+      `pages_per_partition` option) so fewer tasks run, or read with fewer
+      cores.
+    - **Secrets.** Pass a token as an option (`.option("token", ...)`)
+      rather than in the source code. Remember that the reader object,
+      options included, is pickled and sent to every task.
+    - **Big pages beat many pages.** Each request has a fixed cost. Use the
+      largest page size the API allows, which also means fewer partitions
+      to plan.
+    - **Stable ordering.** Page-number pagination is only correct if the
+      API sorts by something stable (an id or a creation time). If new
+      records are inserted at the front while you read, rows shift across
+      pages and you can get duplicates or gaps. Check the result for
+      duplicate ids, as the exercise does.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: A Paginated Tickets Source
+
+    The API server and the data source skeleton are in the exercise file.
+    Complete:
+
+    1. `fetch_json(url, timeout, retries)`: GET with a timeout, retry
+       5xx and network errors with a growing pause, raise 4xx at once.
+    2. `TicketsDataSource.__init__`: raise
+       `ValueError("option 'url' is required")` when the option is
+       missing.
+    3. `TicketsReader.partitions()`: fetch page 0, compute the number of
+       pages, return one `PagePartition` per page.
+    4. `TicketsReader.read(partition)`: fetch the page and yield
+       `(id, status, subject, meta)` with `meta` as a `VariantVal`.
+
+    The harness checks the load-time error, 95 tickets in 5 partitions,
+    that the flaky page 3 needed a retry, status, tag, priority and
+    customer counts through VARIANT, 2 partitions with `page_size` 50,
+    that `retries` 0 fails on the 503, and that a cached DataFrame makes
+    no more API calls.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "partitions(): first = fetch_json(self.page_url(0), self.timeout, self.retries); math.ceil(first['total'] / self.page_size). In fetch_json, catch HTTPError before URLError, because HTTPError is a subclass of URLError."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - **Page-number pagination** becomes one partition per page;
+      **cursor** pagination is a chain and reads as one partition (split
+      on another dimension if the API allows it).
+    - `partitions()` runs once per DataFrame before the first tasks;
+      `read()` runs in every task of every action. Keep network calls in
+      `read()`, and always pass a **timeout**.
+    - **Retry inside the reader** for 5xx and network errors, with a
+      pause. `local[*]` never retries a task; clusters retry the whole
+      partition with no pause.
+    - Return loose payloads as **VARIANT** with `VariantVal.parseJson`;
+      yielding a dict fails with `MALFORMED_VARIANT`.
+    - Validate options in `DataSource.__init__` so a missing one fails
+      with `PYTHON_DATA_SOURCE_ERROR` when the plan is analyzed.
+    - Every uncached action calls the API again; **cache** or land the
+      data in a table.
+
+    Next: **Types, Arrow and Performance**, where you make a reader fast
+    by yielding Arrow batches instead of tuples, and learn to read the
+    type errors Spark 4.2 now raises.
