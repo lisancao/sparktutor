@@ -1,0 +1,895 @@
+- Class: meta
+  Lesson: "A Database Source: Partitions and Pushdown with SQLite"
+  EstimatedMinutes: 55
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    In "Filter Pushdown" your reader received the query's filters and
+    used them to skip files. A database is where pushdown pays off most:
+    the database has indexes and can answer `WHERE status = 'shipped'`
+    without sending you the other rows. It is also where pushdown is
+    easiest to get **wrong**, because the database and Spark do not
+    always agree on what a condition means.
+
+    This lesson builds a Python data source over a SQLite table, using
+    only `sqlite3` from Python's standard library. SQLite is a good
+    teacher because it is messy in exactly the ways real databases are:
+    its column types are suggestions, its `LIKE` ignores case, and it
+    happily compares a word with a number.
+
+    By the end of this lesson you will be able to:
+
+    - Derive a Spark schema from a table definition, and convert values
+      that do not fit their declared type into NULL instead of garbage
+    - Split a table into key ranges the way Spark's JDBC source does
+      (`partitionColumn`, `lowerBound`, `upperBound`, `numPartitions`),
+      see why that skews, and balance it with quantile bounds
+    - Push filters into each range's SQL `WHERE` clause with `?`
+      parameters, never by pasting values into SQL text
+    - Keep the database's answer identical to Spark's, including NULLs,
+      case and values of the wrong type
+    - Open connections in the right place, and explain why the
+      partitions of one read do not see one consistent snapshot
+    - Handle the 4.2.0 plan-reuse trap from "Filter Pushdown" by loading
+      a fresh DataFrame per query and per reference
+
+    You need the reader from "Your First Python Data Source", partitions
+    from "Reading a Custom File Format, in Parallel" and the Python to
+    Spark value rules from "Types, Arrow and Performance". The exercise
+    creates its own database in a temporary folder, so there is no
+    sample file to read.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Why Not Just Use JDBC?
+
+    Spark has a built-in JDBC source (`spark.read.jdbc(...)` or
+    `format("jdbc")`) and it is the right tool for Postgres, MySQL,
+    SQL Server, Oracle and friends. It needs two things a Python source
+    does not:
+
+    - **A JDBC driver jar** on the classpath. Spark ships none for most
+      databases. PySpark's own jars happen to include Apache Derby, an
+      embedded Java database, which the examples below use because it
+      runs with nothing else installed.
+    - **A dialect** for SQL quirks. Spark 4.2.0 has dialects for DB2,
+      Databricks, Derby, H2, SQL Server, MySQL, Oracle, Postgres,
+      Snowflake and Teradata (`sql/core/src/main/scala/org/apache/spark/sql/jdbc/`).
+      There is none for SQLite.
+
+    A Python data source fits when the database has a good Python
+    client and no good JDBC story (SQLite, DuckDB files, an embedded
+    key-value store), when the "database" is really an API with a query
+    language, or when you need conversion rules of your own for values
+    that do not match their declared types. That last reason is the big
+    one for messy data, as the next sections show.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Think of the database as a warehouse with its own staff. A plain
+    reader asks the staff to bring out every box, and Spark sorts them
+    on the loading dock. Pushdown hands the staff a written order ("only
+    boxes for customer Ana"). That saves a lot of carrying, but only if
+    the staff read the order the way you meant it. If their idea of
+    "Ana" includes "ANA" and "ana", you get boxes you did not ask for,
+    and nobody on the dock checks again.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## SQLite's Types Are Suggestions
+
+    In most databases a column declared `INT` only holds integers.
+    SQLite stores each **value** with its own storage class (`integer`,
+    `real`, `text`, `blob` or `null`). The declared type only gives the
+    column an **affinity**: a preference that converts a value on insert
+    when the conversion loses nothing, and keeps the value as it is
+    otherwise.
+
+    ```python
+    import sqlite3
+    conn = sqlite3.connect(":memory:")
+    conn.execute("""CREATE TABLE t (
+        a DECIMAL(10,2), q INT, s VARCHAR(10), fp "FLOATING POINT", n)""")
+    conn.executemany("INSERT INTO t VALUES (?, ?, ?, ?, ?)", [
+        ("12.50", "7", 42, "2.0", "five"),
+        ("N/A", "seven", "x", 2.7, 5),
+        ("12,50", " 8", None, "1.5", b"\x00")])
+    for row in conn.execute("""SELECT a, typeof(a), q, typeof(q), s, typeof(s),
+                                      fp, typeof(fp), typeof(n) FROM t"""):
+        print(row)
+    ```
+
+    ```text
+    (12.5, 'real', 7, 'integer', '42', 'text', 2, 'integer', 'text')
+    ('N/A', 'text', 'seven', 'text', 'x', 'text', 2.7, 'real', 'integer')
+    ('12,50', 'text', 8, 'integer', None, 'null', 1.5, 'real', 'blob')
+    ```
+
+    Read it column by column:
+
+    - `a DECIMAL(10,2)`: the text `"12.50"` became the number 12.5, but
+      `"N/A"` and the decimal comma `"12,50"` stayed **text** in a
+      "decimal" column.
+    - `q INT`: `"7"` and even `" 8"` became integers; `"seven"` stayed
+      text.
+    - `s VARCHAR(10)`: the number 42 became the text `'42'`. Text
+      affinity turns numbers into text, so text columns are the most
+      predictable.
+    - `fp "FLOATING POINT"`: `"2.0"` became the **integer** 2. The rule
+      that decides affinity looks for `INT` first, and `POINT` contains
+      `INT`, so this column has integer affinity.
+    - `n` (no declared type): every value is kept exactly as given.
+
+    The rules (from the SQLite documentation, "Datatypes In SQLite",
+    section 3.1), checked in this order:
+
+    | Declared type contains | Affinity |
+    |---|---|
+    | `INT` | INTEGER |
+    | `CHAR`, `CLOB` or `TEXT` | TEXT |
+    | `BLOB`, or no type at all | BLOB (keep as given) |
+    | `REAL`, `FLOA` or `DOUB` | REAL |
+    | anything else (`DECIMAL`, `NUMERIC`, `BOOLEAN`, `DATETIME`) | NUMERIC |
+
+    `PRAGMA table_info(t)` returns the declared types, so a source can
+    read them at planning time:
+
+    ```text
+    [(0, 'a', 'DECIMAL(10,2)', 0, None, 0), (1, 'q', 'INT', 0, None, 0),
+     (2, 's', 'VARCHAR(10)', 0, None, 0), (3, 'fp', 'FLOATING POINT', 0, None, 0),
+     (4, 'n', '', 0, None, 0)]
+    ```
+
+    Two other traps show up immediately. `sqlite3` cannot bind a
+    `Decimal` parameter, and a connection cannot be pickled:
+
+    ```text
+    Error binding parameter 1: type 'decimal.Decimal' is not supported
+    cannot pickle 'sqlite3.Connection' object
+    ```
+
+    Both matter below. (These outputs are from SQLite 3.45.1, the
+    version bundled with the Python 3.12 used to test this course; the
+    affinity rules have been stable for many years.)
+
+- Class: mult_question
+  Depth: all
+  Output: "A SQLite column is declared `amount DECIMAL(10,2)`. A row is inserted with the text 'N/A'. What does SQLite store?"
+  AnswerChoices: "The text 'N/A', because it cannot be converted without loss;NULL, because the value is not a number;An error, because the column is a decimal;The number 0"
+  CorrectAnswer: "The text 'N/A', because it cannot be converted without loss"
+  Hint: "Affinity converts only when nothing is lost, and keeps the value as it is otherwise."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## From Declared Types to a Spark Schema
+
+    A Spark schema is a promise: every value in `amount` is a
+    `decimal(10,2)` or NULL. The source has to keep that promise even
+    when the table does not. The design in this lesson has two halves.
+
+    **The schema follows the affinity**, refined by the declared name
+    for NUMERIC columns:
+
+    | Affinity | Spark type |
+    |---|---|
+    | INTEGER | `bigint` (SQLite integers are 64-bit) |
+    | TEXT, BLOB (or no type) | `string` |
+    | REAL | `double` |
+    | NUMERIC named `DECIMAL(p,s)` or `NUMERIC(p,s)` | `decimal(p,s)` |
+    | NUMERIC named `BOOL...` | `boolean` |
+    | NUMERIC named `...DATE...` or `...TIME...` | `timestamp` |
+    | other NUMERIC | `double` |
+
+    **Values are converted one by one**, and a value that does not fit
+    becomes NULL. The exercise's `to_spark_value(value, spark_type)` does
+    this: for `bigint` it keeps Python `int`s only (so `'seven'` and
+    `2.5` become NULL), for decimals it keeps numbers and rounds them
+    to the scale, for `boolean` it accepts 0/1 and words like `yes` and
+    `false`, and for `timestamp` it parses ISO text (with `T` or a space,
+    with or without `Z`) and integer epoch seconds, as UTC.
+
+    For the exercise's `orders` table that gives:
+
+    ```text
+    root
+     |-- order_id: long (nullable = true)
+     |-- customer: string (nullable = true)
+     |-- status: string (nullable = true)
+     |-- amount: decimal(10,2) (nullable = true)
+     |-- qty: long (nullable = true)
+     |-- placed_at: timestamp (nullable = true)
+     |-- gift: boolean (nullable = true)
+     |-- note: string (nullable = true)
+    ```
+
+    NULL is the honest answer for a value the source cannot read. If you
+    also need to know **which** values were rejected, add a column such
+    as `_rejected` (an array of column names) and fill it in `read()`;
+    that is the same quarantine idea as in "JSON Drift and Quarantine".
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## What Spark's JDBC Source Does With the Same Table
+
+    For comparison, the exercise's table was also read through Spark's
+    JDBC source with the third-party SQLite driver
+    (`org.xerial:sqlite-jdbc:3.50.3.0`, added with `--packages` or
+    `spark.jars`; it is not part of Spark). The JDBC source asks the
+    **driver** for column types and values, so what you get is the
+    driver's interpretation:
+
+    | Column | Declared | JDBC + sqlite-jdbc 3.50.3.0 | This lesson's source |
+    |---|---|---|---|
+    | `qty` | `INT` | `bigint`; `'two'` read as 0, `2.5` as 2 | `bigint`; both NULL |
+    | `gift` | `BOOLEAN` | `boolean`; `'yes'` read as false | `boolean`; `'yes'` is true |
+    | `placed_at` | `DATETIME` | `date`; reading fails with `java.sql.SQLException: Error parsing date` on `2026-09-01T07:00:00Z` | `timestamp`, parsed |
+    | `amount` | `DECIMAL(10,2)` | `decimal(10,2)`; reading fails with `java.sql.SQLException: column -1 out of bounds [1,1]` | NULL for `'N/A'` |
+    | `note` | (none) | `decimal(38,18)`; reading fails the same way | `string` |
+
+    None of this is a Spark bug: Spark trusts the driver's metadata, and
+    this driver maps SQLite's loose values in its own way. It is the
+    reason to own the conversion when the data is messy. With JDBC you
+    can still take control with the `customSchema` option or by casting
+    in a `query`, but you cannot change how the driver converts a value
+    it has already decided is a number.
+
+- Class: mult_question
+  Depth: all
+  Output: "The source declares qty as bigint. A row's qty is the text 'two'. What should read() yield for that column?"
+  AnswerChoices: "None, so Spark sees NULL;The string 'two', Spark will cast it;0;Skip the whole row"
+  CorrectAnswer: "None, so Spark sees NULL"
+  Hint: "The schema promises a bigint or NULL. A string in a bigint column fails the Arrow conversion, and 0 is a wrong value."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Where Each Method Runs, and Where Connections Belong
+
+    The same rule as every data source so far: some methods run on the
+    driver during planning, `read()` runs in a task.
+
+    | Method | Runs | Opens a connection? |
+    |---|---|---|
+    | `DataSource.schema()` | driver, once per `load()` | yes, to read `PRAGMA table_info`, then closes it |
+    | `reader(schema)` and `DataSourceReader.__init__` | driver | may, briefly, for metadata |
+    | `pushFilters(filters)` | driver, during planning | no: it only builds SQL |
+    | `partitions()` | driver, after `pushFilters` | yes, for `min`/`max` or quantiles |
+    | `read(partition)` | one task per partition | yes: its own connection, closed in `finally` |
+
+    The reader object travels from the driver to every task by pickling,
+    so it must not hold a connection. Keep one on `self` and the first
+    action fails:
+
+    ```python
+    class BadReader(DataSourceReader):
+        def __init__(self, options):
+            self.conn = sqlite3.connect(options["path"])   # don't
+    ```
+
+    ```text
+    AnalysisException: [PYTHON_DATA_SOURCE_ERROR] Failed to initialize
+    Python data source reader: Traceback (most recent call last):
+      ...
+    TypeError: cannot pickle 'sqlite3.Connection' object
+    ```
+
+    Database clients for Postgres or MySQL fail the same way (sockets do
+    not pickle). Store the connection **settings** (path, URL, user) on
+    `self` and connect inside `read()`:
+
+    ```python
+    def connect_ro(path):
+        """Open a SQLite file read-only."""
+        return sqlite3.connect(pathlib.Path(path).resolve().as_uri() + "?mode=ro", uri=True)
+
+    def read(self, partition):
+        sql, params = self.build_query(partition)
+        conn = connect_ro(self.path)
+        try:
+            cursor = conn.execute(sql, params)
+            while True:
+                rows = cursor.fetchmany(500)
+                if not rows:
+                    break
+                for row in rows:
+                    yield tuple(to_spark_value(v, self.types[c])
+                                for v, c in zip(row, self.columns))
+        finally:
+            conn.close()
+    ```
+
+    Three details in there:
+
+    - `?mode=ro` opens the file **read-only**. A reader should never be
+      able to change the source; a write on such a connection fails with
+      `sqlite3.OperationalError: attempt to write a readonly database`.
+    - `fetchmany` streams rows in chunks instead of loading the whole
+      range into memory with `fetchall`.
+    - `finally` closes the connection even when converting a row raises
+      half way through the range.
+
+    Pass absolute paths: on Spark Connect the workers do not run in your
+    directory (the relative-path surprise in "Reading a Custom File
+    Format, in Parallel").
+
+- Class: mult_question
+  Depth: all
+  Output: "Why must a data source reader not keep an open database connection on self?"
+  AnswerChoices: "The reader is pickled and sent to the tasks, and connections cannot be pickled;Spark closes all connections after planning;SQLite allows one connection per file;Connections are slower than cursors"
+  CorrectAnswer: "The reader is pickled and sent to the tasks, and connections cannot be pickled"
+  Hint: "Think about how the reader object gets from the driver to the executors."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Partitions as Key Ranges: How JDBC Does It
+
+    One partition means one task and one query: no parallelism. Spark's
+    JDBC source splits a table by ranges of a numeric (or date or
+    timestamp) column, with four options that always come together:
+    `partitionColumn` (or `column=` in `spark.read.jdbc`), `lowerBound`,
+    `upperBound` and `numPartitions`. This example uses Derby, which
+    ships inside PySpark, so you can run it as it is. The ids are 1 to
+    1000 plus two late ids near one million and one row without an id:
+
+    ```python
+    url = "jdbc:derby:memory:shop;create=true"
+    props = {"driver": "org.apache.derby.jdbc.EmbeddedDriver"}
+    ids = list(range(1, 1001)) + [1_000_000, 1_000_001]
+    (spark.createDataFrame([(i, f"c{i % 7}") for i in ids] + [(None, "nokey")],
+                           "ID int, CUSTOMER string")
+        .write.jdbc(url, "orders", mode="overwrite", properties=props))
+
+    df = spark.read.jdbc(url, "orders", column="ID", lowerBound=1, upperBound=1000001,
+                         numPartitions=4, properties=props)
+    for p in df._jdf.queryExecution().toRdd().partitions():   # classic sessions only
+        print(p.whereClause())
+    df.groupBy(sf.spark_partition_id().alias("p")).count().orderBy("p").show()
+    ```
+
+    ```text
+    "ID" < 250001 or "ID" is null
+    "ID" >= 250001 AND "ID" < 500001
+    "ID" >= 500001 AND "ID" < 750001
+    "ID" >= 750001
+    +---+-----+
+    |  p|count|
+    +---+-----+
+    |  0| 1001|
+    |  3|    2|
+    +---+-----+
+    ```
+
+    (Upper-case names keep Derby's identifier rules out of the way.)
+    What to notice:
+
+    - **The bounds only choose the stride.** They are not filters: the
+      first range is open below and takes NULL keys, the last is open
+      above. With `lowerBound=100, upperBound=200` the read still
+      returns all 1003 rows.
+    - **The ranges are even in key space, not in rows.** 1001 rows land
+      in the first task, two tasks get nothing, and the last gets 2. That
+      is the classic JDBC skew: ids with gaps, late imports, or one big
+      customer.
+    - **Too many partitions for the range are reduced.** With bounds 1
+      and 3 and `numPartitions=8`, Spark makes 2 partitions and logs a
+      warning (`JDBCRelation.columnPartition` in the 4.2.0 source does
+      the arithmetic, including a small alignment of the first and last
+      stride).
+    - **Each partition is one connection.** `numPartitions` is also the
+      number of concurrent queries against the database. Choose it for
+      what the database can take, not only for your cluster.
+
+    When you know a better split, give the `WHERE` clauses yourself with
+    `predicates`, one partition each:
+
+    ```python
+    by_hand = spark.read.jdbc(url, "orders", properties=props, predicates=[
+        "ID < 500 OR ID IS NULL", "ID >= 500 AND ID < 1000", "ID >= 1000"])
+    ```
+
+    ```text
+    +---+-----+
+    |  p|count|
+    +---+-----+
+    |  0|  500|
+    |  1|  500|
+    |  2|    3|
+    +---+-----+
+    ```
+
+    The predicates must cover every row exactly once, or rows are lost or
+    read twice. Spark does not check that.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    `url` and `props` point at a JDBC database with a table `orders`.
+    Create `df`: the table read by Spark's JDBC source in 8 ranges of
+    the `ID` column, with stride bounds 1 and 1000000.
+  CorrectAnswer: |
+    df = spark.read.jdbc(url, "orders", column="ID", lowerBound=1, upperBound=1000000, numPartitions=8, properties=props)
+  Hint: "spark.read.jdbc takes column, lowerBound, upperBound and numPartitions as keyword arguments, plus properties for the driver."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Same Ranges in a Python Source
+
+    The exercise source accepts the same options as JDBC. In
+    `partitions()` it computes split points and turns them into SQL
+    fragments with `?` parameters:
+
+    ```python
+    def range_partitions(column, split_points):
+        q = quote_ident(column)
+        if not split_points:
+            return [("1 = 1", [])]
+        ranges = [(f"({q} < ? OR {q} IS NULL)", [split_points[0]])]
+        for lo, hi in zip(split_points, split_points[1:]):
+            ranges.append((f"({q} >= ? AND {q} < ?)", [lo, hi]))
+        ranges.append((f"{q} >= ?", [split_points[-1]]))
+        return ranges
+    ```
+
+    Each `InputPartition` carries its `where` string and its `params`,
+    which pickle fine. The split points come from `lowerBound` and
+    `upperBound` when given, and from `SELECT min(...), max(...)` on the
+    driver otherwise.
+
+    The best partition column in SQLite is an `INTEGER PRIMARY KEY`. It
+    is the only column SQLite types strictly (it is an alias of the
+    internal `rowid`, so every value is an integer), and range conditions
+    on it use the table's own B-tree, so each task reads only its range.
+    A range condition on a column without an index makes **every** task
+    scan the whole table.
+
+    The exercise's table has ids 1 to 1201 plus six legacy ids from
+    100001. Four ranges over min..max:
+
+    ```text
+    Rows per partition, min..max ranges: [1201, 6]
+    ```
+
+    (Only partitions with rows appear in a `groupBy` on
+    `spark_partition_id()`; the two middle ranges are empty.)
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Balancing Ranges with Quantiles
+
+    The database can tell you where the rows are. On an indexed key,
+    `ORDER BY key LIMIT 1 OFFSET k` walks the index to the k-th key
+    without sorting anything (SQLite's query plan for it is a plain
+    `SCAN orders` in rowid order), so `n - 1` small queries on the driver
+    give split points with the same number of rows on each side:
+
+    ```python
+    def quantile_bounds(conn, table, column, n):
+        q, t = quote_ident(column), quote_ident(table)
+        count = conn.execute(f"SELECT count({q}) FROM {t}").fetchone()[0]
+        points = []
+        for i in range(1, n):
+            row = conn.execute(f"SELECT {q} FROM {t} WHERE {q} IS NOT NULL ORDER BY {q} "
+                               f"LIMIT 1 OFFSET ?", (count * i // n,)).fetchone()
+            if row and (not points or row[0] > points[-1]):
+                points.append(row[0])
+        return points
+    ```
+
+    ```text
+    Rows per partition, quantile ranges: [301, 302, 302, 302]
+    ```
+
+    The cost is a little planning work, and the split is only as good as
+    the moment it was computed. Other options, each with a catch:
+
+    - **Modulo partitions** (`key % n = i`): perfectly even, but no index
+      can serve them, so every task scans the whole table.
+    - **Statistics from the database** (Postgres `pg_stats` histograms):
+      free, but only as fresh as the last `ANALYZE`.
+    - **Many small ranges** (say 4 times the number of cores): uneven
+      ranges matter less when there are many of them, at the price of
+      more queries.
+
+- Class: mult_question
+  Depth: all
+  Output: "You read a table with partitionColumn=id, lowerBound=1, upperBound=1000 and numPartitions=4. Some rows have id 5000 and some have a NULL id. What happens to them?"
+  AnswerChoices: "They are read: id 5000 by the last range and NULL ids by the first;They are dropped, because they are outside the bounds;The read fails with an error about the bounds;They go to a fifth partition"
+  CorrectAnswer: "They are read: id 5000 by the last range and NULL ids by the first"
+  Hint: "The first range is open below and includes IS NULL; the last range is open above."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Pushing Filters: Parameters, Never Pasted Values
+
+    `pushFilters` receives the same filter objects as in "Filter
+    Pushdown". Here each one you take over becomes a SQL fragment that
+    `read()` adds to its range's `WHERE`. The obvious way to build it is
+    wrong:
+
+    ```python
+    # DON'T: the value is pasted into the SQL text
+    self.pushed.append((f"\"customer\" = '{f.value}'", []))
+    ```
+
+    One customer in the exercise's table is literally named
+    `x' OR '1'='1`. Filtering for that name:
+
+    ```python
+    df.filter(sf.col("customer") == "x' OR '1'='1").count()
+    ```
+
+    With the value pasted into the SQL this returns **1207**, every row
+    in the table. With the value bound as a parameter it returns 1.
+    The pasted version ran `"customer" = 'x' OR '1'='1' AND ...`, which
+    is true for every row, and since the reader took the filter over,
+    Spark did not check it again. A customer named `O'Brien` fails the
+    task outright with `sqlite3.OperationalError: near "Brien": syntax
+    error`. This is **SQL injection**, and in a pushdown it needs no
+    attacker: a value in your own data is enough.
+
+    With parameters, the SQL text holds a `?` and the value travels
+    separately, so the database never parses it as SQL:
+
+    ```python
+    return f"({g} AND {q} = ?)", [f.value]
+    ```
+
+    **Names cannot be parameters.** A table or column name has to be in
+    the SQL text. So check it against the database (the exercise's
+    `table_columns` looks the table up in `sqlite_master` and fails with
+    `ValueError: No table named 'orders; DROP TABLE orders' in the
+    database` otherwise), and quote it with `quote_ident`, which wraps it
+    in double quotes and doubles any quote inside.
+
+- Class: mult_question
+  Depth: all
+  Output: "Your pushFilters turns EqualTo(customer, v) into f\"customer = '{v}'\". What is the risk?"
+  AnswerChoices: "A value containing a quote changes the SQL, giving wrong rows or a failed task;None, because Spark escapes filter values;Only a performance cost;Spark rejects the filter"
+  CorrectAnswer: "A value containing a quote changes the SQL, giving wrong rows or a failed task"
+  Hint: "Spark hands you the raw value. Whatever you paste is parsed by the database as SQL."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Same Answer as Spark, or a Wrong Answer
+
+    Parameters make the SQL safe. They do not make it **correct**. The
+    contract from "Filter Pushdown" still holds: Spark stops checking a
+    filter you take over, so your SQL must keep exactly the rows Spark
+    would keep. A straightforward translation (`amount > ?`,
+    `amount IS NULL`, `status LIKE 'ship%'`) against the exercise's
+    table, compared with letting Spark filter everything itself:
+
+    | Condition | Spark filters itself | Straightforward SQL | Guarded SQL |
+    |---|---|---|---|
+    | `amount > 100` | 693 | **756** | 693 |
+    | `qty > 3` | 300 | **330** | 300 |
+    | `status LIKE 'ship%'` | 610 | **732** | 610 |
+    | `amount IS NULL` | 81 | **18** | 81 |
+
+    Each wrong number has a cause you have already seen:
+
+    - **Text in a numeric column.** SQLite orders every number before
+      every text value, so `'N/A' > 100` is **true**. Those rows come
+      back with `amount` converted to NULL, and Spark shows NULL amounts
+      in an `amount > 100` result.
+    - **NULL is not the only NULL.** For Spark, `amount IS NULL` is true
+      for real NULLs **and** for every `'N/A'`, `''` and `'12,50'` the
+      source turned into NULL. SQL `IS NULL` sees only the first kind.
+    - **LIKE ignores case** for ASCII letters in SQLite, so
+      `'Shipped' LIKE 'ship%'` is true, while Spark's `startswith` is
+      case-sensitive. `LIKE` also treats `%` and `_` inside the value as
+      wildcards.
+
+    The fix is one idea: a **guard** that is true exactly when
+    `to_spark_value` would keep the value.
+
+    ```python
+    def guard(column, spark_type):
+        q = quote_ident(column)
+        if spark_type == "bigint":
+            return f"typeof({q}) = 'integer'"
+        if spark_type == "double" or spark_type.startswith("decimal"):
+            return f"typeof({q}) IN ('integer', 'real')"
+        return f"typeof({q}) = 'text'"
+    ```
+
+    Then every comparison is `guard AND column op ?`, `IsNotNull` is the
+    guard itself, `IsNull` is `NOT (guard) OR column IS NULL`, and a
+    prefix test compares `substr(column, 1, ?) = ?` instead of `LIKE`.
+    The SQL generated for `amount > 100` on one partition:
+
+    ```text
+    SELECT "order_id", "customer", ... FROM "orders"
+    WHERE ("order_id" < ? OR "order_id" IS NULL) AND rowid <= ?
+      AND (typeof("amount") IN ('integer', 'real'))
+      AND (typeof("amount") IN ('integer', 'real') AND "amount" > ?)
+    params: [50003, 100006, 100.0]
+    ```
+
+    (The first guard comes from the `IsNotNull(amount)` that Spark adds
+    to every comparison.) The general lesson for any database: **push a
+    filter only when the backend's semantics match Spark's for every
+    value the column can hold.** Collations, trailing spaces in `CHAR`
+    columns, case-insensitive defaults (MySQL), NULL ordering and
+    floating-point equality are the usual suspects.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "In the exercise's table, amount holds numbers, NULLs and some text like 'N/A' that the source turns into NULL. Which SQL matches Spark's amount IS NULL?"
+  AnswerChoices: "NOT (typeof(amount) IN ('integer', 'real')) OR amount IS NULL;amount IS NULL;amount IS NULL OR amount = '';typeof(amount) = 'null'"
+  CorrectAnswer: "NOT (typeof(amount) IN ('integer', 'real')) OR amount IS NULL"
+  Hint: "Spark sees NULL for every value the source could not convert, not only for SQL NULLs."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What to Push, and What to Leave to Spark
+
+    The values Spark puts in the filters, measured on 4.2.0 with one
+    column of each type:
+
+    | Column type | Condition | Filter received |
+    |---|---|---|
+    | `decimal(10,2)` | `amount > 10` | `GreaterThan(('amount',), Decimal('10.00'))` |
+    | `bigint` | `id > 1.5` | `GreaterThan(('id',), 1)` (the optimizer rewrote it) |
+    | `double` | `score > 1` | `GreaterThan(('score',), 1.0)` |
+    | `boolean` | `shipped` | `EqualTo(('shipped',), True)` |
+    | `date` | `day = date'2026-10-01'` | `EqualTo(('day',), datetime.date(2026, 10, 1))` |
+    | `timestamp` | `ts >= timestamp'2026-10-01 10:00:00'` | aware `datetime` in **UTC** |
+    | `timestamp_ntz` | same | naive `datetime` |
+    | `string` | `name IN ('a', NULL)` | `In(('name',), ['a', None])` |
+    | `string` | `name LIKE 'a%b'` | `StringStartsWith` **and** `StringEndsWith` |
+    | `bigint` | `NOT (id > 3)` | `LessThanOrEqual(('id',), 3)` |
+    | `bigint` | `id = 2 OR id = 3` | nothing (`pushFilters` is not called) |
+
+    For timestamps the value is the instant converted to UTC: with the
+    session time zone `America/Los_Angeles`, `timestamp'2026-10-01
+    10:00:00'` arrived as `datetime(2026, 10, 1, 17, 0,
+    tzinfo=ZoneInfo('UTC'))`.
+
+    The exercise pushes:
+
+    - `EqualTo`, `GreaterThan`, `GreaterThanOrEqual`, `LessThan`,
+      `LessThanOrEqual`, `In`, `IsNull`, `IsNotNull` on columns whose
+      affinity is INTEGER, TEXT or REAL, and on decimals (bound as
+      `float`, because `sqlite3` cannot bind `Decimal`; SQLite stores
+      them as REAL anyway)
+    - `StringStartsWith` on those string columns
+
+    and returns everything else, including:
+
+    - **`placed_at`**: the table stores three timestamp formats (ISO with
+      a space, ISO with `T` and `Z`, epoch integers). No single SQL
+      comparison matches all three the way the parsed values compare.
+    - **`note`**, the untyped column: an integer 42 and the text `'42'`
+      look the same to Spark after conversion (`"42"`), but `note = '42'`
+      in SQLite only matches the text.
+    - **`Not(...)`**, `EqualNullSafe`, `StringEndsWith`,
+      `StringContains`: possible, but each needs its own NULL and
+      wildcard care; returning them is always correct.
+
+    Returning a filter costs only speed: Spark evaluates it on the rows
+    you send. Taking it over wrongly costs correctness.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## No Column Pruning in 4.2
+
+    Spark's JDBC source selects only the columns the query needs. For
+    the Derby table:
+
+    ```text
+    (1) Scan JDBCRelation(orders) [numPartitions=4]  [codegen id : 1]
+    Output [1]: [ID#11]
+    PushedFilters: [*IsNotNull(CUSTOMER), *IsNotNull(ID), *EqualTo(CUSTOMER,c3), *GreaterThan(ID,500)]
+    ReadSchema: struct<ID:int>
+    External engine query: SELECT "ID" FROM orders  WHERE ("CUSTOMER" IS NOT NULL) AND ...
+    ```
+
+    A Python data source in 4.2.0 cannot do that. `reader(schema)`
+    receives the **full** schema even for `select("order_id")`, there
+    is no pruning method on `DataSourceReader`, and `read()` must yield
+    every column. The plan says so:
+
+    ```text
+    (1) BatchScan sqlite
+    Output [8]: [order_id#373L, customer#374, status#375, amount#376, ...]
+    PushedFilters: [IsNotNull(status), IsNotNull(amount), EqualTo(status,shipped), GreaterThan(amount,100.00)]
+    ReadSchema: struct<order_id:bigint,customer:string,status:string,amount:decimal(10,2),...>
+
+    (2) Filter [codegen id : 1]
+    Condition : (isnotnull(note#380) AND (note#380 = fragile))
+    ```
+
+    JDBC marks the filters it fully handles with `*`; the Python scan's
+    list has no marks, so check Spark's `Filter` node to see what Spark
+    still evaluates (here only the condition on `note`, as designed). If a
+    table has wide columns most queries never need (documents, blobs),
+    offer an option such as `columns` and let the user choose, or expose
+    two tables. Also note: the Python filter API has no limit or
+    aggregate pushdown in 4.2.0, so `limit(10)` and `count()` read every
+    row of every range.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Plan-Reuse Trap, Again
+
+    "Filter Pushdown" showed that in 4.2.0 a DataFrame over a Python
+    source shares one planned read across every scan of its relation.
+    With a database
+    source and a temporary view:
+
+    ```python
+    df = spark.read.format("sqlite").option("path", db).option("table", "orders").load()
+    df.createOrReplaceTempView("orders_v")
+    spark.sql("SELECT count(*) FROM orders_v").first()[0]                          # 1207
+    spark.sql("SELECT count(*) FROM orders_v WHERE status = 'shipped'").first()[0] # 610
+    spark.sql("SELECT count(*) FROM orders_v").first()[0]                          # 610, not 1207
+    spark.sql("SELECT count(*) FROM orders_v WHERE status = 'pending' OR qty = 4").first()[0]  # 152
+    ```
+
+    The last query should return 580 (a fresh `load()` does). The `OR`
+    is not pushed, so `pushFilters` is not called, and the query reuses
+    the partitions, and the `WHERE` clauses, of the `status = 'shipped'`
+    query. The same happens on Spark Connect. Until you run a release
+    with the fix (it is on Spark's master branch as part of SPARK-58551;
+    4.2.0 and the 4.3 branch still have it), with pushdown on:
+
+    - build a fresh DataFrame with `load()` for each query (the exercise
+      harness has an `orders()` helper for exactly this), don't
+      register long-lived views over a pushdown source, and use a
+      separate `load()` for each reference to the source inside one
+      query (a self-join or a union of two filters)
+    - or copy the table into Parquet or Delta once and query that
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "With pushdown on in 4.2.0, a view over your source answered a filtered query and then an unfiltered count. Why is the count too small?"
+  AnswerChoices: "The unfiltered query reuses the planned read, WHERE clauses included, from the filtered one;SQLite caches query results;The view applies the filter permanently;Spark samples the table"
+  CorrectAnswer: "The unfiltered query reuses the planned read, WHERE clauses included, from the filtered one"
+  Hint: "A query with no pushable filter never calls pushFilters, so it keeps whatever the relation planned last."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## One Read, Many Moments in Time
+
+    Each partition opens its own connection, at its own moment: task 3
+    might start minutes after task 0 on a busy cluster. A database
+    transaction cannot span several processes, so nothing makes the
+    tasks see the table at one point in time. Read two ranges with
+    plain Python (no Spark), and change the table between them: move
+    order 1 to id 1300 and insert a new order.
+
+    The table had 1207 rows when planning started. Without protection
+    the read returns **1209** rows: order 1 twice (as id 1 in the first
+    range and as id 1300 in the second) and the new order. With the
+    snapshot mark described next it returns 1208.
+
+    The exercise adds a **snapshot mark**: `partitions()` reads
+    `max(rowid)` on the driver and every task adds `rowid <= ?`. That
+    stops rows inserted after planning (here, the new order). It does
+    not stop updates and deletes: the moved order is still counted
+    twice. Stronger options:
+
+    - **Copy first.** Snapshot the database on the driver (SQLite's
+      backup API is `sqlite3.Connection.backup` in Python) to storage the
+      tasks can read, then read the copy. Simple and exact, but it costs
+      a full copy.
+    - **Use the database's own snapshots.** Postgres can export a
+      snapshot from one transaction (`pg_export_snapshot()`) and import
+      it in others (`SET TRANSACTION SNAPSHOT ...`); parallel `pg_dump`
+      works this way. A source could do the same if every task uses it.
+    - **Read from a replica or an export** (a nightly dump, change data
+      capture into a table format), and let the table format give you
+      snapshots.
+
+    Spark's JDBC source has exactly the same limitation, so this is not
+    a Python problem. Know which of these your downstream checks can
+    tolerate before calling a read "consistent".
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Production Notes
+
+    - **Load on the database.** Every partition is one query running
+      concurrently. Many ranges on a busy production database can hurt
+      the people using it; read from a replica when you can.
+    - **Statement timeouts and retries.** A task that fails is retried by
+      Spark (on a cluster; local mode does not retry by default), which
+      reruns the whole range query. Make queries cheap to repeat.
+    - **Arrow batches.** For large tables, convert each `fetchmany` chunk
+      into a `pyarrow.RecordBatch` (see "Types, Arrow and Performance"),
+      but run `to_spark_value` first: Arrow is strict about types, and
+      SQLite is not.
+    - **Credentials** passed as options travel to every task inside the
+      pickled reader. Prefer secrets the executors fetch themselves (a
+      mounted file, an environment variable).
+    - **Partition pruning by pushed filters.** `partitions()` runs after
+      `pushFilters`, so a reader could drop ranges that cannot match a
+      pushed condition on the key (`order_id < 100` needs only the first
+      range). With an index on the key the database already skips the
+      empty ranges quickly, so this mostly saves tasks, not I/O.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: A SQLite Source with Ranges and Pushdown
+
+    The harness builds `shop.db` with a messy `orders` table in a
+    temporary folder. The helpers (`affinity`, `to_spark_value`,
+    `guard`, `quantile_bounds`, `connect_ro`, `quote_ident`) and most of
+    the source are written. Complete:
+
+    1. `spark_type(declared)`: declared SQLite type to a Spark type, as
+       in the table in "From Declared Types to a Spark Schema".
+    2. `range_partitions(column, split_points)`: one
+       `(where_sql, params)` per key range.
+    3. `compile_filter(f, types, pushable)`: one pushed filter to
+       `(sql, params)` with a guard, or `None` to leave it to Spark.
+    4. `SqliteReader.pushFilters`: take over what compiles, yield the
+       rest.
+    5. `SqliteReader.build_query(partition)`: the range, the snapshot
+       mark and the pushed filters, with params in `?` order.
+
+    The harness tests parts 1 to 3 as plain Python first. Then, with
+    Spark, it checks the schema, the `DATA_SOURCE_PUSHDOWN_DISABLED`
+    error with the flag off, and for several conditions that the pushed
+    query returns exactly what Spark's own filtering returns, that each
+    partition's SQL contains the pushed condition with no value pasted
+    into it, and that the customer named `x' OR '1'='1` matches one row.
+    It checks the plan's `PushedFilters`, the skew of min..max ranges
+    against quantile ranges, and the snapshot mark (without Spark).
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "compile_filter: for comparisons use COMPARISONS[type(f)] for the operator and return (f\"({g} AND {q} {op} ?)\", [param(f.value)]). build_query: conditions = [partition.where, 'rowid <= ?'] + [sql for sql, _ in self.pushed], and params = partition.params + [partition.snapshot] + every pushed filter's params."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - SQLite stores each value with its own type; the declared type only
+      sets an **affinity**. Text like `'N/A'` stays in "decimal" columns,
+      and `FLOATING POINT` has integer affinity.
+    - Derive the Spark schema from the declared types and convert value
+      by value, turning anything that does not fit into NULL. Spark's
+      JDBC source trusts the driver instead, which with sqlite-jdbc reads
+      `'two'` as 0 or fails the read.
+    - Never keep a connection on the reader (`cannot pickle
+      'sqlite3.Connection' object`); connect read-only in `read()` and
+      close in `finally`.
+    - Key ranges work like JDBC's `partitionColumn`, `lowerBound`,
+      `upperBound`, `numPartitions`: bounds set the stride, not a
+      filter, and ranges are even in keys, not rows. Quantile split
+      points or explicit `predicates` fix the skew.
+    - Push filters with `?` parameters; validate and quote names, which
+      cannot be parameters.
+    - A pushed filter must match Spark's semantics for every stored
+      value: guard with `typeof`, map `IsNull` to "NULL or unconvertible",
+      avoid case-insensitive `LIKE`, and leave the rest to Spark.
+    - Python sources have no column, limit or aggregate pushdown in
+      4.2.0. With pushdown on, load a fresh DataFrame per query and per
+      reference (the plan-reuse trap).
+    - Partitions read at different moments; a snapshot mark stops
+      inserts, not updates. Copy or use database snapshots when you need
+      a consistent read.
+
+    Next: **Writers**, where Spark hands rows to your code and a commit
+    protocol decides whether a failed job leaves garbage behind.

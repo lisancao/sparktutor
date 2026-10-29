@@ -1,0 +1,41 @@
+customer_id,full_name,email,phone,country,signup_date,lifetime_value,newsletter,age,city
+C001,  ana   maria  nguyen , Ana.Nguyen@Example.COM ,(416) 555-0199,Canada,2025-03-04,"$1,234.50",yes,34,Montréal
+ c002,BINH TRAN,binh@example.com,416.555.0123, usa ,2025/03/05,1234.5,Y, 41 ,MONTREAL
+C003,Zoë Tremblay,N/A,+1 416 555 0147,U.S.,05/03/2025,$12,0,,montreal  
+C004,José	García,jose.garcia@example,555-0100,Viet Nam,4 Mar 2025,-$5.00,N,-3,Hà Nội
+C005,nguyễn thị hà,,,VN,"March 4, 2025",N/A,,29,Ha Noi
+C006,Emma Smith,emma.at.example.com,4165550188,Mars,2025-02-30,abc,maybe,thirty,Toronto
+C007,Dev Patel,dev@example.ca,1-416-555-0177,can,20250306,"1,000",TRUE,200,toronto
+C008,MONA LEE,mona@example.com,n/a,France,unknown, $7.25 ,false,52,Paris
+C009,Omar Haddad,OMAR@EXAMPLE.COM,416 555 0101,United States of America,2025-03-09T14:30:00,$0.99,no,61,  Toronto
+C010,  ,ghost@example.com,4165550100,CA,2025-03-10,$5,1,40,Paris 
+C011,Binh Kim,,+1 416 898 2560,ca,2025-03-13,N/A,No,29,MONTRÉAL
+C012,DEV PATEL, DEV12@Example.org,n/a,CA,09/01/2025,4898.08,1, 24,HA NOI
+C013,JADE LÊ,,514.312.9311,CAN,2025-12-10, $3830 ,1,,Toronto
+C014,Linh García , LINH14@Example.org,514.718.6038,U.S.,2025/09/02,"$1,857.61",no, 19,montreal
+C015,Quinn Roy,,n/a,Viet Nam,20250710,4922.35,Y,,paris
+C016,Binh Lê, BINH16@Example.org,(514) 299-5148,United States,2025/07/27,1188.78,N, 43,Ha Noi
+C017,Binh Tremblay,binh.17@example.com,n/a,Viet Nam,2025-10-14,"$2,390.20",0,,HA NOI
+C018,QUINN KIM,,+1 604 694 7943,U.S.,3 Jun 2025, $1920 ,No,82,Hà Nội
+C019,QUINN NGUYEN,,(416) 916-9034,Canada,20250410,"$3,020.61",Y,,Montréal
+C020,DEV TREMBLAY, DEV20@Example.org,4163269018,France,2025/12/16,$26.57,N, 19,Toronto
+C021,Linh Lê ,linh.21@example.com,+1 514 344 8926,Viet Nam,22 Feb 2025, $2806 ,1, 72,Paris
+C022,Ivan Kim, IVAN22@Example.org,n/a,Viet Nam,25 Jun 2025, $4225 ,0,,MONTRÉAL
+C023, linh  patel,,416.703.2472,US,18/07/2025,"$4,564.06",No,37,MONTRÉAL
+C024,Zoë Patel,zoë.24@example.com,n/a,Canada,2025/05/08,542.67,1,,Toronto
+C025, zoë  martin,,+1 416 750 2938,U.S.,"August 22, 2025",2238.92,TRUE, 55,toronto 
+C026, binh  patel,,(514) 683-4758,France,20250706,"$2,108.55",No,,Hà Nội
+C027, quinn  martin,,416.699.6370,United States,22/12/2025, $1259 ,1,45,Toronto
+C028,Tuấn Tremblay,tuấn.28@example.com,(604) 530-6858,VN,26 Feb 2025,"$2,025.69",0,68,HA NOI
+C029, chloé  lê,chloé.29@example.com,(604) 214-5886,CAN,09/11/2025,2400.26,Y, 29,Montréal
+C030,Quinn Nguyen ,quinn.30@example.com,(514) 579-1182,Canada,2025-02-13,N/A,0,,MONTRÉAL
+C031, dev  kim, DEV31@Example.org,5144902752,ca,"August 20, 2025",144.84,true,,HA NOI
+C032, jade  lê,,6045543974,United States,2025/04/28,N/A,Y,43,montreal
+C033,Jade Kim,jade.33@example.com,4166907770,France,10 Feb 2025,N/A,TRUE,,Paris
+C034,Rosa Kim, ROSA34@Example.org,514.569.1232,United States,2025/08/11,N/A,Y, 35,montreal
+C035, hoa  lee,hoa.35@example.com,n/a,CA,2025/08/10,452.66,No,,Toronto
+C036,QUINN LEE, QUINN36@Example.org,+1 604 929 9286,VN,04/02/2025,N/A,false, 87,paris
+C037,Rosa Lê,rosa.37@example.com,(416) 435-6190,usa,28/03/2025,"$3,725.38",Y, 48,montreal
+C038,Tuấn Martin,tuấn.38@example.com,4169645402,CA,24 Feb 2025, $3283 ,0,63,toronto 
+C039,IVAN NGUYEN,,416.344.6531,VN,2025-04-08,"$4,459.75",Y, 83,paris
+C040,Chloé García,chloé.40@example.com,(416) 468-7342,ca,2025/12/23,N/A,N,,Montréal

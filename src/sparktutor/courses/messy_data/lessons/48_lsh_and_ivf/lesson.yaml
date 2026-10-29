@@ -1,0 +1,987 @@
+- Class: meta
+  Lesson: Building LSH and an IVF Vector Index
+  EstimatedMinutes: 90
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    "Text Analytics Without an LLM" used MLlib's `MinHashLSH` to find
+    near-duplicate support messages, and "Feature Vectors and Similarity
+    Search" in the intermediate level turned text and images into
+    vectors and searched them with MLlib's LSH. "Designing Tables for
+    Blobs" stored embeddings in a derived table keyed by content hash.
+    This lesson builds the indexes themselves, from DataFrame
+    primitives, and measures them against exact answers.
+
+    Approximate search is only worth what you can prove about it. Every
+    index in this lesson is checked the two ways "Feature Vectors and
+    Similarity Search" measured MLlib's LSH: **recall** (what
+    fraction of the true answers it finds, against an exact computation
+    on the same data) and **work saved** (how many pairs or vectors it
+    had to score, against brute force). Time is a poor measure on a
+    laptop; candidate counts are not.
+
+    By the end of this lesson you will be able to:
+
+    - Compute exact Jaccard similarity for every pair of a small corpus,
+      and explain why an inverted index does not make the exact answer
+      cheap on messy text
+    - Build MinHash signatures with Spark's higher-order functions, with
+      hash functions of the form `(a * x + b) mod p`, and stay inside
+      64-bit arithmetic under ANSI mode
+    - Derive the banding S-curve, choose bands and rows for a target
+      similarity, and predict candidate counts and recall before
+      running the join
+    - Explain from the 4.2.0 source why MLlib's LSH compares far more
+      pairs than a banded index, and measure the difference
+    - Find hot buckets, the LSH version of skew, and say where they
+      come from
+    - Build random-projection LSH (SimHash) for cosine similarity
+    - Build an IVF index: k-means centroids, inverted lists, search over
+      the `nprobe` nearest lists, a recall curve, and the skew that
+      makes the work larger than `nprobe / nlist`
+    - Choose between a literal array, a broadcast join and
+      `mapInPandas` for shipping centroids to executors
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Data: Reposted Listings and Clustered Vectors
+
+    `data/messy/listings/listings.jsonl` holds 424 listings from a
+    second-hand marketplace, posted by 152 sellers. Sellers repost the
+    same item again and again, and every repost differs a little. One
+    seller's kayak:
+
+    ```text
+    +----------+----------+--------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    |listing_id|posted    |price   |description                                                                                                                                                           |
+    +----------+----------+--------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    |L0007     |2026-09-12|785.00  |Mint sit on top kayak with paddle and seat, stored indoors over winter. Works perfectly. Downsizing. Located in Montreal.                                             |
+    |L0008     |2026-09-13|$760 OBO|Mnit sit on top kayak with paddle and seat, stored indoors over winter. Works perfectly. Downsizing. Located in Montreal. Must go this week.                          |
+    |L0009     |2026-09-17|$710 OBO|Serious buyers only. Mint sit on top kayak with paddle and seat, stored indoors over winter. Downsizing. Located in Montreal.                                         |
+    |L0010     |2026-09-21|710 CAD |Mint sit on top kayak with paddle and seat stored indoors over winter Works perfectly Downsizing Located in Montreal                                                  |
+    |L0011     |2026-09-23|710.00  |Mint sit on top kayak with paddle and seat, stored indoors over winter. Works perfectly. Located in Montreal. Price drop!                                             |
+    |L0012     |2026-09-25|685     |Open to offers. mint sit on top kayak with paddle and seat, stored indoors over winter. works perfectly. downsizing. located in montreal. can deliver for a small fee.|
+    +----------+----------+--------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    ```
+
+    A typo ("Mnit"), punctuation dropped, a sentence added, a sentence
+    removed, a change of case. Two sellers also post many *different*
+    items from one template, which makes their listings look alike
+    without being the same item:
+
+    ```text
+    L0391 Marc's Furniture Outlet. 27 inch gaming monitor, 165 hz, no dead pixels, original box in great
+          condition. All our items are cleaned and inspected. Delivery available across the island. ...
+    L0403 Marc's Furniture Outlet. Computerised sewing machine, 100 stitches, barely used in great
+          condition. All our items are cleaned and inspected. Delivery available across the island. ...
+    ```
+
+    Those two have a Jaccard similarity of 0.60 on character shingles
+    (below). The generator is `scripts/messy_gen/listings.py`.
+
+    The second half of the lesson needs vectors. Real embeddings come
+    from a model, as in "Feature Vectors and Similarity Search"; here the
+    exercise makes 20,000 synthetic unit vectors in 32 dimensions with
+    numpy (a fixed seed), drawn around 40 cluster centres whose sizes
+    follow a Zipf law, plus 200 held-out query vectors. The skew is on
+    purpose: real embedding spaces have dense regions too.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Shingles: Text as a Set
+
+    Jaccard similarity compares **sets**: `J(A, B) = |A ∩ B| / |A ∪ B|`.
+    Word sets are too coarse for short listings (one typo replaces a
+    whole word), so the lesson uses **character 5-shingles**: every
+    substring of five characters of the normalized text (lower case,
+    runs of anything that is not a letter or a digit replaced by one
+    space). Each shingle is hashed to an integer below the prime
+    `P = 2^31 - 1`:
+
+    ```python
+    P = 2147483647
+    text = F.trim(F.regexp_replace(F.lower("description"), r"[^a-z0-9]+", " "))
+    grams = F.when(F.length(text) < 5, F.array(text)).otherwise(
+        F.transform(F.sequence(F.lit(1), F.length(text) - 4),
+                    lambda i: F.substring(text, i, 5)))
+    sh = listings.select("listing_id",
+        F.transform(F.array_distinct(grams),
+                    lambda s: F.pmod(F.xxhash64(s), F.lit(P))).alias("h"))
+    ```
+
+    The listings have between 89 and 250 distinct shingles, 145 on
+    average.
+
+    The `when` guards a real trap. `sequence(1, n)` with `n < 1` does
+    not return an empty array: it counts **down**. Without the guard:
+
+    ```text
+    +-----------+-------------------------------------------------+
+    |text       |sh                                               |
+    +-----------+-------------------------------------------------+
+    |abc        |[abc, abc, c]                                    |
+    |           |[, , , , , ]                                     |
+    |hello world|[hello, ello , llo w, lo wo, o wor,  worl, world]|
+    +-----------+-------------------------------------------------+
+    ```
+
+    `sequence(1, -1)` is `[1, 0, -1]`, and `substring` with a position
+    of 0 or less counts from the other end. Every empty description
+    would get the same set of empty strings and match every other empty
+    description perfectly. Keep one shingle for short texts (or drop
+    them), never let them through unguarded. ("Text Analytics Without an
+    LLM" showed the MLlib form of the same problem: an empty vector is an
+    error there.)
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Exact Answer, and Why It Is Expensive
+
+    424 listings make `424 * 423 / 2 = 89,676` pairs. That is small
+    enough to compute every Jaccard similarity exactly, and the lesson
+    does so, because you cannot measure recall without the truth:
+
+    ```python
+    a = sh.select(F.col("listing_id").alias("a"), F.col("h").alias("ha"))
+    b = sh.select(F.col("listing_id").alias("b"), F.col("h").alias("hb"))
+    pairs = a.join(b, F.col("a") < F.col("b")).select("a", "b",
+        (F.size(F.array_intersect("ha", "hb")) / F.size(F.array_union("ha", "hb"))).alias("j"))
+    ```
+
+    The distribution, in buckets of 0.1 (`floor(j * 10)`):
+
+    ```text
+    +------+-----+
+    |bucket|count|
+    +------+-----+
+    |     0|70475|
+    |     1|13164|
+    |     2| 2689|
+    |     3| 1408|
+    |     4|  796|
+    |     5|  548|
+    |     6|  161|
+    |     7|  113|
+    |     8|  150|
+    |     9|  107|
+    |    10|   65|
+    +------+-----+
+    ```
+
+    435 pairs have `J >= 0.7` (the reposts), 65 are identical after
+    normalization. Everything else is noise you never want to compare.
+    The join is a `BroadcastNestedLoopJoin` (a non-equi condition, so
+    Spark has no hash key): quadratic, fine at 424 rows, hopeless at a
+    million.
+
+    The usual trick for sparse similarity is an **inverted index**:
+    explode the shingles, join on the shingle, and only pairs that share
+    at least one shingle meet. On messy text it is worse than brute
+    force. The most common shingles here are pieces of "located in":
+
+    ```text
+    +-----+-----+
+    |    g|count|
+    +-----+-----+
+    |ed in|  371|
+    |d in |  370|
+    |ted i|  357|
+    |ated |  356|
+    |ocate|  355|
+    |locat|  355|
+    | loca|  355|
+    |cated|  355|
+    +-----+-----+
+    ```
+
+    A shingle in `n` listings makes `n * (n - 1) / 2` join rows, and
+    summing that over the 3,218 distinct shingles gives **1,674,500**
+    rows: 18 times more than comparing every pair directly, and 87,566
+    of the 89,676 pairs share at least one shingle anyway. Boilerplate
+    is what makes messy text messy, and it defeats exact indexes. You
+    could drop frequent shingles, but then the similarities are no
+    longer exact. LSH takes the other way out: keep the exact
+    similarity, give up on finding *every* similar pair, and say with
+    numbers how many you miss.
+
+- Class: mult_question
+  Depth: all
+  Output: "A shingle appears in 300 of the listings. How many rows does it alone add to an inverted-index self-join on shingles (pairs a < b)?"
+  AnswerChoices: "44,850;300;90,000;600"
+  CorrectAnswer: "44,850"
+  Hint: "Every pair of the 300 listings meets on that shingle: n * (n - 1) / 2."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## MinHash: One Number That Estimates Jaccard
+
+    Take a random permutation of all possible shingles, and for a set
+    `A` keep `min(A)`, the first of its shingles in that order. For two
+    sets, the first shingle of `A ∪ B` in the permutation is equally
+    likely to be any element of the union, and the two minima are equal
+    exactly when that element is in both sets. So:
+
+    ```text
+    Pr[ min(A) == min(B) ] = |A ∩ B| / |A ∪ B| = J(A, B)
+    ```
+
+    One permutation gives a coin that lands heads with probability `J`.
+    `K` independent permutations give `K` coins; the fraction of
+    positions where two **signatures** agree is an unbiased estimate of
+    `J` with standard deviation `sqrt(J (1 - J) / K)`.
+
+    Real permutations of 2^31 values are too big to store, so MinHash
+    uses hash functions instead: `h(x) = (a * x + b) mod P` with random
+    `a` in `[1, P)` and `b` in `[0, P)`, where `P` is a prime. This is
+    the family MLlib uses too; in
+    `mllib/src/main/scala/org/apache/spark/ml/feature/MinHashLSH.scala`
+    (4.2.0) the hash is `((1L + i) * a + b) % MinHashLSH.HASH_PRIME`
+    with `HASH_PRIME = 2038074743`.
+
+    In Spark the whole signature is two nested higher-order functions,
+    with the `K` coefficient pairs as a literal array of structs:
+
+    ```python
+    def minhash(sh, params):
+        coeffs = F.array(*[F.struct(F.lit(a).cast("bigint").alias("a"),
+                                    F.lit(b).cast("bigint").alias("b")) for a, b in params])
+        sig = F.transform(coeffs, lambda c: F.array_min(
+            F.transform("h", lambda x: (c["a"] * x + c["b"]) % P)))
+        return sh.withColumn("sig", sig)
+    ```
+
+    No UDF, no `explode`, no shuffle: each row's signature depends only
+    on that row, so the plan is a single `Project`. The physical plan
+    prints the coefficients inline:
+
+    ```text
+    Project [listing_id#7, h#51, transform([[695425565,2035525362],[323946140,847876999],...],
+      lambdafunction(array_min(transform(h#51, lambdafunction((((lambda x_4#361.a * lambda x_5#362L)
+      + lambda x_4#361.b) % 2147483647), lambda x_5#362L, false))), lambda x_4#361, false)) AS sig#360]
+    ```
+
+    The literal travels inside the serialized plan to every task. That
+    is right for 100 pairs of numbers; for megabytes, use a broadcast
+    (the IVF section compares the options).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Staying Inside 64 Bits
+
+    `x` is below `P = 2^31 - 1` and so is `a`, so `a * x + b` is below
+    `2^62`: it fits in a `bigint`. That is why the shingle hashes are
+    reduced with `pmod` first and why `P` is a 31-bit prime, not the
+    61-bit Mersenne prime many papers use. Spark 4 runs with ANSI mode
+    on (`spark.sql.ansi.enabled` is `true` by default since 4.0), so an
+    overflowing multiplication is an error, not a silent wrap. With
+    `P = 2^61 - 1` and a large `a`:
+
+    ```text
+    ArithmeticException [ARITHMETIC_OVERFLOW] overflow. Use 'try_multiply' to tolerate overflow
+    and return NULL instead. If necessary set "spark.sql.ansi.enabled" to "false" to bypass this
+    error. SQLSTATE: 22003
+    ```
+
+    Do not take either suggestion. `try_multiply` would turn the overflow
+    into NULL, and `array_min` skips NULLs, so some signatures would be
+    computed from fewer shingles without any error. Turning ANSI off
+    makes the product wrap around, which is a different hash function
+    from the one your maths assumes. Pick a prime that keeps the
+    arithmetic exact.
+
+    The other edge: `array_min` of an **empty** array is NULL. Every
+    listing with no shingles would get a signature of NULLs, and all of
+    them would land in the same buckets. The shingle guard above makes
+    that impossible here; in your own data, filter empty sets out before
+    hashing.
+
+- Class: mult_question
+  Depth: all
+  Output: "Why does the lesson reduce shingle hashes modulo 2^31 - 1 instead of 2^61 - 1?"
+  AnswerChoices: "So that a * x + b stays below 2^62 and fits in a bigint without ANSI overflow errors;Because xxhash64 only returns 31-bit values;Because Spark arrays cannot hold values above 2^31;Because MinHash needs the prime to be smaller than the number of shingles"
+  CorrectAnswer: "So that a * x + b stays below 2^62 and fits in a bigint without ANSI overflow errors"
+  Hint: "Both a and x are below P, and Spark 4 raises ARITHMETIC_OVERFLOW instead of wrapping."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Measuring the Estimate
+
+    With `K = 100` hash functions, the lesson compared the MinHash
+    estimate with the exact Jaccard similarity for all 89,676 pairs,
+    grouped by the exact value. The last column is the theoretical
+    standard deviation at the middle of each bucket:
+
+    ```text
+    bucket   pairs   mean(est - J)   sd(est - J)   sqrt(J(1-J)/K)
+    0.0      70475   -0.0037         0.0174        0.0218
+    0.1      13164   -0.0083         0.0304        0.0357
+    0.2       2689   -0.0105         0.0367        0.0433
+    0.3       1408   -0.0039         0.0421        0.0477
+    0.4        796   -0.0016         0.0444        0.0497
+    0.5        548    0.0045         0.0475        0.0497
+    0.6        161    0.0079         0.0525        0.0477
+    0.7        113    0.0040         0.0410        0.0433
+    0.8        150    0.0081         0.0343        0.0357
+    0.9        172    0.0030         0.0199        0.0218
+    ```
+
+    The spread follows the theory: largest near 0.5, smallest at the
+    ends. The bias is small but not zero; `(a * x + b) mod P` is not a
+    truly random permutation. Over every pair that shares a shingle,
+    the mean absolute error was 0.017. The exercise checks this number.
+
+    The signature replaces a set of about 145 shingles with 100 numbers,
+    which is not much of a saving here. The point is what comes next:
+    signatures can be **bucketed**, and sets cannot.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Banding: Turning Signatures into Buckets
+
+    Cut each signature into `b` **bands** of `r` values (`b * r = K`).
+    Two listings become a **candidate pair** if all `r` values agree in
+    at least one band. For a pair with similarity `s`:
+
+    - one band agrees with probability `s^r` (AND within the band)
+    - no band agrees with probability `(1 - s^r)^b`
+    - so the pair is a candidate with probability `1 - (1 - s^r)^b` (OR
+      across bands)
+
+    Plotted against `s` this is an **S-curve**: near 0 for dissimilar
+    pairs, near 1 for similar ones, with the steepest point near the
+    threshold `t ≈ (1/b)^(1/r)`. More rows per band push the curve
+    right and make it steeper; more bands push it left.
+
+    In Spark, each band becomes a bucket key, `xxhash64` of the band's
+    `r` values, and candidates come from a self-join on `(band, bucket)`:
+
+    ```python
+    bands = sig.select("listing_id",
+        F.posexplode(F.transform(F.sequence(F.lit(0), F.lit(b - 1)),
+                                 lambda i: F.xxhash64(F.slice("sig", i * r + 1, r))))
+         .alias("band", "bucket"))
+    x, y = bands.alias("x"), bands.alias("y")
+    cands = (x.join(y, (F.col("x.band") == F.col("y.band"))
+                     & (F.col("x.bucket") == F.col("y.bucket"))
+                     & (F.col("x.listing_id") < F.col("y.listing_id")))
+             .select(F.col("x.listing_id").alias("a"), F.col("y.listing_id").alias("b"))
+             .distinct())
+    ```
+
+    `slice` is 1-based, hence `i * r + 1`. The `distinct` matters: a
+    pair that agrees in five bands meets five times. The physical plan
+    (shortened):
+
+    ```text
+    HashAggregate(keys=[a#1859, b#1860], functions=[])
+    +- Exchange hashpartitioning(a#1859, b#1860, 8), ENSURE_REQUIREMENTS
+       +- HashAggregate(keys=[a#1859, b#1860], functions=[])
+          +- Project [listing_id#7 AS a#1859, listing_id#1849 AS b#1860]
+             +- BroadcastHashJoin [band#1846, bucket#1847L], [band#1856, bucket#1857L], Inner, BuildRight,
+                (listing_id#7 < listing_id#1849), false, false
+                :- Generate posexplode(transform(..., lambdafunction(xxhash64(slice(sig#360, ...), 42), ...)))
+                +- BroadcastExchange HashedRelationBroadcastMode(List(input[1, int, false], input[2, bigint, false]),false)
+                   +- Generate posexplode(...)
+    ```
+
+    Now the join is an **equi-join** on `(band, bucket)`, so Spark can
+    hash it (here a broadcast hash join; at scale a sort-merge join on
+    those keys), and `a < b` is only a filter on the matches. That is
+    the whole trick: an equality key that similar items are likely to
+    share.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Predicting Candidates Before You Join
+
+    Because the S-curve is a formula, you can predict the size of the
+    join from the similarity distribution: the expected number of
+    candidates is the sum of `1 - (1 - s^r)^b` over all pairs. With the
+    exact similarities of all 89,676 pairs, predicted and measured,
+    and the recall of the 435 pairs with `J >= 0.7`:
+
+    ```text
+    b    r    threshold   predicted   measured   predicted   measured
+                          candidates  candidates  recall      recall
+    100  1    0.010       81008       82593       1.0000      1.0000
+    50   2    0.141       20792       18862       1.0000      1.0000
+    25   4    0.447       2388        2244        1.0000      1.0000
+    20   5    0.549       1359        1431        0.9985      1.0000
+    10   10   0.794       390         414         0.8108      0.8299
+    ```
+
+    The prediction is good to a few percent. `b = 25, r = 4` finds every
+    repost while comparing 2,244 pairs, 2.5% of the 89,676. `b = 10,
+    r = 10` compares even fewer but loses 17% of the reposts, because
+    its threshold (0.79) sits above many of them.
+
+    In practice you do not know the distribution in advance, so you
+    pick `(b, r)` from the curve alone. A useful rule: choose the
+    largest `r` (fewest false candidates) such that a pair exactly at
+    your threshold still becomes a candidate with high probability. For
+    `K = 100`, `t = 0.7` and 99%:
+
+    ```text
+    r    b     P(candidate | s = 0.7)
+    1    100   1.0000
+    2    50    1.0000
+    4    25    0.9990
+    5    20    0.9748
+    10   10    0.2491
+    ```
+
+    `r = 4` is the largest that clears 0.99. The exercise asks you to
+    write this choice as a function.
+
+- Class: mult_question
+  Depth: all
+  Output: "With b = 20 bands of r = 5 rows, what is the probability that a pair with Jaccard similarity 0.5 becomes a candidate?"
+  AnswerChoices: "About 0.47;About 0.03;About 0.97;Exactly 0.5"
+  CorrectAnswer: "About 0.47"
+  Hint: "0.5^5 = 0.03125. Then 1 - (1 - 0.03125)^20."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Using Python only, set `t` to the approximate threshold of a banded
+    MinHash index with `b = 50` bands of `r = 2` rows, the formula
+    `(1/b)^(1/r)`.
+  CorrectAnswer: |
+    t = (1 / 50) ** (1 / 2)
+  Hint: "Raise 1/b to the power 1/r."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What MLlib Does Instead
+
+    MLlib's `LSH` base class
+    (`mllib/src/main/scala/org/apache/spark/ml/feature/LSH.scala`) says
+    it in its own doc comment: "This LSH class implements
+    OR-amplification: more than 1 hash functions can be chosen, and each
+    input vector are hashed by all hash functions. Two input vectors are
+    defined to be in the same bucket as long as ANY one of the hash
+    value matches." Each of the `numHashTables` tables holds **one** hash
+    value; there is no AND inside a table. In banding terms, MLlib always
+    uses `r = 1`. The `hashFunction` in `MinHashLSH.scala` even carries
+    the comment `// TODO: Output vectors of dimension numHashFunctions
+    in SPARK-18450`; SPARK-18450, "Add AND-amplification to Locality
+    Sensitive Hashing", was resolved as Incomplete without a fix.
+
+    `approxSimilarityJoin` posexplodes the hash array, joins on
+    `(entry, hashValue)`, takes `distinct()`, computes the exact distance
+    with a UDF, and filters. The candidate set is the join before the
+    filter. Rebuilding that join on MLlib's own hashes over the same
+    shingles (`HashingTF` with `binary=True`, distance threshold 0.3,
+    that is `J >= 0.7`):
+
+    ```text
+    MLlib numHashTables=5:  candidate pairs inside the join 17730, returned 435, recall vs exact J>=0.7 1.000
+    MLlib numHashTables=25: candidate pairs inside the join 56168, returned 435, recall vs exact J>=0.7 1.000
+    ```
+
+    Same answer as the banded index, but 17,730 or 56,168 exact distance
+    computations instead of 2,244. With `r = 1` the S-curve is
+    `1 - (1 - s)^b`, which is not an S at all: at `s = 0.1`, five tables
+    already make 41% of pairs candidates. More tables raise recall
+    *and* the number of candidates; only rows per band can make the
+    curve steep. MLlib's LSH is a fine tool for "Feature Vectors and
+    Similarity Search" sizes; for millions of items, banding is what
+    keeps the join from becoming quadratic again.
+
+- Class: mult_question
+  Depth: all
+  Output: "Why does raising numHashTables in MLlib's MinHashLSH never make its candidate filter more selective?"
+  AnswerChoices: "Each table holds one hash value and tables are ORed, so more tables only add candidates;Because MLlib recomputes the exact distance for every pair;Because the hash prime is too small;Because approxSimilarityJoin ignores numHashTables"
+  CorrectAnswer: "Each table holds one hash value and tables are ORed, so more tables only add candidates"
+  Hint: "Read the doc comment of the LSH class: OR-amplification only."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Hot Buckets: Skew in LSH
+
+    Prediction from the S-curve is an **expectation**. The variance can
+    be large on messy text, and you can see why by counting, for each of
+    the 100 hash functions on its own, how many pairs share its minimum:
+
+    ```text
+     i   pairs  biggest
+     0  5191.0       53
+     1 20425.0      184
+     2 15453.0      150
+     3 19581.0      185
+     4  5781.0       75
+    count      100.000000
+    mean      6521.730000
+    std       5746.830961
+    min       2594.000000
+    max      48108.000000
+    ```
+
+    For hash function 1, 184 listings share one minimum. That happens
+    when a boilerplate shingle (from "located in", "pick up only") gets
+    a small hash value: every listing that contains it has the same
+    minimum. On average over hash functions the collision rate is right;
+    for one hash function it can be more than seven times the mean. Banding with
+    only the first five hash functions and `r = 1` produced 46,495
+    candidates where the S-curve predicted 24,783, because three of
+    those five are heavy hitters.
+
+    Rows per band are the cure: a bucket key needs `r` minima to agree,
+    and the chance that `r` independent hash functions all pick
+    boilerplate is small. With `b = 25, r = 4` the largest bucket held
+    17 listings, and the buckets with 15 or more belonged to:
+
+    ```text
+    +---------------+--------+
+    |         seller|listings|
+    +---------------+--------+
+    |        user114|       1|
+    |        user068|       6|
+    |        user018|       5|
+    |        user052|       1|
+    |liquidation_pro|      15|
+    |  deals_by_marc|      20|
+    |        user089|       2|
+    +---------------+--------+
+    ```
+
+    The template sellers. A bucket of `m` listings costs `m (m - 1) / 2`
+    pairs, so at scale one template seller with 10,000 ads would add 50
+    million candidates. Watch the bucket size distribution
+    (`groupBy("band", "bucket").count()`) the way you would watch key
+    skew in any join, and treat very large buckets separately: verify
+    them with a stricter rule, sample them, or remove the template text
+    before shingling.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Verification Keeps the Answer Exact
+
+    LSH decides which pairs to compare; it never decides the answer. The
+    last step recomputes the exact similarity of every candidate:
+
+    ```python
+    j = F.size(F.array_intersect("ha", "hb")) / F.size(F.array_union("ha", "hb"))
+    found = cands.join(ha, "a").join(hb, "b").select("a", "b", j.alias("j")).filter("j >= 0.7")
+    ```
+
+    So **precision is always 1.0**: every reported pair really is above
+    the threshold. Only recall is approximate. This is the same promise
+    as MLlib's `distCol` ("Text Analytics Without an LLM" made the point
+    for the MLlib version) and the reason you can tune `(b, r)` with
+    confidence: the only error you can make is a missed pair, and the
+    S-curve tells you how likely that is.
+
+    If the sets are large, ship signatures instead of sets and accept
+    the MinHash estimate as the answer; then precision is approximate
+    too, and you should say so in the output (for example, a column
+    with the estimate's standard deviation).
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Random Projections: LSH for Cosine Similarity
+
+    MinHash is for sets. For vectors and cosine similarity, the matching
+    trick is **random hyperplanes** (also called SimHash): draw a random
+    vector `w` with independent normal components and keep one bit,
+    `w · v >= 0`. Two vectors at angle `θ` get different bits only when
+    the hyperplane falls between them, which happens with probability
+    `θ / π`:
+
+    ```text
+    Pr[ bit(u) == bit(v) ] = 1 - θ(u, v) / π
+    ```
+
+    That is a coin again, so banding works unchanged: `b` bands of `r`
+    bits, each band packed into an integer bucket key. On 2,000 random
+    pairs of the lesson's vectors with 256 hyperplanes, the measured
+    agreement rate was within 0.023 of `1 - θ/π` on average.
+
+    In Spark, with the planes as a literal array and the bits packed
+    with `aggregate`:
+
+    ```python
+    def dot(u, v):
+        return F.aggregate(F.zip_with(u, v, lambda x, y: x * y), F.lit(0.0), lambda acc, z: acc + z)
+
+    bits = F.transform(planes, lambda p: F.when(dot(F.col("v"), p) >= 0, 1).otherwise(0))
+    keys = F.transform(F.sequence(F.lit(0), F.lit(b - 1)),
+                       lambda i: F.aggregate(F.slice(bits, i * r + 1, r), F.lit(0),
+                                             lambda acc, bit: acc * 2 + bit))
+    ```
+
+    Searching the 200 queries for their 10 nearest neighbours among the
+    20,000 vectors this way (candidates from shared band keys, exact
+    cosine on the candidates):
+
+    ```text
+    simhash b=8 r=8 recall@10=0.9020 scored=751778 frac=0.1879
+    simhash b=12 r=6 recall@10=0.9945 scored=1429178 frac=0.3573
+    ```
+
+    Random hyperplanes ignore where the data is: the same planes cut a
+    dense cluster and an empty region alike. On clustered data, an index
+    that learns the clusters does much better, which is the next
+    section.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## IVF: An Inverted File over Vectors
+
+    An **IVF** index (inverted file) partitions the vector space with
+    k-means: `nlist` centroids, and an **inverted list** per centroid
+    holding the vectors nearest to it. A query computes its distance to
+    every centroid (cheap: `nlist` distances), picks the `nprobe` nearest
+    lists, and scores only the vectors in those lists. Quality comes
+    from the probes: the true neighbours of a query near the edge of a
+    cell live partly in the next cell.
+
+    Three steps, all DataFrames:
+
+    1. **Train** centroids. MLlib's `KMeans` wants an ML vector column,
+       and `pyspark.ml.functions.array_to_vector` (3.1) converts
+       `array<double>`:
+
+       ```python
+       km = KMeans(k=64, seed=1, maxIter=20, featuresCol="f").fit(
+           vectors.select(array_to_vector("v").alias("f")))
+       centroids = [c.tolist() for c in km.clusterCenters()]
+       ```
+
+       `clusterCenters()` returns numpy arrays. Use `tolist()`: passing
+       `list(c)` (numpy floats) to `createDataFrame` with an
+       `array<double>` schema fails with
+       `[FIELD_DATA_TYPE_UNACCEPTABLE_WITH_NAME] element in array field
+       c: DoubleType() can not accept object
+       np.float64(-0.08270024441535336) in type <class 'numpy.float64'>.`
+
+    2. **Assign** every vector to its nearest centroid:
+
+       ```python
+       def sqdist(u, v):
+           return F.aggregate(F.zip_with(u, v, lambda x, y: (x - y) * (x - y)),
+                              F.lit(0.0), lambda acc, z: acc + z)
+
+       d = F.transform(centroid_array(centroids), lambda c: sqdist(F.col("v"), c))
+       index = vectors.withColumn("list", F.array_position(d, F.array_min(d)) - 1)
+       ```
+
+       `array_position` is 1-based and returns the first match, so ties
+       go to the lower list.
+
+    3. **Search**: rank the centroids for each query, explode the first
+       `nprobe`, join to the index on `list`, score, and keep the top
+       `k` per query:
+
+       ```python
+       ranked = F.array_sort(F.arrays_zip(d.alias("d"), F.sequence(F.lit(0), F.lit(63)).alias("l")))
+       probes = queries.select("qid", "q", F.explode(F.slice(ranked, 1, nprobe)).alias("p"))
+       scored = (probes.select("qid", "q", F.col("p.l").alias("list"))
+                 .join(index, "list")
+                 .select("qid", "id", sqdist(F.col("q"), F.col("v")).alias("dist")))
+       top = scored.groupBy("qid").agg(
+           F.slice(F.array_sort(F.collect_list(F.struct("dist", "id"))), 1, 10).alias("top"))
+       ```
+
+       `array_sort` on structs sorts by the first field, then the next,
+       so `(dist, id)` gives nearest first with a deterministic tie
+       break.
+
+    The vectors are unit length, so squared Euclidean distance ranks
+    neighbours exactly as cosine similarity does
+    (`|u - v|^2 = 2 - 2 u·v`).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Recall Curve
+
+    With 64 lists over the 20,000 vectors, against exact top-10
+    neighbours computed with numpy:
+
+    ```text
+    IVF: 64 lists, sizes from 16 to 610 (mean 312)
+      nprobe= 1: recall@10=0.424, vectors scored 79820 (2.0% of brute force)
+      nprobe= 4: recall@10=0.765, vectors scored 308524 (7.7% of brute force)
+      nprobe= 8: recall@10=0.913, vectors scored 588344 (14.7% of brute force)
+      nprobe=16: recall@10=0.988, vectors scored 1004910 (25.1% of brute force)
+      nprobe=64: recall@10=1.000, vectors scored 4000000 (100.0% of brute force)
+    ```
+
+    Brute force is 200 queries times 20,000 vectors, 4,000,000 distances.
+    Two facts make this table trustworthy:
+
+    - At `nprobe = nlist` the index scores every vector and must return
+      **exactly** the brute-force answer. If it does not, the bug is in
+      your top-k, not in the index. The exercise checks this.
+    - Recall rises with `nprobe` and so does work, monotonically. The
+      useful region is the knee: here `nprobe = 8` gives 91% recall for
+      15% of the work, and `nprobe = 16` gives 99% for 25%.
+
+    Compare SimHash above on the same vectors and queries: random
+    hyperplanes reached 90% recall for 19% of brute force and 99.5% for
+    36%; learned centroids reach 91% for 15% and 98.8% for 25%. An index
+    that adapts to the data spends its work where the neighbours are.
+
+- Class: mult_question
+  Depth: all
+  Output: "An IVF search with nprobe equal to the number of lists returns different neighbours than brute force. Where is the bug?"
+  AnswerChoices: "In the scoring or top-k step, because every vector was scored;In the k-means training;In the number of lists;Nowhere, IVF is approximate even at full probe"
+  CorrectAnswer: "In the scoring or top-k step, because every vector was scored"
+  Hint: "Probing every list means the candidate set is the whole index."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Skew: Why the Work Is More Than nprobe / nlist
+
+    At `nprobe = 1` you might expect to score `1/64` of the index per
+    query, 62,500 vectors for 200 queries. The run scored 79,820. Queries
+    are drawn from the same distribution as the data, so they land in
+    dense lists more often than in sparse ones: the expected work is the
+    sum over queries of the size of the list each one probes, and with
+    this data that sum is exactly the 79,820 measured. Skewed data means
+    skewed work.
+
+    It also means skewed tasks. With `k = 16` lists the Zipf clusters
+    show through:
+
+    ```text
+    k=16 sizes [3355, 2107, 1994, 1987, 1963, 1359, 1305, 1299, 1019, 803, 783, 602, 497, 453, 267, 207]
+    rows per partition after repartition(8,'list') with k=16: [5318, 1010, 1305, 1236, 2665, 6359, 2107]
+    ```
+
+    Partitioning the index by list (the natural layout: one list per
+    task) gave seven non-empty partitions for eight slots, and the
+    largest held 6,359 vectors against a mean of 2,500. A query batch
+    that probes the big lists waits for that one task.
+
+    The usual fix is to **split large lists**: run k-means again inside
+    every list larger than twice the mean and replace it with the
+    sub-lists. With `k = 16`, one list was over the limit (3,355) and
+    became three, for 18 lists:
+
+    ```text
+    before (16 lists)  nprobe 1: recall 0.680, scored 369995    nprobe 2: recall 0.861, scored 648176
+    after (18 lists)   nprobe 1: recall 0.598, scored 282517    nprobe 2: recall 0.831, scored 567194
+                       nprobe 4: recall 0.999, scored 1105909
+    ```
+
+    Splitting is not free: smaller cells mean more of a query's
+    neighbours sit across a border, so the same `nprobe` finds fewer.
+    What it buys is a bound on the largest list (2,107 instead of
+    3,355), and so on the slowest task and the worst query. Choose
+    `nlist` the way this section did, by measuring the recall curve and
+    the list sizes for a few values, and re-check list sizes whenever
+    you add data without retraining.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Getting Centroids to the Executors
+
+    Every vector needs every centroid. Four ways to ship them, measured
+    on the assignment step (20,000 cached vectors, 64 centroids, `noop`
+    sink, best of three runs on the machine used to write this lesson;
+    the ratios matter, not the seconds):
+
+    ```text
+    literal array + higher-order functions: best of 3 1.85s
+    broadcast crossJoin + min_by: best of 3 3.62s
+    mapInPandas + numpy: best of 3 0.04s
+    literal array + vector_l2_distance: best of 3 0.19s
+    ```
+
+    All four assigned every vector to the same list.
+
+    1. **A literal array with higher-order functions** (the exercise's
+       way). The centroids are part of the plan, serialized with each
+       task; no join, no shuffle. But `transform`, `zip_with` and
+       `aggregate` are `CodegenFallback` expressions
+       (`sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/higherOrderFunctions.scala`):
+       Catalyst interprets the lambda for every element, 64 times 32 per
+       vector here. Beyond a few thousand centroids the plan itself gets
+       large (`explain()` prints every number).
+
+    2. **A broadcast cross join** with `min_by` (3.3):
+
+       ```python
+       vectors.crossJoin(F.broadcast(cdf)).groupBy("id").agg(
+           F.min_by("list", sqdist(F.col("v"), F.col("c"))).alias("list"))
+       ```
+
+       ```text
+       HashAggregate(keys=[id#0], functions=[min_by(list#480, aggregate(zip_with(v#1, c#481, ...)))])
+       +- Exchange hashpartitioning(id#0, 8), ENSURE_REQUIREMENTS
+          +- HashAggregate(keys=[id#0], functions=[partial_min_by(list#480, ...)])
+             +- BroadcastNestedLoopJoin BuildRight, Cross
+                :- InMemoryTableScan [id#0, v#1]
+                +- BroadcastExchange IdentityBroadcastMode
+       ```
+
+       It materializes 1,280,000 rows and shuffles them to regroup by
+       vector: clean to read, the slowest here.
+
+    3. **`mapInPandas` with a broadcast variable** and numpy:
+
+       ```python
+       bc = spark.sparkContext.broadcast(np.array(centroids))
+
+       def nearest(batches):
+           C = bc.value
+           for pdf in batches:
+               V = np.stack(pdf["v"].to_numpy())
+               d = (V * V).sum(1)[:, None] - 2 * V @ C.T + (C * C).sum(1)[None, :]
+               yield pd.DataFrame({"id": pdf["id"], "list": d.argmin(1).astype("int32")})
+
+       vectors.mapInPandas(nearest, "id int, list int")
+       ```
+
+       One `MapInPandas` node and one matrix multiply per Arrow batch,
+       with the Python workers already warm (an accumulator in the
+       function confirmed all 20,000 rows went through it on each run).
+       This is the shape for large `nlist` and high dimensions, at the
+       cost of the Python worker round trip ("The Python Worker
+       Protocol"). It is a map over Arrow batches, not an Arrow UDF, so
+       the 4.2.0 hang of SPARK-58241 (an `@udf` straight over a Parquet
+       scan; see "How Catalyst Plans Python") does not apply to it.
+
+    4. **The 4.2 vector functions.** "Feature Vectors and Similarity
+       Search" introduced `vector_l2_distance` and friends (SPARK-54713):
+       compiled loops instead of interpreted lambdas, ten times faster
+       than option 1 here, but `array<float>` only (cast both sides) and
+       single precision, with the 4.2.0 overflow on huge values that
+       lesson describes (SPARK-58544):
+
+       ```python
+       cf = F.array(*[F.array(*[F.lit(float(x)).cast("float") for x in c]) for c in centroids])
+       d = F.transform(cf, lambda c: F.call_function(
+           "vector_l2_distance", F.col("v").cast("array<float>"), c))
+       ```
+
+    One trap when you benchmark this yourself: if an earlier step cached
+    the very same query (the index, say), the `CacheManager` substitutes
+    the cached result for an identical plan, and you time a cache read.
+    A first version of this comparison did exactly that and reported the
+    literal array at 0.4 seconds.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Taking It Further
+
+    - **Product quantization.** IVF still stores full vectors in the
+      lists. PQ splits each vector into `m` sub-vectors, runs k-means in
+      each subspace (typically 256 centroids, so one byte per
+      sub-vector), and stores only the codes; distances are computed
+      from per-query lookup tables. It cuts memory by an order of
+      magnitude or more (32 doubles are 256 bytes; 8 one-byte codes are
+      8) at a further cost in recall, and is the "PQ" in IVF-PQ
+      indexes. This lesson did not build it.
+      The same Spark pieces apply (k-means per subspace, a broadcast of
+      codebooks, `mapInPandas` for the lookup), but the recall must be
+      measured again the same way: against exact search, never assumed.
+    - **Re-ranking.** Search with a cheap representation (PQ codes,
+      SimHash bits) for the top 100, then compute exact distances on
+      those to return the top 10.
+    - **Incremental data.** New vectors go to their nearest existing
+      list without retraining; track list sizes and retrain or split
+      when the largest list grows past your bound.
+    - **Joins, not lookups.** Everything here answers a batch of queries
+      at once, which is what Spark is good at (deduplication, "find
+      similar items for every item"). For single interactive queries in
+      milliseconds, export the index to a vector database or a library
+      built for it; Spark is the place to build and evaluate the index.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: A Banded MinHash Index and an IVF Search
+
+    The harness loads the listings, shingles them with the given
+    `shingles()`, makes the vectors with `make_vectors()` and trains
+    k-means centroids for you. It computes the exact answers in plain
+    Python and numpy. Complete:
+
+    1. `minhash(sh, params)`: the `sig` column, with built-in functions
+       only.
+    2. `candidate_probability(s, b, r)` and `choose_bands(k, threshold,
+       min_prob)`: the S-curve, and the `(b, r)` with the largest `r`
+       that still makes a pair at the threshold a candidate with
+       probability `min_prob` (None if none does).
+    3. `candidate_pairs(sig, b, r)`: distinct pairs `a < b` sharing a
+       band bucket.
+    4. `verify(cands, sh, threshold)`: exact Jaccard `j`, kept if at
+       least the threshold.
+    5. `assign_lists(vectors, centroids)`: the 0-based nearest centroid
+       as `list`.
+    6. `ivf_candidates(queries, index, centroids, nprobe)` and
+       `top_k(scored, k)`.
+
+    The checks: signatures equal `min((a * x + b) % P)` computed in
+    Python, the plan of `minhash` has no Python, `Exchange` or
+    `Generate` node, the estimate is within 0.05 of the exact Jaccard
+    on average, `choose_bands` picks the right shapes, the banded index
+    finds at least 99% of the pairs with `J >= 0.7` while comparing at
+    most 5% of all pairs, verification has precision 1.0, every vector
+    is in its nearest list, IVF at full probe equals brute force, and
+    IVF reaches recall 0.88 at `nprobe = 8` and 0.97 at `nprobe = 16`
+    while scoring at most a quarter of brute force at `nprobe = 8`.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "minhash: F.transform(coeffs, lambda c: F.array_min(F.transform('h', lambda x: (c['a'] * x + c['b']) % P))). candidate_probability: 1 - (1 - s ** r) ** b. candidate_pairs: posexplode the band hashes, self-join on band and bucket with a < b, distinct. assign_lists: F.array_position(d, F.array_min(d)) - 1. top_k: F.slice(F.array_sort(F.collect_list(F.struct('dist', 'id'))), 1, k), then transform to the ids."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - Measure approximate search two ways, against exact answers on the
+      same data: recall, and the work saved (candidate pairs or vectors
+      scored versus brute force). Not time.
+    - On messy text, an inverted index on shingles is worse than brute
+      force: boilerplate shingles appear in hundreds of documents (1.67
+      million join rows for 89,676 pairs here).
+    - MinHash: `Pr[min h(A) = min h(B)] = J(A, B)`. Build signatures
+      with `transform` and `array_min` over `(a * x + b) % P`, with a
+      31-bit prime so the arithmetic stays exact under ANSI mode.
+      `sequence(1, n)` counts down for `n < 1`; guard short texts.
+    - Banding: `b` bands of `r` rows make a pair with similarity `s` a
+      candidate with probability `1 - (1 - s^r)^b`, an S-curve with
+      threshold near `(1/b)^(1/r)`. Candidate counts and recall can be
+      predicted from it, and matched the measurements within a few
+      percent.
+    - MLlib's LSH is OR-amplification only (`r = 1`, SPARK-18450 never
+      landed): the same recall cost 17,730 to 56,168 comparisons
+      instead of 2,244.
+    - Boilerplate makes hot buckets; more rows per band dilute them,
+      template sellers still show up as the largest buckets.
+    - Verification on candidates keeps precision at 1.0.
+    - Random hyperplanes give LSH for cosine: `Pr[same bit] = 1 - θ/π`.
+    - IVF: k-means centroids, inverted lists, `nprobe` nearest lists.
+      Full probe must equal brute force. Skewed data makes the work
+      larger than `nprobe / nlist` and makes tasks uneven; splitting big
+      lists bounds the worst case at some recall per probe.
+    - Ship centroids as a literal (small; use the 4.2 `vector_*`
+      functions on `array<float>` for speed), a broadcast join (simple,
+      slow) or a broadcast variable in `mapInPandas` (large).
+
+    Next: **Distributed Connected Components**, which takes the pairs
+    an index like this finds and turns them into clusters of the same
+    item, for graphs with millions of edges.

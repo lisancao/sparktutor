@@ -1,0 +1,16 @@
+{"event_id": "e013", "user_id": "u2", "type": "add_to_cart", "page": "/", "ts": "2026-10-05T09:10:57"}
+{"event_id": "e019", "user_id": "u2", "type": "checkout", "page": "/checkout", "ts": "2026-10-05T09:11:30"}
+{"event_id": "e001", "user_id": "u1", "type": "page_view", "page": "/p/chair", "ts": "2026-10-05T09:00:51"}
+{"event_id": "e014", "user_id": "u2", "type": "add_to_cart", "page": "/p/desk", "ts": "2026-10-05T09:11:38"}
+{"event_id": "e011", "user_id": "u1", "type": "page_view", "page": "/p/chair", "ts": "2026-10-05T09:14:46"}
+{"event_id": "e005", "user_id": "u2", "type": "add_to_cart", "page": "/cart", "ts": "2026-10-05T09:04:23"}
+{"event_id": "e012", "user_id": "u1", "type": "page_view", "page": "/p/chair", "ts": "2026-10-05T09:15:59"}
+{"event_id": "e012", "user_id": "u1", "type": "page_view", "page": "/p/chair", "ts": "2026-10-05T09:15:59"}
+{"event_id": "e015", "user_id": "u4", "type": "add_to_cart", "page": "/p/lamp", "ts": "2026-10-05T09:16:51"}
+{"event_id": "e900", "user_id": "u3", "type": "page_v
+{"event_id": "e016", "user_id": "u4", "type": "page_view", "page": "/p/lamp", "ts": "2026-10-05T09:18:17"}
+{"event_id": "e901", "user_id": "u3", "type": "page_view", "page": "/", "ts": "yesterday"}
+{"event_id": "e902", "type": "page_view", "page": "/", "ts": "2026-10-05T09:21:00"}
+{"event_id": "e017", "user_id": "u4", "type": "add_to_cart", "page": "/p/desk", "ts": "2026-10-05T09:20:42"}
+{"event_id": "e903", "user_id": "u4", "type": "page_view", "page": "/cart", "ts": "2026-10-06T09:22:00"}
+{"event_id": "e018", "user_id": "u4", "type": "add_to_cart", "page": "/p/desk", "ts": "2026-10-05T09:24:54"}

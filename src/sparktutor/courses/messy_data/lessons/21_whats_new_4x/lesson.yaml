@@ -1,0 +1,1153 @@
+- Class: meta
+  Lesson: "What Spark 4.x Adds for Messy Data"
+  EstimatedMinutes: 55
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    This is the last lesson of the basics level. Along the way you have
+    used a lot of Spark 4.x without stopping to call it new: ANSI mode
+    and the `try_` functions in "Columns and Expressions: Cleaning
+    Values", VARIANT in "VARIANT Basics: Profiling and Nested Data", the
+    built-in XML reader in "XML", Arrow UDFs in "Images and Audio",
+    Python data sources in "Your First Python Data Source", and
+    Arrow-optimized UDFs by default in "Running a Model over Your Data
+    with pandas UDFs".
+
+    This lesson collects those in one place, then goes deep on the 4.x
+    features that matter for messy data and that no earlier lesson
+    covered in full:
+
+    - **Collations** beyond the basics: Unicode normalization, trailing
+      spaces, language rules, what does not work with them, table
+      defaults and their cost
+    - The newer **`try_` functions**, and **UTF-8 validation** in brief
+    - The **TIME** type, and why it is not ready to use in 4.2.0
+    - **Geospatial types** applied to messy coordinates: validate,
+      build WKB, find the nearest store with a grid and a haversine
+      distance, tag zones with a point-in-polygon UDF
+    - **SQL features** that make exploring messy data faster: pipe
+      syntax, `QUALIFY`, `approx_top_k`, `listagg`, `randstr`, `DESCRIBE
+      ... AS JSON`
+
+    If you have taken the separate "What's New in Apache Spark 4.x"
+    course, this lesson does not repeat it: it points to it for the
+    general tour and spends its time on messy data.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Think of each Spark release as a new set of tools in the same
+    workshop. Some tools you have been using for weeks without reading
+    the label (ANSI mode is the reason a bad cast stops your job). Some
+    are brand new and still have rough edges (geospatial types arrived
+    with only five functions). Part of being good with a tool is knowing
+    where its edges are, so this lesson tests every one of them on the
+    course's messy data and shows you exactly where they stop.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Spark 4.x on One Page
+
+    Spark 4.0 shipped in May 2025, followed by 4.1 and 4.2. Here is what
+    this course uses from them, with the lesson that teaches it:
+
+    | Feature | Version | JIRA | Where you used it |
+    |---|---|---|---|
+    | ANSI mode on by default | 4.0 | SPARK-44444 | "Columns and Expressions: Cleaning Values" |
+    | Spark Connect, `spark.api.mode` | 4.0 | SPARK-50605 | "Why Spark for Messy Data, and How It Runs Your Code" |
+    | VARIANT type | 4.0 | SPARK-45827 | "VARIANT Basics: Profiling and Nested Data" |
+    | VARIANT shredding on by default | 4.1 | SPARK-54454 | "VARIANT Shredding and Performance" (intermediate) |
+    | Built-in XML data source | 4.0 | SPARK-44265 | "XML" |
+    | Collations | 4.0 | SPARK-46830 | "Columns and Expressions: Cleaning Values", and below |
+    | Python Data Source API | 4.0 | SPARK-44076 | "Your First Python Data Source" |
+    | Python data source filter pushdown | 4.1 | SPARK-51271 | "Filter Pushdown" (intermediate) |
+    | Python stream readers with admission control | 4.2 | SPARK-55304 | "Streaming Readers and Writers" (intermediate) |
+    | `arrow_udf` | 4.1 | SPARK-52214 | "Images and Audio" |
+    | Arrow-optimized Python UDFs by default | 4.2 | SPARK-54555 | "Running a Model over Your Data with pandas UDFs" |
+    | Declarative Pipelines | 4.1 | SPARK-51727 | the intermediate capstone |
+    | SQL pipe syntax | 4.0 | SPARK-49555 | below |
+    | `QUALIFY` | 4.2 | SPARK-31561 | below |
+    | Geospatial types on by default | 4.2 | SPARK-56771 | below |
+
+    The "What's New in Apache Spark 4.x" course tours the rest
+    (SQL scripting, `transformWithState`, CDC, metric views,
+    `time_bucket`, `NEAREST BY` joins) one release feature at a time.
+    Its lessons "Geospatial Types: GEOMETRY and GEOGRAPHY" and "SQL Pipe
+    Syntax and QUALIFY" are the background for two sections below; you
+    do not need them first, but they go wider where this lesson goes
+    deeper.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Collations, Deeper
+
+    "Columns and Expressions: Cleaning Values" introduced collations: a
+    string type can carry comparison rules (`UTF8_LCASE`, `UNICODE_CI`,
+    `UNICODE_CI_AI`, ...), and grouping by a collated column treats
+    equal-under-the-rules values as one group without changing the data.
+    Real city names push those rules much harder.
+
+    The sample file `data/messy/geo_deliveries/deliveries.csv` has 166
+    deliveries whose `city` was typed by couriers and apps: 29 distinct
+    raw strings for 9 real cities. Count the distinct values under each
+    collation, without and with `trim` first:
+
+    ```python
+    raw = (spark.read.option("header", True)
+           .csv("data/messy/geo_deliveries/deliveries.csv"))
+    for coll in ["UTF8_LCASE", "UNICODE_CI", "UNICODE_CI_AI", "UNICODE_CI_AI_RTRIM"]:
+        print(coll,
+              raw.select(F.collate("city", coll)).distinct().count(),
+              raw.select(F.collate(F.trim("city"), coll)).distinct().count())
+    ```
+
+    ```text
+    UTF8_LCASE 20 15
+    UNICODE_CI 18 13
+    UNICODE_CI_AI 15 9
+    UNICODE_CI_AI_RTRIM 11 9
+    ```
+
+    Only an accent-insensitive collation on trimmed values reaches 9.
+    Each step teaches something.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Same Letters, Different Bytes
+
+    `UTF8_LCASE` (case-insensitive) left three groups of Montréal. Look
+    at the bytes:
+
+    ```python
+    (raw.filter(F.collate(F.trim("city"), "UNICODE_CI_AI") == "montreal")
+        .groupBy(F.collate("city", "UTF8_LCASE").alias("utf8_lcase"))
+        .agg(F.count("*").alias("n"), F.hex(F.encode(F.first("city"), "UTF-8")).alias("bytes"))
+        .orderBy("bytes").show(truncate=False))
+    ```
+
+    ```text
+    +----------+---+--------------------+
+    |utf8_lcase|n  |bytes               |
+    +----------+---+--------------------+
+    |MONTRÉAL  |9  |4D4F4E5452C389414C  |
+    |Montréal |5  |4D6F6E747265CC81616C|
+    |montreal  |4  |6D6F6E747265616C20  |
+    +----------+---+--------------------+
+    ```
+
+    The first two print the same word, but one has `C3 89` (the single
+    character É) and the other has `65 CC 81` (a plain `e` followed by a
+    combining acute accent). Unicode calls these **canonically
+    equivalent**: two encodings of the same text. Text pasted from a Mac
+    file name, a PDF or some keyboards often arrives in the decomposed
+    form. `UTF8_LCASE` compares bytes after lower-casing, so it sees two
+    different words. The `UNICODE...` collations use the ICU library,
+    which compares canonically equivalent strings as equal. (The column
+    widths also wobble: the decomposed `é` is two characters to `show()`.)
+
+    If you need to group text that came from many sources, prefer a
+    `UNICODE` collation over `UTF8_LCASE`, even when you only want case
+    insensitivity.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Trailing and Leading Spaces
+
+    The `_RTRIM` suffix (4.0) makes a collation ignore **trailing**
+    spaces. Only trailing:
+
+    ```python
+    spark.sql("""SELECT 'Vancouver  ' = 'vancouver' COLLATE UNICODE_CI_RTRIM AS trailing,
+                        ' Vancouver'  = 'vancouver' COLLATE UNICODE_CI_RTRIM AS leading""").show()
+    ```
+
+    ```text
+    +--------+-------+
+    |trailing|leading|
+    +--------+-------+
+    |    true|  false|
+    +--------+-------+
+    ```
+
+    That is why `UNICODE_CI_AI_RTRIM` stopped at 11 groups: ` Vancouver`
+    and ` Toronto ` kept their leading space. `RTRIM` exists because the
+    SQL standard pads `CHAR` columns with trailing spaces; for messy
+    input, `trim()` first and collate second. There is no collation that
+    ignores leading spaces.
+
+- Class: mult_question
+  Depth: all
+  Output: "Which expression puts `' Montreal'`, `'MONTRÉAL '` and `'Montréal'` (with a decomposed é) in one group?"
+  AnswerChoices: "F.collate(F.trim('city'), 'UNICODE_CI_AI');F.collate('city', 'UTF8_LCASE_RTRIM');F.collate('city', 'UNICODE_CI_AI_RTRIM');F.lower(F.trim('city'))"
+  CorrectAnswer: "F.collate(F.trim('city'), 'UNICODE_CI_AI')"
+  Hint: "RTRIM ignores only trailing spaces, UTF8_LCASE compares bytes, and you need accent insensitivity."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Language Rules
+
+    `UNICODE_CI_AI` uses ICU's language-neutral rules. Spark also ships
+    a collation for each language ICU knows, with the same suffixes
+    (`fr_CI_AI`, `de_CI`, `vi_CI_AI_RTRIM`, ...). Language rules can
+    disagree with the neutral ones:
+
+    ```python
+    spark.sql("""SELECT
+      'Straße'  = 'STRASSE' COLLATE UNICODE_CI    AS ci,
+      'Straße'  = 'STRASSE' COLLATE UNICODE_CI_AI AS ci_ai,
+      'Đà Nẵng' = 'da nang' COLLATE UNICODE_CI_AI AS root_ai,
+      'Đà Nẵng' = 'da nang' COLLATE vi_CI_AI      AS vi_ai,
+      'Hà Nội'  = 'HÀ NỘI'  COLLATE vi_CI_AI      AS vi_ci""").show()
+    ```
+
+    ```text
+    +-----+-----+-------+-----+-----+
+    |   ci|ci_ai|root_ai|vi_ai|vi_ci|
+    +-----+-----+-------+-----+-----+
+    |false| true|   true|false| true|
+    +-----+-----+-------+-----+-----+
+    ```
+
+    - `ß` and `ss` are equal only once accents are ignored.
+    - Under the neutral rules `Đ` is a `D` with a mark, so `Đà Nẵng`
+      equals `da nang`. In **Vietnamese**, `đ`, `ă`, `â`, `ê`, `ô`, `ơ`,
+      `ư` are letters of their own, so `vi_CI_AI` keeps `Đà Nẵng` and
+      `da nang` apart (it still ignores case).
+
+    Which is right depends on the question. For "which deliveries went
+    to Đà Nẵng", the neutral `UNICODE_CI_AI` matches what people type on
+    an English keyboard. For sorting a Vietnamese customer list the way
+    a Vietnamese reader expects, use `vi`. Ordering changes too:
+    `ORDER BY x` sorts by bytes (`A B a b e f é`), and
+    `ORDER BY x COLLATE UNICODE` sorts like a dictionary (`a A b B e é f`).
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Finding Collations
+
+    There are 1164 built-in collations. Two ways to search them:
+
+    ```python
+    spark.sql("SHOW COLLATIONS LIKE 'UNICODE_CI*'").show(truncate=False)   # 4.2
+    spark.sql("""SELECT NAME, LANGUAGE, ACCENT_SENSITIVITY, CASE_SENSITIVITY, PAD_ATTRIBUTE
+                 FROM collations() WHERE NAME LIKE 'vi%'""").show()        # 4.0
+    ```
+
+    ```text
+    +-------------------+--------+-------+------------------+----------------+-------------+-----------+
+    |NAME               |LANGUAGE|COUNTRY|ACCENT_SENSITIVITY|CASE_SENSITIVITY|PAD_ATTRIBUTE|ICU_VERSION|
+    +-------------------+--------+-------+------------------+----------------+-------------+-----------+
+    |UNICODE_CI         |NULL    |NULL   |ACCENT_SENSITIVE  |CASE_INSENSITIVE|NO_PAD       |78.3.0.0   |
+    |UNICODE_CI_AI      |NULL    |NULL   |ACCENT_INSENSITIVE|CASE_INSENSITIVE|NO_PAD       |78.3.0.0   |
+    |UNICODE_CI_AI_RTRIM|NULL    |NULL   |ACCENT_INSENSITIVE|CASE_INSENSITIVE|RTRIM        |78.3.0.0   |
+    |UNICODE_CI_RTRIM   |NULL    |NULL   |ACCENT_SENSITIVE  |CASE_INSENSITIVE|RTRIM        |78.3.0.0   |
+    +-------------------+--------+-------+------------------+----------------+-------------+-----------+
+    ```
+
+    `SHOW COLLATIONS` is new in 4.2 (SPARK-49543); the `collations()`
+    table function has been there since 4.0 and is the one to use in
+    code that must also run on 4.0 or 4.1. The `ICU_VERSION` column
+    tells you which Unicode rules you get; a Spark upgrade that bumps ICU
+    can, in rare cases, change which strings compare equal.
+
+- Class: cmd_question
+  Depth: intermediate
+  Output: |
+    Use `spark.sql` to list every Vietnamese collation with the 4.2
+    command for it.
+  CorrectAnswer: |
+    spark.sql("SHOW COLLATIONS LIKE 'vi*'")
+  Hint: "SHOW COLLATIONS takes a LIKE pattern in which * matches any characters."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Where Collations Stop
+
+    Collated strings are a different type (`string collate
+    UNICODE_CI_AI`), and not every function accepts them yet. Measured on
+    4.2.0:
+
+    - **`collect_set` refuses them**: `[DATATYPE_MISMATCH.UNSUPPORTED_INPUT_TYPE]
+      ... The input of collect_set can't be "MAP" or "COLLATED STRING"
+      type data.` Collect the original, uncollated column instead, as the
+      exercise does.
+    - **`LIKE`, `ILIKE` and `RLIKE` accept only `UTF8_BINARY` and
+      `UTF8_LCASE`.** `'Montréal' COLLATE UNICODE_CI_AI LIKE 'mont%'`
+      fails with `[DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] ... The first
+      parameter requires the "STRING" type, however ... has the type
+      "STRING COLLATE UNICODE_CI_AI".` The same with `UTF8_LCASE` works;
+      `UTF8_LCASE_RTRIM` and plain `UNICODE` are refused too.
+    - **Two different explicit collations cannot meet**: `'a' COLLATE
+      UTF8_LCASE = 'A' COLLATE UNICODE_CI` fails with
+      `COLLATION_MISMATCH.EXPLICIT`. Collate both sides the same way.
+    - **A misspelt name** (`UNICODE_CIAI`) fails with
+      `COLLATION_INVALID_NAME` and a suggestion.
+    - **`hash()` and `xxhash64()` ignore the collation** by default
+      (4.0.1 made that the default; `spark.sql.legacy.collationAwareHashFunctions`
+      restores the old behaviour): `'Montréal'` and `'MONTREAL'` are equal
+      under `UNICODE_CI_AI` but hash differently. Grouping, joins and
+      shuffles are not affected, because Spark hashes a collation key
+      internally; only your own `hash(...)` calls are.
+    - **Which spelling represents a group is not defined.** In one run
+      the Hà Nội group was labelled `Ha Noi` and Montréal `MONTRÉAL`. If
+      you need a canonical name, join to a reference list (the exercise
+      joins to the store list) or pick one with `min`/`max` on the
+      original column.
+
+- Class: mult_question
+  Depth: all
+  Output: "`df.groupBy(F.collate('city', 'UNICODE_CI_AI').alias('c')).agg(F.collect_set('c'))` fails. Why?"
+  AnswerChoices: "collect_set does not accept collated strings in 4.2;UNICODE_CI_AI cannot be used in groupBy;An alias cannot be used inside agg;collect_set needs a sorted input"
+  CorrectAnswer: "collect_set does not accept collated strings in 4.2"
+  Hint: "Read the error: DATATYPE_MISMATCH.UNSUPPORTED_INPUT_TYPE names the input type it refuses."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Collations in Tables and Joins
+
+    A table can declare a default collation for its string columns
+    (`DEFAULT COLLATION`, part of the 4.0 collation work), and Parquet
+    keeps it in the file's metadata:
+
+    ```python
+    spark.sql("""CREATE TABLE delivery_cities (city STRING, n INT)
+                 USING parquet DEFAULT COLLATION UNICODE_CI_AI""")
+    spark.sql("""INSERT INTO delivery_cities VALUES
+                 ('Montréal', 1), ('MONTREAL', 2), ('Hà Nội', 3), ('ha noi', 4)""")
+    spark.sql("SELECT city, sum(n) AS n FROM delivery_cities GROUP BY city ORDER BY n").show()
+    spark.sql("SELECT * FROM delivery_cities WHERE city = 'montreal'").show()
+    ```
+
+    ```text
+    +--------+---+
+    |    city|  n|
+    +--------+---+
+    |Montréal|  3|
+    |  Hà Nội|  7|
+    +--------+---+
+
+    +--------+---+
+    |    city|  n|
+    +--------+---+
+    |Montréal|  1|
+    |MONTREAL|  2|
+    +--------+---+
+    ```
+
+    Reading the table's files back with `spark.read.parquet(...)` gives
+    `StringType('UNICODE_CI_AI')`, so the rules travel with the data.
+    That is convenient and a little dangerous: every query on the column
+    now compares accent-insensitively, including filters nobody meant to
+    be fuzzy. Use it for columns that are *names*, not codes.
+
+    Joins work the same way. Collate both sides of the condition:
+
+    ```python
+    stores = spark.read.option("header", True).csv("data/messy/geo_deliveries/stores.csv")
+    store_cities = stores.select(F.col("city").alias("store_city")).distinct()
+    joined = raw.join(store_cities,
+        F.collate(F.trim("city"), "UNICODE_CI_AI") == F.collate("store_city", "UNICODE_CI_AI"),
+        "left")
+    ```
+
+    The plan shows Spark shuffling on the collated value, so equal names
+    meet in the same task:
+
+    ```text
+    +- SortMergeJoin [collate(trim(city#18, None), UNICODE_CI_AI)], [collate(store_city#331, UNICODE_CI_AI)], LeftOuter
+       :- Sort [collate(trim(city#18, None), UNICODE_CI_AI) ASC NULLS FIRST], false, 0
+       :  +- Exchange hashpartitioning(collate(trim(city#18, None), UNICODE_CI_AI), 200), ...
+    ```
+
+    **The cost.** Grouping 2 million cached rows of 8 city spellings on
+    `local[2]`, best of three runs on one laptop:
+
+    | Collation | Groups | Time |
+    |---|---|---|
+    | `UTF8_BINARY` | 8 | 0.12 s |
+    | `UTF8_LCASE` | 6 | 1.01 s |
+    | `UNICODE` | 8 | 1.13 s |
+    | `UNICODE_CI_AI` | 4 | 0.98 s |
+
+    Any non-binary collation was roughly eight times slower here,
+    because every comparison or hash computes a collation key instead of
+    using the bytes. Fine for a cleaning step or a dimension table; for a
+    hot join key on billions of rows, compute a normalized key once,
+    store it, and join on that.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## UTF-8 Validation and the try_ Family
+
+    "Columns and Expressions: Cleaning Values" covered UTF-8 validation
+    (`is_valid_utf8`, `make_valid_utf8`, `validate_utf8`,
+    `try_validate_utf8`, all 4.0) and the idea of `try_` functions. For
+    reference, here are the
+    `try_` functions that arrived in 4.x (checked against the function
+    registry of each release; the others are older):
+
+    | Function | Since |
+    |---|---|
+    | `try_parse_json`, `try_variant_get` | 4.0 |
+    | `try_parse_url`, `try_url_decode` | 4.0 |
+    | `try_make_timestamp`, `try_make_timestamp_ltz`, `try_make_timestamp_ntz`, `try_make_interval` | 4.0 |
+    | `try_mod`, `try_reflect`, `try_validate_utf8` | 4.0 |
+    | `try_to_date` | 4.1 (SPARK-52866) |
+    | `try_to_time` | 4.1, but the TIME type is disabled (below) |
+
+    `DESCRIBE FUNCTION EXTENDED try_to_date` says "Since: 4.0.0", but the
+    function is not registered in 4.0.0; it arrived in 4.1. Code that
+    must run on 4.0 should use `try_to_timestamp(...)` and `to_date`.
+
+    Each `try_` variant turns one error condition into a NULL:
+
+    ```python
+    spark.sql("""SELECT
+      try_url_decode('caf%C3%A9%2')                     AS url,   -- CANNOT_DECODE_URL
+      try_parse_url('http://x.com/a b?q=1', 'QUERY')    AS query, -- INVALID_URL
+      try_make_timestamp(2026, 2, 30, 10, 0, 0)         AS ts,    -- no 30 February
+      try_mod(7, 0)                                     AS m,     -- DIVIDE_BY_ZERO
+      try_reflect('java.lang.Integer', 'parseInt', 'x12') AS r""").show()
+    ```
+
+    ```text
+    +----+-----+----+----+----+
+    | url|query|  ts|   m|   r|
+    +----+-----+----+----+----+
+    |NULL| NULL|NULL|NULL|NULL|
+    +----+-----+----+----+----+
+    ```
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    A column `link` holds URLs typed by people, some of them invalid.
+    Using `spark.sql` over a view `clicks`, select the value of the
+    `utm_source` query parameter as `source`, returning NULL for invalid
+    URLs instead of failing.
+  CorrectAnswer: |
+    spark.sql("SELECT try_parse_url(link, 'QUERY', 'utm_source') AS source FROM clicks")
+  Hint: "parse_url fails with INVALID_URL on a bad URL; its try_ variant (4.0) takes the same arguments: the URL, the part, and a query key."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The TIME Type: Not Yet
+
+    A time of day without a date (a shop's opening hours, a shift
+    start) is a classic messy-data value: `"9:30"`, `"09:30:00"`,
+    `"24:00"`, `"closed"`. Spark 4.1 added a `TIME` type (SPIP
+    SPARK-51162), with `to_time`, `try_to_time`, `make_time`,
+    `time_trunc`, `time_diff` and `current_time`, and then switched it
+    off before the release (SPARK-54609): `spark.sql.timeType.enabled`
+    is an internal setting whose default is `false` outside Spark's own
+    tests, in 4.1 and in 4.2.0.
+
+    What happens on a stock 4.2.0 session:
+
+    | Works | Fails with `UNSUPPORTED_TIME_TYPE` |
+    |---|---|
+    | the literal `TIME '09:30:00'` (`typeof` says `time(6)`) | `CAST('09:30' AS TIME)` |
+    | comparing literals, `CAST(TIME '...' AS STRING)` | `to_time`, `try_to_time`, `make_time` |
+    | `current_time()` | `hour(TIME '09:30:00')`, `time_trunc`, `time_diff` |
+    | `createDataFrame` with Python `datetime.time` values | writing a TIME column to Parquet |
+
+    The error is `[UNSUPPORTED_TIME_TYPE] The data type TIME is not
+    supported. SQLSTATE: 0A000`. The pieces that work are not enough to
+    store or compute with times, and the inconsistency (Python can create
+    a TIME column that SQL cannot read with `hour()`) is a sign of a
+    feature mid-construction. Setting the internal flag does make
+    `to_time` work, but internal flags are not a supported interface;
+    this course does not use it.
+
+    Until it is enabled, store times of day as a day-time interval or
+    as minutes since midnight:
+
+    ```python
+    spark.sql("""SELECT store, opens,
+                   try_cast(opens AS INTERVAL HOUR TO MINUTE) AS as_interval,
+                   hour(try_to_timestamp(opens, 'H:mm')) * 60
+                     + minute(try_to_timestamp(opens, 'H:mm')) AS minutes
+                 FROM VALUES ('S01', '09:00'), ('S02', '9:30'), ('S03', '24:00'),
+                             ('S04', 'closed') AS t(store, opens)""").show(truncate=False)
+    ```
+
+    ```text
+    +-----+------+-------------------------------+-------+
+    |store|opens |as_interval                    |minutes|
+    +-----+------+-------------------------------+-------+
+    |S01  |09:00 |INTERVAL '09:00' HOUR TO MINUTE|540    |
+    |S02  |9:30  |INTERVAL '09:30' HOUR TO MINUTE|570    |
+    |S03  |24:00 |INTERVAL '24:00' HOUR TO MINUTE|NULL   |
+    |S04  |closed|NULL                           |NULL   |
+    +-----+------+-------------------------------+-------+
+    ```
+
+    Note the difference on `24:00`: the interval cast accepts it (an
+    interval of 24 hours is valid, and `'25:00'` is too), while parsing
+    it as a clock time with `H:mm` rejects it. Validate the range
+    yourself when you use intervals.
+
+- Class: mult_question
+  Depth: all
+  Output: "On stock Spark 4.2.0, what does `SELECT CAST('09:30:00' AS TIME)` do?"
+  AnswerChoices: "Fails with UNSUPPORTED_TIME_TYPE;Returns 09:30:00 as a TIME;Returns NULL under ANSI mode;Returns a TIMESTAMP on 1970-01-01"
+  CorrectAnswer: "Fails with UNSUPPORTED_TIME_TYPE"
+  Hint: "spark.sql.timeType.enabled is false by default outside Spark's own tests."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Geospatial: From Messy Coordinates to GEOGRAPHY
+
+    The "What's New in Apache Spark 4.x" lesson "Geospatial Types:
+    GEOMETRY and GEOGRAPHY" covers the types themselves: `GEOGRAPHY(4326)`
+    for longitude and latitude on the globe, `GEOMETRY(srid)` for flat
+    coordinates, values stored as WKB (Well-Known Binary, x before y,
+    so longitude first), and the five functions 4.2 has:
+    `st_geomfromwkb`, `st_geogfromwkb`, `st_asbinary`, `st_srid` and
+    `st_setsrid`. There is no `st_point`, no `st_distance` and no
+    `st_contains`. The functions first appeared in 4.1 behind
+    `spark.sql.geospatial.enabled`, which was off by default; 4.2 turned
+    it on (SPARK-56771).
+
+    That leaves the question this course cares about: what to do with
+    coordinates that arrive as messy text. The courier app behind
+    `deliveries.csv` produced all of these:
+
+    ```text
+    delivery_id,city,lat,lon
+    D001,Vancouver, 49.25336,-122.95484
+    D005,HỒ CHÍ MINH,10.75949 ,1067.26259
+    D008,MONTRÉAL,45.4767N,73.5301W
+    D015,Toronto,-79.39139, 43.71964
+    D050,montreal ,0,0
+    D053,Ho Chi Minh,NaN,106.73194
+    D080,Toronto,43.68837,79.37243
+    ```
+
+    Stray spaces, a slipped decimal point (`1067`), compass letters,
+    latitude and longitude swapped, "null island" (0, 0, the classic
+    default for a GPS that had no fix), `NaN`, and a lost minus sign
+    (`79.37` east instead of west puts Toronto in China).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Parsing Numbers: Four Surprises
+
+    ```python
+    spark.sql("""SELECT try_cast(' 49.25 ' AS DOUBLE) AS spaces,
+                        try_cast('45.4767N' AS DOUBLE) AS suffix,
+                        try_cast('NaN' AS DOUBLE) AS nan,
+                        try_cast('1.5d' AS DOUBLE) AS d_suffix,
+                        try_cast('' AS DOUBLE) AS empty""").show()
+    ```
+
+    ```text
+    +------+------+---+--------+-----+
+    |spaces|suffix|nan|d_suffix|empty|
+    +------+------+---+--------+-----+
+    | 49.25|  NULL|NaN|     1.5| NULL|
+    +------+------+---+--------+-----+
+    ```
+
+    - Surrounding spaces are fine (trimming anyway costs nothing).
+    - `NaN` is a valid double, so it **passes** `try_cast`.
+    - `1.5d` parses, because Spark accepts the Java `d`/`f` suffixes.
+      Harmless here, surprising if you use `try_cast(...) IS NOT NULL` as
+      a "this is a plain number" test.
+    - And NaN has its own comparison rules ("Columns and Expressions:
+      Cleaning Values" showed them): NaN equals NaN and is larger than
+      every other number, so `double('NaN') > 90` is true and a range
+      check alone will not catch it.
+
+    So test `isnan` explicitly, before any range check.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## A Validation Ladder
+
+    Decide each row's fate with one `when` chain, checked in order. The
+    order matters: NaN must be caught before a range check, and 0, 0 is
+    in range but almost never real.
+
+    ```python
+    SERVICE_AREAS = [("Canada", 41.0, 84.0, -142.0, -52.0),
+                     ("Vietnam", 8.0, 24.0, 102.0, 110.0)]
+
+    def in_area(lat, lon):
+        cond = F.lit(False)
+        for _, lat_min, lat_max, lon_min, lon_max in SERVICE_AREAS:
+            cond = cond | (lat.between(lat_min, lat_max) & lon.between(lon_min, lon_max))
+        return cond
+
+    lat_s, lon_s = F.trim("lat"), F.trim("lon")
+    lat, lon = lat_s.try_cast("double"), lon_s.try_cast("double")
+    status = (F.when(lat_s.isNull() | lon_s.isNull() | (lat_s == "") | (lon_s == ""), "missing")
+        .when(lat.isNull() | lon.isNull() | F.isnan(lat) | F.isnan(lon), "unparseable")
+        .when((lat == 0) & (lon == 0), "null_island")
+        .when(in_area(lat, lon), "ok")
+        .when(in_area(lon, lat), "swapped")
+        .when(lat.between(-90, 90) & lon.between(-180, 180), "outside_area")
+        .otherwise("out_of_range"))
+    ```
+
+    ```text
+    +------------+-----+
+    |      status|count|
+    +------------+-----+
+    |          ok|  134|
+    |     swapped|   15|
+    | unparseable|    7|
+    |outside_area|    4|
+    | null_island|    3|
+    |out_of_range|    2|
+    |     missing|    1|
+    +------------+-----+
+    ```
+
+    Why a **service area** and not just the valid ranges? A range check
+    catches a swap only when the longitude is beyond ±90: Vancouver
+    swapped is latitude -123, impossible. Toronto swapped is latitude
+    -79.39, longitude 43.72, a real place in the Southern Ocean. Only
+    knowing where you deliver tells you that row is wrong, and that
+    swapping it back lands in Toronto. The same knowledge flags the lost
+    minus sign (`outside_area`) that no range check could see.
+
+- Class: mult_question
+  Depth: all
+  Output: "A Montréal delivery arrives as lat = -73.58, lon = 45.52. Which check identifies it as swapped?"
+  AnswerChoices: "Swapping the values lands it inside a known service area;Latitude is outside [-90, 90];Longitude is outside [-180, 180];try_cast returns NULL"
+  CorrectAnswer: "Swapping the values lands it inside a known service area"
+  Hint: "Both values are within the valid ranges as they are."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## From Coordinates to GEOGRAPHY
+
+    With no `st_point`, build the WKB yourself. A point is 21 bytes: a
+    byte-order flag (1 = little-endian), the type (1 = Point), then x and
+    y as doubles:
+
+    ```python
+    import struct
+
+    def point_wkb(lon, lat):
+        if lon is None or lat is None:
+            return None
+        return struct.pack("<BIdd", 1, 1, lon, lat)
+
+    to_wkb = F.udf(point_wkb, "binary")
+    geo = (points.withColumn("wkb", to_wkb("lon", "lat"))
+                 .withColumn("geo", F.st_geogfromwkb("wkb")))
+    geo.filter("status = 'swapped'").select(
+        "delivery_id", "lat", "lon", F.hex("wkb").alias("wkb"), F.st_srid("geo").alias("srid")
+    ).show(3, truncate=False)
+    ```
+
+    ```text
+    +-----------+--------+----------+------------------------------------------+----+
+    |delivery_id|lat     |lon       |wkb                                       |srid|
+    +-----------+--------+----------+------------------------------------------+----+
+    |D015       |43.71964|-79.39139 |0101000000D07EA4880CD953C05C72DC291DDC4540|4326|
+    |D022       |49.29137|-123.14097|0101000000E5ED08A705C95EC08C84B69C4BA54840|4326|
+    |D031       |49.24378|-122.95228|0101000000A228D027F2BC5EC09EB5DB2E349F4840|4326|
+    +-----------+--------+----------+------------------------------------------+----+
+    ```
+
+    Read the first one: `01` little-endian, `01000000` Point, then
+    eight bytes of x (-79.39) and eight of y (43.72). The swap was fixed
+    before the bytes were built. `geo` has type `geography(4326)`, and
+    `collect()` gives `pyspark.sql.types.Geography` objects with
+    `getBytes()` and `getSrid()`.
+
+    **Validate before you convert.** There is no `try_` version of the
+    ST functions, and `st_geogfromwkb` rejects any coordinate outside the
+    valid ranges. One bad row fails the whole job:
+
+    ```text
+    [WKB_PARSE_ERROR] Error parsing WKB: Invalid coordinate value found at position 5 SQLSTATE: 22023
+    ```
+
+    And two things it does **not** catch: `st_geomfromwkb` (planar
+    GEOMETRY) accepts a latitude of 123 without complaint, and
+    `st_geogfromwkb` accepts NaN coordinates (`0101000000000000000000F87F...`
+    round-trips unchanged). The ladder above, not the type, is your
+    validation.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## WKB With Built-ins Only
+
+    The Python UDF costs a trip to a Python worker per batch. If that
+    matters, you can build the same point in the JVM. Spark has no
+    function that returns a double's bytes, and under ANSI mode you
+    cannot cast a `BIGINT` to `BINARY` (`DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION`),
+    but `reflect` can call Java's `Double.doubleToLongBits`, and `hex()`
+    of a `BIGINT` gives its 16 hex digits, most significant first. That
+    is big-endian WKB (byte order `00`):
+
+    ```python
+    bits = lambda c: F.lpad(F.hex(F.expr(
+        f"cast(reflect('java.lang.Double', 'doubleToLongBits', {c}) AS BIGINT)")), 16, "0")
+    xdr = F.unhex(F.concat(F.lit("0000000001"), bits("lon"), bits("lat")))
+
+    (geo.filter("geo IS NOT NULL")
+        .select((F.st_asbinary(F.st_geogfromwkb(xdr)) == F.col("wkb")).alias("same"))
+        .groupBy("same").count().show())
+    ```
+
+    ```text
+    +----+-----+
+    |same|count|
+    +----+-----+
+    |true|  149|
+    +----+-----+
+    ```
+
+    `st_geogfromwkb` reads either byte order and `st_asbinary` writes
+    little-endian by default, so all 149 points match the Python version
+    byte for byte. It is clever and unreadable; prefer the UDF unless a
+    profile says otherwise, and note that `reflect` is a general escape
+    hatch that some platforms disable.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Gotcha: Geo Columns Cannot Be Cached
+
+    `cache()` on a DataFrame with a `GEOGRAPHY` or `GEOMETRY` column
+    fails in 4.2.0 as soon as the cache is filled:
+
+    ```text
+    org.apache.spark.SparkException: not support type: GeographyType(4326).
+    ```
+
+    The in-memory columnar cache (`ColumnBuilder` in
+    `sql/core/.../execution/columnar/`) has no encoder for the geo types
+    yet, and `persist(StorageLevel.DISK_ONLY)` goes through the same
+    code. The error has no proper condition (`_LEGACY_ERROR_TEMP_2100`)
+    and in classic PySpark arrives as a `Py4JJavaError`. Two ways around
+    it: cache the WKB `BINARY` column and apply `st_geogfromwkb` after
+    the cache, or use `localCheckpoint()`, which stores rows in a
+    different format and works.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Distance Without ST_Distance
+
+    For points on a sphere, the **haversine** formula gives the
+    great-circle distance, and every piece of it is a built-in function,
+    so it runs in the JVM with no UDF:
+
+    ```python
+    EARTH_RADIUS_KM = 6371.0
+
+    def haversine_km(lat1, lon1, lat2, lon2):
+        dlat = F.radians(lat2 - lat1)
+        dlon = F.radians(lon2 - lon1)
+        a = (F.pow(F.sin(dlat / 2), 2)
+             + F.cos(F.radians(lat1)) * F.cos(F.radians(lat2)) * F.pow(F.sin(dlon / 2), 2))
+        return 2 * EARTH_RADIUS_KM * F.asin(F.sqrt(a))
+    ```
+
+    Vancouver (49.2827, -123.1207) to Montréal (45.5019, -73.5674) comes
+    out at 3686.30 km. Haversine treats the Earth as a sphere of radius
+    6371 km, which is within about 0.5% of the true ellipsoidal distance:
+    plenty for "which store is closest", not for surveying.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Nearest Store With a Grid
+
+    Finding each delivery's nearest store by comparing it with every
+    store is a cross join: 149 deliveries times 12 stores is 1788 pairs
+    here, and billions for real data. A **grid** cuts that down. Give
+    every point a cell number by rounding its coordinates down to
+    `cell_deg` degrees:
+
+    ```python
+    cell = 0.1
+    pts = (geo.filter("lat IS NOT NULL")
+        .select("delivery_id", "lat", "lon",
+                F.floor(F.col("lat") / cell).alias("cell_lat"),
+                F.floor(F.col("lon") / cell).alias("cell_lon")))
+    ```
+
+    ```text
+    +-----------+--------+----------+--------+--------+
+    |delivery_id|     lat|       lon|cell_lat|cell_lon|
+    +-----------+--------+----------+--------+--------+
+    |       D001|49.25336|-122.95484|     492|   -1230|
+    |       D002|43.64286| -79.43799|     436|    -795|
+    |       D003|16.01392| 108.17913|     160|    1081|
+    +-----------+--------+----------+--------+--------+
+    ```
+
+    A store near a cell's edge can be closer than a store inside the
+    cell, so copy each store into its own cell and the 8 around it, then
+    join on the cell numbers. An equi-join on cells is a normal hash
+    join, not a cross join:
+
+    ```python
+    offsets = F.sequence(F.lit(-1), F.lit(1))
+    cand = (stores.select("store_id", F.col("lat").cast("double").alias("s_lat"),
+                          F.col("lon").cast("double").alias("s_lon"))
+        .withColumn("dlat", F.explode(offsets))
+        .withColumn("dlon", F.explode(offsets))
+        .select("store_id", "s_lat", "s_lon",
+                (F.floor(F.col("s_lat") / cell) + F.col("dlat")).alias("cell_lat"),
+                (F.floor(F.col("s_lon") / cell) + F.col("dlon")).alias("cell_lon")))
+    pairs = pts.join(cand, ["cell_lat", "cell_lon"], "left")
+    ```
+
+    The 12 stores become 108 store-cells, and the join compares 274
+    pairs instead of 1788. Then compute `haversine_km` for each pair and
+    keep the closest per delivery with `row_number()` over a window
+    partitioned by `delivery_id` (or `QUALIFY`, below; "Window Functions
+    in One Page" in "Binary Records: Avro and Protobuf" covers both, and
+    why the order needs a tie-breaker). The six
+    deliveries in Ottawa, Calgary and Huế find no store within one cell
+    and come out with NULLs, which is the honest answer for "nearest
+    store within roughly 10 km".
+
+    Know the grid's limits:
+
+    - It answers "nearest **within the neighbourhood**". A 0.1 degree
+      cell is about 11 km north to south everywhere, but east to west it
+      shrinks with latitude (about 7 km in Vancouver, 11 km in Hồ Chí
+      Minh). Choose the cell from the largest search radius you need,
+      at the highest latitude you serve.
+    - Cells do not wrap at the 180° meridian or behave near the poles.
+      For global data, use a real spatial index (H3, S2, geohash) from a
+      library.
+    - Skew: a city centre puts thousands of deliveries in one cell and
+      one task. "Plans, Partitions and Caching" shows how to spot it.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## The Same Question With NEAREST BY (4.2)
+
+    Spark 4.2's top-K join (SPIP SPARK-56395, covered in the "What's New
+    in Apache Spark 4.x" lesson "CDC, NEAREST BY Joins, time_bucket and
+    Metric Views") can rank by any expression, including the haversine
+    distance:
+
+    ```python
+    hav = """2 * 6371.0 * asin(sqrt(pow(sin(radians(s.s_lat - d.lat) / 2), 2)
+             + cos(radians(d.lat)) * cos(radians(s.s_lat))
+             * pow(sin(radians(s.s_lon - d.lon) / 2), 2)))"""
+    nearest = spark.sql(f"""
+        SELECT d.delivery_id, s.store_id, {hav} AS km
+        FROM (SELECT * FROM geo_points WHERE lat IS NOT NULL) d
+        JOIN store_points s EXACT NEAREST 1 BY DISTANCE {hav}
+    """)
+    ```
+
+    For the 143 deliveries that have a store nearby, it picks the same
+    store as the grid. The other six differ: `NEAREST BY` always returns
+    a store, so Calgary's nearest is Metrotown, 667.6 km away, and Huế's
+    is Hải Châu at 81.2 km. Whether that is right depends on the
+    question; a distance filter afterwards gives you the grid's answer.
+
+    The plan shows the price: a `BroadcastNestedLoopJoin` (every
+    delivery against every store) feeding a `min_by` aggregate per
+    delivery. 4.2 has no index behind `NEAREST BY` yet: with `APPROX
+    NEAREST` instead of `EXACT NEAREST` the plan is the same
+    `BroadcastNestedLoopJoin`.
+    Use it for small right sides, and pre-filter (a grid, a region
+    match) when the right side is large.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Zones: Point in Polygon in Python
+
+    "Is this delivery inside the downtown zone?" is `ST_Contains` in a
+    spatial library, and 4.2 does not have it. A zone is a polygon: a
+    closed ring of (lon, lat) corners. The **ray casting** test draws a
+    line from the point towards the east and counts how many edges of the
+    ring it crosses; an odd count means inside:
+
+    ```python
+    def point_in_ring(lon, lat, ring):
+        inside = False
+        for (x1, y1), (x2, y2) in zip(ring, ring[1:]):
+            if (y1 > lat) != (y2 > lat):
+                x_cross = x1 + (lat - y1) * (x2 - x1) / (y2 - y1)
+                if lon < x_cross:
+                    inside = not inside
+        return inside
+    ```
+
+    It works for concave shapes, such as the exercise's L-shaped
+    downtown zone. Wrap it in a UDF that reads the point back out of the
+    geography's WKB with `st_asbinary`, so the column you pass around is
+    the typed `geo` and not two loose doubles:
+
+    ```python
+    def point_from_wkb(wkb):
+        wkb = bytes(wkb)
+        order = "<" if wkb[0] == 1 else ">"
+        return struct.unpack(order + "dd", wkb[5:21])
+    ```
+
+    On the sample data, 8 deliveries fall in "Downtown Vancouver", 6 in
+    the "Old Quarter" of Hà Nội, and the other 135 in neither.
+
+    Polygons can be stored as geography too: a WKB polygon (type 3, a
+    ring count, then the points) goes through `st_geogfromwkb` just
+    like a point (a five-corner ring is 93 bytes). Spark keeps it; it
+    just cannot test containment against it yet. A ring with corners
+    0.06 degrees apart is small enough that planar ray casting on
+    longitude and latitude is accurate; for zones hundreds of kilometres
+    wide, edges on a sphere curve and you need a geodesic library.
+
+    4.2 also allows casting between the two geo types
+    (`CAST(geo AS GEOMETRY(4326))`, SPARK-55539), which is how you would
+    hand a geography column to code written for planar geometry.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## When to Reach for Apache Sedona
+
+    Everything above is a workaround for a function library that is
+    still small. **Apache Sedona** is the established spatial library
+    for Spark: hundreds of `ST_` functions, spatial indexes, spatial
+    joins and readers for shapefiles and GeoParquet. Check versions
+    before you plan on it: as of October 2026 its latest release, 1.9.1,
+    publishes builds for Spark 4.0 and 4.1 (`sedona-spark-4.1_2.13` on
+    Maven Central) and its Python package requires `pyspark<4.2.0`, so
+    there is no release for Spark 4.2 yet. Sedona also has its own
+    geometry type, separate from Spark's native one; moving between them
+    goes through WKB, which is one more reason to keep a `wkb` column.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## SQL That Helps You Explore
+
+    A few 4.x SQL features make the first hour with a messy file
+    faster. **Pipe syntax** (4.0, SPARK-49555) writes the query in the
+    order you think it:
+
+    ```python
+    raw.createOrReplaceTempView("deliveries")
+    spark.sql("""
+    FROM deliveries
+    |> EXTEND try_cast(trim(lat) AS DOUBLE) AS lat_d, try_cast(trim(lon) AS DOUBLE) AS lon_d
+    |> EXTEND CASE WHEN lat_d IS NULL OR lon_d IS NULL OR isnan(lat_d) OR isnan(lon_d) THEN 'bad number'
+                   WHEN abs(lat_d) > 90 OR abs(lon_d) > 180 THEN 'out of range'
+                   ELSE 'plausible' END AS verdict
+    |> AGGREGATE count(*) AS n GROUP BY verdict
+    |> ORDER BY n DESC
+    """).show()
+    ```
+
+    ```text
+    +------------+---+
+    |     verdict|  n|
+    +------------+---+
+    |   plausible|145|
+    |out of range| 13|
+    |  bad number|  8|
+    +------------+---+
+    ```
+
+    Each `|>` step works on the previous one, so you can run the first
+    two lines alone while you build it up. (`out of range` here includes
+    the swaps whose latitude is beyond ±90.)
+
+    **Frequent values** with `approx_top_k` (4.1, SPARK-52515), a
+    one-pass sketch:
+
+    ```python
+    spark.sql("SELECT approx_top_k(city, 5) AS top_spellings FROM deliveries").show(truncate=False)
+    ```
+
+    ```text
+    +----------------------------------------------------------------------------------+
+    |top_spellings                                                                     |
+    +----------------------------------------------------------------------------------+
+    |[{vancouver , 13}, { Vancouver, 11}, {Hồ Chí Minh, 10}, {ha noi, 9}, {TORONTO, 8}]|
+    +----------------------------------------------------------------------------------+
+    ```
+
+    The two most common spellings of Vancouver both have a stray space.
+
+    **All the variants in one cell** with `listagg` (4.0, SPARK-42746;
+    `string_agg` is a synonym):
+
+    ```python
+    spark.sql("""
+    SELECT collate(trim(city), 'UNICODE_CI_AI') AS city, count(*) AS n,
+           listagg(DISTINCT city, ' | ') WITHIN GROUP (ORDER BY city) AS spellings
+    FROM deliveries GROUP BY 1 ORDER BY n DESC
+    """).show(truncate=False)
+    ```
+
+    ```text
+    +-----------+---+-------------------------------------------------------------+
+    |city       |n  |spellings                                                    |
+    +-----------+---+-------------------------------------------------------------+
+    |Vancouver  |46 | Vancouver | VANCOUVER | Vancouver | Vancouver   | vancouver |
+    |Ha Noi     |33 |Ha Noi | Hà Nội | HÀ NỘI | Hà Nội | ha noi                |
+    |Ho Chi Minh|27 |Ho Chi Minh | HỒ CHÍ MINH | Hồ Chí Minh | ho chi minh        |
+    |Toronto    |23 | Toronto  | TORONTO | Toronto | toronto                      |
+    |MONTRÉAL   |18 |MONTRÉAL | Montréal | Montréal | montreal                   |
+    |Da Nang    |13 |Da Nang | da nang | ĐÀ NẴNG | Đà Nẵng                        |
+    |Calgary    |2  |Calgary                                                      |
+    |Huế        |2  |Huế                                                          |
+    |Ottawa     |2  |Ottawa                                                       |
+    +-----------+---+-------------------------------------------------------------+
+    ```
+
+    Two `Hà Nội`s and two `Montréal`s that look identical: one of each
+    is the decomposed form. And notice the group labels (`Ha Noi`,
+    `MONTRÉAL`): one of the members, not a canonical name.
+
+    **`QUALIFY`** (4.2, SPARK-31561; first shown in "Window Functions in
+    One Page") filters on a window function without a subquery, which turns "nearest store" into one statement
+    (here as a cross join, fine for 12 stores; `points` is the cleaned
+    view and `store_points` the stores with `s_lat`, `s_lon` doubles):
+
+    ```python
+    spark.sql("""
+    SELECT d.delivery_id, s.store_id,
+           2 * 6371.0 * asin(sqrt(pow(sin(radians(s.s_lat - d.lat) / 2), 2)
+             + cos(radians(d.lat)) * cos(radians(s.s_lat))
+             * pow(sin(radians(s.s_lon - d.lon) / 2), 2))) AS km
+    FROM points d JOIN store_points s
+    WHERE d.lat IS NOT NULL
+    QUALIFY row_number() OVER (PARTITION BY d.delivery_id ORDER BY km) = 1
+    ORDER BY d.delivery_id LIMIT 3
+    """).show()
+    ```
+
+    ```text
+    +-----------+--------+------------------+
+    |delivery_id|store_id|                km|
+    +-----------+--------+------------------+
+    |       D001|     S03| 4.397734548127639|
+    |       D002|     S06|3.1097775638770306|
+    |       D003|     S12| 6.732799695929505|
+    +-----------+--------+------------------+
+    ```
+
+    The same stores and distances as the grid, as it should be.
+
+    **Test data** with `randstr` and `uniform` (4.0, SPARK-49505):
+    `SELECT randstr(6, 42) AS junk_city, uniform(-180.0, 180.0, 42) AS
+    junk_lon FROM range(3)` makes reproducible junk (the last argument
+    is the seed) for testing a cleaning rule against values you did not
+    think of.
+
+    **Schemas as JSON** with `DESCRIBE TABLE t AS JSON` (4.0,
+    SPARK-50541): one JSON document with every column, its type and,
+    for strings, its collation, ready to store and compare between days
+    the way "Schemas for Data You Don't Control" compared schemas.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Clean Up the Delivery Map
+
+    The helpers are written for you: `read_csv`, `point_wkb`,
+    `point_from_wkb`, `point_in_ring`, `in_area`, `SERVICE_AREAS` and
+    `ZONES`. Implement:
+
+    1. `clean_points(raw)`: `delivery_id, city, lat, lon, status`, with
+       the validation ladder from this lesson. `lat` and `lon` are
+       doubles for `ok` and `swapped` rows (swapped back), NULL
+       otherwise.
+    2. `with_geography(points)`: add `wkb` (a UDF over `point_wkb`) and
+       `geo` (`st_geogfromwkb`).
+    3. `haversine_km(lat1, lon1, lat2, lon2)`: the distance in km from
+       built-in functions only.
+    4. `nearest_store(points, stores, cell_deg)`: the closest store in
+       the 3 x 3 grid neighbourhood, with NULLs when there is none.
+    5. `zone_of(geo_points)`: the `ZONES` name containing each point,
+       with a UDF over `st_asbinary(geo)`.
+    6. `city_groups(raw, stores)`: one row per real city, with the store
+       list's spelling (or NULL), the delivery count and the sorted raw
+       spellings, using a collation.
+
+    The harness recomputes every answer in plain Python: each row's
+    status and coordinates, the WKB bytes and SRID, the nearest store
+    and distance by brute force over the same neighbourhood, the zone,
+    and the city groups (with its own accent and case folding).
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Status: F.when(...).when(...) in the order of the docstring, with F.isnan before the range checks. Grid: explode F.sequence(F.lit(-1), F.lit(1)) twice on the stores and add the offsets to their cells, then a left join on cell_lat and cell_lon and row_number over Window.partitionBy('delivery_id').orderBy(F.col('km').asc_nulls_last(), 'store_id'). Cities: group by F.collate(F.trim('city'), 'UNICODE_CI_AI'), collect_set the raw city, and join the stores on F.collate('store_city', 'UNICODE_CI_AI')."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Where to Go Next
+
+    That completes the basics level. The intermediate level starts with
+    "Reading a Custom File Format, in Parallel", which builds a Python
+    data source for a folder of mixed files, then teaches each
+    production piece on a source of its own.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    In this lesson you learned:
+
+    - **What 4.x gave this course**: ANSI mode, Connect, VARIANT, XML,
+      collations and Python data sources (4.0); `arrow_udf`, shredding,
+      pushdown and pipelines (4.1); Arrow UDFs by default, `QUALIFY` and
+      geospatial types (4.2)
+    - **Collations in depth**: `UNICODE...` collations treat decomposed
+      and precomposed accents as equal and `UTF8_LCASE` does not; `_RTRIM`
+      ignores only trailing spaces, so `trim()` first; language
+      collations (`vi_CI_AI`) follow that language's rules; `collect_set`
+      and `LIKE` (except with `UTF8_LCASE`) refuse collated strings;
+      `hash()` ignores collations; tables can declare `DEFAULT COLLATION`
+      and Parquet keeps it; expect roughly an order of magnitude slower
+      comparisons than binary
+    - **`SHOW COLLATIONS`** (4.2) and `collations()` (4.0) to find them
+    - **4.x `try_` functions** turn single error conditions into NULLs;
+      `try_to_date` is 4.1 despite what `DESCRIBE FUNCTION` says
+    - **TIME** is disabled in 4.2.0 (`UNSUPPORTED_TIME_TYPE`); use
+      intervals or minutes since midnight
+    - **Messy coordinates**: `try_cast` lets `NaN` and `1.5d` through,
+      NaN is larger than every number in Spark, so check `isnan` first;
+      validate against your service area to catch swaps and lost signs
+    - **GEOGRAPHY from WKB** with a small UDF (or `reflect` for the
+      brave); no `try_` ST functions, so validate first; geo columns
+      cannot be cached in 4.2.0
+    - **Nearest store** with a grid (cells, 3 x 3 neighbours, an
+      equi-join) and a built-in haversine; `NEAREST BY` (4.2) is simpler
+      and brute force
+    - **Point in polygon** with ray casting in a UDF over `st_asbinary`;
+      Apache Sedona has no Spark 4.2 release yet
+    - **Exploring SQL**: pipe syntax, `approx_top_k`, `listagg`,
+      `QUALIFY`, `randstr`/`uniform`, `DESCRIBE ... AS JSON`
+
+    Next: **Reading a Custom File Format, in Parallel**, the first lesson
+    of the intermediate level, where you build the docs data source that
+    the intermediate capstone finishes.

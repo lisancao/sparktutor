@@ -1,0 +1,1399 @@
+- Class: meta
+  Lesson: "Columns and Expressions: Cleaning Values"
+  EstimatedMinutes: 60
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    "Why Spark for Messy Data, and How It Runs Your Code" showed what
+    happens when Spark runs a job, "Setup, a First Session and a Tour of
+    the Sample Data" got you reading files into DataFrames, and "Schemas
+    for Data You Don't Control" showed how to give those DataFrames the
+    right column types. This lesson works one level down: on the values
+    inside the columns.
+
+    Real exports are full of values that are almost right. A name with
+    three spaces in the middle, a price written `$1,234.50`, a date as
+    `4 Mar 2025` in one row and `05/03/2025` in the next, `N/A` where a
+    value is missing, `yes` and `Y` and `1` for the same answer. Typing
+    the column (as in the schemas lesson) only works once the values
+    have been cleaned.
+
+    By the end of this lesson you will be able to:
+
+    - Build and combine **column expressions** with
+      `pyspark.sql.functions`, `when`/`otherwise`, `withColumns` (3.3)
+      and `withColumnsRenamed` (3.4), and write the same logic as SQL
+      with `F.expr`, `selectExpr` and `spark.sql`
+    - Explain what **ANSI mode** (on by default since Spark 4.0) changes,
+      and use the `try_*` functions so one bad value does not fail a job
+    - Clean strings: whitespace (including the non-breaking space that
+      `trim` misses), case, `regexp_replace`, `translate`
+    - Handle accents and case-insensitive grouping with **collations**
+      (4.0) or a small Python UDF, and spot invalid UTF-8
+    - Parse money with `try_to_number` or a strip-and-cast, dates in
+      several formats with `coalesce` over `try_to_date`, and yes/no
+      booleans
+    - Tell `NULL`, `""`, `"N/A"` and `NaN` apart and use `isNull`,
+      `coalesce`, `nullif`, `<=>`/`eqNullSafe`, `isnan` and `nanvl`
+    - Standardize categories with a mapping table instead of a growing
+      `CASE WHEN`, and record a **reject reason** for every bad row
+      instead of dropping it
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Sample File: customers_raw.csv
+
+    `data/messy/cleaning/customers_raw.csv` is a customer export from an
+    imaginary CRM. Every column is text and every column has problems.
+    `data/messy/cleaning/country_codes.csv` is a small mapping table you
+    will use near the end.
+
+    Read the export with every column as a string. The `header` option
+    takes column names from the first line; without a schema (and
+    without `inferSchema`) the CSV reader makes every column a `STRING`,
+    which is exactly what you want before cleaning. "CSV and Delimited
+    Files" covers the CSV reader and its many options properly.
+
+    ```python
+    from pyspark.sql import functions as F
+
+    raw = spark.read.option("header", True).csv("data/messy/cleaning/customers_raw.csv")
+    raw.select("customer_id", "full_name", "lifetime_value", "age").show(5, truncate=False)
+    ```
+
+    ```
+    +-----------+----------------------+--------------+----+
+    |customer_id|full_name             |lifetime_value|age |
+    +-----------+----------------------+--------------+----+
+    |C001       |  ana   maria  nguyen |$1,234.50     |34  |
+    | c002      |BINH TRAN             |1234.5        | 41 |
+    |C003       |Zoë Tremblay          |$12           |NULL|
+    |C004       |José\tGarcía          |-$5.00        |-3  |
+    |C005       |nguyễn thị hà         |N/A           |29  |
+    +-----------+----------------------+--------------+----+
+    only showing top 5 rows
+    ```
+
+    Already you can see padded and lower-case IDs, names in every case,
+    a tab inside a name (`show()` prints it as `\t`), money with and
+    without `$`, a negative age, and `N/A`. Some problems don't show at
+    all: the space in `Zoë Tremblay` is a **non-breaking space**
+    (U+00A0), which looks like a space and behaves differently. And the
+    reader has already turned empty fields into `NULL` (C003's age).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Columns Are Expressions, Not Values
+
+    The examples in this course import Spark's functions like this:
+
+    ```python
+    from pyspark.sql import functions as F
+    ```
+
+    `pyspark.sql.functions` holds hundreds of functions (`trim`, `upper`,
+    `to_date`, ...), and the `F.` prefix keeps them apart from Python's
+    own names (`F.sum` is not Python's `sum`, and a bare `from ...
+    import *` would replace Python's `sum`, `min`, `max` and `round`).
+    You will also see `sf` in the PySpark API docs; the name doesn't
+    matter, the prefix does.
+
+    A function such as `F.trim` does not trim anything when you call it.
+    It returns a `Column`: a description of a computation that Spark will
+    run later, on every row, inside its engine:
+
+    ```python
+    name = F.trim(F.col("full_name"))
+    print(name)
+    ```
+
+    ```
+    Column<'trim(full_name)'>
+    ```
+
+    You use expressions inside `select`, `withColumn`, `filter` and
+    friends. Most functions accept a column name as a string or a
+    `Column`; `F.lit(value)` turns a plain Python value into a constant
+    column:
+
+    ```python
+    out = raw.select(
+        "customer_id",
+        F.trim("full_name").alias("name"),
+        F.lower(F.col("email")).alias("email"),
+        F.lit("crm").alias("source"))
+    out.show(3, truncate=False)
+    ```
+
+    ```
+    +-----------+-------------------+------------------------+------+
+    |customer_id|name               |email                   |source|
+    +-----------+-------------------+------------------------+------+
+    |C001       |ana   maria  nguyen| ana.nguyen@example.com |crm   |
+    | c002      |BINH TRAN          |binh@example.com        |crm   |
+    |C003       |Zoë Tremblay       |n/a                     |crm   |
+    +-----------+-------------------+------------------------+------+
+    ```
+
+    Expressions nest freely, and nothing runs until an action such as
+    `show`, `count` or `collect` (the lazy evaluation from the first
+    lessons). That has a consequence you will meet in a moment: an
+    expression that fails on bad data fails when the action runs, not
+    where you wrote it.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Think of a `Column` as a formula in a spreadsheet: `=TRIM(B2)` is
+    not a value, it is an instruction that the spreadsheet applies to
+    every row. Spark collects all your formulas, plans the cheapest way
+    to apply them, and only then reads the data.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Adding and Renaming Many Columns
+
+    `withColumn(name, expr)` adds or replaces one column. For several at
+    once, `withColumns` (3.3) takes a dict, and `withColumnsRenamed`
+    (3.4) renames several:
+
+    ```python
+    wide = raw.withColumns({
+        "name": F.trim("full_name"),
+        "email": F.lower(F.trim("email")),
+    }).withColumnsRenamed({"lifetime_value": "ltv_raw", "signup_date": "signup_raw"})
+    print(wide.columns)
+    ```
+
+    ```
+    ['customer_id', 'full_name', 'email', 'phone', 'country', 'signup_raw',
+     'ltv_raw', 'newsletter', 'age', 'city', 'name']
+    ```
+
+    Replacing an existing name (`email`) keeps its position; a new name
+    (`name`) goes at the end. `withColumnsRenamed` ignores names that
+    don't exist, so a typo silently does nothing; check `columns` when
+    it matters.
+
+    Prefer one `withColumns` or one `select` over a long loop of
+    `withColumn` calls: each call adds a step to the query plan that
+    Spark has to analyze, and plans built from hundreds of them get slow
+    to plan.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Conditions: &, |, ~ and Parentheses
+
+    Combine conditions with `&` (and), `|` (or) and `~` (not), never
+    Python's `and`, `or` and `not`, and **always put parentheses around
+    each comparison**. In Python, `&` binds tighter than `>` and `==`, so
+    this does not mean what it looks like:
+
+    ```python
+    raw.filter(F.col("age") > 30 & F.col("city") == "Paris")
+    ```
+
+    ```
+    PySparkValueError: [CANNOT_CONVERT_COLUMN_INTO_BOOL] Cannot convert
+    column into bool: please use '&' for 'and', '|' for 'or', '~' for
+    'not' when building DataFrame boolean expressions.
+    ```
+
+    ```python
+    raw.filter((F.col("age").try_cast("int") > 30) & (F.col("city") == "Paris")).count()   # 2
+    ```
+
+    (`try_cast` is coming up; it turns the text ages into numbers.)
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Same Logic in SQL: F.expr, selectExpr and spark.sql
+
+    Everything you can write with `F.` functions you can also write as
+    SQL text, and mix freely:
+
+    ```python
+    a = raw.select(F.expr("upper(trim(customer_id)) AS id"),
+                   F.expr("try_cast(trim(age) AS INT) AS age"))
+
+    b = raw.selectExpr("upper(trim(customer_id)) AS id",
+                       "try_cast(trim(age) AS INT) AS age")
+
+    raw.createOrReplaceTempView("raw_customers")
+    c = spark.sql("SELECT upper(trim(customer_id)) AS id, "
+                  "try_cast(trim(age) AS INT) AS age FROM raw_customers")
+    ```
+
+    All three produce the same physical plan; `a.explain()` and
+    `c.explain()` both print:
+
+    ```
+    *(1) Project [upper(trim(customer_id#17, None)) AS id#84,
+                  try_cast(trim(age#25, None) as int) AS age#85]
+    +- FileScan csv [customer_id#17,age#25] ... ReadSchema: struct<customer_id:string,age:string>
+    ```
+
+    So choose by readability, not speed. The DataFrame API is easier to
+    build programmatically (loops over columns, helper functions that
+    return expressions, as in this lesson's exercise); SQL is handy for
+    one-off expressions and for SQL-only syntax such as
+    `TRIM(LEADING '0' FROM x)` or the `'12'::INT` cast shorthand (4.0,
+    SPARK-45574).
+
+- Class: mult_question
+  Depth: all
+  Output: "What does `F.upper(F.col('email'))` return in PySpark?"
+  AnswerChoices: "A Column expression that Spark evaluates later, row by row;A Python list of upper-cased emails;A new DataFrame with the column replaced;The upper-cased email of the first row"
+  CorrectAnswer: "A Column expression that Spark evaluates later, row by row"
+  Hint: "Print it: you get Column<'upper(email)'>. Nothing has been read yet."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## when and otherwise
+
+    `F.when(condition, value)` is SQL's `CASE WHEN`. Chain more `.when`
+    calls for more cases and finish with `.otherwise`:
+
+    ```python
+    age = F.col("age").try_cast("int")
+    raw.select("customer_id", "age",
+        F.when(age.isNull(), "unknown")
+         .when(age < 18, "minor")
+         .when(age < 65, "adult")
+         .otherwise("senior").alias("band"),
+        F.when(age > 100, "check me").alias("flag")).show(8)
+    ```
+
+    ```
+    +-----------+------+-------+--------+
+    |customer_id|   age|   band|    flag|
+    +-----------+------+-------+--------+
+    |       C001|    34|  adult|    NULL|
+    |       c002|   41 |  adult|    NULL|
+    |       C003|  NULL|unknown|    NULL|
+    |       C004|    -3|  minor|    NULL|
+    |       C005|    29|  adult|    NULL|
+    |       C006|thirty|unknown|    NULL|
+    |       C007|   200| senior|check me|
+    |       C008|    52|  adult|    NULL|
+    +-----------+------+-------+--------+
+    ```
+
+    Two rules to remember:
+
+    - **The first true branch wins**, so order matters: check
+      `age.isNull()` first, or a NULL age would fall through to
+      `otherwise`.
+    - **No `otherwise` means NULL** for rows that match nothing (the
+      `flag` column). That is often what you want, and occasionally a
+      silent bug when you forgot a case.
+
+    Notice also that `-3` landed in `minor` and `200` in `senior`: the
+    expression did exactly what it was told. Range checks are a separate
+    step, as you will see in the exercise.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## ANSI Mode: Bad Values Fail Loudly
+
+    Since Spark 4.0, `spark.sql.ansi.enabled` is `true` by default
+    (SPARK-44444). ANSI mode makes Spark follow the SQL standard: an
+    operation that cannot produce a correct value **raises an error**
+    instead of quietly returning `NULL` or a wrong number. "Schemas for
+    Data You Don't Control" showed it for numbers that overflow their
+    type; on messy text the failure you will meet most is a cast.
+
+    ```python
+    spark.conf.get("spark.sql.ansi.enabled")   # 'true'
+
+    ages = raw.select("customer_id", F.col("age").cast("int").alias("age"))
+    ages.columns        # ['customer_id', 'age']: defining it is fine
+    ages.collect()      # the action fails
+    ```
+
+    ```
+    [CAST_INVALID_INPUT] The value 'thirty' of the type "STRING" cannot be
+    cast to "INT" because it is malformed. Correct the value as per the
+    syntax, or change its target type. Use `try_cast` to tolerate
+    malformed input and return NULL instead. SQLSTATE: 22018
+    ```
+
+    The error names the error condition (`CAST_INVALID_INPUT`), the bad
+    value, and the fix. Other conditions you will see on messy data:
+
+    | Query | Error condition |
+    |-------|-----------------|
+    | `SELECT 10 / 0` | `DIVIDE_BY_ZERO` |
+    | `SELECT 2147483647 + 1` | `ARITHMETIC_OVERFLOW` |
+    | `SELECT CAST(3000000000 AS INT)` | `CAST_OVERFLOW` |
+    | `SELECT element_at(array(1, 2), 5)` | `INVALID_ARRAY_INDEX_IN_ELEMENT_AT` |
+    | `to_date('2026-03-04', 'dd/MM/yyyy')` | `CANNOT_PARSE_TIMESTAMP` |
+
+    With ANSI mode off, `CAST('12a' AS INT)`, `10 / 0` and
+    `2147483647 + 1` return `NULL`, `NULL` and `-2147483648` (the
+    integer wrapped around). That is why
+    turning it off is the wrong fix: the job "works" and the numbers are
+    wrong. One row out of millions is enough to fail an ANSI job, so on
+    messy data you choose, per expression, between failing and
+    tolerating, with the `try_*` functions.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    In PySpark, catch these errors as `pyspark.errors.PySparkException`
+    and read `e.getCondition()` to see which one it was. PySpark 4.x also
+    logs a line from a logger called `DataFrameQueryContextLogger` when
+    a DataFrame query fails; that is the same error, printed with the
+    place in your code that caused it.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The try_ Family
+
+    Each `try_` function does the same work as its plain version but
+    returns `NULL` where the plain one would raise:
+
+    ```python
+    raw.select("customer_id", "age", F.col("age").try_cast("int").alias("age_int")).show(8)
+    ```
+
+    ```
+    +-----------+------+-------+
+    |customer_id|   age|age_int|
+    +-----------+------+-------+
+    |       C001|    34|     34|
+    |       c002|   41 |     41|
+    |       C003|  NULL|   NULL|
+    |       C004|    -3|     -3|
+    |       C005|    29|     29|
+    |       C006|thirty|   NULL|
+    |       C007|   200|    200|
+    |       C008|    52|     52|
+    +-----------+------+-------+
+    ```
+
+    The ones you will use most (versions are when they arrived in
+    PySpark):
+
+    | Function | Instead of | Since |
+    |----------|------------|-------|
+    | `Column.try_cast(type)`, SQL `try_cast(x AS type)` | `cast` | 4.0 (Python method) |
+    | `try_to_number(col, format)` | `to_number` | 3.5 |
+    | `try_to_date(col, format)` | `to_date` | 4.1 (SPARK-52866; the docstring says 4.0) |
+    | `try_to_timestamp(col, format)` | `to_timestamp` | 3.5 |
+    | `try_divide`, `try_add`, `try_subtract`, `try_multiply` | `/`, `+`, `-`, `*` | 3.5 |
+    | `try_mod` | `%` | 4.0 |
+    | `try_element_at` | `element_at` | 3.5 |
+    | `try_sum`, `try_avg` | `sum`, `avg` (overflow) | 3.5 |
+    | `try_parse_json`, `try_parse_url`, `try_url_decode` | `parse_json`, ... | 4.0 |
+
+    ```python
+    spark.sql("""SELECT try_divide(10, 0) AS a, try_add(2147483647, 1) AS b,
+      try_cast('12a' AS INT) AS c, '12'::INT + 1 AS d,
+      try_element_at(array(1, 2), 5) AS e""").show()
+    ```
+
+    ```
+    +----+----+----+---+----+
+    |   a|   b|   c|  d|   e|
+    +----+----+----+---+----+
+    |NULL|NULL|NULL| 13|NULL|
+    +----+----+----+---+----+
+    ```
+
+    A `NULL` from a `try_` function is information: "this value was
+    present and did not parse". Keep the raw value next to it so you can
+    tell that apart from "this value was missing", which is what the
+    exercise's reject reasons do.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## What a Cast Accepts
+
+    Casting text to a number is stricter than you might guess, and
+    stricter in some places than others:
+
+    ```python
+    vals = spark.createDataFrame([(v,) for v in
+        [" 12 ", "+12", "0012", "12.7", "1e3", "1,234", "\u00a012"]], "s STRING")
+    vals.select("s", F.col("s").try_cast("int").alias("as_int"),
+                F.col("s").try_cast("double").alias("as_double")).show()
+    ```
+
+    ```
+    +-----+------+---------+
+    |    s|as_int|as_double|
+    +-----+------+---------+
+    |  12 |    12|     12.0|
+    |  +12|    12|     12.0|
+    | 0012|    12|     12.0|
+    | 12.7|  NULL|     12.7|
+    |  1e3|  NULL|   1000.0|
+    |1,234|  NULL|     NULL|
+    |   12|  NULL|     NULL|
+    +-----+------+---------+
+    ```
+
+    - Spaces, tabs and newlines around the number are trimmed, but the
+      non-breaking space (the last row) is not.
+    - `12.7` is not an `INT` under ANSI mode (it used to be truncated to
+      12); cast to `DOUBLE` or `DECIMAL` first if you mean to round.
+    - Thousands separators always fail. Strip them first (see "Money and
+      Numbers" below).
+    - Leading zeros disappear in any numeric type. Keep IDs, ZIP codes
+      and phone numbers as strings.
+
+- Class: mult_question
+  Depth: all
+  Output: "A column of 10 million text amounts has one value `12,50`. With default Spark 4.2 settings, what does `F.col('amount').cast('double')` do in a `collect()`?"
+  AnswerChoices: "Fails the query with CAST_INVALID_INPUT;Returns NULL for that row;Returns 1250.0;Skips that row"
+  CorrectAnswer: "Fails the query with CAST_INVALID_INPUT"
+  Hint: "ANSI mode is on by default since 4.0. Which method returns NULL instead?"
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Whitespace: What trim Misses
+
+    `F.trim` removes **space characters** (U+0020) from both ends, and
+    nothing else:
+
+    ```python
+    names = spark.createDataFrame(
+        [("  ana   maria  ",), ("\tBinh\n",), ("\u00a0Chloé\u00a0",)], "s STRING")
+    names.select("s", F.length("s").alias("len"),
+                 F.trim("s").alias("trimmed"), F.length(F.trim("s")).alias("len2")).show()
+    ```
+
+    ```
+    +---------------+---+-----------+----+
+    |              s|len|    trimmed|len2|
+    +---------------+---+-----------+----+
+    |  ana   maria  | 15|ana   maria|  11|
+    |       \tBinh\n|  6|   \tBinh\n|   6|
+    |         Chloé |  7|     Chloé |   7|
+    +---------------+---+-----------+----+
+    ```
+
+    The tab and newline stay, the non-breaking spaces around `Chloé`
+    stay, and the run of spaces inside `ana   maria` stays. Non-breaking
+    spaces are common in data copied from web pages, PDFs and
+    spreadsheets, and they defeat equality tests: `"Chloé" == trim(s)`
+    is false here.
+
+    `trim` can take the characters to remove as a second argument (in
+    PySpark since 4.0), but it must be a **column**: a plain string is
+    read as a column name, a trap you will meet again with the regex
+    functions in "Text and Logs".
+
+    ```python
+    names.select(F.trim("s", " \t\n"))
+    # [UNRESOLVED_COLUMN.WITH_SUGGESTION] A column ... with name ` \t\n` cannot be resolved.
+
+    names.select(F.trim("s", F.lit(" \t\n\u00a0")))   # works
+    ```
+
+    The robust fix collapses **every** run of whitespace to one space,
+    then trims:
+
+    ```python
+    squeeze = F.trim(F.regexp_replace("s", r"[\s\u00a0]+", " "))
+    ```
+
+    Spark uses Java regular expressions, where `\s` means
+    `[ \t\n\x0B\f\r]` only. Adding `\u00a0` to the class (or starting
+    the pattern with `(?U)`, which makes `\s` Unicode-aware) catches the
+    non-breaking space too. Measured on the three names, the result
+    lengths are 9, 4 and 7 with plain `\s+` (the `Chloé` row keeps its
+    non-breaking spaces) and 9, 4 and 5 with either fix.
+
+    Related functions: `ltrim` and `rtrim` (one side), `btrim(str,
+    chars)` (3.5, SQL's `TRIM(BOTH chars FROM str)`), and in SQL
+    `TRIM(LEADING '0' FROM '000120')` gives `120`.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Case
+
+    `lower`, `upper` and `initcap` work on Unicode letters (`zoë` and
+    `ZOË` round-trip). `initcap` upper-cases the first letter after each
+    **space** and lower-cases everything else, which is usually right
+    for names and sometimes not:
+
+    ```python
+    (spark.createDataFrame([("BINH TRAN",), ("o'neil",), ("mary-jane van dyke",), ("McDONALD",)], "s STRING")
+        .select("s", F.initcap("s")).show())
+    ```
+
+    ```
+    +------------------+------------------+
+    |                 s|        initcap(s)|
+    +------------------+------------------+
+    |         BINH TRAN|         Binh Tran|
+    |            o'neil|            O'neil|
+    |mary-jane van dyke|Mary-jane Van Dyke|
+    |          McDONALD|          Mcdonald|
+    +------------------+------------------+
+    ```
+
+    For matching and grouping, don't change the case of what you store;
+    compare a lower-cased key, or use a case-insensitive collation (two
+    sections down). Keep `initcap` for display.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## regexp_replace and translate
+
+    `regexp_replace(col, pattern, replacement)` replaces every match of
+    a Java regular expression. `translate(col, from, to)` replaces single
+    characters: each character of `from` becomes the character at the
+    same position in `to`, or is deleted when `to` is shorter.
+
+    ```python
+    phones = spark.createDataFrame([("(416) 555-0199",), ("416.555.0123",),
+                                    ("+1 416 555 0147",), ("n/a",)], "p STRING")
+    phones.select("p",
+        F.regexp_replace("p", r"[^0-9]", "").alias("digits"),
+        F.translate("p", "()-. +", "").alias("translated")).show()
+    ```
+
+    ```
+    +---------------+-----------+-----------+
+    |              p|     digits| translated|
+    +---------------+-----------+-----------+
+    | (416) 555-0199| 4165550199| 4165550199|
+    |   416.555.0123| 4165550123| 4165550123|
+    |+1 416 555 0147|14165550147|14165550147|
+    |            n/a|           |        n/a|
+    +---------------+-----------+-----------+
+    ```
+
+    "Keep only digits" (`[^0-9]` means "anything that is not a digit")
+    is more robust than listing the characters to delete, because it
+    also handles separators you didn't think of. Note what it does to
+    `n/a`: an empty string, not NULL. Handle null markers **before**
+    stripping characters, or `""` slips through as a value.
+
+    Replacements can refer to capture groups as `$1`, `$2`:
+
+    ```python
+    F.regexp_replace("n", r"^(\w+), (\w+)$", "$2 $1")   # "Nguyen, Linh" -> "Linh Nguyen"
+    ```
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    `raw` has a string column `full_name`. Assign to `names` a DataFrame
+    with one column `name`: `full_name` with every run of whitespace
+    (including the non-breaking space) replaced by one space, then
+    trimmed. Use the pattern `r"[\s\u00a0]+"`.
+  CorrectAnswer: |
+    names = raw.select(F.trim(F.regexp_replace("full_name", r"[\s\u00a0]+", " ")).alias("name"))
+  Hint: "regexp_replace first, then trim the result, then alias it."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Accents and Other Unicode Differences
+
+    `Montréal`, `Montreal` and `MONTRÉAL` are the same city to a person
+    and three different strings to `==`. Spark 4.2 has **no built-in
+    function that removes accents** (there is no Unicode normalization
+    function in the 4.2.0 function registry). You have three tools,
+    each right for a different job.
+
+    **1. Compare without changing the data: collations.** Covered in the
+    next section; the best choice for grouping, joining and filtering.
+
+    **2. `translate` for a known, small set of characters.** Fast and
+    built in, but you have to list every letter, and letters that are
+    not a base letter plus an accent (Vietnamese `Đ`, the ligature `ﬁ`)
+    need their own entries:
+
+    ```python
+    F.translate("s", "éễịàëặ", "eeiaea")   # "Nguyễn Thị Hà" -> "Nguyen Thi Ha"
+    ```
+
+    **3. A Python UDF with `unicodedata`.** A **user-defined function**
+    (UDF) is a Python function that Spark calls for every row. Python's
+    standard library can split an accented letter into the base letter
+    plus a combining mark (Unicode normalization form NFKD), and the
+    marks can then be dropped:
+
+    ```python
+    import unicodedata
+    from pyspark.sql.types import StringType
+
+    @F.udf(StringType())
+    def strip_accents(s):
+        if s is None:
+            return None
+        decomposed = unicodedata.normalize("NFKD", s)
+        return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+
+    people = spark.createDataFrame(
+        [(s,) for s in ["Montréal", "Nguyễn Thị Hà", "Zoë", "Đặng", "ﬁancé", None]], "s STRING")
+    people.select("s", strip_accents("s").alias("ascii_ish")).show()
+    ```
+
+    ```
+    +-------------+-------------+
+    |            s|    ascii_ish|
+    +-------------+-------------+
+    |     Montréal|     Montreal|
+    |Nguyễn Thị Hà|Nguyen Thi Ha|
+    |          Zoë|          Zoe|
+    |         Đặng|         Đang|
+    |        ﬁancé|       fiance|
+    |         NULL|         NULL|
+    +-------------+-------------+
+    ```
+
+    Two lessons in that output. NFKD also unpacks compatibility
+    characters (`ﬁ` becomes `fi`), but `Đ` is a separate letter in
+    Unicode, not `D` plus a mark, so it survives; Vietnamese data needs
+    `translate` for `Đ` and `đ` as well. And a UDF has a cost: Spark
+    cannot look inside it, so it cannot optimize it, and every value is
+    shipped to a separate Python worker process and back. The plan shows
+    that as its own step (`ArrowEvalPython` in 4.2, where Arrow-optimized
+    Python UDFs are the default). Use a UDF when no built-in does the
+    job; "Running a Model over Your Data with pandas UDFs" covers UDFs
+    in depth.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Collations: Case- and Accent-Insensitive Comparison
+
+    Spark 4.0 added **collations** (SPARK-46830): a string can carry
+    rules for how it is compared and sorted. Attach one with
+    `F.collate(col, name)` or `COLLATE name` in SQL:
+
+    ```python
+    spark.sql("""SELECT 'Montréal' = 'MONTREAL' AS plain,
+      'Montréal' COLLATE UTF8_LCASE = 'MONTRÉAL' AS lcase,
+      'Montréal' COLLATE UNICODE_CI = 'montréal' AS ci,
+      'Montréal' COLLATE UNICODE_CI_AI = 'montreal' AS ci_ai""").show()
+    ```
+
+    ```
+    +-----+-----+----+-----+
+    |plain|lcase|  ci|ci_ai|
+    +-----+-----+----+-----+
+    |false| true|true| true|
+    +-----+-----+----+-----+
+    ```
+
+    The names read as: `UTF8_BINARY` (the default, byte by byte),
+    `UTF8_LCASE` (ignore case), `UNICODE` (Unicode ordering), `_CI`
+    case-insensitive, `_AI` accent-insensitive, and `_RTRIM` variants
+    that ignore trailing spaces. `SELECT name FROM collations()` lists
+    them all, including language-specific ones.
+
+    Grouping by a collated column treats equal-under-the-collation values
+    as one group:
+
+    ```python
+    cities = spark.createDataFrame([(c,) for c in ["Montréal", "MONTREAL", "montréal",
+        "Toronto", "toronto", "Hà Nội", "Ha Noi"]], "city STRING")
+    cities.groupBy("city").count().count()                          # 7 groups
+    cities.groupBy(F.collate("city", "UNICODE_CI_AI").alias("city")).count().show()
+    ```
+
+    ```
+    +--------+-----+
+    |    city|count|
+    +--------+-----+
+    |  Hà Nội|    2|
+    |Montréal|    3|
+    | Toronto|    2|
+    +--------+-----+
+    ```
+
+    The values are not changed: each group is shown with one of its
+    original spellings (which one is not guaranteed), and the column's
+    type is now `string collate UNICODE_CI_AI`. A misspelt name fails
+    with `COLLATION_INVALID_NAME` and a suggestion. "What Spark 4.x Adds
+    for Messy Data" goes deeper into collations; for this lesson, they
+    are the cleanest way to say "same city, different typing".
+
+- Class: mult_question
+  Depth: all
+  Output: "You want to count customers per city so that `Montréal`, `MONTREAL` and `montreal` are one group, without changing the stored values. What is the most direct tool in Spark 4.2?"
+  AnswerChoices: "groupBy(F.collate('city', 'UNICODE_CI_AI'));groupBy(F.trim('city'));A built-in unaccent() function;groupBy(F.initcap('city'))"
+  CorrectAnswer: "groupBy(F.collate('city', 'UNICODE_CI_AI'))"
+  Hint: "_CI means case-insensitive and _AI accent-insensitive. Spark 4.2 has no unaccent function."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Invalid UTF-8, Briefly
+
+    Spark strings are UTF-8. Bytes that are not valid UTF-8 (typically a
+    Latin-1 file read as UTF-8) can still end up inside a string column.
+    Spark 4.0 added four functions to find and fix them:
+
+    ```python
+    # The same word as Latin-1 bytes (E9) and as UTF-8 bytes (C3 A9), cast to strings
+    bad = (spark.createDataFrame([(bytearray(b"Caf\xe9"),), (bytearray("Café".encode()),)], "b BINARY")
+           .select(F.col("b").cast("string").alias("s")))
+    bad.select(F.hex(F.col("s").cast("binary")).alias("bytes"),
+               F.is_valid_utf8("s").alias("valid"),
+               F.make_valid_utf8("s").alias("made_valid"),
+               F.try_validate_utf8("s").alias("try_valid")).show()
+    ```
+
+    ```
+    +----------+-----+----------+---------+
+    |     bytes|valid|made_valid|try_valid|
+    +----------+-----+----------+---------+
+    |  436166E9|false|      Caf�|     NULL|
+    |436166C3A9| true|      Café|     Café|
+    +----------+-----+----------+---------+
+    ```
+
+    `make_valid_utf8` replaces bad bytes with U+FFFD (the "�"), which
+    loses the letter; `validate_utf8` fails with `INVALID_UTF8_STRING`.
+    None of them can recover the original text: for that you need the
+    right encoding when reading, which "Text and Logs" and "CSV and
+    Delimited Files" show.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Money and Numbers
+
+    `to_number(col, format)` (3.5) parses text by a format string, and
+    `try_to_number` returns NULL instead of failing. Format characters:
+    `9` or `0` a digit, `.` the decimal point, `,` a grouping separator,
+    `$` a dollar sign, `S` a sign, `MI` a trailing minus, `PR` angle
+    brackets for negatives. It returns a `DECIMAL`.
+
+    ```python
+    money = spark.createDataFrame([(v,) for v in
+        ["$1,234.50", "$12", "1234.5", "-$5.00", " $7.25 ", "1.234,50", "abc"]], "s STRING")
+    money.select("s",
+        F.try_to_number("s", F.lit("$9,999.99")).alias("to_number"),
+        F.regexp_replace("s", r"[$,\s]", "").try_cast("decimal(12,2)").alias("stripped")).show()
+    ```
+
+    ```
+    +---------+---------+--------+
+    |        s|to_number|stripped|
+    +---------+---------+--------+
+    |$1,234.50|  1234.50| 1234.50|
+    |      $12|    12.00|   12.00|
+    |   1234.5|     NULL| 1234.50|
+    |   -$5.00|     NULL|   -5.00|
+    |   $7.25 |     NULL|    7.25|
+    | 1.234,50|     NULL|    1.23|
+    |      abc|     NULL|    NULL|
+    +---------+---------+--------+
+    ```
+
+    `to_number` is strict: the text must fit the format, so `1234.5`
+    (no `$`) and ` $7.25 ` (spaces) fail. It suits clean machine output
+    in one known format; `S$999.99`, `999.99MI` and `999.99PR` cover
+    signed forms such as `-$5.00`, `5.00-` and `<5.00>`. For mixed human
+    input, **strip and cast** is more forgiving: remove the currency
+    symbol, grouping commas and spaces, then `try_cast` to a `DECIMAL`.
+
+    Now look at the `1.234,50` row: the strip-and-cast gave **1.23**, a
+    plausible, wrong number, with no error. In much of Europe `.` groups
+    thousands and `,` is the decimal point, and no single rule handles
+    both conventions. Decide per source, and for European text swap the
+    separators deliberately:
+
+    ```python
+    eu = F.regexp_replace(F.regexp_replace(F.col("s"), r"\.", ""), ",", ".")
+    eu.try_cast("decimal(12,2)")   # "1.234,50" -> 1234.50, "12,5" -> 12.50
+    ```
+
+    Use `DECIMAL(p, s)` for money, never `DOUBLE` ("Schemas for Data You
+    Don't Control" showed `0.1 + 0.2` as doubles). To format numbers for
+    output, `to_char(1234.5, '$9,999.99')` gives `$1,234.50` and
+    `format_number(1234567.891, 2)` gives `1,234,567.89`.
+
+- Class: mult_question
+  Depth: all
+  Output: "A European file has the amount `1.234,50`. You remove `$`, `,` and spaces, then `try_cast` to `DECIMAL(12,2)`. What do you get?"
+  AnswerChoices: "1.23, a wrong value with no error;1234.50;NULL;A CAST_INVALID_INPUT error"
+  CorrectAnswer: "1.23, a wrong value with no error"
+  Hint: "Removing the comma leaves 1.23450, which is a perfectly valid decimal."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Dates in Many Formats
+
+    `try_to_date(col)` without a format accepts ISO dates
+    (`2025-03-04`, also `2025-03-09T14:30:00`). With a format it accepts
+    exactly that format. When a column mixes formats, try each in turn
+    and keep the first that parses, with `coalesce` (which returns its
+    first non-NULL argument):
+
+    ```python
+    DATE_PATTERNS = ["yyyy/MM/dd", "dd/MM/yyyy", "d MMM yyyy", "MMMM d, yyyy", "yyyyMMdd"]
+
+    def parse_date(c):
+        return F.coalesce(F.try_to_date(c), *[F.try_to_date(c, p) for p in DATE_PATTERNS])
+
+    dates = spark.createDataFrame([(v,) for v in ["2025-03-04", "2025/03/05", "05/03/2025",
+        "4 Mar 2025", "March 4, 2025", "20250306", "2025-03-09T14:30:00", "2025-02-30", "unknown"]],
+        "s STRING")
+    dates.select("s", F.try_to_date("s").alias("default_only"),
+                 parse_date(F.col("s")).alias("parsed")).show(truncate=False)
+    ```
+
+    ```
+    +-------------------+------------+----------+
+    |s                  |default_only|parsed    |
+    +-------------------+------------+----------+
+    |2025-03-04         |2025-03-04  |2025-03-04|
+    |2025/03/05         |NULL        |2025-03-05|
+    |05/03/2025         |NULL        |2025-03-05|
+    |4 Mar 2025         |NULL        |2025-03-04|
+    |March 4, 2025      |NULL        |2025-03-04|
+    |20250306           |NULL        |2025-03-06|
+    |2025-03-09T14:30:00|2025-03-09  |2025-03-09|
+    |2025-02-30         |NULL        |NULL      |
+    |unknown            |NULL        |NULL      |
+    +-------------------+------------+----------+
+    ```
+
+    `parse_date` is a Python function that returns a `Column`, a handy
+    way to give a name to an expression you use more than once. 30
+    February is not a date in any format, so it stays NULL: a reject,
+    not a guess.
+
+    Pattern letters (Spark's datetime patterns): `yyyy` year, `MM` month
+    number, `MMM` short month name (`Mar`, matched case-insensitively),
+    `MMMM` full month name, `dd` day, `HH` hour (0 to 23), `mm` minute,
+    `ss` second, `X` or `XXX` a zone offset. Literal text goes in single
+    quotes (`yyyy-MM-dd'T'HH:mm`).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Date Traps
+
+    **Ambiguity cannot be parsed away.** `04/03/2026` is 4 March with
+    `dd/MM/yyyy` and 3 April with `MM/dd/yyyy`, and both parse:
+
+    ```python
+    spark.sql("""SELECT try_to_date('04/03/2026', 'dd/MM/yyyy') AS day_first,
+      try_to_date('04/03/2026', 'MM/dd/yyyy') AS month_first""").show()
+    ```
+
+    ```
+    +----------+-----------+
+    | day_first|month_first|
+    +----------+-----------+
+    |2026-03-04| 2026-04-03|
+    +----------+-----------+
+    ```
+
+    In a `coalesce`, whichever pattern comes first wins, silently. Find
+    out which convention the source uses (the sample file documents
+    day/month/year) and use only that one, per source.
+
+    **Pattern letters are case-sensitive, and some mistakes are silent:**
+
+    ```python
+    spark.sql("""SELECT try_to_date('2026-03-04', 'yyyy-mm-dd') AS minutes_trap,
+      try_to_date('4/3/2026', 'dd/MM/yyyy') AS dd_needs_two,
+      try_to_date('4/3/2026', 'd/M/yyyy') AS d_takes_both,
+      try_to_date('04-Mar-69', 'dd-MMM-yy') AS yy_69""").show()
+    ```
+
+    ```
+    +------------+------------+------------+----------+
+    |minutes_trap|dd_needs_two|d_takes_both|     yy_69|
+    +------------+------------+------------+----------+
+    |  2026-01-04|        NULL|  2026-03-04|2069-03-04|
+    +------------+------------+------------+----------+
+    ```
+
+    - `mm` is **minutes**, so `yyyy-mm-dd` reads `03` as a minute and
+      gives 4 **January**. No error.
+    - `dd` requires two digits; `d` accepts one or two, so `d/M/yyyy`
+      is the forgiving choice.
+    - `yy` maps two-digit years into 2000 to 2099, so `69` is 2069. A
+      birth date of `04-Mar-69` needs a rule of your own.
+    - `YYYY` (week-based year) is rejected outright, even by
+      `try_to_date`: it raises
+      `INCONSISTENT_BEHAVIOR_CROSS_VERSION.DATETIME_PATTERN_RECOGNITION`.
+      Use `yyyy`.
+
+- Class: mult_question
+  Depth: all
+  Output: "`try_to_date('2026-03-04', 'yyyy-mm-dd')` returns 2026-01-04. Why?"
+  AnswerChoices: "mm means minutes, so the month defaulted to January;try_to_date ignores the month when the day is set;The session time zone shifted the date;03 was parsed as a week number"
+  CorrectAnswer: "mm means minutes, so the month defaulted to January"
+  Hint: "Compare MM and mm in the pattern letter list."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Timestamps and Time Zones
+
+    "Schemas for Data You Don't Control" explained `TIMESTAMP` (an
+    instant) versus `TIMESTAMP_NTZ` (a wall-clock reading), and that
+    `collect()` hands you Python datetimes in your machine's zone. For
+    parsing, the rule to remember is: text **with** an offset
+    (`2026-03-04T09:30:00-05:00`) names an instant by itself; text
+    **without** one (`2026-03-04 09:30`) is read in the session time
+    zone. Formatting with `date_format(ts, '... XXX')` shows the zone:
+
+    ```python
+    q = """SELECT date_format(try_to_timestamp('2026-03-04 09:30'), 'yyyy-MM-dd HH:mm XXX') AS no_offset,
+      date_format(try_to_timestamp('2026-03-04T09:30:00-05:00'), 'yyyy-MM-dd HH:mm XXX') AS with_offset"""
+    spark.sql(q).show(truncate=False)                       # session time zone UTC
+    spark.conf.set("spark.sql.session.timeZone", "America/Toronto")
+    spark.sql(q).show(truncate=False)
+    spark.conf.set("spark.sql.session.timeZone", "UTC")    # back to UTC
+    ```
+
+    ```
+    +------------------+------------------+
+    |no_offset         |with_offset       |
+    +------------------+------------------+
+    |2026-03-04 09:30 Z|2026-03-04 14:30 Z|
+    +------------------+------------------+
+
+    +-----------------------+-----------------------+
+    |no_offset              |with_offset            |
+    +-----------------------+-----------------------+
+    |2026-03-04 09:30 -05:00|2026-03-04 09:30 -05:00|
+    +-----------------------+-----------------------+
+    ```
+
+    The text without an offset became a **different instant** when the
+    session zone changed; the text with one did not. When a source
+    writes local times without an offset, set the session time zone to
+    that source's zone while parsing (or parse into `TIMESTAMP_NTZ` with
+    `to_timestamp_ntz` and convert later), and know which of your
+    sources carry an offset. Epoch numbers are a third format:
+    `timestamp_seconds(1772616600)` is `2026-03-04 09:30:00` UTC.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Booleans: yes, Y, 1 and true
+
+    Casting text to `BOOLEAN` already understands the usual spellings,
+    case-insensitively and after trimming:
+
+    ```python
+    spark.sql("""SELECT x, try_cast(x AS BOOLEAN) AS b FROM VALUES
+      ('yes'), ('Y'), ('t'), ('1'), (' TRUE '), ('no'), ('n'), ('0'),
+      ('false'), ('on'), ('maybe') AS v(x)""").show()
+    ```
+
+    ```
+    +------+-----+
+    |     x|    b|
+    +------+-----+
+    |   yes| true|
+    |     Y| true|
+    |     t| true|
+    |     1| true|
+    | TRUE | true|
+    |    no|false|
+    |     n|false|
+    |     0|false|
+    | false|false|
+    |    on| NULL|
+    | maybe| NULL|
+    +------+-----+
+    ```
+
+    `true`, `t`, `yes`, `y` and `1` are true; `false`, `f`, `no`, `n`
+    and `0` are false. Anything else (`on`, `si`, `maybe`) is NULL with
+    `try_cast` and `CAST_INVALID_INPUT` with `cast`. For other
+    vocabularies, map them with `when` or a mapping table first.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## NULL, "", "N/A" and NaN
+
+    Four different things that all mean "no proper value":
+
+    ```python
+    v = spark.createDataFrame([("a", None, float("nan")), ("b", "", 1.0),
+                               ("c", "N/A", None), ("d", "Paris", 2.0)],
+                              "k STRING, city STRING, score DOUBLE")
+    v.show()
+    ```
+
+    ```
+    +---+-----+-----+
+    |  k| city|score|
+    +---+-----+-----+
+    |  a| NULL|  NaN|
+    |  b|     |  1.0|
+    |  c|  N/A| NULL|
+    |  d|Paris|  2.0|
+    +---+-----+-----+
+    ```
+
+    - `NULL` is SQL's "unknown". It is not equal to anything, not even
+      another NULL.
+    - `""` is a real string of length 0.
+    - `"N/A"`, `"null"`, `"-"` are real strings that a person meant as
+      missing. Spark has no idea.
+    - `NaN` ("not a number") is a real floating-point value, produced by
+      things like `0.0 / 0.0` in other systems and stored as such.
+
+    **Comparisons with NULL are NULL**, and `filter` drops rows whose
+    condition is NULL:
+
+    ```python
+    v.filter(F.col("city") != "Paris").count()    # 2: b and c, not a
+    v.filter(F.col("city") == None).count()        # 0, always
+    v.filter(F.col("city").isNull()).count()       # 1
+    ```
+
+    `col == None` builds the SQL `city = NULL`, which is never true; use
+    `isNull()`/`isNotNull()`. To compare treating NULLs as equal values,
+    use the null-safe forms `eqNullSafe` (Python), `<=>` or
+    `equal_null` (SQL):
+
+    ```python
+    spark.sql("""SELECT NULL = NULL AS eq, NULL <=> NULL AS null_safe,
+      equal_null(NULL, NULL) AS fn, 'x' NOT IN ('a', NULL) AS not_in,
+      concat('a', NULL) AS concat, concat_ws('-', 'a', NULL, 'b') AS concat_ws""").show()
+    ```
+
+    ```
+    +----+---------+----+------+------+---------+
+    |  eq|null_safe|  fn|not_in|concat|concat_ws|
+    +----+---------+----+------+------+---------+
+    |NULL|     true|true|  NULL|  NULL|      a-b|
+    +----+---------+----+------+------+---------+
+    ```
+
+    `NOT IN` with a NULL in the list is NULL for every value, so a
+    filter with it returns nothing: a classic bug when the list comes
+    from data. `concat` is NULL if any part is NULL; `concat_ws` skips
+    NULLs, which makes it perfect for building a list of reasons, as in
+    the exercise.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Normalizing Missing Values
+
+    Turn every spelling of "missing" into a real NULL early, once, so
+    the rest of the pipeline only has one case to handle:
+
+    ```python
+    v.select("k", "city",
+        F.coalesce("city", F.lit("unknown")).alias("coalesce"),
+        F.nullif(F.col("city"), F.lit("")).alias("nullif_empty"),
+        F.when(F.upper(F.trim("city")).isin("", "N/A", "NA", "NULL"), None)
+         .otherwise(F.col("city")).alias("markers_to_null")).show()
+    ```
+
+    ```
+    +---+-----+--------+------------+---------------+
+    |  k| city|coalesce|nullif_empty|markers_to_null|
+    +---+-----+--------+------------+---------------+
+    |  a| NULL| unknown|        NULL|           NULL|
+    |  b|     |        |        NULL|           NULL|
+    |  c|  N/A|     N/A|         N/A|           NULL|
+    |  d|Paris|   Paris|       Paris|          Paris|
+    +---+-----+--------+------------+---------------+
+    ```
+
+    - `coalesce(a, b, ...)` returns the first non-NULL argument; `""`
+      and `"N/A"` are not NULL, so it keeps them. (`nvl` and `ifnull`
+      are two-argument versions.)
+    - `nullif(a, b)` is NULL when `a = b`, otherwise `a`.
+    - `when(... isin(markers), None)` handles a whole list of markers.
+
+    One more trap: `coalesce` needs one type for its result. Mixing a
+    date with a text default, `coalesce(try_to_date(x), 'n/a')`, makes
+    Spark cast `'n/a'` to `DATE`, which fails with `CAST_INVALID_INPUT`.
+    Keep "missing" as NULL in typed columns and put the explanation in a
+    separate column.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## NaN Is Not NULL
+
+    `NaN` behaves differently from NULL, and Spark's rules for it differ
+    from IEEE floating point:
+
+    ```python
+    v.select("k", "score", F.isnan("score").alias("isnan"),
+             F.col("score").isNull().alias("isnull"),
+             F.nanvl("score", F.lit(None)).alias("nan_to_null")).show()
+    ```
+
+    ```
+    +---+-----+-----+------+-----------+
+    |  k|score|isnan|isnull|nan_to_null|
+    +---+-----+-----+------+-----------+
+    |  a|  NaN| true| false|       NULL|
+    |  b|  1.0|false| false|        1.0|
+    |  c| NULL|false|  true|       NULL|
+    |  d|  2.0|false| false|        2.0|
+    +---+-----+-----+------+-----------+
+    ```
+
+    - `isNull` is false for NaN; test with `F.isnan` (or the
+      `Column.isNaN` method, 4.0).
+    - In Spark, `NaN = NaN` is **true** and NaN is larger than every
+      other number, so it sorts last ascending and wins `max`.
+    - Aggregates don't skip NaN: on the score column, `count` is 3,
+      `avg` and `max` are `NaN`. After
+      `F.nanvl("score", F.lit(None))` (NaN becomes NULL) they are 2,
+      `1.5` and `2.0`.
+    - `df.fillna({"score": 0.0})` replaces NULL **and** NaN in numeric
+      columns, which may or may not be what you meant.
+
+- Class: mult_question
+  Depth: all
+  Output: "`df` has 4 rows; `city` is NULL in one of them and 'Paris' in one. How many rows does `df.filter(F.col('city') != 'Paris')` return?"
+  AnswerChoices: "2;3;4;1"
+  CorrectAnswer: "2"
+  Hint: "NULL != 'Paris' is NULL, not true, and filter only keeps rows where the condition is true."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Standardizing Categories: Mapping Tables, Not Endless CASE WHEN
+
+    The country column has a dozen spellings of four countries. A first
+    attempt is a `when` chain over a normalized key:
+
+    ```python
+    key = F.upper(F.regexp_replace(F.trim("country"), r"\.", ""))
+    case_version = (F.when(key.isin("CANADA", "CA", "CAN"), "CA")
+                     .when(key.isin("US", "USA", "UNITED STATES", "UNITED STATES OF AMERICA"), "US")
+                     .when(key.isin("VIET NAM", "VIETNAM", "VN"), "VN"))
+    ```
+
+    It works until the next spelling arrives, and every new one is a
+    code change. Put the mapping in **data** instead,
+    `data/messy/cleaning/country_codes.csv` (`raw`, `code`), and join:
+
+    ```python
+    codes = spark.read.option("header", True).csv("data/messy/cleaning/country_codes.csv")
+    mapped = (raw.withColumn("key", key)
+                 .join(F.broadcast(codes), F.col("key") == F.col("raw"), "left"))
+    (mapped.select("customer_id", "country", "code")
+        .withColumn("by_case", case_version).show(8))
+    ```
+
+    ```
+    +-----------+--------+----+-------+
+    |customer_id| country|code|by_case|
+    +-----------+--------+----+-------+
+    |       C001|  Canada|  CA|     CA|
+    |       c002|    usa |  US|     US|
+    |       C003|    U.S.|  US|     US|
+    |       C004|Viet Nam|  VN|     VN|
+    |       C005|      VN|  VN|     VN|
+    |       C006|    Mars|NULL|   NULL|
+    |       C007|     can|  CA|     CA|
+    |       C008|  France|  FR|   NULL|
+    +-----------+--------+----+-------+
+    only showing top 8 rows
+    ```
+
+    The `when` chain forgot France and nothing complained; the mapping
+    table has it, and a non-technical colleague can add the next
+    spelling without touching code. Three details:
+
+    - **`"left"` join**: rows without a match (`Mars`) are kept with a
+      NULL code, so you can report them. An inner join would drop them
+      silently.
+    - **`F.broadcast(codes)`** tells Spark the table is small enough to
+      send a full copy to every task, so the big side is never shuffled.
+      The plan shows `BroadcastHashJoin` with a `BroadcastExchange` on
+      the mapping side. ("Plans, Partitions and Caching" explains
+      shuffles and join strategies.)
+    - **Joins don't promise any row order.** This broadcast join happened
+      to keep the file's order; a join that shuffles both sides will
+      not. Sort explicitly when order matters.
+
+    Finding the values that need a new mapping entry is one query:
+    `mapped.filter(F.col("country").isNotNull() & F.col("code").isNull())`
+    returns only `Mars` here.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Reject Reasons: Keep the Row, Say What Was Wrong
+
+    Later in this level, "Text and Logs" will split records into parsed
+    and rejected. For a table
+    of many columns, a finer pattern works well: keep every row, give
+    every typed column NULL when its value was bad, and add a
+    `reject_reason` column that lists **which** checks failed.
+
+    A value is *bad* when the raw text was present but its typed version
+    is NULL. Each check is a `when` that yields a reason name or NULL,
+    and `concat_ws` joins the non-NULL ones:
+
+    ```python
+    bad_age = F.when(F.col("age").isNotNull() & F.col("age").try_cast("int").isNull(), "bad_age")
+    bad_ltv = F.when(F.col("lifetime_value").isNotNull()
+                     & F.regexp_replace("lifetime_value", r"[$,\s]", "").try_cast("decimal(12,2)").isNull()
+                     & (F.col("lifetime_value") != "N/A"), "bad_ltv")
+    reasons = F.concat_ws(",", bad_age, bad_ltv)
+    (raw.select("customer_id", reasons.alias("reasons"),
+                F.nullif(reasons, F.lit("")).alias("reject_reason"))
+        .filter("customer_id IN ('C001', 'C006')").show())
+    ```
+
+    ```
+    +-----------+---------------+---------------+
+    |customer_id|        reasons|  reject_reason|
+    +-----------+---------------+---------------+
+    |       C001|               |           NULL|
+    |       C006|bad_age,bad_ltv|bad_age,bad_ltv|
+    +-----------+---------------+---------------+
+    ```
+
+    With every reason in a column you can count problems per check,
+    send rows with reasons to a quarantine table, and still load the
+    good columns of a partly bad row. (That `!= "N/A"` is ugly; the
+    exercise normalizes null markers first so each check stays simple.)
+    You will build on this idea later in this level in "JSON Drift and
+    Quarantine", and again in the intermediate "Production Ingestion:
+    Quality Rules, Quarantine and Pipelines".
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Built-ins, UDFs and Plans
+
+    Everything in this lesson except `strip_accents` is a built-in
+    expression. Built-ins run inside the JVM on Spark's internal row
+    format, take part in whole-stage code generation (the `*(1)` in the
+    plans above marks a generated stage), and can be reordered and
+    simplified by the optimizer. A Python UDF is opaque: its rows leave
+    the JVM, are converted to Arrow or pickled, processed by a Python
+    worker and sent back.
+
+    Practical consequences when cleaning large data:
+
+    - Reach for a UDF last, and keep it small and deterministic (same
+      input, same output), because Spark may call it more than once per
+      row.
+    - Build expressions with Python helpers (`tidy`, `parse_date`) and
+      apply them in one `select` or `withColumns`: the helpers cost
+      nothing at run time, they only build the plan.
+    - Long `coalesce` lists are cheap: each `try_to_date` attempt only
+      runs when the previous one returned NULL.
+    - `explain()` is how you check: a cleaning query made only of
+      built-ins shows one `Project` over the `FileScan`.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Clean the Customer Export
+
+    Turn `customers_raw.csv` into a typed table with a reject reason for
+    every row that had a bad value. The harness reads the file with
+    every column as a string and passes you the mapping table.
+
+    Implement five functions:
+
+    1. `tidy(c)`: collapse every run of `[\s\u00a0]` to one space,
+       trim, and return NULL when the upper-cased result is one of
+       `NULL_TOKENS` (`""`, `N/A`, `NA`, `NULL`, `NONE`, `-`).
+    2. `parse_date(c)`: `coalesce` of `try_to_date(c)` and
+       `try_to_date(c, p)` for each of `DATE_PATTERNS`.
+    3. `parse_money(c)`: remove `$`, `,` and whitespace, then
+       `try_cast("decimal(12,2)")`.
+    4. `clean_customers(raw, countries)`: tidy every column, then build
+       - `customer_id` upper-cased, `name` with `initcap`
+       - `email` lower-cased, kept only if it matches `EMAIL_RE`
+       - `phone` as 10 digits (drop a leading `1` from 11 digits)
+       - `country` from the mapping table (broadcast left join)
+       - `signup_date`, `lifetime_value`, `newsletter` (boolean) and
+         `age` (0 to 120) typed with the `try_` functions
+       - `city` tidied
+       - `reject_reason`: the names in `REASONS` whose check failed,
+         joined with `,`, or NULL for a clean row. A missing value is
+         not a reject (except the name); a present value that does not
+         parse is.
+    5. `city_counts(clean)`: customers per city, ignoring case, accents
+       and padding, with a collation.
+
+    The harness first shows that a plain `cast` on the raw ages fails
+    under ANSI mode, then checks: each helper on tricky inputs (a
+    non-breaking space, `n/a`, every date format, money with and
+    without `$`), the output columns and types, all 40 rows kept, every
+    field of the ten hand-planted rows (C001 to C010) including their
+    exact reject reasons, no rejects among the other rows, and the city
+    groups compared with a pure-Python accent-stripping count.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "tidy: s = F.trim(F.regexp_replace(c, r'[\\s\\u00a0]+', ' ')); F.when(F.upper(s).isin(NULL_TOKENS), None).otherwise(s). parse_date: F.coalesce(F.try_to_date(c), *[F.try_to_date(c, p) for p in DATE_PATTERNS]). Each check is F.col(raw).isNotNull() & <typed is NULL or not ok>; reasons = F.concat_ws(',', *[F.when(check, F.lit(name)) ...]), then F.nullif(reasons, F.lit('')). City groups: F.collate('city', 'UNICODE_CI_AI')."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    In this lesson you learned:
+
+    - **Column expressions** from `pyspark.sql.functions` (imported as
+      `F`) describe work that runs later, on every row. Build many
+      columns with `withColumns` (3.3), rename with `withColumnsRenamed`
+      (3.4), combine conditions with `&`, `|`, `~` and parentheses, and
+      write the same logic as SQL with `F.expr`, `selectExpr` or
+      `spark.sql`: one engine, one plan.
+    - **`when`/`otherwise`**: first true branch wins; no `otherwise`
+      means NULL.
+    - **ANSI mode** (default since 4.0) fails the query on bad casts,
+      division by zero and overflow (`CAST_INVALID_INPUT`,
+      `DIVIDE_BY_ZERO`, `ARITHMETIC_OVERFLOW`). The **`try_` functions**
+      return NULL instead; keep the raw value to tell "bad" from
+      "missing".
+    - **Strings**: `trim` removes only spaces; collapse
+      `[\s\u00a0]+` with `regexp_replace` to catch tabs and
+      non-breaking spaces. `initcap` for display, lower-cased keys or
+      collations for matching. `translate` for single characters.
+    - **Accents**: no built-in unaccent in 4.2. Use collations
+      (`UNICODE_CI_AI`, 4.0) to compare and group, `translate` for known
+      letters, or a Python UDF with `unicodedata` (slower, opaque).
+      `is_valid_utf8` and friends (4.0) find invalid bytes.
+    - **Money**: `try_to_number` for one strict format, strip-and-cast
+      to `DECIMAL` for mixed input, and never guess between `1.234,50`
+      and `1,234.50`.
+    - **Dates**: `coalesce` over `try_to_date` patterns; ambiguity must
+      be resolved per source; `mm` is minutes, `d` beats `dd`, `yy` is
+      2000 to 2099, `YYYY` is rejected; set `spark.sql.session.timeZone`.
+    - **Booleans**: `try_cast(x AS BOOLEAN)` handles yes/no/y/n/t/f/1/0.
+    - **Missing values**: normalize markers to NULL once; NULL
+      comparisons are NULL (use `isNull`, `eqNullSafe`, `<=>`); beware
+      `NOT IN` with NULLs; `concat_ws` skips NULLs; NaN is a value
+      (`isnan`, `nanvl`).
+    - **Mapping tables** joined with `F.broadcast` and a left join beat
+      long `CASE WHEN` chains, and show you unmapped values.
+
+    Next: **Files as Files: binaryFile, Globs and Metadata**, where you
+    step back from values to the files themselves: listing, filtering
+    and identifying them before any parsing.

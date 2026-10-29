@@ -1,0 +1,161 @@
+ticket_id,text,label
+T0001,"Hey there, standard shipping is taking forever Order 1956. Please help.",shipping
+T0002,"Hey there, the parcel is stuck in transit Thanks.",shipping
+T0003,"Hello team, the parcel is stuck in transit Order 1722. Cheers",shipping
+T0004,"Hi, the parcel is stuck in transit. can I change the delivery address. Thank you!",shipping
+T0005,"To whom it may concern, my package has not arrived! Thanks.",shipping
+T0006,"it still says not shipped delivery is late. Regards, a customer",shipping
+T0007,"Hey there, when will my order be delivered! Thanks.",shipping
+T0008,"Good morning, the courier left no note? the parcel is stuck in transit!",shipping
+T0009,"Hi, can I change the delivery address. Order 1988. Thank you!",shipping
+T0010,"Hi, when will my order be delivered? my package has not arrived!",shipping
+T0011,"Hi, how long does shipping take where is my order! Cheers",shipping
+T0012,my package has not arrived! it still says not shipped. Order 1680.,shipping
+T0013,"Hello, the parcel is stuck in transit. it still says not shipped Order 1511. Thanks.",shipping
+T0014,"Hey there, where is my order. my package has not arrived Order 1169. Please help.",shipping
+T0015,"Hi, it still says not shipped. Cheers",shipping
+T0016,"Hi, standard shipping is taking forever can I change the delivery address Please help.",shipping
+T0017,"Hello team, standard shipping is taking forever! Order 1724. Please help.",shipping
+T0018,"Hello team, can I change the delivery address. the courier left no note Order 1822. Regards, a customer",shipping
+T0019,"Hello, the tracking number does not work Order 1417. Thank you!",shipping
+T0020,"Hello, do you offer express shipping to the US? it still says not shipped Order 1252. Regards, a customer",shipping
+T0021,"Hello, the courier left no note how long does shipping take. Order 1708. Regards, a customer",shipping
+T0022,can I change the delivery address? where is my order! Order 1869. Cheers,shipping
+T0023,"Good morning, how long does shipping take? the parcel is stuck in transit! Order 1288. Please help.",shipping
+T0024,the parcel is stuck in transit? Please help.,shipping
+T0025,"Hello team, standard shipping is taking forever?",shipping
+T0026,"Hello, it still says not shipped Order 1149.",shipping
+T0027,"Hey there, the tracking number does not work? Regards, a customer",shipping
+T0028,"Hello, the courier left no note? Order 1740. Regards, a customer",shipping
+T0029,"Hi, standard shipping is taking forever! it still says not shipped. Regards, a customer",shipping
+T0030,"Hello, do you offer express shipping to Canada! Order 1822.",shipping
+T0031,"Hey there, how long does shipping take. the courier left no note! Order 1294. Cheers",shipping
+T0032,"Hey there, standard shipping is taking forever. when will my order be delivered! Order 1936. Thank you!",shipping
+T0033,"the tracking number does not work! where is my order. Order 1502. Regards, a customer",shipping
+T0034,"Good morning, how long does shipping take? standard shipping is taking forever. Order 1476. Thanks.",shipping
+T0035,"Hello, where is my order! Thank you!",shipping
+T0036,"Good morning, where is my order! how long does shipping take",shipping
+T0037,"Hi, the tracking number does not work? my package has not arrived Order 1100. Cheers",shipping
+T0038,"Good morning, where is my order! the courier left no note! Order 1935. Cheers",shipping
+T0039,"Hey there, delivery is late! Order 1066. Thank you!",shipping
+T0040,"Hey there, the parcel is stuck in transit. my package has not arrived! Order 1430. Please help.",shipping
+T0041,"Good morning, wrong size, please take it back I would like an exchange for a bigger size? Order 1772. Thank you!",returns
+T0042,"To whom it may concern, how do I get a refund. I would like an exchange for a bigger size Order 1007. Thank you!",returns
+T0043,"Good morning, refund has not arrived. please refund the original payment? Please help.",returns
+T0044,"Hello team, I want to return this? I would like an exchange for a bigger size? Order 1131. Thanks.",returns
+T0045,"Hello team, I would like an exchange for a bigger size how do I get a refund! Order 1665. Regards, a customer",returns
+T0046,"Hello, return label is missing? I changed my mind about this purchase Order 1191. Please help.",returns
+T0047,"Hello team, I want to return this. Order 1156. Regards, a customer",returns
+T0048,"To whom it may concern, return label is missing. please refund the original payment Order 1798.",returns
+T0049,"Hello, I want to return this. Order 1563. Please help.",returns
+T0050,"Hey there, how many days do I have to return items! Order 1365. Cheers",returns
+T0051,"Hello team, I changed my mind about this purchase. Order 1981.",returns
+T0052,"To whom it may concern, how do I get a refund! Order 1514. Please help.",returns
+T0053,"Good morning, wrong size, please take it back I want to return this Cheers",returns
+T0054,"To whom it may concern, I would like an exchange for a bigger size!",returns
+T0055,"Hey there, I changed my mind about this purchase Order 1056. Cheers",returns
+T0056,"Hello team, please refund the original payment Regards, a customer",returns
+T0057,"Hey there, I would like an exchange for a bigger size? can I send it back. Thanks.",returns
+T0058,"Hello, how do I get a refund? Order 1643.",returns
+T0059,"Hello team, how many days do I have to return items. Cheers",returns
+T0060,"Hey there, I changed my mind about this purchase. I would like an exchange for a bigger size. Thanks.",returns
+T0061,"Hey there, return label is missing! I changed my mind about this purchase? Order 1114. Thanks.",returns
+T0062,"Hello team, how many days do I have to return items! please refund the original payment! Order 1880. Regards, a customer",returns
+T0063,"Hello, I want my money back. Order 1588. Regards, a customer",returns
+T0064,"Hello, refund has not arrived! please refund the original payment? Cheers",returns
+T0065,"Hello, the box is still unopened. Cheers",returns
+T0066,"Hey there, how many days do I have to return items please refund the original payment! Thank you!",returns
+T0067,the box is still unopened? return label is missing Order 1985.,returns
+T0068,"To whom it may concern, can I send it back. Order 1846. Regards, a customer",returns
+T0069,"Hello, I changed my mind about this purchase the box is still unopened! Order 1651. Regards, a customer",returns
+T0070,"Hello, can I send it back",returns
+T0071,"Hello team, how many days do I have to return items! Order 1786. Please help.",returns
+T0072,"Hey there, return label is missing? Thank you!",returns
+T0073,"Hi, return label is missing. Please help.",returns
+T0074,"Good morning, refund has not arrived! how many days do I have to return items? Thank you!",returns
+T0075,"Hi, return label is missing? wrong size, please take it back Please help.",returns
+T0076,"To whom it may concern, I would like an exchange for a bigger size. Order 1116. Regards, a customer",returns
+T0077,"To whom it may concern, the box is still unopened? can I send it back? Thank you!",returns
+T0078,"To whom it may concern, I want my money back Cheers",returns
+T0079,"Hi, I would like an exchange for a bigger size! Thanks.",returns
+T0080,"Hello team, wrong size, please take it back! Regards, a customer",returns
+T0081,"Hi, it stopped working after a week? the electronics are damaged. Order 1395. Thank you!",warranty
+T0082,"Hi, the item arrived broken.",warranty
+T0083,"To whom it may concern, the charger is faulty one year warranty claim. Order 1137. Thank you!",warranty
+T0084,"Hello team, the battery does not charge! one year warranty claim! Order 1134.",warranty
+T0085,"To whom it may concern, it stopped working after a week the electronics are damaged Regards, a customer",warranty
+T0086,"Good morning, the electronics are damaged? Please help.",warranty
+T0087,"Good morning, the charger is faulty! the screen is cracked Order 1778.",warranty
+T0088,"To whom it may concern, the battery does not charge?",warranty
+T0089,"Good morning, the charger is faulty? Order 1166. Please help.",warranty
+T0090,"Hey there, the battery does not charge. is this covered by the warranty. Order 1315. Cheers",warranty
+T0091,"Hey there, one year warranty claim it is defective! Order 1466. Thank you!",warranty
+T0092,the item arrived broken! Order 1133. Thank you!,warranty
+T0093,"Hi, is this covered by the warranty! the device keeps turning off. Order 1806. Regards, a customer",warranty
+T0094,"Hello, the electronics are damaged the screen is cracked Order 1127. Please help.",warranty
+T0095,"Good morning, it stopped working after a week the charger is faulty. Order 1932. Thanks.",warranty
+T0096,one year warranty claim? the electronics are damaged. Order 1756. Please help.,warranty
+T0097,"Hello team, it stopped working after a week? is this covered by the warranty? Order 1780. Thanks.",warranty
+T0098,"Hey there, it is defective? Cheers",warranty
+T0099,"Hey there, the electronics are damaged! the charger is faulty! Thank you!",warranty
+T0100,"Hey there, it is defective Thanks.",warranty
+T0101,"To whom it may concern, it stopped working after a week Thanks.",warranty
+T0102,"Hello, is this covered by the warranty! the electronics are damaged. Order 1989. Thanks.",warranty
+T0103,"Hello, the battery does not charge. one year warranty claim! Order 1303. Thanks.",warranty
+T0104,"Hello team, the item arrived broken? the charger is faulty? Order 1575. Cheers",warranty
+T0105,"Hey there, the screen is cracked! Cheers",warranty
+T0106,"Hello, it is defective. one year warranty claim Order 1846. Regards, a customer",warranty
+T0107,"Hello team, the battery does not charge. Thank you!",warranty
+T0108,"Hello, the electronics are damaged? Thank you!",warranty
+T0109,"Hi, can you repair it. the electronics are damaged Please help.",warranty
+T0110,"Hello team, the device keeps turning off Order 1267. Regards, a customer",warranty
+T0111,"Good morning, is this covered by the warranty. Order 1651. Thank you!",warranty
+T0112,"Hey there, the battery does not charge. the screen is cracked Order 1472. Cheers",warranty
+T0113,"To whom it may concern, the battery does not charge! the charger is faulty! Order 1743. Thank you!",warranty
+T0114,"Good morning, the screen is cracked. the device keeps turning off. Regards, a customer",warranty
+T0115,"Hello team, one year warranty claim! can you repair it! Order 1050. Regards, a customer",warranty
+T0116,"Good morning, batteries died after two months it is defective? Order 1700. Cheers",warranty
+T0117,"Hi, is this covered by the warranty! it stopped working after a week! Please help.",warranty
+T0118,"Hey there, the electronics are damaged. the battery does not charge Order 1979. Please help.",warranty
+T0119,"Hello team, it stopped working after a week. the device keeps turning off Thank you!",warranty
+T0120,"Hi, it stopped working after a week Please help.",warranty
+T0121,I want a copy of my account data. close my account and erase my data Order 1525. Thanks.,privacy
+T0122,"Good morning, stop sending me promotions! Order 1996. Regards, a customer",privacy
+T0123,"Hi, how long do you keep my order history! unsubscribe me from marketing emails! Order 1239. Please help.",privacy
+T0124,update my privacy settings? Order 1103. Thanks.,privacy
+T0125,"Hello team, update my privacy settings. I did not consent to marketing! Order 1761. Cheers",privacy
+T0126,"Hey there, stop sending me promotions. Order 1841. Cheers",privacy
+T0127,"To whom it may concern, stop sending me promotions? what personal information do you store? Order 1438. Thanks.",privacy
+T0128,please delete my data! Order 1949.,privacy
+T0129,"Hi, update my privacy settings Order 1627. Regards, a customer",privacy
+T0130,"Hello, what personal information do you store? Order 1066. Thanks.",privacy
+T0131,"Hello, what personal information do you store! Cheers",privacy
+T0132,"Hello team, close my account and erase my data. gdpr request for deletion?",privacy
+T0133,remove my email address! Order 1442. Thank you!,privacy
+T0134,"Hey there, stop sending me promotions what personal information do you store? Order 1034. Cheers",privacy
+T0135,"To whom it may concern, how long do you keep my order history?",privacy
+T0136,"To whom it may concern, please delete my data. Order 1745. Thank you!",privacy
+T0137,"To whom it may concern, I did not consent to marketing? update my privacy settings? Please help.",privacy
+T0138,"Hey there, what personal information do you store! update my privacy settings",privacy
+T0139,"Hi, close my account and erase my data. what personal information do you store? Regards, a customer",privacy
+T0140,"Hello team, how long do you keep my order history? Please help.",privacy
+T0141,"Hey there, I want a copy of my account data. what personal information do you store. Order 1251. Cheers",privacy
+T0142,"Hello team, close my account and erase my data. stop sending me promotions? Order 1239. Regards, a customer",privacy
+T0143,"To whom it may concern, how long do you keep my order history. remove my email address! Please help.",privacy
+T0144,"Hi, how long do you keep my order history! gdpr request for deletion? Thank you!",privacy
+T0145,"Good morning, I want a copy of my account data. close my account and erase my data! Order 1437. Cheers",privacy
+T0146,please delete my data. Order 1040. Please help.,privacy
+T0147,"Hey there, update my privacy settings! stop sending me promotions?",privacy
+T0148,"Hello team, unsubscribe me from marketing emails? update my privacy settings? Order 1535. Cheers",privacy
+T0149,unsubscribe me from marketing emails. stop sending me promotions? Order 1870. Thank you!,privacy
+T0150,"Hey there, who do you share my information with? Regards, a customer",privacy
+T0151,"Hi, I did not consent to marketing. I want a copy of my account data! Order 1379. Thanks.",privacy
+T0152,"Hello team, please delete my data. Order 1898. Thank you!",privacy
+T0153,"Good morning, close my account and erase my data. I want a copy of my account data! Order 1861. Thanks.",privacy
+T0154,"Hi, how long do you keep my order history I did not consent to marketing. Order 1899. Thank you!",privacy
+T0155,"Hi, how long do you keep my order history. gdpr request for deletion? Order 1030. Please help.",privacy
+T0156,I want a copy of my account data? close my account and erase my data Order 1633. Thank you!,privacy
+T0157,"To whom it may concern, remove my email address? update my privacy settings?",privacy
+T0158,"Good morning, I did not consent to marketing Order 1746.",privacy
+T0159,"Good morning, unsubscribe me from marketing emails Order 1295. Cheers",privacy
+T0160,"Hey there, who do you share my information with. Regards, a customer",privacy

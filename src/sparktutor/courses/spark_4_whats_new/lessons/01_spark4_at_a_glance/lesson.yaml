@@ -301,9 +301,12 @@
     UDF out with `@udf(returnType, useArrow=False)`.
 
     Related 4.2 changes from the PySpark migration guide: the minimum
-    PyArrow is now 18.0.0, PyPy is no longer supported, and a pandas UDF
-    that receives a nullable integer column with nulls now sees a pandas
-    nullable dtype (`Int64`) instead of `float64`.
+    PyArrow is now 18.0.0 and PyPy is no longer supported. The guide also
+    says a pandas UDF that receives a nullable integer column with nulls
+    now sees a pandas nullable dtype (`Int64`) instead of `float64`; on
+    4.2.0 that only happens after
+    `spark.conf.set("spark.sql.execution.pythonUDF.pandas.preferIntExtensionDtype", "true")`
+    (SPARK-55788, default `false`), so by default you still get `float64`.
 
     4.1 added `@arrow_udf` and `@arrow_udtf` (SPARK-52214, SPARK-52979),
     which hand your function `pyarrow` arrays directly with no pandas

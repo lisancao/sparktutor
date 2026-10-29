@@ -1,0 +1,875 @@
+- Class: meta
+  Lesson: "Observability: Listeners, Metrics and Profiling Executors"
+  EstimatedMinutes: 80
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    You have met pieces of Spark's telemetry already: the Spark UI in
+    "Plans, Partitions and Caching", `observe` and quality metrics in
+    "Production Ingestion: Quality Rules, Quarantine and Pipelines",
+    `python_worker_logs()` in "Packaging, Registration, Testing and
+    Debugging", and the UDF profiler's basics in "Tuning Python on
+    Spark" (all earlier levels). "Shipping Python Dependencies to a
+    Cluster" ended with Python running on executors you cannot see.
+    This lesson is about seeing them, after the fact and from code,
+    without clicking through a UI.
+
+    By the end you will be able to:
+
+    - Trace any number in the Spark UI back to its source: the listener
+      bus, task metrics, SQL metrics (accumulators) or the metrics
+      system, with the 4.2.0 classes that produce each one
+    - Write Python listeners for streaming queries in Classic and
+      Connect, and a Py4J listener for batch queries in Classic, and know
+      where each one runs
+    - Read the 4.x event log (rolling, zstd) with Spark itself, tame its
+      messy JSON (spaces, dotted keys, mixed types, re-planned queries)
+      and attribute Python time to a plan node
+    - Query the REST API of a live application and of the History
+      Server, including task quantiles for skew
+    - Expose metrics as JSON and Prometheus, and know what the metric
+      names contain
+    - Profile Python UDFs and, new in 4.2, Python data sources, and read
+      the profiles critically (the profiler can be most of what you
+      measure)
+    - Sample executors with `py-spy`, and turn on structured JSON logs
+      for the JVM and for Python and query them with Spark
+
+    The exercise is a messy-data problem: diagnose a job from nothing
+    but its event log, and prove your numbers against the REST API.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Where the Numbers Come From
+
+    Almost every number you see about a Spark application starts as an
+    event on one bus:
+
+    ```text
+    DAGScheduler, TaskSetManager, SQLExecution, StreamExecution ...
+                    |  post(event)
+                    v
+    LiveListenerBus (core/.../scheduler/LiveListenerBus.scala)
+      queues: appStatus | executorManagement | eventLog | shared | streams
+        |                    |                   |            |
+        v                    v                   v            v
+    AppStatusListener   ExecutorAllocation   EventLogging   your SparkListeners,
+    SQLAppStatusListener  Manager            Listener       ExecutionListenerBus
+        |                                       |
+        v                                       v
+    status store -> Spark UI, REST /api/v1   eventlog_v2_<appId>/events_*.zstd
+                                              -> History Server (same REST API)
+
+    MetricsSystem (core/.../metrics/MetricsSystem.scala), separate:
+      sources (JVM, BlockManager, DAGScheduler, executor ...) -> sinks
+      (MetricsServlet /metrics/json, PrometheusServlet, CSV, JMX, Graphite,
+       StatsD, Slf4j, Console)
+    ```
+
+    Two kinds of per-task numbers ride on those events:
+
+    - **Task metrics**: `Executor Run Time`, `JVM GC Time`, spill, shuffle
+      read and write, input and output. Fixed fields, produced by the
+      executor for every task.
+    - **SQL metrics**: one `SQLMetric` accumulator per plan-node metric
+      (`number of output rows`, `peak memory`, and, for Python nodes, the
+      ones in `PythonSQLMetrics.scala`: `data sent to Python workers`,
+      `time to start Python workers`, `time to initialize Python
+      workers`, `time to run Python workers`, `time to execute Python
+      code`, ...). Their per-task updates travel in the task's
+      accumulables.
+
+    Each queue is bounded by `spark.scheduler.listenerbus.eventqueue.capacity`
+    (default 10000). A slow listener does not slow the job; its queue
+    fills and events are **dropped** (`AsyncEventQueue` counts them and
+    logs a warning). Keep listener callbacks fast, and never treat a
+    listener as a source of truth for billing or correctness.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Streaming Listeners in Python
+
+    `StreamingQueryListener` (3.4; `onQueryIdle` added in 3.5) is the one
+    listener with a Python API. Here it collects every event of a query
+    over the drifting JSON events, with an `observe` that counts rows
+    and missing `user` values per batch:
+
+    ```python
+    class Collector(StreamingQueryListener):
+        def __init__(self):
+            self.events = []
+        def onQueryStarted(self, e):
+            self.events.append(("started", e.id, e.runId, e.name))
+        def onQueryProgress(self, e):
+            p = e.progress
+            self.events.append(("progress", p.batchId, p.numInputRows, p.durationMs,
+                                p.observedMetrics, p.sources[0].description, p.sink.description))
+        def onQueryIdle(self, e):
+            self.events.append(("idle",))
+        def onQueryTerminated(self, e):
+            self.events.append(("terminated", e.exception))
+
+    c = Collector()
+    spark.streams.addListener(c)
+    schema = spark.read.json("data/messy/events").schema
+    q = (spark.readStream.schema(schema).option("maxFilesPerTrigger", 1).json("data/messy/events")
+         .observe("quality", F.count(F.lit(1)).alias("rows"),
+                  F.sum(F.col("user").isNull().cast("int")).alias("null_users"))
+         .writeStream.format("noop").option("checkpointLocation", ck)
+         .trigger(availableNow=True).queryName("events_q").start())
+    q.awaitTermination()
+    # then poll: listener events arrive asynchronously, wait for "terminated"
+    ```
+
+    ```text
+    ('started', UUID('2e6e5728-...'), UUID('ca3ed2b2-...'), 'events_q')
+    ('progress', 0, 21, {'triggerExecution': 318, 'queryPlanning': 49, 'getBatch': 17, 'commitOffsets': 20,
+      'latestOffset': 22, 'addBatch': 179, 'walCommit': 24}, {'quality': Row(rows=21, null_users=1)},
+      'FileStreamSource[file:.../data/messy/events]', 'NoopTable')
+    ('progress', 1, 20, {...}, {'quality': Row(rows=20, null_users=20)}, ...)
+    ('progress', 2, 20, {...}, {'quality': Row(rows=20, null_users=0)}, ...)
+    ('terminated', None)
+    ```
+
+    Batch 1 is the drifted file where `user` was renamed: 20 of 20 rows
+    have no `user`. That is the observability payoff of `observe` in a
+    stream: the drift shows up in a metric before anyone looks at the
+    data. `durationMs` splits a trigger into phases (`addBatch` is your
+    sink's work, `walCommit` and `commitOffsets` the checkpoint writes).
+    `onQueryIdle` did not fire: an `availableNow` query stops instead of
+    idling.
+
+    Details that bite:
+
+    - Since 4.0 `StreamingQueryProgress` is a `dict` subclass, but
+      `json.dumps(q.lastProgress)` fails with `TypeError: Object of type
+      UUID is not JSON serializable`. Use `q.lastProgress.json` (or
+      `.prettyJson`).
+    - **Where the callbacks run.** In Classic they run in your driver
+      Python, called from the JVM through the Py4J callback server. On
+      Spark Connect in 4.2 they run in the **client** too: the client
+      keeps a `StreamingQueryListenerBus`
+      (`pyspark/sql/connect/streaming/query.py`) and the server streams
+      events to it. We checked: every callback reported the client's
+      PID. (Spark 3.5 ran Connect listeners on the server; older
+      articles say so.)
+    - On Connect, remove listeners before `spark.stop()`. Otherwise the
+      stop prints `Failed to remove the listener because of exception:
+      [NO_ACTIVE_SESSION]`.
+
+- Class: mult_question
+  Depth: all
+  Output: "On Spark Connect in 4.2, where does the code of a Python StreamingQueryListener run?"
+  AnswerChoices: "In the client process, fed by a server-side listener bus;In a Python worker on the server;On the executors that run the micro-batch;Nowhere, Connect has no listener API"
+  CorrectAnswer: "In the client process, fed by a server-side listener bus"
+  Hint: "Look for StreamingQueryListenerBus in pyspark/sql/connect/streaming/query.py."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Batch Listeners: Java, or Py4J in Classic
+
+    There is no Python API for `SparkListener` or
+    `QueryExecutionListener`. The supported routes are Java (or Scala)
+    classes named in `spark.extraListeners` (1.3, for `SparkListener`)
+    or `spark.sql.queryExecutionListeners` (2.3, a static SQL config for
+    `org.apache.spark.sql.util.QueryExecutionListener`), on the
+    classpath at startup. "Catalyst Extensions: Rules and Native
+    Functions" shows how to compile and load such classes from a
+    SparkTutor exercise.
+
+    In Classic you can also implement the Java interface in Python and
+    let Py4J call it back, which is handy for one-off debugging. A
+    `QueryExecutionListener` has two methods, and sees the
+    `QueryExecution` of every action:
+
+    ```python
+    class QEL:
+        def __init__(self): self.seen = []
+        def onSuccess(self, funcName, qe, durationNs):
+            self.seen.append((funcName, durationNs // 1_000_000, qe.executedPlan().nodeName()))
+        def onFailure(self, funcName, qe, exc):
+            self.seen.append((funcName, "FAILED", str(exc.getMessage())[:80]))
+        class Java:
+            implements = ["org.apache.spark.sql.util.QueryExecutionListener"]
+
+    from pyspark.java_gateway import ensure_callback_server_started
+    ensure_callback_server_started(spark.sparkContext._gateway)
+    l = QEL()
+    spark._jsparkSession.listenerManager().register(l)
+    spark.range(100).groupBy((F.col("id") % 3).alias("k")).count().collect()
+    try:
+        spark.sql("select 1/0").collect()
+    except Exception:
+        pass
+    # poll l.seen: the ExecutionListenerBus delivers asynchronously
+    ```
+
+    ```text
+    listener saw: [('collectToPython', 335, 'AdaptiveSparkPlan'),
+      ('collectToPython', 'FAILED', '[DIVIDE_BY_ZERO] Division by zero. Use `try_divide` to tolerate divisor being 0 ')]
+    ```
+
+    `qe` is the live JVM `QueryExecution`, so `qe.executedPlan()` and its
+    metrics are there to read. The callback runs on a listener thread
+    that waits for Python, so keep it tiny. This needs Py4J and therefore
+    does not exist on Connect.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Your Own Counters
+
+    - **Accumulators** (`sc.accumulator`) are Classic only: on Connect
+      `spark.sparkContext` fails with `JVM_ATTRIBUTE_NOT_SUPPORTED`. Their
+      updates from transformations can be applied more than once when a
+      task or stage is retried ("Determinism, Retries and Fault
+      Injection").
+    - **`observe`** works in both modes and in streams, as above and in
+      "Production Ingestion: Quality Rules, Quarantine and Pipelines".
+    - **Python data sources** have no custom-metric API in 4.2.0
+      (`pyspark/sql/datasource.py` defines none). A Java DSv2 connector
+      can declare `CustomMetric`s and report them per task, which show
+      up in the scan node in the UI ("A DSv2 Connector in Java").
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Event Log
+
+    `EventLoggingListener` writes every event to storage as one JSON
+    object per line (`core/.../util/JsonProtocol.scala` defines the
+    format). The settings that matter in 4.2.0:
+
+    | Config | Default | Since |
+    |---|---|---|
+    | `spark.eventLog.enabled` | `false` | 1.0 |
+    | `spark.eventLog.dir` | `/tmp/spark-events` | 1.0 |
+    | `spark.eventLog.rolling.enabled` | `true` (since 4.0) | 3.0 |
+    | `spark.eventLog.rolling.maxFileSize` | `128m` | 3.0 |
+    | `spark.eventLog.compress` | `true` (since 4.0) | 1.0 |
+    | `spark.eventLog.compression.codec` | `zstd` | 3.0 |
+    | `spark.eventLog.logStageExecutorMetrics` | `false` | 3.0 |
+
+    The two 4.0 changes are in `docs/core-migration-guide.md`. Together
+    they mean that a 4.x log is not a file but a folder
+    (`RollingEventLogFilesWriter`, `EventLogFileWriters.scala`):
+
+    ```text
+    while running:
+      <logdir>/eventlog_v2_local-1793220246135
+        ['.appstatus_local-1793220246135.inprogress.crc', 'events_1_local-1793220246135.zstd',
+         'appstatus_local-1793220246135.inprogress']
+    after spark.stop():
+      <logdir>/eventlog_v2_local-1793220246135
+        ['appstatus_local-1793220246135', '.appstatus_local-1793220246135.crc',
+         'events_1_local-1793220246135.zstd']
+    ```
+
+    `events_<n>_<appId>.zstd` are the events; a new numbered file starts
+    when one reaches `maxFileSize`. `appstatus_*` is an empty marker whose
+    `.inprogress` suffix disappears when the application ends cleanly;
+    an application that never stopped cleanly keeps it.
+
+    Spark reads the events directly, zstd and all: since 4.1 file
+    sources decompress `.zstd` and `.zst` files (SPARK-52482,
+    `core/.../io/HadoopCodecStreams.scala`).
+
+    ```python
+    events = spark.read.json(log_dir + "/eventlog_v2_*/events_*")
+    print(len(events.columns), "top-level columns")
+    events.groupBy("Event").count().orderBy(F.desc("count")).show(40, truncate=False)
+    ```
+
+    ```text
+    49 top-level columns
+    +-------------------------------------------------------------------------+-----+
+    |Event                                                                    |count|
+    +-------------------------------------------------------------------------+-----+
+    |SparkListenerTaskStart                                                   |3    |
+    |org.apache.spark.sql.execution.ui.SparkListenerSQLAdaptiveExecutionUpdate|3    |
+    |SparkListenerTaskEnd                                                     |3    |
+    |SparkListenerJobStart                                                    |2    |
+    |SparkListenerStageCompleted                                              |2    |
+    |SparkListenerJobEnd                                                      |2    |
+    |org.apache.spark.sql.execution.ui.SparkListenerDriverAccumUpdates        |2    |
+    |SparkListenerStageSubmitted                                              |2    |
+    |org.apache.spark.sql.execution.ui.SparkListenerSQLExecutionEnd           |1    |
+    |SparkListenerBlockManagerAdded                                           |1    |
+    |SparkListenerResourceProfileAdded                                        |1    |
+    |SparkListenerApplicationEnd                                              |1    |
+    |SparkListenerLogStart                                                    |1    |
+    |SparkListenerExecutorAdded                                               |1    |
+    |org.apache.spark.sql.execution.ui.SparkListenerSQLExecutionStart         |1    |
+    |SparkListenerEnvironmentUpdate                                           |1    |
+    |SparkListenerApplicationStart                                            |1    |
+    +-------------------------------------------------------------------------+-----+
+    ```
+
+    (One small application with a Python UDF and AQE on.) Schema
+    inference merges every event type into 49 sparse columns: this is
+    "JSON Drift and Quarantine" all over again, with Spark as the
+    producer.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    The event logs of one application are under `/tmp/logs` (the
+    default rolling layout). Read all of its events into a DataFrame
+    called `events`.
+  CorrectAnswer: |
+    events = spark.read.json("/tmp/logs/eventlog_v2_*/events_*")
+  Hint: "Glob the eventlog_v2_* folder and the events_* files inside it; Spark decompresses .zstd itself."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Messy Parts of a Task End Event
+
+    A trimmed `SparkListenerTaskEnd` (the real one has more metrics):
+
+    ```text
+    {"Event": "SparkListenerTaskEnd", "Stage ID": 0, "Stage Attempt ID": 0,
+     "Task Type": "ShuffleMapTask", "Task End Reason": {"Reason": "Success"},
+     "Task Info": {"Task ID": 1, "Index": 1, "Attempt": 0, "Partition ID": 1,
+                   "Launch Time": 1793220253639, "Finish Time": 1793220255004,
+                   "Executor ID": "driver", "Failed": false, "Killed": false,
+                   "Accumulables": [
+                     {"ID": ..., "Name": "time to execute Python code", "Update": "235", "Value": "235"},
+                     {"ID": ..., "Name": "internal.metrics.executorRunTime", "Update": 1277, "Value": 1277}, ...]},
+     "Task Metrics": {"Executor Run Time": 1277, "JVM GC Time": 17,
+                      "Memory Bytes Spilled": 0, "Disk Bytes Spilled": 0,
+                      "Shuffle Read Metrics": {"Local Bytes Read": 0, "Total Records Read": 0, ...},
+                      "Shuffle Write Metrics": {"Shuffle Bytes Written": 201, ...},
+                      "Input Metrics": {"Bytes Read": 0, "Records Read": 100000}, ...}}
+    ```
+
+    Four kinds of mess:
+
+    1. **Spaces in names**: every field needs backticks,
+       `` F.col("`Task Metrics`.`Executor Run Time`") ``.
+    2. **Dots in names**: job properties land as a struct with fields
+       like `spark.job.description`, so
+       ``F.col("Properties.`spark.job.description`")``. Without the
+       backticks Spark looks for a field `spark` and fails.
+    3. **Mixed types**: SQL metric updates are JSON *strings* (`"235"`),
+       internal task metrics are numbers (`1277`). Inference widens
+       `Update` to `string` for all of them. Cast before you sum.
+    4. **Plans that change**: with AQE the plan in
+       `SQLExecutionStart` is replaced by
+       `SQLAdaptiveExecutionUpdate` events, and the new plan nodes carry
+       new accumulator ids. Join task updates to plans by accumulator
+       id across *all* plan versions, or you find nothing (our first
+       attempt, using only the start event, returned an empty table).
+
+    Put together, this attributes every SQL metric to the plan node
+    that owns it, which the task metrics cannot do:
+
+    ```python
+    plans = (events.where(F.col("sparkPlanInfo").isNotNull())
+             .select("Event", F.to_json("sparkPlanInfo").alias("plan")).collect())
+    metric_owner = {}
+    def walk(node):
+        for m in node.get("metrics") or []:
+            metric_owner[m["accumulatorId"]] = (node["nodeName"], m["name"])
+        for child in node.get("children") or []:
+            walk(child)
+    for p in plans:
+        walk(json.loads(p["plan"]))
+    owners = spark.createDataFrame(
+        [(k, v[0], v[1]) for k, v in metric_owner.items()], "id long, node string, metric string")
+
+    updates = (events.where(F.col("Event") == "SparkListenerTaskEnd")
+               .select(F.explode("`Task Info`.Accumulables").alias("a"))
+               .select(F.col("a.ID").alias("id"), F.col("a.Update").cast("long").alias("update")))
+    (updates.join(owners, "id").groupBy("node", "metric").agg(F.sum("update").alias("total"))
+     .where(F.col("node").contains("Python")).orderBy("metric").show(truncate=False))
+    ```
+
+    ```text
+    +---------------+---------------------------------+-------+
+    |node           |metric                           |total  |
+    +---------------+---------------------------------+-------+
+    |ArrowEvalPython|data returned from Python workers|1602880|
+    |ArrowEvalPython|data sent to Python workers      |1628000|
+    |ArrowEvalPython|number of output rows            |200000 |
+    |ArrowEvalPython|time to execute Python code      |491    |
+    |ArrowEvalPython|time to initialize Python workers|437    |
+    |ArrowEvalPython|time to run Python workers       |2219   |
+    |ArrowEvalPython|time to start Python workers     |1289   |
+    +---------------+---------------------------------+-------+
+    ```
+
+    For this small UDF (`x * 2` over 200,000 rows) the workers spent
+    491 ms in your code and more than 1.7 s starting and initializing.
+    The plan is a tree of unknown depth, so it is walked in Python on
+    the driver; it is one row per plan version, not data.
+
+- Class: mult_question
+  Depth: all
+  Output: "You sum the Update of the accumulables named 'time to execute Python code' straight from spark.read.json of an event log and get an error about types. Why?"
+  AnswerChoices: "SQL metric updates are written as JSON strings, so Update is inferred as string and must be cast;The event log stores times in nanoseconds;Accumulables are only present in TaskStart events;zstd files must be decompressed first"
+  CorrectAnswer: "SQL metric updates are written as JSON strings, so Update is inferred as string and must be cast"
+  Hint: "Compare \"235\" with 1277 in the same Accumulables array."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The REST API, Live and After the Fact
+
+    The UI's data is a REST API at `<ui>/api/v1`
+    (`core/.../status/api/v1/`). The port starts at 4040 and moves up
+    when it is taken ("Service 'SparkUI' could not bind on port 4040.
+    Attempting port 4041."), so build the URL from
+    `spark.sparkContext.uiWebUrl` instead of hard-coding it:
+
+    ```python
+    base = f"{sc.uiWebUrl}/api/v1/applications/{sc.applicationId}"
+    get = lambda p: json.load(urllib.request.urlopen(base + p))
+    print("jobs:", [(j["jobId"], j["status"], j["numTasks"]) for j in get("/jobs")])
+    st = get("/stages")
+    print("stages:", [(s["stageId"], s["status"], s["numTasks"], s["shuffleReadRecords"]) for s in st])
+    ts = get(f"/stages/{sid}/0/taskSummary?quantiles=0.0,0.5,1.0")
+    print("records read quantiles:", ts["shuffleReadMetrics"]["readRecords"])
+    print("executorRunTime quantiles:", ts["executorRunTime"])
+    print("sql:", [(q["id"], q["status"], len(q.get("nodes", []))) for q in get("/sql")])
+    ```
+
+    ```text
+    jobs: [(0, 'SUCCEEDED', 6)]
+    stages: [(1, 'COMPLETE', 4, 60000), (0, 'COMPLETE', 2, 0)]
+    records read quantiles: [0.0, 2572.0, 56571.0]
+    executorRunTime quantiles: [10.0, 65.0, 85.0]
+    sql: [(0, 'COMPLETED', 7)]
+    ```
+
+    `taskSummary` is the skew detector: the median task of stage 1
+    read 2,572 records and the largest 56,571 (90% of the rows had the
+    same key). Notice that run time hardly shows it here (85 ms against
+    65 ms), because counting is cheap; record counts are the stable
+    signal, time is the expensive one. The stage objects also carry
+    `executorRunTime`, `memoryBytesSpilled`, `diskBytesSpilled`,
+    `inputRecords`, `shuffleReadRecords`, `peakExecutionMemory` and
+    more, summed over tasks.
+
+    The API dies with the application. The **History Server** replays
+    event logs into the same API. From a pip install (`SPARK_HOME` is
+    the `pyspark` package folder):
+
+    ```bash
+    SPARK_HOME=$SH SPARK_HISTORY_OPTS="-Dspark.history.fs.logDirectory=file:/tmp/tmpszk95_g0 -Dspark.history.ui.port=18181" \
+      $SH/bin/spark-class org.apache.spark.deploy.history.HistoryServer
+    curl -s localhost:18181/api/v1/applications
+    ```
+
+    ```text
+    [ {
+      "id" : "local-1793220246135",
+      "name" : "a1.py",
+      "attempts" : [ {
+        ...
+        "completed" : true,
+        "appSparkVersion" : "4.2.0",
+        "logSourceName" : "file:/tmp/tmpszk95_g0",
+    ```
+
+    and `/api/v1/applications/local-1793220246135/stages` returned the
+    same stages as the live API. `sbin/start-history-server.sh` is in
+    the pip package too, but `sbin/spark-daemon.sh` writes its logs to
+    `${SPARK_HOME}/logs`, inside your venv, unless you set
+    `SPARK_LOG_DIR`.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Metrics System
+
+    `MetricsSystem` is independent of the listener bus: Dropwizard
+    metrics from sources (JVM, BlockManager, DAGScheduler, executors,
+    streaming queries when `spark.sql.streaming.metricsEnabled` is
+    `true`) pushed to or pulled by sinks. Configuration comes from a
+    `metrics.properties` file (`spark.metrics.conf`, template in
+    `conf/metrics.properties.template`) or from `spark.metrics.conf.*`
+    settings. With no configuration, `MetricsConfig.setDefaultProperties`
+    adds a JSON servlet at `/metrics/json`. This session added
+    Prometheus:
+
+    ```python
+    spark = (SparkSession.builder.master("local[2]")
+             .config("spark.metrics.conf.*.sink.prometheusServlet.class",
+                     "org.apache.spark.metrics.sink.PrometheusServlet")
+             .config("spark.metrics.conf.*.sink.prometheusServlet.path", "/metrics/prometheus")
+             .getOrCreate())
+    ```
+
+    ```text
+    == /metrics/json/ 13200
+    {"version":"4.0.0","gauges":{"local-1793220343059.driver.BlockManager.disk.diskSpaceUsed_MB":{"value":0},...
+    == /metrics/prometheus/ 37839
+    metrics_local_1793220343059_driver_BlockManager_disk_diskSpaceUsed_MB_Number{type="gauges"} 0
+    metrics_local_1793220343059_driver_BlockManager_memory_maxMem_MB_Number{type="gauges"} 434
+    == /metrics/executors/prometheus/ 5424
+    spark_info{version="4.2.0", revision="32f7299601108917fb01920a54e084595b7b3bf8"} 1.0
+    metrics_executor_memoryUsed_bytes{application_id="local-1793220343059", application_name="a3.py", executor_id="driver"} 312293
+    metrics_executor_totalCores{application_id="local-1793220343059", application_name="a3.py", executor_id="driver"} 2
+    ```
+
+    Three things to read correctly. The `"version":"4.0.0"` in the JSON
+    is the Dropwizard metrics format, not Spark's version. The metric
+    names contain the application id, so every run is a new time series
+    in Prometheus; set `spark.metrics.namespace` (2.1), for example to
+    `${spark.app.name}`, to get stable names. And
+    `/metrics/executors/prometheus` comes from a different switch,
+    `spark.ui.prometheus.enabled` (an internal setting, default `true`
+    in 4.2.0), and uses labels instead of names. The other sinks
+    (`CsvSink`, `JmxSink`, `GraphiteSink`, `StatsdSink`, `Slf4jSink`,
+    `ConsoleSink`) live in `core/.../metrics/sink/`.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Profiling Python Inside Executors
+
+    "Tuning Python on Spark" introduced `spark.sql.pyspark.udf.profiler`
+    (4.0; `perf` or `memory`) and `spark.profile.show`. Here is what
+    the profile is made of, and how to keep it from fooling you. A
+    row-at-a-time UDF and a pandas UDF doing the same work over 20,000
+    strings:
+
+    ```python
+    spark.conf.set("spark.sql.pyspark.udf.profiler", "perf")
+
+    @F.udf("string")
+    def norm(s):
+        import unicodedata
+        return unicodedata.normalize("NFKC", s).strip().lower() if s else s
+
+    @F.pandas_udf("string")
+    def norm_vec(s: pd.Series) -> pd.Series:
+        return s.str.normalize("NFKC").str.strip().str.lower()
+
+    df = spark.range(20000).select(F.concat(F.lit(" Ｃity "), F.col("id").cast("string")).alias("c"))
+    q = df.select(norm("c").alias("a"), norm_vec("c").alias("b"))
+    q.explain()
+    q.write.format("noop").mode("overwrite").save()
+    ```
+
+    ```text
+    == Physical Plan ==
+    *(2) Project [pythonUDF0#6 AS a#4, pythonUDF0#7 AS b#5]
+    +- ArrowEvalPython [norm_vec(c#1)#3], [pythonUDF0#7], 200
+       +- ArrowEvalPython [norm(c#1)#2], [pythonUDF0#6], 101
+          +- *(1) Project [concat( Ｃity , cast(id#0L as string)) AS c#1]
+             +- *(1) Range (0, 20000, step=1, splits=2)
+    ```
+
+    The profile ids are the UDFs' expression ids from the plan,
+    `norm(c#1)#2` and `norm_vec(c#1)#3`; the numbers 101 and 200 are
+    the eval types (`SQL_ARROW_BATCHED_UDF`, `SQL_SCALAR_PANDAS_UDF`).
+    `spark.profile.render` (4.0) accepts a callable that receives the
+    `pstats.Stats`, which lets code read a profile:
+
+    ```python
+    def own_time(stats):
+        mine = sum(v[3] for (file, _, name), v in stats.stats.items()
+                   if file.endswith("a12.py") and name in ("norm", "norm_vec"))
+        prof = sum(v[2] for (file, _, name), v in stats.stats.items()
+                   if "_lsprof" in name or file.endswith("profiler.py"))
+        calls = sum(v[1] for (file, _, name), v in stats.stats.items()
+                    if file.endswith("a12.py") and name in ("norm", "norm_vec"))
+        return round(mine, 3), round(prof, 3), calls
+
+    print(2, spark.profile.render(2, renderer=own_time))
+    print(3, spark.profile.render(3, renderer=own_time))
+    ```
+
+    ```text
+    2 (0.04, 0.281, 20000)
+    3 (0.029, 0.0, 2)
+    ```
+
+    The row UDF was called 20,000 times and spent 0.04 s in `norm`, and
+    0.281 s inside the profiler itself. The reason is in
+    `pyspark/worker.py`: `wrap_perf_profiler` wraps **every call** of a
+    non-iterator UDF in `with WorkerPerfProfiler(...)`, which enables
+    and disables cProfile each time. In `spark.profile.show` that
+    appears as the top line `{method 'disable' of '_lsprof.Profiler'
+    objects}`. The pandas UDF was called once per batch (twice) and
+    the profiler cost nothing. So read the cumulative time of your own
+    functions, not the total, and never compare a profiled row UDF's
+    wall time with anything.
+
+    Also from the source: `spark.profile.dump(path)` writes one
+    `udf_<id>_perf.pstats` per UDF (we got `udf_2_perf.pstats` and
+    `udf_3_perf.pstats`), readable with `pstats` or snakeviz. The
+    `memory` profiler needs the `memory_profiler` package on the
+    executors; without it the worker silently returns the unwrapped
+    function, the query runs, and `show` only warns: "Install the
+    'memory_profiler' library in the cluster to enable memory
+    profiling".
+
+- Class: text
+  Depth: all
+  Output: |
+    ## New in 4.2: Profiling Python Data Sources
+
+    `spark.sql.pyspark.dataSource.profiler` (4.2.0, SPARK-55161) takes
+    the same `perf`/`memory` values for Python data sources. Before
+    4.2 the UDF profiler happened to cover data source reads, because
+    reads run as a UDF internally; the commit notes that it no longer
+    does. With a two-partition source whose `read()` calls a helper:
+
+    ```python
+    spark.dataSource.register(Nums)
+    spark.conf.set("spark.sql.pyspark.dataSource.profiler", "perf")
+    print(spark.read.format("nums").load().count())
+    ```
+
+    ```text
+    2000
+    ['Profile of create_data_source', 'Profile of plan_data_source_read', 'Profile of UDF<id=10>', 'Profile of UDF<id=11>']
+            1    0.000    0.000    0.000    0.000 a5.py:13(partitions)
+         1000    0.000    0.000    0.004    0.000 a5.py:17(slow_square)
+         1001    0.000    0.000    0.005    0.000 a5.py:14(read)
+    ```
+
+    The profile covers the **planning workers** too: `create_data_source`
+    (where `schema()` and the reader are created) and
+    `plan_data_source_read` (where `partitions()` runs), both on the
+    driver, then the read tasks. The switch is
+    `read_single_udf` in `pyspark/worker.py`: functions from modules
+    under `pyspark.sql.worker.` use the data source profiler setting,
+    everything else the UDF one. A slow `partitions()` (listing a bucket,
+    calling an API) is a planning cost you could not see before.
+
+- Class: mult_question
+  Depth: all
+  Output: "A perf profile of a row-at-a-time @udf shows {method 'disable' of '_lsprof.Profiler' objects} as the most expensive line. What does that mean?"
+  AnswerChoices: "The profiler is wrapped around every call, so its own overhead dominates, so read your function's cumulative time instead;The UDF spends most of its time disabling the garbage collector;The profile is corrupted and should be cleared;Arrow is disabled for this UDF"
+  CorrectAnswer: "The profiler is wrapped around every call, so its own overhead dominates, so read your function's cumulative time instead"
+  Hint: "Look at wrap_perf_profiler in pyspark/worker.py and count how often it runs for a non-iterator UDF."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Sampling Executors with py-spy
+
+    The profilers above only see your function. `py-spy` (a separate
+    tool, not part of PySpark; we used 0.4.2 in a scratch venv) samples
+    a whole Python process from outside, with no code changes,
+    including stuck ones. Attaching to a running worker needs ptrace
+    rights. On this Linux machine (`/proc/sys/kernel/yama/ptrace_scope`
+    is `1`), `py-spy dump --pid <worker>` from another shell failed:
+
+    ```text
+    Permission Denied: Try running again with elevated permissions by going 'sudo env "PATH=$PATH" !!'
+    ```
+
+    A process may always trace its own descendants, though, and every
+    Python worker descends from the driver in local mode. So launch the
+    driver *under* py-spy and follow subprocesses:
+
+    ```bash
+    py-spy record --subprocesses --format raw -o busy.txt -- python a8.py
+    ```
+
+    ```text
+    py-spy> Stopped sampling because process exited
+    py-spy> Wrote raw flamegraph data to 'busy.txt'. Samples: 693 Errors: 0
+    ```
+
+    Summing the raw stacks by process and by innermost frame:
+
+    ```text
+    439 process (worker.py:3612)
+    176 process 3477247:""                      (the driver)
+     78 .../bin/python -m pyspark.daemon pyspark.worker"
+
+    307 busy (a8.py:8)
+     79 busy (a8.py:7)
+     44 _compile_source (<frozen zipimport>:637)
+     42 run (py4j/clientserver.py:58)
+     36 _compile_bytecode (<frozen importlib._bootstrap_external>:753)
+    ```
+
+    The UDF's loop dominates, as it should, but notice
+    `_compile_source (<frozen zipimport>)`: workers import PySpark from
+    `pyspark.zip` on their `PYTHONPATH` ("Shipping Python Dependencies
+    to a Cluster"), and `zipimport` compiles those modules from source.
+    No in-process profiler shows you that. Use `--format speedscope` or
+    the default SVG for a flame graph.
+
+    On a cluster you attach inside the executor's host or container
+    (for Kubernetes, `kubectl exec` into the executor pod), where the
+    container needs the `SYS_PTRACE` capability, per py-spy's own
+    documentation. For a hang, `py-spy dump` prints every thread's
+    stack at once, which is the quickest answer to "what is it doing";
+    "The Python Worker Protocol" covers the built-in alternative,
+    Python's `faulthandler` in workers.
+
+    A task that never finishes and never fails is when a stack dump
+    (`py-spy dump`, or a JVM thread dump from the UI's Executors tab)
+    beats every metric. SPARK-58241 on stock 4.2.0 ("How Catalyst Plans
+    Python", "The Python Worker Protocol") is such a hang; this lesson's
+    workloads read no Parquet, so they never meet it.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Structured Logs, JVM and Python
+
+    `spark.log.structuredLogging.enabled` (4.0, default `false`) switches
+    the JVM's log4j layout to JSON lines with the context Spark attaches
+    to each message. It is read when logging is set up, so set it at
+    launch. With `spark-submit --conf spark.log.structuredLogging.enabled=true`
+    the log printed "Using Spark's default log4j profile:
+    org/apache/spark/log4j2-json-layout.properties" and then JSON:
+
+    ```text
+    {"ts":"2026-10-28T20:47:33.334Z","level":"INFO","msg":"Running Spark version 4.2.0","context":{"spark_version":"4.2.0"},"logger":"SparkContext"}
+    ```
+
+    The same setting in `SparkSession.builder.config(...)` of a plain
+    `python app.py` produced plain text: logging was already configured
+    by then. (The config's doc also says it does not apply to
+    interactive shells.)
+
+    Read the logs back with the schema PySpark exports,
+    `pyspark.logger.SPARK_LOG_SCHEMA` (the Scala twin is
+    `LogUtils.SPARK_LOG_SCHEMA`):
+
+    ```python
+    from pyspark.logger import SPARK_LOG_SCHEMA
+    logs = spark.read.schema(SPARK_LOG_SCHEMA).json("s1.log")
+    print("rows:", logs.count(), "non-json rows:", logs.filter("ts IS NULL").count())
+    logs.select(F.explode(F.map_keys("context")).alias("k")).groupBy("k").count() \
+        .orderBy(F.desc("count")).show(6)
+    ```
+
+    ```text
+    ts TIMESTAMP, level STRING, msg STRING, context map<STRING, STRING>, exception STRUCT<class STRING, msg STRING, stacktrace ARRAY<STRUCT<class STRING, method STRING, file STRING, line STRING>>>, logger STRING
+    rows: 120 non-json rows: 5
+    +-----------+-----+
+    |          k|count|
+    +-----------+-----+
+    |  task_name|   21|
+    |       host|    9|
+    |modify_acls|    9|
+    |      stage|    9|
+    |  view_acls|    9|
+    |executor_id|    7|
+    +-----------+-----+
+    ```
+
+    The five non-JSON rows are lines printed before log4j switched
+    layouts; with an explicit schema they become all-NULL rows instead
+    of failures. The context keys are the MDC fields
+    (`task_name` replaced `mdc.taskName` in 4.0, per the core migration
+    guide), so "every log line of task 7 in stage 3" is a filter on
+    `context['task_name']`.
+
+    On the Python side, `pyspark.logger.PySparkLogger` (4.0) writes the
+    same shape, and PySpark itself uses it: an error with a query
+    context is logged as JSON by the `SQLQueryContextLogger` or
+    `DataFrameQueryContextLogger` loggers (`_log_exception` in
+    `pyspark/errors/exceptions/base.py`), which is the JSON line you
+    may have noticed on stderr after a failed query:
+
+    ```python
+    from pyspark.logger import PySparkLogger
+    log = PySparkLogger.getLogger("ingest")
+    log.warning("quarantined rows", table="events", rows=20)
+    ```
+
+    ```text
+    {"ts": "2026-10-28 14:24:26.981", "level": "WARNING", "logger": "ingest", "msg": "quarantined rows", "context": {"table": "events", "rows": 20}}
+    ```
+
+    Reading both files with one schema works, and shows the remaining
+    mess:
+
+    ```text
+    +-----------------------+-------+----------------+-----------------------------+
+    |ts                     |level  |logger          |context                      |
+    +-----------------------+-------+----------------+-----------------------------+
+    |2026-10-28 13:47:33.381|WARN   |NativeCodeLoader|NULL                         |
+    |2026-10-28 14:24:26.981|WARNING|ingest          |{table -> events, rows -> 20}|
+    +-----------------------+-------+----------------+-----------------------------+
+    ```
+
+    The JVM writes `WARN` and a UTC timestamp with `Z`; Python writes
+    `WARNING` and a local time without an offset, which Spark reads in
+    the session time zone. Normalize levels and zones before you join
+    them. For logs of Python workers on executors, use
+    `python_worker_logs()` from "Packaging, Registration, Testing and
+    Debugging".
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Diagnose a Job From Its Event Log
+
+    The harness runs an application with the event log on (AQE off for
+    a stable stage layout, four shuffle partitions): a job
+    `skewed_scoring` sends events where 90% belong to one user through a
+    deliberately slow Python UDF, and a job `spilling_sort` sorts with
+    the sorter forced to spill every 2,000 rows
+    (`spark.shuffle.spill.numElementsForceSpillThreshold`, internal). It
+    reads the REST API's stage list, stops the application, and starts a
+    new one that has only the log. You write:
+
+    1. `load_events(spark, log_dir)`: every event, from the rolling
+       folder and its zstd files.
+    2. `stage_descriptions(events)`: stage id to the job description set
+       with `setJobDescription`, from `StageSubmitted` properties.
+    3. `task_metrics(events)`: one row per successful task, including
+       `python_ms` summed from the accumulables named
+       `time to execute Python code` (strings).
+    4. `diagnose(tasks, descriptions)`: one row per stage with tasks,
+       sums, max and exact median of records read, `record_skew`, and
+       `flags` (`skew`, `spill`, `python`).
+
+    The checks compare your counts, run times, records and spill bytes
+    with the REST API stage by stage (exact equality, so they hold on
+    any machine), and check that only the UDF stage is flagged `skew`
+    and `python` and that only `spilling_sort` spills.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Backticks for every name with spaces or dots: F.col('`Task Metrics`.`Executor Run Time`'), F.col('Properties.`spark.job.description`'). python_ms: F.aggregate(F.filter(acc, lambda a: a['Name'] == PYTHON_TIME), F.lit(0).cast('long'), lambda s, a: s + a['Update'].cast('long')). Flags: F.array_compact(F.array(F.when(...), ...))."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - Events flow through `LiveListenerBus` to the UI's status store, the
+      event log and your listeners; queues are bounded and drop events
+      when a listener is slow. The metrics system is separate.
+    - Task metrics are fixed per task; SQL metrics are accumulators per
+      plan node, Python nodes included (`PythonSQLMetrics`).
+    - `StreamingQueryListener` is the Python listener (3.4); on Connect
+      in 4.2 it runs in the client. Batch listeners are Java
+      (`spark.extraListeners`, `spark.sql.queryExecutionListeners`), or
+      Py4J callbacks in Classic.
+    - 4.x event logs are rolling folders of zstd JSON (4.0 defaults);
+      Spark reads them directly (4.1). Mind spaces, dotted keys, string
+      metric updates and AQE plan versions.
+    - The REST API (`/api/v1`, with `taskSummary` quantiles) serves live
+      apps, and the History Server serves logs.
+    - Metrics go to `/metrics/json` by default; Prometheus needs the
+      servlet sink, and stable names need `spark.metrics.namespace`.
+    - The UDF profiler (4.0) wraps every call of a row UDF, so its own
+      cost can dominate; the data source profiler (4.2, SPARK-55161)
+      also profiles planning. `py-spy` sees everything, given ptrace
+      rights.
+    - Structured logging (4.0) is a launch-time setting; read JVM and
+      Python logs with `SPARK_LOG_SCHEMA` and normalize levels and time
+      zones.
+
+    Next: **From Wrong Results to a Fix: An Upstream Case Study**, where
+    these tools meet a real wrong-results bug in Spark 4.2.0.

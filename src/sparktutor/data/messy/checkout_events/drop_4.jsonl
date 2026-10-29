@@ -1,0 +1,4 @@
+{"event_id": "c024", "user": "u6", "action": "view", "page": "/p/lamp", "ts": "2026-10-05T11:20:44Z"}
+{"event_id": "c025", "user": "u6", "action": "pay", "page": "/checkout", "ts": "2026-10-05T11:31:49Z", "amount": 19.15}
+{"event_id": "c026", "user": "u1", "action": "add", "page": "/", "ts": "2026-10-05T11:40:50Z"}
+{"event_id": "c027", "user": "u7", "action": "add", "page": "/p/desk", "ts": "2026-10-05T11:48:03Z"}

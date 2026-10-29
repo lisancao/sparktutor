@@ -1,0 +1,56 @@
+crm_id,first_name,last_name,email,phone,city,updated_at
+CRM-0001,dev,García,dev.garcia@mail.com,902-555-6970,Halifax,2025-02-24
+CRM-0002,Sofia,Wong,sofia.wong@example.ca,(416) 555-0943,HALIFAX,2024-10-31
+CRM-0003,Michael,martin,Michael.martin@mail.com,(514) 555-6368,QUÉBEC,2025-09-12
+CRM-0004,Mateo,García,mateogarcia+promo@gmail.com,416.555.1245,Halifax,2024-09-04
+CRM-0005,Bill,Singh,William.singh@example.ca,9025555794,Vancouver,2024-09-15
+CRM-0006,Bob,Ahmed, robert.ahmed@example.ca ,+1 613 555 4144,Ottawa,2024-01-03
+CRM-0007,Jose,Cote,jose.cote@example.ca,+1 416 555 2897,Vancouver,2025-04-15
+CRM-0008,  Noah ,Muller,,5145559456,Montréal,2026-01-05
+CRM-0009,Chloé,Smith,chloe.smith@mail.com,403.555.0492,Montreal,2026-01-22
+CRM-0010,samantha,Garcia,Samantha.garcia@example.com,9025556128,Calgary,2025-04-02
+CRM-0011,Jonathan,Tremblay,jonathantremblay@gmail.com,6135557069,Vancouver,2024-11-20
+CRM-0012,Minh Tấn,Lê, minhtuan.le@example.ca ,416.555.2394,Ottawa,2024-10-27
+CRM-0013,Priya,Okafor,,,Montréal,2026-04-20
+CRM-0014,Priya,Okasor, priya.okafor@example.ca ,+1 403 555 4693,Montréal,2024-06-18
+CRM-0015,Liz,Tremblay, elizabeth.tremblay@gmail.com ,,Vancouver,2024-03-09
+CRM-0016,Priya,Brown,priya.brown@mail.com,,Ottawa,2024-12-12
+CRM-0017,Olivia,MARTIN,Olivia.martin@example.ca,,Calgary,2024-11-09
+CRM-0018,  Raj ,Boucharrd,RAJ.BOUCHARD+SHOP@GMAIL.COM,+1 604 555 3783,Québec,2024-04-11
+CRM-0019,Mihcael,Rossi,michael.rossi@example.ca,4165552795,Vancouver,2025-05-31
+CRM-0020,DAN,PATEL, daniel.patel@example.com ,6045557275,CALGARY,2024-08-17
+CRM-0021,Sofia,lee,sofia.lee@mail.com,403-555-9411,CALGARY,2025-09-14
+CRM-0022,AISHHA,SILVA,aisha.silva@example.ca,(416) 555-9748,Vancouver,2025-08-23
+CRM-0023,Jose,Smith,jose.smith@mail.com,514.555.4987,Vancouver,2025-02-05
+CRM-0024,Omar,silva,omar.silva@example.ca,4035552355,Québec,2025-12-13
+CRM-0025,Samantha,Haddad, samantha.haddad@mail.com ,514.555.4824,OTTAWA,2024-08-26
+CRM-0026,BENJAMIN,Cohen,benjamin.cohen@example.com,(613) 555-0179,Vancouver,2025-11-29
+CRM-0027,José,Cohen,jose.cohen@mail.com,(416) 555-7565,Ottawa,2025-09-27
+CRM-0028,Katherine,Brown,Katherine.brown+shop@gmail.com,,Ottawa,2025-12-03
+CRM-0029,  Ana ,cohen,ana.cohen@example.com,902.555.7102,Montréal,2024-06-07
+CRM-0030,Jennifer,Côté,Jennifer.cote@gmail.com,(902) 555-7843,Montréal,2024-05-04
+CRM-0031,Mike,TREMBLAY,michael.tremblay@gmail.com,,Calgary,2026-01-25
+CRM-0032,JENNIFER,Tremblay,jennifer.tremblay@mail.com,403.555.5642,Québec,2025-06-08
+CRM-0033,mei,Ahmed,,902.555.4743,Quebec,2024-01-17
+CRM-0034,Alexander,Lefebvre,alexander.lefebvre@example.ca,4165555137,TORONTO,2025-01-25
+CRM-0035,Wiliam,Côté,,902-555-9021,Toronto,2024-06-12
+CRM-0036,Jon,Bouchard,jonathan.bouchard@mail.com,,Toronto,2025-05-01
+CRM-0037,Jennifer,Haddad, jennifer.haddad@gmail.com ,+1 403 555 1952,Halifax,2024-01-20
+CRM-0038,Priya,Smith,priyasmith+promo@gmail.com,+1 403 555 8408,Montreal,2025-05-09
+CRM-0039,  Aisha ,Wong,,,Ottawa,2025-10-05
+CRM-0040,  Mateo ,Ahmed,Mateoahmed+promo@gmail.com,(416) 555-9106,Vancouver,2024-09-23
+CRM-0041,Michael,Côté,michael.cote@example.com,+1 613 555 3991,Québec,2025-02-17
+CRM-0042,Sam,Singh,Samantha.singh@mail.com,(416) 555-7985,Halifax,2024-02-04
+CRM-0043,Ivin,Chen,ivanchen@gmail.com,4035554965,Vancouver,2024-07-14
+CRM-0044,IVAN,Chen,ivanchen+promo@gmail.com,,Vancouver,2024-02-19
+CRM-0045,Thooas,García,thomas.garcia@example.com,(613) 555-9662,Montreal,2024-05-23
+CRM-0046,Dev,Patel,DEV.PATEL@EXAMPLE.COM,9025554983,Halifax,2024-03-23
+CRM-0047,  Robert ,Smith,robert.smith@mail.com,(604) 555-4532,Québec,2024-02-13
+CRM-0048,Robert,Smith,ROBERT.SMITH36@EXAMPLE.CA,,Québec,2025-04-12
+CRM-0049,Mei,  Chen ,,902.555.1413,Halifax,2025-04-25
+CRM-0050,Mei,Chen, Mei.chen41@mail.com ,902.555.5398,TORONTO,2025-09-06
+CRM-0051,JOSE,GARCIA,jose.garcia@gmail.com,+1 416 555 0368,Halifax,2026-05-24
+CRM-0052,Joe,garcia,Jose.garcia50@gmail.com,604-555-6099,Vancouver,2024-05-09
+CRM-0053,ANDY,Gacría,andy.garcia@example.ca,4165551245,Halifax,2025-03-11
+CRM-0054,andy,García,andy.garcia@example.ca,416-555-1245,Halifax,2025-09-26
+CRM-0055,Linh,Chne,linh.chen@example.ca,4035559516,MONTRÉAL,2024-07-22

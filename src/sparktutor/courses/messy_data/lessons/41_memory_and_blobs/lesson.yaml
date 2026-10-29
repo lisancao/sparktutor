@@ -1,0 +1,603 @@
+- Class: meta
+  Lesson: Memory, Spill and Very Large Files
+  EstimatedMinutes: 70
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    "The Python Worker Protocol" looked at memory from the Python side:
+    workers outside the JVM, `RLIMIT_AS`, a worker killed for memory.
+    This lesson looks at the JVM side and at the files that break naive
+    jobs: scanned PDFs of hundreds of megabytes, raw sensor dumps,
+    multi-gigabyte logs.
+
+    It builds on "Plans, Partitions and Caching" (partitions, shuffles,
+    caching), "Files as Files: binaryFile, Globs and Metadata" (the
+    `binaryFile` source) and "Reading a Custom File Format, in Parallel"
+    (planning partitions in a Python data source).
+
+    By the end of this lesson you will be able to:
+
+    - Compute the execution and storage memory Spark has from the heap
+      size, and read the numbers from `UnifiedMemoryManager` yourself
+    - Make a sort spill, measure memory and disk spill from the REST API,
+      and remove it by changing partitioning
+    - Explain why `binaryFile` cannot read a file over 2 GiB, why the
+      practical limit is far lower, and what the error looks like
+    - Predict the size of the Arrow batches Spark sends to Python when
+      rows are blobs, and which settings bound them
+    - Read huge files in byte-range chunks with a Python data source,
+      with the line boundary rule that makes chunking correct
+    - Choose between inline bytes, lazy fetching and pointers for blobs
+
+    The experiments use small numbers so they run on a laptop: the
+    default driver heap of 1 GiB that `spark-submit` gives you, files of
+    hundreds of megabytes made in a temporary folder (sparse files where
+    possible, so they take no disk space), and cleanup at the end. The
+    ratios are what matter; on a cluster everything scales up together.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Unified Memory Model
+
+    In local mode the driver JVM is also the executor, so its heap is the
+    executor heap. `UnifiedMemoryManager`
+    (`core/src/main/scala/org/apache/spark/memory/UnifiedMemoryManager.scala`)
+    divides it:
+
+    ```text
+    heap (spark.driver.memory / spark.executor.memory)
+    ├─ reserved: 300 MiB (RESERVED_SYSTEM_MEMORY_BYTES)
+    └─ usable = heap - 300 MiB
+       ├─ unified pool = usable * spark.memory.fraction (0.6)
+       │  ├─ storage region = pool * spark.memory.storageFraction (0.5)
+       │  └─ execution: the rest of the pool
+       └─ user memory = usable * 0.4: your objects, UDF buffers,
+          and everything Spark allocates without asking the manager
+    ```
+
+    Both fractions date from 1.6. Read the real numbers through Py4J:
+
+    ```python
+    mm = spark._jvm.org.apache.spark.SparkEnv.get().memoryManager()
+    heap = spark._jvm.java.lang.Runtime.getRuntime().maxMemory()
+    print(heap >> 20, mm.maxHeapMemory() >> 20, mm.maxOnHeapStorageMemory() >> 20,
+          mm.maxOffHeapStorageMemory() >> 20)
+    ```
+
+    | Run | `Runtime.maxMemory` | `maxHeapMemory` (pool) | `maxOnHeapStorageMemory` | `maxOffHeapStorageMemory` |
+    |---|---|---|---|---|
+    | `spark-submit` defaults | 1024 MiB | 434 MiB | 434 MiB | 0 |
+    | `--driver-memory 2g`, off-heap 256m | 2048 MiB | 1048 MiB | 1048 MiB | 256 MiB |
+
+    (1024 - 300) * 0.6 = 434.4, the same "434.4 MiB RAM" the
+    `BlockManager` logs at startup. `maxOnHeapStorageMemory` is the whole
+    pool, not half of it: the boundary is **soft**. From the class
+    comment: storage can borrow all free execution memory, and execution
+    can borrow all free storage memory; when execution needs its share
+    back, cached blocks are evicted, but execution memory is never
+    evicted for storage. So a cache can use the whole pool while nothing
+    runs, and a big sort can push a cache out down to the storage region.
+
+    Off-heap memory (`spark.memory.offHeap.enabled`,
+    `spark.memory.offHeap.size`, both 1.6) is a second, separate pool
+    outside the garbage-collected heap, used by Tungsten for execution
+    and storage when enabled. It is not counted in the heap, so on a
+    cluster it must fit into the container's overhead.
+
+    Two edge cases from the same file. A heap below 1.5 * 300 MiB fails
+    at startup with `INVALID_DRIVER_MEMORY`: "System memory ... must be
+    at least ...". And when `spark.testing` is set (as `SPARK_TESTING=1`
+    does), the reserved memory becomes 0, so test runs see different
+    numbers; that is one more reason the course runs script exercises
+    without it. Spark 4.1 also added tracking of memory that components
+    such as the RocksDB state store manage themselves
+    (`spark.memory.unmanagedMemoryPollingInterval`, off by default).
+
+- Class: mult_question
+  Depth: all
+  Output: "An executor has a 4 GiB heap and default memory settings. How large is the unified pool shared by execution and storage?"
+  AnswerChoices: "About 2278 MiB, (4096 - 300) * 0.6;About 2458 MiB, 4096 * 0.6;About 1229 MiB, 4096 * 0.3;About 3796 MiB, 4096 - 300"
+  CorrectAnswer: "About 2278 MiB, (4096 - 300) * 0.6"
+  Hint: "Subtract the 300 MiB reserved memory first, then apply spark.memory.fraction."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What Uses Which Memory
+
+    **Execution memory** is taken by operators while a task runs:
+    sorts (`UnsafeExternalSorter`), hash aggregates, sort-merge and
+    shuffled hash joins, shuffle write buffers. Each task asks the
+    `TaskMemoryManager` for pages; with N tasks running, each task is
+    guaranteed at least 1/(2N) of the execution pool and may take up to
+    1/N. When a request cannot be met, the operator **spills**: it
+    writes what it has, sorted, to local disk, frees the memory and
+    merges the pieces later.
+
+    **Storage memory** holds cached blocks (`cache()`, `persist()`) and
+    broadcast variables. When it is full, blocks are evicted, or written
+    to disk if their storage level allows it.
+
+    **User memory** is everything else on the heap: rows being built,
+    the byte arrays of a `binaryFile` row, collections in your code,
+    the Arrow buffers sent to Python. The memory manager does not track
+    it, so nothing spills it; when it runs out, the JVM throws
+    `OutOfMemoryError`.
+
+    Python workers are outside all of this, as "The Python Worker
+    Protocol" showed.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Making a Sort Spill, and Measuring It
+
+    Sort 6 million rows of about 170 bytes (an `id`, a SHA-256 hex
+    string and 100 bytes of padding) into 2 partitions, with the default
+    1 GiB heap and AQE off, and write them to the `noop` sink (a plain
+    aggregate after `orderBy` would let the optimizer drop the sort):
+
+    ```python
+    spark.conf.set("spark.sql.shuffle.partitions", "2")
+    df = spark.range(0, 6_000_000, 1, 4).select(
+        "id", F.sha2(F.col("id").cast("string"), 256).alias("h"),
+        F.repeat(F.lit("x"), 100).alias("pad"))
+    df.orderBy("h").write.format("noop").mode("overwrite").save()
+    ```
+
+    Spill is a task metric. The UI's REST API sums it per stage:
+
+    ```python
+    import json, urllib.request
+    sc = spark.sparkContext
+    url = f"{sc.uiWebUrl}/api/v1/applications/{sc.applicationId}/stages?details=false"
+    for s in json.load(urllib.request.urlopen(url)):
+        print(s["stageId"], s["numTasks"], s["memoryBytesSpilled"], s["diskBytesSpilled"])
+    ```
+
+    | `spark.sql.shuffle.partitions` | AQE | Sort tasks | Memory spilled | Disk spilled | Time |
+    |---|---|---|---|---|---|
+    | 2 | off | 2 | 1103 MiB | 415 MiB | 9.7 s |
+    | 16 | off | 16 | 0 | 0 | 6.8 s |
+    | 200 | off | 200 | 0 | 0 | 6.7 s |
+    | 2 | on | 2 | 1103 MiB | 415 MiB | 6.1 s |
+    | 200 | on | 7 (coalesced) | 0 | 0 | 10.8 s |
+
+    (One run each; the times are noisy on a shared machine. In every run
+    the shuffle wrote about 410 MiB.)
+
+    The two spill numbers measure different things.
+    **`memoryBytesSpilled`** is the size the spilled data had **in
+    memory**, deserialized, when it was released; **`diskBytesSpilled`**
+    is what it took on disk, serialized and compressed. 1103 MiB of
+    in-memory records became 415 MiB of spill files. Neither is "how
+    much memory was missing".
+
+    With 2 partitions each sort task held 200 MiB of shuffle data that
+    expands in memory, more than its share of a 434 MiB pool with two
+    tasks running. With 16 partitions each task's share fit. With AQE on
+    and 200 partitions, `CoalesceShufflePartitions` merged them into 7
+    partitions of about 60 MiB (its target is
+    `spark.sql.adaptive.advisoryPartitionSizeInBytes`, 64 MB), which also
+    fit. AQE cannot help in the first AQE row: it only coalesces, and 2
+    partitions were already too few.
+
+    Spill is not an error. It is the mechanism that lets a 1 GiB heap
+    sort far more than 1 GiB. It costs disk I/O and serialization, so
+    when a stage spills a lot, the usual fixes are more partitions, less
+    data per row (select only the columns you need before a wide
+    operation), or more memory per task (fewer cores per executor).
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    `sc` is the SparkContext. Build `url`: the REST API address that
+    lists the stages of the current application, from `sc.uiWebUrl` and
+    `sc.applicationId`.
+  CorrectAnswer: |
+    url = f"{sc.uiWebUrl}/api/v1/applications/{sc.applicationId}/stages"
+  Hint: "The path is /api/v1/applications/<app id>/stages under the UI address."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## binaryFile and the 2 GiB Wall
+
+    `binaryFile` returns a file as one row with a `content` column. Its
+    reader is short enough to quote
+    (`sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/binaryfile/BinaryFileFormat.scala`):
+
+    ```scala
+    requiredSchema.fieldNames.zipWithIndex.foreach {
+      case (PATH, i) => writer.write(i, UTF8String.fromString(status.getPath.toString))
+      case (LENGTH, i) => writer.write(i, status.getLen)
+      ...
+      case (CONTENT, i) =>
+        if (status.getLen > maxLength) {
+          throw QueryExecutionErrors.fileLengthExceedsMaxLengthError(status, maxLength)
+        }
+        val stream = fs.open(status.getPath)
+        try {
+          writer.write(i, stream.readAllBytes())
+        } ...
+    ```
+
+    Four facts follow:
+
+    1. **Content is read only when the query needs it.** The loop runs
+       over `requiredSchema`, so `select("path", "length")` never opens
+       a file.
+    2. **The limit is a setting.** `maxLength` is
+       `spark.sql.sources.binaryFile.maxLength` (internal, since 3.0,
+       default `Int.MaxValue`, 2147483647 bytes), because a row is backed
+       by one Java byte array.
+    3. **The file is not splittable** (`isSplitable` returns `false`):
+       one file, one task, one row.
+    4. **The whole file is read into memory** with `readAllBytes()`,
+       and then copied into the row.
+
+    A sparse 2.5 GB file (created with `f.truncate(2_500_000_000)`, so
+    it uses no disk blocks) shows the first two:
+
+    ```text
+    apparent size 2500000000 blocks on disk 0
+    [Row(path='file:/tmp/tmpamdrd4or/huge.bin', length=2500000000)]   # select("path", "length")
+    count 1
+    Caused by: org.apache.spark.SparkException: The length of file:/tmp/tmpamdrd4or/huge.bin is
+    2500000000, which exceeds the max length allowed: 2147483647.
+    ```
+
+    The error class is `_LEGACY_ERROR_TEMP_2076`. The check runs
+    before anything is read, so it fails fast. Lowering the setting
+    turns it into a guard against surprises:
+
+    ```python
+    spark.conf.set("spark.sql.sources.binaryFile.maxLength", str(100 * 1024 * 1024))
+    ```
+
+    ```text
+    The length of file:/tmp/.../mid.bin is 314572800, which exceeds the max length allowed: 104857600.
+    ```
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Real Wall Is Much Lower
+
+    Under the limit is not the same as safe. With the default 1 GiB heap
+    and a single 100 MiB file, `select(F.length("content"))` returned
+    `104857600` in 3 seconds. With a single **300 MiB** file the task
+    died, and so did the application (exit status 52, Spark's exit code
+    for an out-of-memory error):
+
+    ```text
+    ERROR Executor: Exception in task 0.0 in stage 0.0 (TID 0)
+    java.lang.OutOfMemoryError: Java heap space
+        at org.apache.spark.sql.catalyst.expressions.codegen.BufferHolder.grow(BufferHolder.java:85)
+        at org.apache.spark.sql.catalyst.expressions.codegen.UnsafeWriter.grow(UnsafeWriter.java:65)
+        at org.apache.spark.sql.catalyst.expressions.codegen.UnsafeWriter.writeUnalignedBytes(UnsafeWriter.java:133)
+        ...
+        at org.apache.spark.sql.execution.datasources.binaryfile.BinaryFileFormat.$anonfun$buildReader$5(BinaryFileFormat.scala:125)
+    ERROR SparkUncaughtExceptionHandler: Uncaught exception in thread Thread[Executor task launch worker ...]
+    ```
+
+    Line 125 is `writer.write(i, stream.readAllBytes())`. The arithmetic:
+    `readAllBytes()` allocates the 300 MiB array, then the row writer
+    must grow its buffer to hold it, and `BufferHolder.grow`
+    (`sql/catalyst/src/main/java/org/apache/spark/sql/catalyst/expressions/codegen/BufferHolder.java`)
+    **doubles** the needed size (`length * 2`, while under half of its
+    maximum): a 600 MiB array next to the 300 MiB one, before the old
+    buffer is released, in a heap of 1024 MiB that has other things in
+    it. A blob costs about three times its size in heap while its row is
+    built, and that memory is user memory, invisible to the memory
+    manager, so nothing spills.
+
+    Near 2 GiB a different limit applies: the row buffer cannot exceed
+    `ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH` (`Integer.MAX_VALUE - 15`),
+    and `BufferHolder.grow` throws `_LEGACY_ERROR_TEMP_3199`, "Cannot
+    grow BufferHolder by size ... because the size after growing exceeds
+    size limitation ...", when a row would pass it. So the useful rule
+    for `binaryFile` content is: files of a few megabytes, many per
+    task, are fine; files of hundreds of megabytes need several gigabytes
+    of heap per running task; anything near 2 GiB cannot be a row at all.
+
+- Class: mult_question
+  Depth: all
+  Output: "With a 1 GiB heap, `binaryFile` reads a 100 MiB file fine but a 300 MiB file fails. What fails, and why?"
+  AnswerChoices: "OutOfMemoryError, because the file is read into one array and then copied into a row buffer that doubles its size;The 2 GiB limit check, because 300 MiB rounds up;A spill to disk that runs out of space;The Python worker, because content is sent to Python"
+  CorrectAnswer: "OutOfMemoryError, because the file is read into one array and then copied into a row buffer that doubles its size"
+  Hint: "Look at BinaryFileFormat.scala line 125 and BufferHolder.grow."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Blobs on Their Way to Python
+
+    When rows are blobs, the size of the Arrow batches Spark sends to a
+    Python UDF or `mapInArrow` / `mapInPandas` matters more than the
+    number of rows. Two settings bound a batch on the way **into**
+    Python:
+
+    - `spark.sql.execution.arrow.maxRecordsPerBatch` (2.3, default
+      10000)
+    - `spark.sql.execution.arrow.maxBytesPerBatch` (4.0, internal,
+      default 64MB)
+
+    `PythonArrowInput.writeSizedBatch`
+    (`sql/core/src/main/scala/org/apache/spark/sql/execution/python/PythonArrowInput.scala`)
+    keeps adding rows while both hold:
+
+    ```scala
+    def underBatchSizeLimit: Boolean =
+      (maxBytesPerBatch == Int.MaxValue) || (arrowWriter.sizeInBytes() < maxBytesPerBatch)
+
+    while (rowIter.hasNext && numRowsInBatch < maxRecordsPerBatch &&
+      underBatchSizeLimit) {
+      arrowWriter.write(rowIter.next())
+      numRowsInBatch += 1
+    }
+    ```
+
+    Measured: twelve 8 MiB files in one partition, through `mapInArrow`
+    reporting each batch's rows and `nbytes`:
+
+    | Setting | Batches (rows, MiB) |
+    |---|---|
+    | defaults | (8, 64), (4, 32) |
+    | `maxBytesPerBatch` = 16 MiB | six of (2, 16) |
+    | `maxRecordsPerBatch` = 2 | six of (2, 16) |
+
+    The check happens **before** each row, so a batch stops at the first
+    row that brings it to the limit or past it: it can exceed the limit
+    by up to one row, and a single row larger than the limit is sent as
+    a batch of one. With 300 MiB scans and the 64 MB default, every
+    batch is one row of 300 MiB.
+
+    In the other direction, from a **Python data source** to the JVM,
+    only the record count applies: `records_to_arrow_batches` in
+    `pyspark/sql/worker/plan_data_source_read.py` groups the tuples you
+    yield by `maxRecordsPerBatch` alone. A reader yielding 10000 tuples
+    with 1 MiB of bytes each builds a 10 GB batch in the worker. Either
+    lower `maxRecordsPerBatch` for that job, or yield
+    `pyarrow.RecordBatch`es that you size by bytes yourself ("Types,
+    Arrow and Performance" showed how).
+
+    One more limit: Arrow's `string` and `binary` columns use 32-bit
+    offsets, so one column of one batch cannot hold more than 2 GiB.
+    `spark.sql.execution.arrow.useLargeVarTypes` (3.5, default false)
+    switches Spark to the 64-bit `large_string` / `large_binary` types,
+    at a cost in memory per value. Remember from "Types, Arrow and
+    Performance" that a Python data source's declared `string` must then
+    match exactly, or the 4.2 schema check rejects the batch.
+
+- Class: mult_question
+  Depth: all
+  Output: "Rows of 10 MiB each go to a pandas UDF with maxBytesPerBatch at its 64MB default and maxRecordsPerBatch 10000. How many rows does each batch hold?"
+  AnswerChoices: "7, because rows are added until the batch reaches 64 MB, so it can pass the limit by one row;6, because a batch never exceeds 64 MB;10000, because maxBytesPerBatch does not apply to pandas UDFs;1, because each blob is its own batch"
+  CorrectAnswer: "7, because rows are added until the batch reaches 64 MB, so it can pass the limit by one row"
+  Hint: "The size check runs before each row is added: 6 rows are 60 MiB, still under the limit."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Strategy 1: Inventory First, Content Later
+
+    Most jobs over blobs need the bytes of a few files, or need them one
+    at a time. Read the **inventory** (paths and lengths, which open no
+    file), decide what to process, and let each task open its own files
+    and stream them:
+
+    ```python
+    inv = (spark.read.format("binaryFile").option("recursiveFileLookup", "true")
+           .load(folder).select("path", "length"))
+
+    def sha256_files(batches):
+        for pdf in batches:
+            out = []
+            for p in pdf["path"]:
+                h = hashlib.sha256()
+                with open(p.removeprefix("file:"), "rb") as f:
+                    for block in iter(lambda: f.read(1 << 20), b""):
+                        h.update(block)
+                out.append(h.hexdigest())
+            yield pdf.assign(sha256=out)
+
+    inv.mapInPandas(sha256_files, "path string, length long, sha256 string").collect()
+    ```
+
+    Over a folder with a 300 MiB file (the one that killed the 1 GiB
+    driver through `content`) and the sample images:
+
+    ```text
+    scan_300mb.bin 314572800 17a88af83717f68b
+    gradient_32x32.png 1795 08617c474e4b9412
+    gray_20x10.png 90 750a5916d260a937
+    7 files hashed in 1.8s with a 1 GiB driver
+    ```
+
+    The JVM handled only paths; each worker read 1 MiB at a time. On a
+    cluster the path must be readable from executors (an object store
+    URI and a client library, or a shared file system), and a
+    `binaryFile` path comes back as a URI (`file:/...`), hence
+    `removeprefix`.
+
+    The same idea applied to storage is to keep **pointers, not bytes**:
+    a table of `(path, length, sha256, media_type)` with the content in
+    object storage, and derived artifacts (text, thumbnails, embeddings)
+    in their own tables keyed by hash. "Designing Tables for Blobs"
+    builds that catalog with Delta.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Strategy 2: Split One Huge File Into Byte Ranges
+
+    A single 40 GB log is the opposite problem: one file, far too big
+    for one task. Spark's own text and CSV readers split such files into
+    ranges of `spark.sql.files.maxPartitionBytes` ("Plans, Partitions
+    and Caching"). A Python data source can do the same: make each
+    partition a `(path, offset, length)` triple instead of a file, and
+    let `read()` produce only the records that belong to its range.
+
+    Planning is arithmetic on file sizes, on the driver:
+
+    ```python
+    def plan_chunks(files, chunk_bytes):
+        chunks = []
+        for path, size in files:
+            for offset in range(0, size, chunk_bytes):
+                chunks.append((path, offset, min(chunk_bytes, size - offset)))
+        return chunks
+    ```
+
+    Reading needs a rule for records that cross a boundary, and the
+    standard one (the rule Hadoop's `LineRecordReader` follows) is: **a line
+    belongs to the chunk that contains its first byte.** So a reader
+    for the range `[offset, offset + length)`:
+
+    1. If `offset > 0`, seeks to `offset - 1` and discards everything up
+       to and including the next newline. If the byte before the chunk
+       is itself a newline, that discards one byte and a line starts
+       exactly at `offset`; otherwise it skips the tail of a line that
+       the previous chunk owns.
+    2. Reads whole lines while the **start** of the line is before
+       `offset + length`, even if the line ends after it.
+    3. Stops at the first line that starts at or after
+       `offset + length`; the next chunk owns it.
+
+    Worked through for `b"aa\nbbbb\n\nc\nddddd"` (17 bytes) in chunks of
+    4 bytes:
+
+    | Chunk | Byte before | Lines it yields (offset, text) |
+    |---|---|---|
+    | 0 to 4 | none | (0, `aa`), (3, `bbbb`) |
+    | 4 to 8 | `b` at 3 | none: from byte 3 skips `bbbb\n`, lands at 8, and 8 is not before 8 |
+    | 8 to 12 | `\n` at 7 | (8, empty line), (9, `c`), (11, `ddddd`) |
+    | 12 to 16 | `d` at 11 | none: skips `ddddd` to the end of the file |
+    | 16 to 17 | `d` at 15 | none |
+
+    Every line once, from exactly one chunk, whatever the chunk size.
+    The exercise checks that for every chunk size from 1 to 18 bytes
+    before it ever starts Spark.
+
+    Memory per task is now the read buffer plus one line, independent of
+    the file's size. In the exercise, over a 29.9 MiB log in 2 MiB
+    chunks, the task that read the most consumed 2097342 bytes: the
+    chunk (2097152) plus 190 bytes to finish its last line.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Strategy 3: Parse While You Stream
+
+    Whatever the format, `read()` is a generator: it can hold one record
+    at a time. The mistakes that bring a whole file into memory are
+    small and common:
+
+    - `f.read()` or `Path.read_bytes()` on the whole file, then parsing.
+      Use `f.read(n)` in a loop, `iter(lambda: f.read(1 << 20), b"")`,
+      or line iteration.
+    - Building a list of all rows and returning it. Yield them.
+    - Decompressing a whole `.gz` with `gzip.decompress`. Use
+      `gzip.open` and iterate. (A gzip stream cannot be split by byte
+      ranges at all: it must be one partition, or recompressed into a
+      splittable format.)
+    - JSON documents: `json.load` holds the whole document. For JSON
+      Lines, iterate lines; for one huge JSON array, use an incremental
+      parser, or convert it once.
+    - Formats with an index (ZIP, Parquet, many archives) can be split
+      by entry instead of by bytes: plan one partition per entry or
+      group of entries from the index.
+
+    The same goes for the other direction: `applyInPandas` hands each
+    group to Python as one pandas DataFrame, so one giant group is one
+    giant allocation in one worker. Check group sizes before grouping
+    blobs (`groupBy(key).count()` is cheap), and salt or pre-aggregate
+    skewed keys.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Choosing a Layout for Blobs
+
+    | Approach | Good for | Breaks when |
+    |---|---|---|
+    | `binaryFile` with `content` | many small files (KB to a few MB), each processed whole | files of hundreds of MB, or any near 2 GiB |
+    | inventory plus lazy fetch in `mapInPandas` | any size, when each file is processed by streaming code | the processing itself needs the whole file in memory |
+    | byte-range chunks in a data source | huge files with a record boundary rule (lines, fixed records, sync markers) | records without a recognisable start, compressed streams |
+    | entries from an index | archives and formats with a directory | the index itself is huge or missing |
+    | pointers in a table | catalogs, reprocessing, deletion and lineage | the pointed-to store changes behind your back |
+
+    A rule of thumb from the measurements here: keep any single value
+    that Spark materializes below a few percent of the heap per running
+    task. With a 4 GiB executor running 4 tasks, a 50 MB blob is
+    comfortable and a 500 MB blob is not, whatever
+    `spark.sql.sources.binaryFile.maxLength` allows.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: A Chunked Reader for Very Large Files
+
+    The harness makes a 29.9 MiB log with 260000 lines of random length
+    (and a few edge cases: an empty file, a one-line file, a file without
+    a final newline) in a temporary folder, and computes a reference
+    line count and a sum of CRC32 values in plain Python. The
+    `chunked_lines` data source is given; its `read()` writes how many
+    bytes each task consumed to an audit folder. Complete:
+
+    1. `plan_chunks(files, chunk_bytes)`: `(path, offset, length)`
+       triples covering every byte of every file once.
+    2. `read_chunk_lines(f, offset, length)`: yield
+       `(line_offset, line_bytes)` for the lines whose first byte is in
+       the range, with the boundary rule from this lesson.
+    3. `blob_inventory(spark, folder)`: a `binaryFile` DataFrame of
+       `path` and `length` only.
+
+    The checks: your functions pass as plain Python for every chunk size
+    of a small sample; with 2 MiB chunks the source makes one partition
+    per started 2 MiB of each non-empty file; Spark returns every line
+    exactly once, with the same CRC32 sum as the reference; the file
+    without a final newline keeps its last line; no task read more than
+    one chunk plus one line; and the inventory's `ReadSchema` has no
+    `content`.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "plan_chunks: for offset in range(0, size, chunk_bytes). read_chunk_lines: if offset: f.seek(offset - 1); f.readline(). Then pos = f.tell(); while pos < offset + length: line = f.readline(); if not line: break; yield pos, line.rstrip(b'\\n'); pos += len(line)."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - `UnifiedMemoryManager`: (heap - 300 MiB) * `spark.memory.fraction`
+      (0.6) is shared by execution and storage, with a soft boundary at
+      `spark.memory.storageFraction` (0.5). A 1 GiB heap gives 434 MiB.
+      Storage can be evicted for execution, never the reverse. The other
+      40% is user memory, which nothing tracks or spills.
+    - Spill is how sorts, aggregates and joins survive small memory.
+      Read `memoryBytesSpilled` (in-memory size) and `diskBytesSpilled`
+      (on-disk size) from the REST API; more, smaller partitions remove
+      it, and AQE coalescing only merges.
+    - `binaryFile` reads content only when selected, checks
+      `spark.sql.sources.binaryFile.maxLength` (default `Int.MaxValue`;
+      `_LEGACY_ERROR_TEMP_2076`), never splits a file, and costs about
+      three times a file's size in heap while building its row: a
+      300 MiB file killed a 1 GiB driver.
+    - Batches into Python stop at `maxRecordsPerBatch` (10000) rows or
+      when they reach `maxBytesPerBatch` (64MB, internal, 4.0), one row
+      past the limit at most. Python data source output is batched by
+      record count only.
+    - For big blobs: inventory first and stream content inside tasks;
+      split huge files into byte ranges with the "a line belongs to the
+      chunk holding its first byte" rule; parse while streaming; store
+      pointers rather than bytes.
+
+    Next: **A DSv2 Connector in Java**, where you implement the scan
+    interfaces that a Python data source cannot use: column pruning,
+    limit and aggregate pushdown, and partitioning that Spark can reason
+    about.

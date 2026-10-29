@@ -1,0 +1,981 @@
+- Class: meta
+  Lesson: "Streaming Messy Data: Drift, Dead Letters and State"
+  EstimatedMinutes: 75
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    "Streaming Files: Your First Structured Streaming Job" taught the
+    core on a folder of clean JSON: the schema a stream needs,
+    micro-batches, admission control (`maxFilesPerTrigger`,
+    `maxBytesPerTrigger`, file order), the checkpoint and a restart,
+    idempotent `foreachBatch` writes, and watermarks. "Streaming Readers
+    and Writers" built a
+    stream reader and an idempotent stream writer from scratch. This
+    lesson takes the built-in file source into the real world, where
+    the files a tracker uploads are not clean:
+
+    - lines that are cut off, timestamps that are not timestamps,
+      events with no user
+    - a tracker upgrade that renames a field halfway through the day
+    - events sent twice, events that arrive out of order, events that
+      arrive far too late
+    - a phone whose clock is a day ahead
+
+    By the end you will be able to:
+
+    - Explain why a stream's schema is fixed when the query starts, and
+      what that means when the data drifts
+    - Read drifting JSON as text and parse it with VARIANT so that drift
+      never fails the query, and detect new fields as they appear
+    - Route bad rows to a dead-letter folder with `foreachBatch`,
+      written so that a replayed batch changes nothing
+    - Archive processed files with `cleanSource`, know its surprises,
+      and know why file order is not event order
+    - Reason about event time: watermarks, late data, and why one event
+      from the future can silently drop everything after it
+    - Remove duplicates with bounded state
+      (`dropDuplicatesWithinWatermark`), build sessions with
+      `session_window`, and write custom state with
+      `transformWithState`
+    - Know which query changes a checkpoint survives, and which fail
+      with which error
+
+    It also uses "JSON Drift and Quarantine" (corrupt records) and
+    "VARIANT Basics: Profiling and Nested Data" (`parse_json`,
+    `variant_get`).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Clickstream Drops
+
+    `data/messy/clickstream/` holds four JSON Lines files that a web
+    shop's tracker uploaded one after another. Each line is an event:
+
+    ```json
+    {"event_id": "e001", "user_id": "u1", "type": "page_view", "page": "/p/chair", "ts": "2026-10-05T09:00:51"}
+    ```
+
+    | File | Event time | What is wrong with it |
+    |---|---|---|
+    | `drop_01.jsonl` | 09:00 to 09:12 | nothing |
+    | `drop_02.jsonl` | 09:10 to 09:24 | two events re-sent from drop 1, one line sent twice, a truncated line, `"ts": "yesterday"`, an event with no `user_id`, and an event dated **2026-10-06** from a device whose clock is a day ahead |
+    | `drop_03.jsonl` | 09:16 to 09:36 | tracker 2.0: `type` is now `event_type`, and a new field `app_version` appears; two events arrive a few minutes out of order |
+    | `drop_04.jsonl` | 09:05 to 09:50 | one event re-sent from drop 3, and two events from 09:05, far too late |
+
+    The lesson streams the drops in that order, one per run, the way a
+    scheduled job would meet them. Every number below comes from doing
+    exactly that.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Schema Is Fixed When the Query Starts
+
+    A batch read can look at the files and infer a schema. A stream
+    cannot, because the files it will read do not exist yet. Streaming
+    file sources therefore require a schema, as you saw in "Streaming
+    Files: Your First Structured Streaming Job" (`Schema must be specified when creating a streaming source
+    DataFrame`). There is an escape hatch,
+    `spark.sql.streaming.schemaInference` (default `false`): with it set
+    to `true`, Spark infers the schema **once, when the query starts**,
+    from the files already in the folder. With only drop 1 present, and
+    then again after drop 3 arrived and the query was restarted:
+
+    ```text
+    schema: struct<event_id:string,page:string,ts:string,type:string,user_id:string>
+    schema: struct<app_version:string,event_id:string,event_type:string,page:string,ts:string,type:string,user_id:string>
+    ```
+
+    New fields are invisible until the next restart, and every restart
+    lists and samples the whole folder again, which gets slow as the
+    folder grows. The usual choice is an explicit schema. Here is the
+    tracker 1.0 schema meeting tracker 2.0's drop 3:
+
+    ```python
+    SCHEMA = "event_id STRING, user_id STRING, type STRING, page STRING, ts TIMESTAMP"
+    q = (spark.readStream.schema(SCHEMA).json(inbox)
+         .writeStream.format("memory").queryName("v1_schema")
+         .option("checkpointLocation", f"{work}/ck_a")
+         .trigger(availableNow=True).start())
+    q.awaitTermination()
+    spark.table("v1_schema").show(3)
+    ```
+
+    ```text
+    +--------+-------+----+--------+-------------------+
+    |event_id|user_id|type|    page|                 ts|
+    +--------+-------+----+--------+-------------------+
+    |    e023|     u4|NULL| /search|2026-10-05 09:25:15|
+    |    e020|     u3|NULL|/p/chair|2026-10-05 09:26:22|
+    |    e021|     u3|NULL| /search|2026-10-05 09:27:26|
+    +--------+-------+----+--------+-------------------+
+    ```
+
+    All 10 rows of drop 3 have `type` NULL, and nothing failed. A JSON
+    reader ignores fields that are not in the schema (`event_type`,
+    `app_version`) and fills missing ones with NULL. **Drift against a
+    fixed schema is silent data loss**, which is worse than a crash.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Think of the schema as a paper form with boxes. The stream copies
+    each event onto the form. When the tracker starts writing
+    `event_type` instead of `type`, there is no box for it, so the
+    clerk leaves "type" blank and throws the rest away, without telling
+    anyone.
+
+- Class: mult_question
+  Depth: all
+  Output: "A stream reads JSON with an explicit schema that has a `type` column. The producer renames the field to `event_type`. What happens to the running query?"
+  AnswerChoices: "It keeps running and type is NULL for the new rows;It fails with a schema mismatch error;It adds an event_type column automatically;It sends the new rows to _corrupt_record"
+  CorrectAnswer: "It keeps running and type is NULL for the new rows"
+  Hint: "The JSON reader ignores fields that are not in the schema and fills missing fields with NULL."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Corrupt Records in a Stream
+
+    The corrupt record column from "JSON Drift and Quarantine" works in
+    a stream too. Add it to the schema and drop 2's two broken lines
+    show up there:
+
+    ```python
+    raw = (spark.readStream
+           .schema(SCHEMA + ", _corrupt_record STRING")
+           .json(inbox))
+    q = (raw.where("_corrupt_record IS NOT NULL")
+         .writeStream.format("memory").queryName("corrupt")
+         .option("checkpointLocation", f"{work}/ck_b")
+         .trigger(availableNow=True).start())
+    q.awaitTermination()
+    spark.table("corrupt").select("event_id", "ts", "_corrupt_record").show(truncate=45)
+    ```
+
+    ```text
+    +--------+----+---------------------------------------------+
+    |event_id|  ts|                              _corrupt_record|
+    +--------+----+---------------------------------------------+
+    |    NULL|NULL|{"event_id": "e900", "user_id": "u3", "typ...|
+    |    e901|NULL|{"event_id": "e901", "user_id": "u3", "typ...|
+    +--------+----+---------------------------------------------+
+    ```
+
+    Two details:
+
+    - `e901` (`"ts": "yesterday"`) is valid JSON, but its `ts` could not
+      become a TIMESTAMP, so the whole line counts as corrupt, while the
+      fields that did parse (`event_id`) are still filled in.
+    - The `QUERY_ONLY_CORRUPT_RECORD_COLUMN` rule applies to streams.
+      `raw.select("_corrupt_record")` starts fine and then the query
+      dies on its first batch:
+
+    ```text
+    StreamingQueryException: [STREAM_FAILED] Query [id = ..., runId = ...]
+    terminated with exception: [UNSUPPORTED_FEATURE.QUERY_ONLY_CORRUPT_RECORD_COLUMN]
+    The feature is not supported: Queries from raw JSON/CSV/XML files are
+    disallowed when the referenced columns only include the internal corrupt
+    record column (named `_corrupt_record` by default).
+    ```
+
+    In a batch job the fix was `cache()`. In a stream, select at least
+    one real column next to it, as the filter above does by keeping
+    every column.
+
+    The corrupt record column still has the problem from the previous
+    section: a renamed field is not corrupt, it is just missing. For
+    drifting data there is a better tool.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Read Lines, Parse with VARIANT
+
+    Read the files with the **text** source instead. Its schema is one
+    `value STRING` column, so it can never drift. Then parse each line
+    into a VARIANT with `try_parse_json`, and pull fields out with
+    `try_variant_get`:
+
+    ```python
+    KNOWN_KEYS = ["event_id", "user_id", "type", "event_type", "page", "ts"]
+    lines = spark.read.text("data/messy/clickstream/drop_0[23].jsonl")   # or readStream.text(inbox)
+    v = lines.select(F.col("value").alias("line"), F.try_parse_json("value").alias("v"))
+    events = v.select(
+        F.try_variant_get("v", "$.event_id", "string").alias("event_id"),
+        F.coalesce(F.try_variant_get("v", "$.type", "string"),
+                   F.try_variant_get("v", "$.event_type", "string")).alias("type"),
+        F.try_to_timestamp(F.try_variant_get("v", "$.ts", "string")).alias("ts"),
+        F.array_except(F.expr("json_object_keys(line)"),
+                       F.array(*[F.lit(k) for k in KNOWN_KEYS])).alias("unknown_keys"),
+        F.col("v").isNull().alias("bad_json"))
+    events.where("bad_json OR ts IS NULL OR size(unknown_keys) > 0").show(4, truncate=False)
+    ```
+
+    ```text
+    +--------+---------+-------------------+-------------+--------+
+    |event_id|type     |ts                 |unknown_keys |bad_json|
+    +--------+---------+-------------------+-------------+--------+
+    |NULL    |NULL     |NULL               |NULL         |true    |
+    |e901    |page_view|NULL               |[]           |false   |
+    |e023    |page_view|2026-10-05 09:25:15|[app_version]|false   |
+    |e020    |page_view|2026-10-05 09:26:22|[app_version]|false   |
+    +--------+---------+-------------------+-------------+--------+
+    ```
+
+    What each piece buys you:
+
+    - **`try_parse_json`** returns NULL for the truncated line instead
+      of failing. Its strict sibling `parse_json` raises
+      `MALFORMED_RECORD_IN_PARSING.WITHOUT_SUGGESTION`, which in a
+      stream kills the query.
+    - **`try_variant_get`** returns NULL when a path is missing *or*
+      the value cannot be cast. `variant_get` raises
+      `INVALID_VARIANT_CAST` for `{"n": "two"}` read as `int`.
+    - **`coalesce` of both names** absorbs the rename, so drop 3's
+      events keep their type.
+    - **`unknown_keys`** lists keys you did not expect
+      (`json_object_keys` of the line minus `KNOWN_KEYS`). The day
+      tracker 2.0 shipped, this column started saying `[app_version]`.
+      Alert on it and you hear about the next drift from your own job,
+      not from an analyst a month later.
+
+    The row is a VARIANT, so nothing about the stream's schema changes
+    when the producer adds, renames or retypes a field. You decide in
+    code how to map old and new shapes, and you can redeploy that code
+    on the same checkpoint, because the source schema is still `value
+    STRING`.
+
+- Class: mult_question
+  Depth: all
+  Output: "Why does reading JSON Lines with the text source and try_parse_json make a stream immune to schema drift?"
+  AnswerChoices: "The source schema is always one value STRING column, and fields are extracted from a VARIANT in code;The text source infers the schema on every micro-batch;try_parse_json rewrites the checkpoint when fields change;VARIANT columns are not stored in the checkpoint"
+  CorrectAnswer: "The source schema is always one value STRING column, and fields are extracted from a VARIANT in code"
+  Hint: "What is the schema of spark.readStream.text(...)?"
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Every Row Gets a Reason
+
+    Before routing anything, give each row exactly one `error`, the
+    first problem found, or NULL. The order matters: a row that is not
+    JSON has no user to complain about.
+
+    ```python
+    error = (F.when(F.col("_bad_json"), "bad_json")
+             .when(F.col("event_id").isNull(), "missing_event_id")
+             .when(F.col("user_id").isNull(), "missing_user")
+             .when(F.col("ts").isNull(), "bad_ts")
+             .when(F.col("ts") > now + F.expr("INTERVAL 5 minutes"), "future_ts"))
+    ```
+
+    Over all four drops, the exercise's `parse_events` finds:
+
+    ```text
+    Errors in all drops: {'missing_user': 1, 'future_ts': 1, None: 42, 'bad_json': 1, 'bad_ts': 1}
+    ```
+
+    `future_ts` needs a notion of "now". A production job passes
+    `F.current_timestamp()`; the exercise passes a fixed
+    `2026-10-05 10:00:00` so the results never depend on the day you
+    run it. Why bother checking for the future at all? Two sections
+    from now, one future event wrecks the whole stream.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Dead Letters with foreachBatch
+
+    A **dead-letter** table (or folder) keeps the rows a pipeline could
+    not use, with the reason, so someone can fix the producer and replay
+    them. The built-in sinks write one DataFrame to one place; to split
+    a micro-batch in two, use `foreachBatch`, which hands you each
+    micro-batch as a plain DataFrame plus its batch id:
+
+    ```python
+    def route_batch(batch, batch_id, root):
+        batch = batch.persist()          # used twice: compute it once
+        try:
+            (batch.where("error IS NOT NULL").select("line", "error")
+             .write.mode("overwrite").json(f"{root}/dead_letter/batch_id={batch_id}"))
+            (batch.where("error IS NULL")
+             .select("event_id", "user_id", "type", "page", "ts", "unknown_keys")
+             .write.mode("overwrite").parquet(f"{root}/silver/batch_id={batch_id}"))
+        finally:
+            batch.unpersist()
+
+    (parse_events(spark.readStream.text(inbox), now)
+     .writeStream.foreachBatch(lambda df, i: route_batch(df, i, root))
+     .option("checkpointLocation", checkpoint)
+     .trigger(availableNow=True).start())
+    ```
+
+    "Streaming Files: Your First Structured Streaming Job" showed why
+    a replayed batch must be harmless (key every write by the batch id
+    and overwrite) and why a batch written twice should be persisted.
+    Here persisting matters for one more reason: anything
+    nondeterministic in the parsing (`current_timestamp()` in a
+    production future-event check, a UDF that calls a service), which
+    each write job would evaluate again, could otherwise
+    route a row to silver in one write and to the dead letters in the
+    other. One rule is specific to dead letters:
+
+    - **Write every batch, even an empty one.** The folder
+      `dead_letter/batch_id=0` with no rows says "batch 0 had no dead
+      letters", which you can tell apart from "batch 0 was never
+      written".
+
+    Reading the folders back later, Spark turns `batch_id=N` into a
+    `batch_id` column (partition discovery), which is handy for
+    tracing a dead letter back to its micro-batch:
+
+    ```text
+    +------------+------------------------------------------------------------+--------+
+    |       error|                                                        line|batch_id|
+    +------------+------------------------------------------------------------+--------+
+    |    bad_json|       {"event_id": "e900", "user_id": "u3", "type": "page_v|       1|
+    |      bad_ts|{"event_id": "e901", "user_id": "u3", "type": "page_view"...|       1|
+    |missing_user|{"event_id": "e902", "type": "page_view", "page": "/", "t...|       1|
+    |   future_ts|{"event_id": "e903", "user_id": "u4", "type": "page_view"...|       1|
+    +------------+------------------------------------------------------------+--------+
+    ```
+
+    Keep the raw `line`, not the parsed columns: the parsed columns of
+    a bad row are exactly the ones you cannot trust.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Duplicates Across Batches, Without State
+
+    Inside `foreachBatch` the batch is an ordinary DataFrame, so
+    `dropDuplicates(["event_id"])` removes duplicates *within* the
+    batch (drop 2 sends `e012` twice). Duplicates *across* batches
+    (drop 2 re-sends `e001` from drop 1) need a memory of what was
+    already written. The silver folder is that memory: anti-join the
+    batch against the event ids of every *other* batch.
+
+    ```python
+    seen = (spark.read.parquet(f"{root}/silver")
+            .where(F.col("batch_id") != batch_id).select("event_id"))
+    good = good.join(seen, "event_id", "left_anti")
+    ```
+
+    `!= batch_id`, not "all of silver": on a replay of batch 3, silver
+    already holds batch 3's own rows, and excluding them would make the
+    replay write an empty batch. With the filter, a replay recomputes
+    exactly the same rows and overwrites them with themselves.
+
+    This lookup grows with the table, so on large tables it becomes a
+    `MERGE INTO` against a Delta table keyed on `event_id` (see
+    "Landing Messy Data in Delta Lake"), which does the same job with
+    file skipping. "Duplicates with Bounded State" below shows the
+    streaming alternative, which keeps a bounded amount of state
+    instead of a lookup.
+
+- Class: mult_question
+  Depth: all
+  Output: "Batch 3 is replayed after a crash. Its de-duplication anti-joins the batch against the event ids of all of silver, including the batch_id=3 folder the first attempt wrote. What does the replay write to batch_id=3?"
+  AnswerChoices: "No rows, because every event id of the batch is already in its own first-attempt output;The same rows as the first attempt;Each row twice;An error, because batch_id=3 already exists"
+  CorrectAnswer: "No rows, because every event id of the batch is already in its own first-attempt output"
+  Hint: "The anti-join removes every event already in silver. Which rows of silver should not count as already seen on a replay?"
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Inside a `foreachBatch` function with arguments `batch` and
+    `batch_id`, write the rows whose `error` column is not NULL as JSON
+    to the folder `f"{root}/dead_letter/batch_id={batch_id}"`, so that a
+    replay of the same batch replaces the earlier output.
+  CorrectAnswer: |
+    (batch.where("error IS NOT NULL")
+     .write.mode("overwrite")
+     .json(f"{root}/dead_letter/batch_id={batch_id}"))
+  Hint: "Filter with where('error IS NOT NULL'), then write.mode('overwrite').json(path)."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Admission Control and Housekeeping
+
+    "Streaming Files: Your First Structured Streaming Job" covered the
+    admission options (`maxFilesPerTrigger`, `maxBytesPerTrigger`,
+    `latestFirst`, `maxFileAge`), the oldest-first file order and the
+    `sources/0/` log of files read. Two things matter more on messy,
+    bursty inboxes. First, files with the same modification time come
+    in no guaranteed order: with
+    `maxFilesPerTrigger` 1 and `drop_01` and `drop_02` given the same
+    modification time, the first batch read `drop_02`. Never rely on
+    file order to mean event order; that is what event time (next
+    section) is for.
+
+    Second, housekeeping: `cleanSource` (default `off`) set to
+    `archive` moves processed files to `sourceArchiveDir`, and `delete`
+    deletes them. It has two surprises worth seeing once:
+
+    ```text
+    inbox after run1: ['drop_01.jsonl']
+    archive: ['/archive/inbox/drop_02.jsonl']
+    ```
+
+    - **The last batch's files stay put.** A source is told a batch is
+      done (`commit`) when Spark plans the *next* batch, so the files of
+      the last batch of a run are archived by the following run. Do not
+      treat "the file is still in the inbox" as "it was not processed".
+    - **The archive keeps the full path** under `sourceArchiveDir`
+      (`archive/inbox/drop_02.jsonl`), and the archive directory must
+      not be somewhere the source pattern could match, or the query
+      fails on start:
+
+    ```text
+    StreamingQueryException: [STREAM_FAILED] ... requirement failed: Base archive
+    path cannot be set to the path where archived path can possibly match with
+    source pattern. Ensure the base archive path doesn't match with source pattern
+    in depth, where the depth is minimum of depth on both paths.
+    ```
+
+    Forgetting `sourceArchiveDir` fails the same way with `Archive mode
+    must be used with 'sourceArchiveDir' option.`
+
+    The `sources/0/` log of files read is why the built-in source does
+    not have the "old modification time" blind spot of the hand-written reader in
+    "Streaming Readers and Writers", and also why a file that is
+    rewritten in place under the same name is **not** read again.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Event Time and Watermarks
+
+    "Streaming Files: Your First Structured Streaming Job" introduced
+    the watermark on clean data: `withWatermark("ts", "10 minutes")`
+    means watermark = (largest `ts` seen so far) minus 10 minutes,
+    stateful operators drop events at or below it, and it is computed
+    at the **end** of a micro-batch and used by the **next** one. On
+    the clickstream, here is the session query of the exercise, one
+    drop per run (from `query.recentProgress`):
+
+    ```text
+    drop_01.jsonl: session batches [0, 1], watermark 2026-10-05T09:02:44.000Z, late rows 0
+    drop_02.jsonl: session batches [2, 3], watermark 2026-10-05T09:14:54.000Z, late rows 1
+    drop_03.jsonl: session batches [4, 5], watermark 2026-10-05T09:26:06.000Z, late rows 0
+    drop_04.jsonl: session batches [6, 7], watermark 2026-10-05T09:40:51.000Z, late rows 3
+    ```
+
+    - Drop 1's newest event is 09:12:44, so after its batch the
+      watermark is 09:02:44.
+    - Each run made **two** batches although each drop is one file.
+      The second has no input: it is a **no-data batch**, which Spark
+      runs for stateful queries when the watermark moved, so state can
+      be emitted and evicted without waiting for more data
+      (`spark.sql.streaming.noDataMicroBatches.enabled`, default
+      `true`). With `availableNow`, this is what makes finished
+      sessions appear at the end of a run.
+    - Drop 3's two out-of-order events (09:16:40 and 09:22:10) are late
+      by the clock but not by the watermark (09:14:54), so they are
+      kept and join their users' sessions.
+    - Drop 2's one late row is the re-sent `e001` (09:00:51, below
+      09:02:44). Drop 4's three are its two 09:05 events and the
+      re-sent `e023` (09:25:15, below 09:26:06). The re-sends are
+      counted as late, not as duplicates: the watermark filter runs
+      before the duplicate check.
+
+    Late rows are counted per stateful operator in
+    `progress.stateOperators[i].numRowsDroppedByWatermark`. Watch that
+    number in production: a sudden rise means a producer is buffering
+    events, or a clock is wrong.
+
+    Late events are only late for the stateful query. The silver folder
+    from `foreachBatch` keeps all 38 unique events, the 09:05 ones
+    included, because an event that happened is still a fact even if
+    it missed its session.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    A watermark works like the "doors close" time at a concert. Once the
+    doors close, people who arrive are turned away, even if their ticket
+    is valid. Here the doors close 10 minutes after the latest arrival
+    anyone has seen, and the time is only updated between batches, like
+    a sign someone changes once per song.
+
+- Class: mult_question
+  Depth: all
+  Output: "A query uses withWatermark('ts', '10 minutes'). Batch 0's newest event is 09:12:44. Batch 1 contains an event with ts 09:04:00. What happens to it?"
+  AnswerChoices: "It is kept, because 09:04:00 is after the watermark of 09:02:44;It is dropped, because it is older than the newest event seen;It is dropped, because batch 1 first raises the watermark to its own newest event;It is sent to _corrupt_record"
+  CorrectAnswer: "It is kept, because 09:04:00 is after the watermark of 09:02:44"
+  Hint: "Watermark = max event time seen so far (09:12:44) minus the delay. Compare the event with that."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## One Event from the Future
+
+    Run the same session query without the `future_ts` check, so the
+    event dated 2026-10-06 (a phone a day ahead) reaches
+    `withWatermark`:
+
+    ```text
+    drop_01.jsonl 0 10 1970-01-01T00:00:00.000Z [('sessionWindowStateStoreSaveExec', 3, 0, 3), ('dedupeWithinWatermark', 10, 0, 10)]
+    drop_01.jsonl 1 0 2026-10-05T09:02:44.000Z [('sessionWindowStateStoreSaveExec', 3, 0, 0), ('dedupeWithinWatermark', 10, 0, 0)]
+    drop_02.jsonl 2 16 2026-10-05T09:02:44.000Z [('sessionWindowStateStoreSaveExec', 6, 0, 5), ('dedupeWithinWatermark', 20, 1, 10)]
+    drop_02.jsonl 3 0 2026-10-06T09:12:00.000Z [('sessionWindowStateStoreSaveExec', 1, 0, 0), ('dedupeWithinWatermark', 1, 0, 0)]
+    drop_03.jsonl 4 10 2026-10-06T09:12:00.000Z [('sessionWindowStateStoreSaveExec', 1, 0, 0), ('dedupeWithinWatermark', 1, 10, 0)]
+    drop_04.jsonl 5 10 2026-10-06T09:12:00.000Z [('sessionWindowStateStoreSaveExec', 1, 0, 0), ('dedupeWithinWatermark', 1, 10, 0)]
+    ```
+
+    (Columns: drop, batch id, input rows, watermark, then per operator:
+    name, rows in state, rows dropped by watermark, rows updated.)
+
+    One event moved the watermark to `2026-10-06T09:12:00`, a day
+    ahead. From then on **every** real event is "late": 10 of 10 rows
+    of drop 3 and 10 of 10 of drop 4 were dropped, and the query
+    reported success every time. The watermark never moves backwards,
+    so the damage lasts until the event time catches up, here a full
+    day, or until you start over with a new checkpoint.
+
+    Defences, cheapest first:
+
+    - Reject events from the future **before** `withWatermark` (the
+      `future_ts` dead letter), with a tolerance for ordinary clock
+      skew.
+    - Prefer a server-side time (when your collector received the
+      event) as the watermark column, and keep the device time as data.
+    - Alert on `numRowsDroppedByWatermark`. A healthy stream drops a
+      few; this one dropped everything.
+
+    Spark offers one more knob: with several watermarked inputs (a
+    join, a union), `spark.sql.streaming.multipleWatermarkPolicy`
+    (`min` by default) picks the slowest input's watermark, so one
+    fast input does not make the others late. `max` would, so leave it
+    at `min` for messy sources.
+
+- Class: mult_question
+  Depth: all
+  Output: "A stream with withWatermark('ts', '10 minutes') receives one event whose ts is a year in the future. What happens to the normal events that follow?"
+  AnswerChoices: "They are all dropped as late by stateful operators until event time catches up;They are kept, because the watermark ignores outliers;The query fails with a watermark error;Only the future event is dropped"
+  CorrectAnswer: "They are all dropped as late by stateful operators until event time catches up"
+  Hint: "The watermark is the maximum event time seen minus the delay, and it never moves backwards."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Duplicates with Bounded State
+
+    `dropDuplicates(["event_id"])` on a stream remembers every
+    `event_id` forever, and the state grows without end.
+    `dropDuplicatesWithinWatermark` (3.5, SPARK-42931) remembers each
+    id only until the watermark passes the event's time plus the delay,
+    which is enough for re-sends that arrive within the delay:
+
+    ```python
+    deduped = (events.where("error IS NULL")
+               .withWatermark("ts", "10 minutes")
+               .dropDuplicatesWithinWatermark(["event_id"]))
+    ```
+
+    In the run above, drop 2's re-sent `e005` (09:04:23, still above
+    the watermark of 09:02:44) was removed as a duplicate; the re-sent
+    `e001` (09:00:51) was removed as late before the duplicate check
+    even looked at it. Either way it is gone, but they land in
+    different counters, which matters when you read the metrics.
+
+    The docstring states the guarantee precisely: "Events are
+    deduplicated as long as the time distance of earliest and latest
+    events are smaller than the delay threshold of watermark." So
+    choose the delay from how late re-sends really arrive, not only
+    from how late first sends arrive. The plain `dropDuplicates` on a
+    stream can only evict state when the event time column is one of
+    its keys, and then two copies with different times are not
+    duplicates at all.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Sessions with session_window
+
+    A **session** is a burst of activity from one user, separated from
+    the next by a gap of inactivity. `session_window` (3.2,
+    SPARK-10816) builds them from event time:
+
+    ```python
+    sessions = (deduped
+                .groupBy("user_id", F.session_window("ts", "5 minutes").alias("s"))
+                .agg(F.count("*").alias("events"),
+                     F.max(F.col("type") == "checkout").alias("checkout"))
+                .select("user_id", F.col("s.start").alias("start"),
+                        F.col("s.end").alias("end"), "events", "checkout"))
+    ```
+
+    In `append` mode a session is written once, when the watermark
+    passes its end (last event plus the gap). After all four drops:
+
+    ```text
+    +-------+-------------------+-------------------+------+--------+
+    |user_id|start              |end                |events|checkout|
+    +-------+-------------------+-------------------+------+--------+
+    |u1     |2026-10-05 09:00:51|2026-10-05 09:08:35|3     |false   |
+    |u1     |2026-10-05 09:14:46|2026-10-05 09:21:40|3     |false   |
+    |u2     |2026-10-05 09:02:03|2026-10-05 09:16:38|7     |true    |
+    |u3     |2026-10-05 09:08:51|2026-10-05 09:17:44|3     |false   |
+    |u3     |2026-10-05 09:26:22|2026-10-05 09:34:48|3     |false   |
+    |u4     |2026-10-05 09:16:51|2026-10-05 09:30:15|6     |false   |
+    |u4     |2026-10-05 09:31:31|2026-10-05 09:36:31|1     |false   |
+    +-------+-------------------+-------------------+------+--------+
+    ```
+
+    - `u1`'s second session includes the late `e028` (09:16:40), and
+      `u4`'s first includes the late `e029` (09:22:10): late, but not
+      too late.
+    - `end` is the last event plus the gap, not the last event.
+    - `u5`, `u6` and `u3`'s third session are not there yet. Their ends
+      are after the final watermark (09:40:51), so they are still in
+      state, waiting for the next run. Append mode trades latency for
+      never having to correct a row.
+    - `u2`'s session ran on after the checkout (09:11:30) because a
+      session window only knows about gaps. A business rule like "a
+      checkout ends the session" needs custom state.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Custom State with transformWithState
+
+    "Structured Streaming" in the learning_spark course introduced
+    `transformWithState`: a `StatefulProcessor` with state variables and
+    timers, available in Python as `transformWithStateInPandas` (4.0)
+    and the `Row`-based `transformWithState` (4.1). Here is a
+    sessionizer that ends a session at a checkout *or* after 5 minutes
+    of silence:
+
+    ```python
+    GAP_MS = 5 * 60 * 1000
+
+    class Sessionizer(StatefulProcessor):
+        def init(self, handle):
+            self.handle = handle
+            # epoch milliseconds, not TIMESTAMP: see the time zone gotcha below
+            self.session = handle.getValueState("session", "start_ms BIGINT, last_ms BIGINT, n INT")
+
+        def _row(self, key, s, reason):
+            return Row(user_id=key[0], start_ms=s[0], end_ms=s[1], n=s[2], reason=reason)
+
+        def handleInputRows(self, key, rows, timerValues):
+            cur = self.session.get() if self.session.exists() else None
+            for r in sorted(rows, key=lambda r: r.ts_ms):
+                if cur is not None and r.ts_ms - cur[1] > GAP_MS:
+                    yield self._row(key, cur, "timeout")
+                    cur = None
+                cur = (r.ts_ms, r.ts_ms, 1) if cur is None else (cur[0], max(cur[1], r.ts_ms), cur[2] + 1)
+                if r.type == "checkout":
+                    yield self._row(key, cur, "checkout")
+                    cur = None
+            for t in self.handle.listTimers():
+                self.handle.deleteTimer(t)
+            if cur is None:
+                self.session.clear()
+            else:
+                self.session.update(cur)
+                self.handle.registerTimer(cur[1] + GAP_MS)   # event time, in ms
+
+        def handleExpiredTimer(self, key, timerValues, expiredTimerInfo):
+            if self.session.exists():
+                s = self.session.get()
+                self.session.clear()
+                yield self._row(key, s, "timeout")
+
+        def close(self):
+            pass
+
+    spark.conf.set("spark.sql.streaming.stateStore.providerClass",
+                   "org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider")
+    sessions = (events.withColumn("ts_ms", F.unix_millis("ts"))
+                .withWatermark("ts", "10 minutes").groupBy("user_id")
+                .transformWithState(statefulProcessor=Sessionizer(),
+                                    outputStructType="user_id STRING, start_ms BIGINT, end_ms BIGINT, n INT, reason STRING",
+                                    outputMode="Append", timeMode="EventTime"))
+    ```
+
+    With `timeMode="EventTime"`, a timer fires when the **watermark**
+    passes it, so a quiet user's session is closed by the no-data batch
+    at the end of a run. After the four drops (no deduplication in this
+    version, so `u1`'s second session counts the twice-sent `e012`):
+
+    ```text
+    +-------+-------------------+-------------------+---+--------+
+    |user_id|start              |end                |n  |reason  |
+    +-------+-------------------+-------------------+---+--------+
+    |u1     |2026-10-05 09:00:51|2026-10-05 09:03:35|3  |timeout |
+    |u1     |2026-10-05 09:14:46|2026-10-05 09:16:40|4  |timeout |
+    |u2     |2026-10-05 09:02:03|2026-10-05 09:11:30|7  |checkout|
+    |u2     |2026-10-05 09:11:38|2026-10-05 09:11:38|1  |timeout |
+    |u3     |2026-10-05 09:08:51|2026-10-05 09:12:44|3  |timeout |
+    |u3     |2026-10-05 09:26:22|2026-10-05 09:29:48|3  |timeout |
+    |u4     |2026-10-05 09:16:51|2026-10-05 09:25:15|6  |timeout |
+    |u4     |2026-10-05 09:31:31|2026-10-05 09:31:31|1  |timeout |
+    |u5     |2026-10-05 09:30:55|2026-10-05 09:41:30|6  |checkout|
+    |u6     |2026-10-05 09:41:51|2026-10-05 09:42:34|2  |timeout |
+    +-------+-------------------+-------------------+---+--------+
+    ```
+
+    `u2` and `u5` now end at their checkouts, and `end` is the last
+    event (this processor's choice), not last event plus gap.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## transformWithState Gotchas (4.2.0)
+
+    - **RocksDB is required.** With the default state store the query
+      fails on its first batch:
+
+    ```text
+    [UNSUPPORTED_FEATURE.STORE_BACKEND_NOT_SUPPORTED_FOR_TWS] The feature is not
+    supported: Store backend
+    org.apache.spark.sql.execution.streaming.state.HDFSBackedStateStoreProvider is
+    not supported by TransformWithState operator. Please use
+    RocksDBStateStoreProvider.
+    ```
+
+    - **Timestamps in state lose their time zone.** The first version
+      of this processor kept `start` and `last` as `TIMESTAMP` in state
+      and failed in the second batch with `TypeError: can't subtract
+      offset-naive and offset-aware datetimes`. Input rows arrived as
+      timezone-aware UTC datetimes (the session time zone was UTC),
+      while values read back from state were naive datetimes in the
+      worker's local time zone (a 09:06:09 UTC event came back as
+      02:06:09 on a machine in Pacific time). Store epoch milliseconds
+      (`F.unix_millis`) and convert at the end with
+      `F.timestamp_millis`, and the problem cannot happen.
+    - **Event-time timers are compared with the watermark**, so they
+      only fire in batches; with `availableNow`, the no-data batch at
+      the end of a run is the one that fires them.
+    - **TTL** is processing time: `getValueState(name, schema,
+      ttlDurationMs)` expires a value that has not been updated for
+      that long *by the clock*, whatever the event times say. Use it to
+      bound state for users who never come back, not as session logic.
+    - **Read the state back** with the state data source from the
+      learning_spark course. After the run, two users still had open
+      sessions:
+
+    ```python
+    spark.read.format("statestore").option("stateVarName", "session").load(checkpoint).show()
+    ```
+
+    ```text
+    +----+---------------------------------+------------+
+    |key |value                            |partition_id|
+    +----+---------------------------------+------------+
+    |{u3}|{1791193507000, 1791193507000, 1}|1           |
+    |{u6}|{1791193851000, 1791193851000, 1}|1           |
+    +----+---------------------------------+------------+
+    ```
+
+    `format("state-metadata")` lists the operator and its state
+    variables, including the hidden `$eventTimers_keyToTimestamp`
+    timer state. "Streaming Internals: Checkpoints, State and Real-Time
+    Mode" in the advanced level opens these files byte by byte.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Unit-Testing a Processor with TwsTester (4.2)
+
+    Spark 4.2 added `pyspark.sql.streaming.TwsTester` (SPARK-54805),
+    which runs a `StatefulProcessor` without a stream, so the session
+    logic gets ordinary unit tests:
+
+    ```python
+    from pyspark.sql.streaming import TwsTester
+
+    M = 60_000
+    T0 = 1_791_190_800_000  # 2026-10-05 09:00 UTC
+    t = TwsTester(Sessionizer(), timeMode="EventTime", eventTimeExtractor=lambda r: r.ts_ms)
+    print(t.test("u1", [Row(user_id="u1", type="page_view", ts_ms=T0 + 0),
+                        Row(user_id="u1", type="page_view", ts_ms=T0 + 2 * M)]))
+    print(t.peekValueState("session", "u1"))
+    print(t.test("u1", [Row(user_id="u1", type="page_view", ts_ms=T0 + 10 * M)]))
+    print(t.test("u2", [Row(user_id="u2", type="page_view", ts_ms=T0 + 20 * M)]))
+    print(t.setWatermark(T0 + 26 * M))
+    ```
+
+    ```text
+    []
+    (1791190800000, 1791190920000, 2)
+    [Row(user_id='u1', start_ms=1791190800000, end_ms=1791190920000, n=2, reason='timeout')]
+    []
+    [Row(user_id='u2', start_ms=1791192000000, end_ms=1791192000000, n=1, reason='timeout')]
+    ```
+
+    `setWatermark` fires the timers at or below the new watermark and
+    returns what `handleExpiredTimer` yielded. Its docstring lists what
+    it does not simulate: TTL, and the automatic watermark that a real
+    stream computes per batch. One trap: the tester's watermark starts
+    at 0 and late events (event time at or below the watermark) are
+    filtered, so a test that uses `ts_ms=0` silently loses its first
+    row. Use realistic epoch times, as above.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What a Checkpoint Survives
+
+    A stateful query's checkpoint stores the state's schema and the list
+    of stateful operators. Restarting the session query (one drop
+    processed) with a changed query gave:
+
+    | Change | Result on restart |
+    |---|---|
+    | session gap 5 to 10 minutes | runs, although the sessions already in state were built with the old gap |
+    | watermark delay 10 to 20 minutes | runs |
+    | a filter after the aggregation | runs |
+    | group by `user_id, event_id` instead of `user_id` | `STATE_STORE_KEY_SCHEMA_NOT_COMPATIBLE` |
+    | one more aggregate (`max("ts")`) | `STATE_STORE_VALUE_SCHEMA_NOT_COMPATIBLE` |
+    | add `dropDuplicatesWithinWatermark` before the window | `STREAMING_STATEFUL_OPERATOR_NOT_MATCH_IN_STATE_METADATA` |
+    | switch the state store to RocksDB | runs, **still on the old store**: the checkpoint's recorded `spark.sql.streaming.stateStore.providerClass` wins over the session's |
+
+    The key schema error, for example:
+
+    ```text
+    [STATE_STORE_KEY_SCHEMA_NOT_COMPATIBLE] Provided key schema does not match
+    existing state key schema. Please check number and type of fields.
+    Existing key_schema=StructType(StructField(user_id,StringType,true),
+    StructField(sessionStartTime,TimestampType,false)) and new
+    key_schema=StructType(StructField(user_id,StringType,true),
+    StructField(event_id,StringType,true),StructField(sessionStartTime,TimestampType,false)).
+    If you want to force running the query without schema validation, please set
+    spark.sql.streaming.stateStore.stateSchemaCheck to false.
+    ```
+
+    Do not take the last sentence's advice: reading state with the
+    wrong schema gives undefined results. The rules that follow:
+
+    - Stateless changes (filters, projections, the parsing code) are
+      safe. This is the payoff of parsing in code from a `value STRING`
+      source: fixing a drift mapping is a stateless change.
+    - Changing keys, aggregates or the set of stateful operators needs a
+      new checkpoint, and so does changing the state store.
+    - Changing a parameter that state depends on (gap, delay) is
+      accepted and can quietly mix two behaviours. Treat it as a new
+      query unless mixed results are acceptable.
+    - A new checkpoint means reprocessing from the files, so keep raw
+      input (or a bronze table) long enough to rebuild from.
+
+- Class: mult_question
+  Depth: all
+  Output: "You restart a session_window query from its checkpoint after adding event_id to the groupBy keys. What happens?"
+  AnswerChoices: "It fails with STATE_STORE_KEY_SCHEMA_NOT_COMPATIBLE;It starts a fresh state automatically;It runs and ignores event_id for existing sessions;It fails with STREAMING_CHECKPOINT_MISSING_METADATA_FILE"
+  CorrectAnswer: "It fails with STATE_STORE_KEY_SCHEMA_NOT_COMPATIBLE"
+  Hint: "The grouping keys are the state's key schema, and the checkpoint remembers it."
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "A team sets spark.sql.streaming.stateStore.providerClass to RocksDB and restarts an existing query from its old checkpoint. Which state store does the query use?"
+  AnswerChoices: "The one recorded in the checkpoint;RocksDB, because the session setting wins;Both, migrating state on the fly;Neither: the query fails"
+  CorrectAnswer: "The one recorded in the checkpoint"
+  Hint: "Look at the conf block stored in each offsets/N file."
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: A Clickstream That Survives Its Producers
+
+    Complete three functions in the starter:
+
+    1. `parse_events(lines, now)`: from a DataFrame with one `value`
+       column, return `line, event_id, user_id, type, page, ts,
+       unknown_keys, error`. Read both `type` and `event_type`, list
+       unknown keys, and set `error` to `bad_json`,
+       `missing_event_id`, `missing_user`, `bad_ts` or `future_ts`
+       (later than `now` plus `CLOCK_SKEW`), first match wins.
+    2. `route_batch(batch, batch_id, root)`: the `foreachBatch` body.
+       Dead letters (`line`, `error`) as JSON in
+       `root/dead_letter/batch_id=<id>`; valid events, deduplicated
+       within the batch and against silver's *other* batches, as
+       Parquet in `root/silver/batch_id=<id>`. Overwrite both.
+    3. `sessions(events)`: valid events, a 10 minute watermark,
+       `dropDuplicatesWithinWatermark` on `event_id`, 5 minute session
+       windows, with `events` (count) and `checkout` columns.
+
+    The harness first tests `parse_events` on a batch DataFrame of all
+    four drops (42 clean lines, one of each error, 20 drifted lines with
+    their type intact). Then it copies the drops into an inbox one at a
+    time and restarts both streaming queries from their checkpoints
+    after each drop. It checks 4 dead letters, 38 unique events in
+    silver, 7 finished sessions (including `u2`'s 7-event session with a
+    checkout) and exactly 4 rows dropped by the watermark. Finally it
+    deletes the last ingest commit, so Spark replays that batch, and
+    checks that silver and the dead letters did not change.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "type: F.coalesce of try_variant_get on $.type and $.event_type. unknown_keys: F.array_except(F.expr('json_object_keys(line)'), F.array(*[F.lit(k) for k in KNOWN_KEYS])). error: a chain of F.when, with now + F.expr(f'INTERVAL {CLOCK_SKEW}') for future_ts. route_batch: persist, write dead letters with mode('overwrite').json, then dropDuplicates(['event_id']) and a left_anti join against spark.read.parquet(silver).where(F.col('batch_id') != batch_id)."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Taking It Further
+
+    - **Replay dead letters.** Once the producer fix ships, a batch job
+      can read `dead_letter/`, re-parse `line` with the new rules, and
+      write the rows that now pass into silver with a new `batch_id`
+      range (for example negative ids), so the replay is itself
+      idempotent.
+    - **Multi-hop streaming.** Make silver a Delta table and run the
+      session query as a second stream over it (`readStream` on the
+      Delta table), so parsing happens once. Overwriting a batch folder
+      that a downstream file stream has already read would make it read
+      the new files again; a Delta table's transaction log avoids that.
+    - **Drift alerts.** A small query over silver
+      (`explode(unknown_keys)` grouped by key and day) is a drift
+      dashboard; add a `StreamingQueryListener` to log each batch's
+      dead-letter count.
+    - **Real-Time Mode** (PySpark in 4.2) lowers latency, but in 4.2.0
+      only for stateless queries from Kafka in update mode; the
+      learning_spark course's "Structured Streaming" lesson lists the
+      constraints. This pipeline could not use it even for the
+      stateless parsing and routing: "Streaming Internals: Checkpoints,
+      State and Real-Time Mode" shows the file source and the
+      `foreachBatch` sink are both rejected, and the sessions are
+      stateful.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - A stream's schema is fixed when the query starts. Against a fixed
+      schema, drift is silent: renamed fields become NULL. Reading JSON
+      Lines as text and parsing with `try_parse_json` and
+      `try_variant_get` makes drift a code change, and an
+      `unknown_keys` column tells you when it happens.
+    - Corrupt records work in streams, but a query that references only
+      `_corrupt_record` fails at its first batch with
+      `UNSUPPORTED_FEATURE.QUERY_ONLY_CORRUPT_RECORD_COLUMN`.
+    - `foreachBatch` splits a micro-batch into silver and dead letters.
+      Persist the batch, overwrite folders keyed by `batch_id`, and a
+      replayed batch changes nothing.
+    - The file source reads oldest first with no order among equal
+      modification times, remembers files in `sources/0`, and with
+      `cleanSource` moves a batch's files only when the next batch is
+      planned.
+    - The watermark (max event time minus delay) is updated between
+      batches; no-data batches emit and evict state. One event from the
+      future pushes it ahead and drops everything after it, so reject
+      future events before `withWatermark`.
+    - `dropDuplicatesWithinWatermark` (3.5) bounds deduplication state;
+      `session_window` (3.2) builds gap-based sessions;
+      `transformWithState` handles custom rules but needs RocksDB, and
+      state is safest in epoch milliseconds. `TwsTester` (4.2) unit-tests
+      processors.
+    - Checkpoints reject changed keys, aggregates and operators with
+      named errors, silently accept changed gaps and delays, and keep
+      their original state store.
+
+    Next: **Production Ingestion: Quality Rules, Quarantine and
+    Pipelines**, which turns the dead-letter idea into rules as data,
+    quality gates and a Declarative Pipeline.

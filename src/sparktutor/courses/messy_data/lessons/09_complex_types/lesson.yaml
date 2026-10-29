@@ -1,0 +1,1176 @@
+- Class: meta
+  Lesson: "Complex Types and Higher-Order Functions"
+  EstimatedMinutes: 60
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    In "JSON Drift and Quarantine" you met nested data from the outside:
+    you wrote a schema with a `STRUCT` for `user` and an
+    `ARRAY<STRUCT<...>>` for `items`, read old and new field locations
+    with `coalesce`, and used `explode_outer` and `inline_outer` to turn
+    items into rows. This lesson works on the nested values from the
+    inside, without turning them into rows first.
+
+    Spark has three **complex types**, and every nested format you will
+    meet in this course (JSON, XML, Avro, Protobuf, Parquet) maps onto
+    them:
+
+    | Type | Holds | DDL |
+    |------|-------|-----|
+    | struct | a fixed set of named fields, each with its own type | `STRUCT<city: STRING, lat: DOUBLE>` |
+    | array | any number of values of one type, in order | `ARRAY<STRING>` |
+    | map | any number of key/value pairs, keys of one type, values of one type | `MAP<STRING, STRING>` |
+
+    If you did `learning_spark` lesson 4 ("Complex Types & Higher-Order
+    Functions") you have seen `explode`, `transform`, `filter`,
+    `aggregate` and the basic map functions on small hand-made
+    DataFrames. Here they meet messy data, and you go further.
+
+    By the end of this lesson you will be able to:
+
+    - Read, build and edit structs at any depth (`withField` and
+      `dropFields`, Spark 3.1), and know when a NULL struct differs from
+      a struct of NULLs
+    - Use the array toolbox (`array_distinct`, `array_sort` with a
+      comparator, `flatten`, `slice`, `arrays_zip`, set operations) and
+      predict what each does with NULL
+    - Write higher-order functions in both Python and SQL lambda syntax,
+      and recognise the errors you get when a Python lambda does
+      something Spark cannot translate
+    - Choose a map instead of a struct for objects whose keys change,
+      and avoid `DUPLICATED_MAP_KEY` and `NULL_MAP_KEY`
+    - Turn rows back into arrays in a guaranteed order
+    - Flatten a deeply nested schema into `a_b_c` columns by walking
+      `df.schema`
+    - Tell when structs stop being the right tool, which is where the
+      next lesson's VARIANT comes in
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Orders File
+
+    `data/messy/nested/orders.json` holds web shop orders, one JSON
+    object per line. One record, pretty-printed:
+
+    ```json
+    {"order_id": "O-1002", "placed_at": "2026-10-06T09:07:00",
+     "customer": {"id": "C3", "name": "Sam Roy", "email": "user1@example.com",
+                  "address": {"city": "Montreal", "country": "CA",
+                              "geo": {"lat": 42.4062, "lon": 43.5345}}},
+     "lines": [{"sku": "P6", "qty": 5, "unit_price": 30.0, "discounts": [],
+                "attrs": {"color": "red", "size": "S", "engraving": "Happy 30th"}}],
+     "tags": ["gift"],
+     "payments": [{"method": "card", "amount": 150.0}],
+     "status_history": [{"status": "paid", "at": "2026-10-06T10:07:00"},
+                        {"status": "placed", "at": "2026-10-06T09:07:00"}]}
+    ```
+
+    It has the problems real nested data has:
+
+    | Problem | Where |
+    |---------|-------|
+    | tags in mixed case, with spaces, duplicates and a NULL | `["Gift", "gift", " GIFT", null, "rush"]` in O-1003 |
+    | a missing array and an empty one | O-1004 has no `tags` key, O-1005 has `[]` |
+    | an order with no lines, and one with no `lines` key | O-1006 and O-1007 |
+    | a NULL inside a struct in an array | `qty` of O-1008's first line |
+    | objects whose keys change from line to line | `attrs` |
+    | country codes in mixed case | `ca`, `CA`, `Ca` |
+    | a history out of time order | O-1002 above, and three more |
+    | a struct that is missing | O-1011 has no `geo` |
+
+    Inference reads it without complaint:
+
+    ```python
+    spark.read.json("data/messy/nested/orders.json").printSchema()
+    ```
+
+    ```
+     |-- lines: array (nullable = true)
+     |    |-- element: struct (containsNull = true)
+     |    |    |-- attrs: struct (nullable = true)
+     |    |    |    |-- color: string (nullable = true)
+     |    |    |    |-- engraving: string (nullable = true)
+     |    |    |    |-- gift_wrap: string (nullable = true)
+     |    |    |    |-- size: string (nullable = true)
+     |    |    |    |-- warranty_years: string (nullable = true)
+     |    |    |-- discounts: array (nullable = true)
+     ...
+    ```
+
+    Look at `attrs`. Every key that appears anywhere became a struct
+    field, so the schema changes whenever a producer invents a new
+    attribute, and most fields are NULL in most rows. JSON inference
+    never produces a map. You will fix that with an explicit schema in
+    the maps section; for now, read the file with this one (the
+    exercise starter has it too):
+
+    ```python
+    ORDER_SCHEMA = """
+        order_id STRING,
+        placed_at TIMESTAMP,
+        customer STRUCT<id: STRING, name: STRING, email: STRING,
+                        address: STRUCT<city: STRING, country: STRING,
+                                        geo: STRUCT<lat: DOUBLE, lon: DOUBLE>>>,
+        lines ARRAY<STRUCT<sku: STRING, qty: INT, unit_price: DOUBLE,
+                           discounts: ARRAY<STRUCT<code: STRING, pct: INT>>,
+                           attrs: MAP<STRING, STRING>>>,
+        tags ARRAY<STRING>,
+        payments ARRAY<STRUCT<method: STRING, amount: DOUBLE>>,
+        status_history ARRAY<STRUCT<status: STRING, at: TIMESTAMP>>
+    """
+    orders = spark.read.schema(ORDER_SCHEMA).json("data/messy/nested/orders.json")
+    orders.createOrReplaceTempView("orders")
+    ```
+
+    The examples below use `orders` (and the `orders` view for SQL),
+    with `from pyspark.sql import functions as F`.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    A struct is a form with labelled boxes: every order's customer has
+    the same boxes (id, name, email, address), and a box can hold another
+    form (the address has its own boxes). An array is a numbered list
+    stapled to the form: any length, every entry the same kind of thing.
+    A map is a sticky-note pad: each note has a label you choose and a
+    value, and no two notes may share a label. Picking the right one for
+    each part of your data is most of the work in this lesson.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Reading Structs
+
+    A dot walks into a struct, as deep as you like. All of these name a
+    field:
+
+    ```python
+    orders.select(
+        "order_id",
+        "customer.address.city",                  # a string path
+        F.col("customer.address.geo.lat"),        # the same in F.col
+        orders.customer.getField("name"),         # getField
+        orders["customer"]["id"])                 # indexing
+    ```
+
+    ```
+    +--------+--------+-------+-------------+-----------+
+    |order_id|    city|    lat|customer.name|customer.id|
+    +--------+--------+-------+-------------+-----------+
+    |  O-1001| Toronto|47.8056|    Linh Tran|         C2|
+    |  O-1002|Montreal|42.4062|      Sam Roy|         C3|
+    |  O-1003|   Hanoi| 27.029|  Priya Patel|         C9|
+    +--------+--------+-------+-------------+-----------+
+    ```
+
+    The output column is named after the last part of the path (`city`)
+    for string paths, and after the whole expression for `getField` and
+    indexing. Alias when the name matters. `"customer.*"` expands one
+    level into separate columns (`id`, `name`, `email`, `address`), and
+    `"customer.address.*"` expands the next level.
+
+    Two things to know:
+
+    - **A field that is not in the schema is an error at analysis
+      time**, not a NULL: `orders.select("customer.phone")` fails with
+      `[FIELD_NOT_FOUND] No such struct field `phone` in `id`, `name`,
+      `email`, `address``. With an explicit schema, the schema decides
+      what exists; a record that lacks the field just gives NULL.
+    - **A field name with a dot in it needs backticks.** For a column
+      called `a.b`, `select("a.b")` looks for field `b` inside a column
+      `a` and fails with `UNRESOLVED_COLUMN.WITH_SUGGESTION` (helpfully
+      suggesting `` `a.b` ``); `select("`a.b`")` works. Producers that
+      write keys like `geo.v1` cause exactly this.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## A NULL Struct Is Not a Struct of NULLs
+
+    Order O-1011 has no `geo` object. Its `customer.address.geo` is a
+    NULL struct, and every field read through it is NULL too:
+
+    ```
+    +----+------------------------------+----+
+    | geo|(customer.address.geo IS NULL)| lat|
+    +----+------------------------------+----+
+    |NULL|                          true|NULL|
+    +----+------------------------------+----+
+    ```
+
+    A struct whose fields are all NULL is a different value:
+
+    ```sql
+    SELECT struct(CAST(NULL AS INT) AS a) AS s,
+           struct(CAST(NULL AS INT) AS a) IS NULL AS n
+    ```
+
+    ```
+    +------+-----+
+    |     s|    n|
+    +------+-----+
+    |{NULL}|false|
+    +------+-----+
+    ```
+
+    `show()` prints the first as `NULL` and the second as `{NULL}`. The
+    difference matters when you check "is there an address?": a parser
+    that always builds the struct (as `from_json` does for malformed
+    input, which you saw in "JSON Drift and Quarantine") never gives you
+    a NULL struct, so `IS NULL` on the struct is always false and you
+    must test a field inside it instead.
+
+- Class: mult_question
+  Depth: all
+  Output: "`SELECT struct(CAST(NULL AS INT) AS a) IS NULL` returns what?"
+  AnswerChoices: "false;true;NULL;It fails with FIELD_NOT_FOUND"
+  CorrectAnswer: "false"
+  Hint: "The struct exists; only its field is NULL. show() prints it as {NULL}."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Building Structs
+
+    `F.struct` groups columns into a struct. Field names come from the
+    columns: a path keeps its last part, an alias wins, and an
+    expression without a name gets `col1`, `col2`, ... by position:
+
+    ```python
+    orders.select(F.struct("order_id", F.col("customer.id"), F.lit(1)).alias("s")).printSchema()
+    ```
+
+    ```
+     |-- s: struct (nullable = false)
+     |    |-- order_id: string (nullable = true)
+     |    |-- id: string (nullable = true)
+     |    |-- col3: integer (nullable = false)
+    ```
+
+    In SQL, `struct(order_id, customer.id)` names fields the same way,
+    and `named_struct('a', 1, 'b', 'x')` takes explicit names (it is also
+    `F.named_struct` in Python since 3.5). A struct built this way is
+    never NULL itself (`nullable = false`), even when every field is.
+
+    Structs compare field by field, in order: `struct(1, 'b') >
+    struct(1, 'a')` is true. That is what makes structs useful for
+    sorting and for "the latest X" tricks later in this lesson, and why
+    you can `groupBy("customer.address")` and `orderBy` a struct column.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Editing Structs: withField and dropFields
+
+    Changing one field deep inside a struct used to mean rebuilding the
+    whole struct by hand. Since Spark 3.1, two `Column` methods do it
+    for you, and they take dotted paths:
+
+    ```python
+    fixed = orders.withColumn(
+        "customer",
+        F.col("customer")
+         .dropFields("email", "address.geo")                       # remove
+         .withField("address.country", F.upper("customer.address.country")))  # replace
+    ```
+
+    ```
+     |-- customer: struct (nullable = true)
+     |    |-- id: string (nullable = true)
+     |    |-- name: string (nullable = true)
+     |    |-- address: struct (nullable = true)
+     |    |    |-- city: string (nullable = true)
+     |    |    |-- country: string (nullable = true)
+    ```
+
+    `withField` replaces a field that exists and appends one that does
+    not (`withField("vip", F.lit(True))` adds `vip` at the end). The
+    rules at the edges:
+
+    - **A NULL struct stays NULL.** `withField("lat", F.lit(1.0))` on
+      O-1011's missing `geo` gives NULL, not `{1.0, NULL}`. If you need
+      the struct to exist, build it with `F.struct` or
+      `F.coalesce(col, F.struct(...))`.
+    - **You cannot drop every field.** Dropping both `lat` and `lon`
+      from `geo` fails with
+      `DATATYPE_MISMATCH.CANNOT_DROP_ALL_FIELDS` ("Cannot drop all
+      fields in struct"). Drop the struct itself instead.
+    - **They work on structs, not on arrays of structs.**
+      `F.col("lines").withField("qty", ...)` fails with
+      `DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE` ("The first parameter
+      requires the "STRUCT" type, however "lines" has the type
+      "ARRAY<STRUCT<...>>""). Edit each element with `transform`:
+
+      ```python
+      F.transform("lines", lambda l: l.withField("qty", F.coalesce(l.qty, F.lit(0))))
+      ```
+
+    - **They are DataFrame methods only.** SQL has no `withField`; in
+      SQL you rebuild the struct with `named_struct`.
+
+    Dropping a personal field such as `email` with `dropFields` before
+    data leaves the raw layer is a common use; the exercise does it.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    `orders` has a struct column `customer` with fields `id`, `name`,
+    `email` and `address`. Assign to `safe` the DataFrame with
+    `customer.email` removed (all other columns and fields kept).
+  CorrectAnswer: |
+    safe = orders.withColumn("customer", F.col("customer").dropFields("email"))
+  Hint: "Replace the customer column with F.col('customer').dropFields('email')."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Arrays: Fields Through an Array
+
+    A dot path also goes *through* an array of structs. `lines.sku`
+    takes the `sku` of every element and gives an array:
+
+    ```python
+    orders.select("order_id", "lines.sku", "lines.qty").show(4)
+    ```
+
+    ```
+    +--------+--------+------+
+    |order_id|sku     |qty   |
+    +--------+--------+------+
+    |O-1001  |[P6, P5]|[4, 2]|
+    |O-1002  |[P6]    |[5]   |
+    |O-1003  |[P3]    |[3]   |
+    |O-1004  |[P6, P2]|[4, 4]|
+    +--------+--------+------+
+    ```
+
+    It only goes through **one** array. `lines.discounts` is an array of
+    arrays, and `lines.discounts.code` fails with a confusing message:
+
+    ```
+    [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve
+    "lines.discounts[code]" due to data type mismatch: The second
+    parameter requires the "INTEGRAL" type, however "code" has the type
+    "STRING".
+    ```
+
+    Spark read `.code` on an array of arrays as an array index. Flatten
+    the outer level first:
+
+    ```sql
+    SELECT order_id, flatten(lines.discounts).code AS codes FROM orders
+    ```
+
+    ```
+    +--------+--------------+
+    |order_id|codes         |
+    +--------+--------------+
+    |O-1001  |[VIP5]        |
+    |O-1004  |[FALL10, VIP5]|
+    ```
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Array Toolbox, and What It Does With NULL
+
+    These run in SQL exactly as shown, and each has an `F.` twin in
+    Python. Every output was produced on Spark 4.2.0:
+
+    | Expression | Result |
+    |------------|--------|
+    | `array_distinct(array('a','a',NULL,NULL,'b'))` | `[a, NULL, b]` (one NULL survives) |
+    | `array_compact(array('a',NULL,'b'))` (3.4) | `[a, b]` |
+    | `sort_array(array(3,NULL,1))` | `[NULL, 1, 3]` |
+    | `sort_array(array(3,NULL,1), false)` | `[3, 1, NULL]` |
+    | `array_sort(array(3,NULL,1))` | `[1, 3, NULL]` |
+    | `flatten(array(array(1,2), array(3), NULL))` | `NULL` (one NULL inner array) |
+    | `sequence(1, 10, 3)` | `[1, 4, 7, 10]` |
+    | `slice(array(1,2,3,4), 2, 2)` | `[2, 3]` (start is 1-based) |
+    | `slice(array(1,2,3,4), -2, 2)` | `[3, 4]` |
+    | `arrays_zip(array(1,2,3), array('a','b'))` | `[{1, a}, {2, b}, {3, NULL}]` |
+    | `array_union(array(1,2,2), array(2,3))` | `[1, 2, 3]` |
+    | `array_intersect(array(1,2,2), array(2,3))` | `[2]` |
+    | `array_except(array(1,2,2,4), array(2))` | `[1, 4]` |
+    | `array_join(array('a',NULL,'b'), ',')` | `a,b` (NULLs skipped) |
+    | `array_join(array('a',NULL,'b'), ',', '?')` | `a,?,b` |
+    | `array_position(array('a','b','a'), 'a')` | `1` (1-based, 0 if absent) |
+    | `array_remove(array(1,2,1,NULL), 1)` | `[2, NULL]` |
+    | `array_insert(array(1,2,3), 2, 9)` (3.4) | `[1, 9, 2, 3]` |
+    | `array_append(array(1,2), 3)` (3.4) | `[1, 2, 3]` |
+
+    Watch the NULL rules, because messy arrays have NULLs in them:
+
+    - **`size` of a NULL array is NULL** under ANSI mode (the default
+      since 4.0). With ANSI off it is `-1`, a Hive leftover. On the
+      orders, `size(tags)` is NULL for O-1004 (no key) and `0` for O-1005
+      (`[]`). `array_size` and `cardinality` behave the same.
+    - **`array_contains` returns NULL, not false, when the array has a
+      NULL and no match:** `array_contains(array('a', NULL), 'b')` is
+      NULL. In a `filter` that acts like false, but `NOT
+      array_contains(...)` drops the row too.
+    - **`sort_array` and `array_sort` put NULLs at opposite ends**
+      (above). Pick one and stay with it.
+    - **Set operations remove duplicates.** `array_union` and
+      `array_intersect` return sets, not multisets.
+
+    Indexing under ANSI mode: `arr[i]` (0-based) and `element_at(arr, i)`
+    (1-based) fail out of range with `INVALID_ARRAY_INDEX` and
+    `INVALID_ARRAY_INDEX_IN_ELEMENT_AT`, while `get(arr, i)` (0-based) and
+    `try_element_at(arr, i)` (1-based) return NULL instead (optional
+    background: `learning_spark` lesson 4). Two more edges from 4.2.0:
+    `element_at(arr, 0)` fails with `INVALID_INDEX_OF_ZERO` (it is
+    1-based, and `-1` means the last element), and `slice(arr, 0, 2)`
+    fails with `INVALID_PARAMETER_VALUE.START`.
+
+    And one trap that bites on real data: `lines[0].attrs` works on
+    every order you test, then a query reaches O-1006, whose `lines` is
+    `[]`, and fails with `[INVALID_ARRAY_INDEX] The index 0 is out of
+    bounds. The array has 0 elements.` Use `get(lines, 0)` (0-based) or
+    `try_element_at(lines, 1)` whenever an array can be empty.
+
+- Class: mult_question
+  Depth: all
+  Output: "With default Spark 4.2 settings, what is `size(tags)` for a row whose `tags` is NULL?"
+  AnswerChoices: "NULL;-1;0;It raises an error"
+  CorrectAnswer: "NULL"
+  Hint: "ANSI mode is on by default in Spark 4, and it changes the old Hive behaviour."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Generators, One Level Deeper
+
+    "JSON Drift and Quarantine" compared `explode` with `explode_outer`.
+    The rest of the family:
+
+    ```python
+    orders.select("order_id", F.posexplode_outer("lines").alias("pos", "line"))
+    ```
+
+    ```
+    +--------+----+--------------------+
+    |order_id| pos|                line|
+    +--------+----+--------------------+
+    |  O-1001|   0|{P6, 4, 30.0, [],...|
+    |  O-1001|   1|{P5, 2, 2.5, [{VI...|
+    |  O-1006|NULL|                NULL|
+    |  O-1007|NULL|                NULL|
+    ```
+
+    - `posexplode` adds the 0-based position, which is how you keep
+      "line 1, line 2" after exploding. O-1006 (`[]`) and O-1007 (no
+      `lines`) survive only because of `_outer`.
+    - `inline` explodes an array of structs straight into one column per
+      field (`sku`, `qty`, `unit_price`, `discounts`, `attrs`).
+    - `explode` on a **map** gives two columns, `key` and `value`
+      (`posexplode` adds `pos`).
+
+    In SQL the same generators appear in three places: in the `SELECT`
+    list, in a `LATERAL VIEW` (the Hive form, with `OUTER` for the
+    outer variant), or as a table-valued function in `FROM`:
+
+    ```sql
+    SELECT order_id, pos, l.sku
+    FROM orders LATERAL VIEW OUTER posexplode(lines) t AS pos, l
+
+    SELECT o.order_id, l.col.sku FROM orders o, LATERAL explode(o.lines) l
+    ```
+
+    Python has the table-valued form too:
+    `orders.lateralJoin(spark.tvf.explode_outer(F.col("tags").outer()))`
+    (4.0), as "VARIANT Basics: Profiling and Nested Data" will use for
+    `variant_explode`.
+
+    The plan shows why `explode` drops rows. For
+    `ev.select(F.inline("items"))` on the events:
+
+    ```
+    *(1) Generate inline(items#5), false, [sku#1005, qty#1006]
+    +- *(1) Filter ((size(items#5, false) > 0) AND isnotnull(items#5))
+    ```
+
+    The optimizer adds a filter that removes empty and NULL arrays before
+    the generator runs; the `_outer` forms have no such filter.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Two Generators in One SELECT
+
+    Two rules about where generators may appear, both checked in 4.2.0:
+
+    - **A generator cannot sit inside another expression.**
+      `F.upper(F.explode("tags"))` fails with
+      `UNSUPPORTED_GENERATOR.NESTED_IN_EXPRESSIONS`. Explode first, then
+      transform the new column (or transform the array, then explode).
+    - **Two generators in one plain `SELECT` multiply.**
+      `SELECT explode(array(1,2)) a, explode(array('x','y')) b` gives
+      four rows, `(1,x) (1,y) (2,x) (2,y)`: every element of the first
+      paired with every element of the second, per input row. If you
+      wanted them side by side, explode one `arrays_zip(...)` instead.
+      In a `SELECT` with an aggregate, two generators fail with
+      `UNSUPPORTED_GENERATOR.MULTI_GENERATOR` ("only one generator
+      allowed per SELECT clause").
+
+    Exploding lines and tags in one select is a classic accident: an
+    order with 3 lines and 4 tags becomes 12 rows, and every sum over
+    lines is now four times too big.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "`orders.select(F.explode('lines'), F.explode('tags'))` on an order with 2 lines and 3 tags produces how many rows for that order?"
+  AnswerChoices: "6;5;3;It fails with MULTI_GENERATOR"
+  CorrectAnswer: "6"
+  Hint: "In a plain SELECT, Spark 4.2 pairs every element of one generator with every element of the other."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Higher-Order Functions in Python and SQL
+
+    A higher-order function takes a function (a **lambda**) and applies
+    it to each element of an array, keeping one row per input row.
+    Python and SQL write the lambda differently and build the same
+    expression:
+
+    ```python
+    clean = F.array_sort(F.array_distinct(
+        F.filter(F.transform("tags", lambda t: F.lower(F.trim(t))),
+                 lambda t: t.isNotNull())))
+    orders.select("order_id", "tags", clean.alias("clean"))
+    ```
+
+    ```sql
+    SELECT order_id, tags,
+           array_sort(array_distinct(
+               filter(transform(tags, t -> lower(trim(t))), t -> t IS NOT NULL))) AS clean
+    FROM orders
+    ```
+
+    ```
+    +--------+-------------------------------+---------------+
+    |order_id|tags                           |clean          |
+    +--------+-------------------------------+---------------+
+    |O-1001  |[fragile, Gift]                |[fragile, gift]|
+    |O-1002  |[gift]                         |[gift]         |
+    |O-1003  |[Gift, gift,  GIFT, NULL, rush]|[gift, rush]   |
+    |O-1004  |NULL                           |NULL           |
+    |O-1005  |[]                             |[]             |
+    |O-1006  |[ rush , gift]                 |[gift, rush]   |
+    +--------+-------------------------------+---------------+
+    ```
+
+    Read it inside out: `transform` cleans each tag, `filter` drops the
+    NULL, `array_distinct` merges the duplicates that cleaning created,
+    and `array_sort` makes the result stable. Note O-1004: a NULL array
+    stays NULL through every step. Wrap the input in
+    `F.coalesce("tags", F.array())` when you want `[]` instead
+    (`F.array()` with no arguments takes the element type from the other
+    side of the `coalesce`).
+
+    In SQL, a lambda is `x -> expr`, or `(x, i) -> expr` for two
+    arguments. `transform` and `filter` accept an optional second
+    argument, the 0-based index: `transform(array('a','b'), (x, i) ->
+    concat(i, ':', x))` is `[0:a, 1:b]`. In Python, write
+    `lambda x, i: ...`.
+
+    The SQL forms of `transform`, `filter`, `exists` and `aggregate`
+    date from Spark 2.4; the Python functions arrived in 3.1.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What a Python Lambda May Do
+
+    A Python lambda in `F.transform` is called **once**, on the driver,
+    with placeholder `Column` objects; whatever `Column` it returns
+    becomes the expression that runs in the JVM for every element. So
+    the lambda must be built from `Column` operations, and these
+    mistakes fail immediately:
+
+    | You write | You get |
+    |-----------|---------|
+    | `lambda x: x + 1 if x > 0 else x` | `[CANNOT_CONVERT_COLUMN_INTO_BOOL]`: a Python `if` needs a real bool; use `F.when(x > 0, x + 1).otherwise(x)` |
+    | `lambda x: 1` | `[HIGHER_ORDER_FUNCTION_SHOULD_RETURN_COLUMN] Function <lambda> should return Column, got int`; use `F.lit(1)` |
+    | `lambda x: x.upper()` | `TypeError: 'Column' object is not callable`: `x.upper` is read as the struct field `upper`; use `F.upper(x)` |
+    | `lambda *a: a[0]` | `[UNSUPPORTED_PARAM_TYPE_FOR_HIGHER_ORDER_FUNCTION]` |
+    | `lambda x, i, j: x` in `transform` | `[INVALID_LAMBDA_FUNCTION_CALL.NUM_ARGS_MISMATCH]` |
+    | a Python UDF called inside the lambda | `[UNSUPPORTED_FEATURE.LAMBDA_FUNCTION_WITH_PYTHON_UDF]` |
+
+    The last one matters for messy data: when the per-element logic is
+    too complex for built-in functions, you cannot call a UDF per
+    element. Either pass the whole array to a UDF, or explode, apply the
+    UDF to the rows, and collect back.
+
+    A lambda can use columns from the same row, not only its argument:
+    `transform(lines, l -> concat(order_id, '/', l.sku))` gives
+    `[O-1001/P6, O-1001/P5]`.
+
+- Class: mult_question
+  Depth: all
+  Output: "`F.transform('tags', lambda t: t.lower())` fails with `TypeError: 'Column' object is not callable`. What is the fix?"
+  AnswerChoices: "Use F.lower(t) instead of t.lower();Write t.lower without the parentheses;Register t.lower as a UDF;Collect the tags and lower them in Python"
+  CorrectAnswer: "Use F.lower(t) instead of t.lower()"
+  Hint: "The lambda receives a Column, and attribute access on a Column means a struct field."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## aggregate: Zero Values, NULLs and a Finish Function
+
+    `aggregate(array, zero, merge, finish)` folds an array into one
+    value (`reduce` is the same function under another name, in Python
+    since 3.5). Three details decide whether it works on real data.
+
+    **The zero sets the type, and SQL literals are not Python
+    literals.** In Python, `F.lit(0.0)` is a `DOUBLE`. In SQL, `0.0` is
+    a `DECIMAL(1,1)`, so this fails:
+
+    ```sql
+    SELECT aggregate(array(1.5, 2.25), 0.0, (a, x) -> a + x)
+    ```
+
+    ```
+    [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] ... The third parameter
+    requires the "DECIMAL(1,1)" type, however "lambdafunction(...)" has
+    the type "DECIMAL(4,2)".
+    ```
+
+    Write `0D` (a double) or `CAST(0 AS DOUBLE)` in SQL. Likewise an
+    integer zero with a double merge fails ("requires the "INT" type,
+    however ... has the type "DOUBLE"").
+
+    **One NULL element poisons the result.** O-1008 has a line with
+    `qty` NULL:
+
+    ```sql
+    SELECT order_id,
+           aggregate(lines, 0, (acc, l) -> acc + l.qty) AS total_qty,
+           aggregate(lines, 0, (acc, l) -> acc + coalesce(l.qty, 0)) AS total_qty2
+    FROM orders WHERE order_id IN ('O-1006', 'O-1007', 'O-1008')
+    ```
+
+    ```
+    +--------+---------+----------+
+    |order_id|total_qty|total_qty2|
+    +--------+---------+----------+
+    |O-1006  |0        |0         |
+    |O-1007  |NULL     |NULL      |
+    |O-1008  |NULL     |0         |
+    +--------+---------+----------+
+    ```
+
+    `acc + NULL` is NULL, and it stays NULL for the rest of the fold.
+    O-1006 (`[]`) returns the zero; O-1007 (no `lines`) is NULL because
+    the array itself is NULL. `coalesce` the element inside the lambda,
+    and the array outside it.
+
+    **The finish function turns the accumulator into the answer.** A
+    struct accumulator carries several running values; an average of an
+    array:
+
+    ```sql
+    SELECT aggregate(array(1, 2, 3, 4),
+                     named_struct('s', 0, 'n', 0),
+                     (acc, x) -> named_struct('s', acc.s + x, 'n', acc.n + 1),
+                     acc -> acc.s / acc.n) AS avg       -- 2.5
+    ```
+
+    Lambdas nest. The net value of an order, applying each line's
+    discounts, is an `aggregate` over lines with another `aggregate`
+    over that line's discounts inside:
+
+    ```sql
+    aggregate(lines, 0D, (acc, l) ->
+        acc + l.qty * l.unit_price
+              * (1 - aggregate(l.discounts, 0, (d, x) -> d + x.pct) / 100.0))
+    ```
+
+    which gives 124.75 for O-1001 and 153.6 for O-1004.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "In SQL, `aggregate(prices, 0.0, (a, x) -> a + x)` over an ARRAY<DOUBLE> fails with DATATYPE_MISMATCH. Why?"
+  AnswerChoices: "In SQL 0.0 is a DECIMAL(1,1), so the accumulator type does not match the merge result;aggregate cannot sum doubles;The lambda needs an index argument;aggregate requires a finish function"
+  CorrectAnswer: "In SQL 0.0 is a DECIMAL(1,1), so the accumulator type does not match the merge result"
+  Hint: "Decimal literals in SQL are exact decimals. Use 0D for a double."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## exists and forall Use Three-Valued Logic
+
+    `exists` is true if any element matches and `forall` if every
+    element does. With NULLs in the array, they can also return NULL:
+
+    | Expression | Result |
+    |------------|--------|
+    | `exists(array(1, NULL), x -> x = 2)` | `NULL` |
+    | `exists(array(1, NULL), x -> x = 1)` | `true` |
+    | `forall(array(1, NULL), x -> x > 0)` | `NULL` |
+    | `forall(array(1, NULL), x -> x > 5)` | `false` |
+    | `exists(array(), x -> x = 1)` | `false` |
+    | `forall(array(), x -> x = 1)` | `true` |
+
+    "Is 2 in `[1, unknown]`?" has no definite answer, so the answer is
+    NULL. This is the SQL standard behaviour, controlled by the internal
+    setting `spark.sql.legacy.followThreeValuedLogicInArrayExists`
+    (`true` by default). It matters in the same way as for
+    `array_contains`: `filter(~F.exists(...))` drops the NULL rows as
+    well as the true ones. Wrap in `F.coalesce(..., F.lit(False))` when
+    you mean "no known match".
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Sorting Arrays of Structs
+
+    Four orders have their `status_history` out of time order. Two ways
+    to put it right:
+
+    **A comparator.** `array_sort(arr, (l, r) -> ...)` takes a function
+    that returns a negative number, 0 or a positive number (the
+    comparator form is in Python since 3.4):
+
+    ```python
+    by_time = F.array_sort(
+        "status_history",
+        lambda a, b: F.when(a.at < b.at, -1).when(a.at > b.at, 1).otherwise(0))
+    ```
+
+    For O-1002, `[paid, placed]` becomes `[placed, paid]`.
+    `F.element_at(by_time, -1).status` is then the latest status.
+
+    **Struct ordering.** `sort_array` on structs sorts by the first
+    field, then the second. Put the sort key first:
+
+    ```sql
+    transform(sort_array(transform(status_history, h -> struct(h.at, h.status))),
+              x -> x.status)
+    ```
+
+    The same idea finds the latest entry without sorting at all:
+    `array_max(transform(status_history, h -> struct(h.at, h.status))).status`
+    takes the largest `(at, status)` pair. For aggregations across rows
+    rather than within an array, `max_by(status, at)` does the same
+    job, and 4.2 added a `k` argument that returns the top `k` as an
+    array: `max_by(status, at, 2)` gives the statuses of the two latest
+    rows, latest first (optional background: `learning_spark` lesson 4).
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Pairing Arrays: zip_with and arrays_zip
+
+    `lines.sku` and `lines.qty` are two parallel arrays. `zip_with`
+    combines them element by element with a lambda, and `arrays_zip`
+    pairs them into structs:
+
+    ```sql
+    SELECT order_id, zip_with(lines.sku, lines.qty, (s, q) -> concat(s, 'x', q)) AS z
+    FROM orders
+    -- O-1001: [P6x4, P5x2]
+    ```
+
+    Both pad the shorter array with NULLs:
+    `zip_with(array(1,2,3), array(10,20), (a, b) -> a + b)` is
+    `[11, 22, NULL]`. When the arrays come from the same array of
+    structs, they always have the same length; when they come from two
+    different producers, a length mismatch is silent, so check
+    `size(a) = size(b)` first.
+
+    In Python, `F.arrays_zip("lines.sku", "lines.qty")` names the struct
+    fields after the inputs (`sku`, `qty`).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Maps: Objects Whose Keys Change
+
+    A struct is right when every record has the same fields. `attrs` is
+    the opposite: each line has a few keys out of an open-ended set
+    (`color`, `size`, `engraving`, `gift_wrap`, `warranty_years`, and
+    whatever the shop adds next month). Declared as
+    `MAP<STRING, STRING>`, it keeps exactly the keys each line has:
+
+    ```
+    +--------+-------------------------------------------------------------------------------------------+
+    |order_id|attrs                                                                                      |
+    +--------+-------------------------------------------------------------------------------------------+
+    |O-1001  |[{engraving -> Happy 30th}, {}]                                                            |
+    |O-1002  |[{color -> red, size -> S, engraving -> Happy 30th}]                                       |
+    |O-1003  |[{warranty_years -> 2}]                                                                    |
+    |O-1004  |[{size -> S, engraving -> Happy 30th}, {color -> red, engraving -> L.T., gift_wrap -> yes}]|
+    +--------+-------------------------------------------------------------------------------------------+
+    ```
+
+    Inference never gives you this (it always makes a struct), so a map
+    needs an explicit schema, or `from_json(col, 'MAP<STRING, STRING>')`
+    on a string. Declaring the values as `STRING` is the forgiving
+    choice: a number, a boolean, even a nested object is kept as its
+    text (`{"x": 1, "y": true, "z": {"a": 1}}` reads as
+    `{x -> 1, y -> true, z -> {"a":1}}`). Declare `MAP<STRING, INT>`
+    and a single string value makes the whole map NULL.
+
+    Profiling the keys is two explodes and a group by (an exploded map
+    gives `key` and `value`):
+
+    ```sql
+    SELECT k, count(*) AS n
+    FROM orders
+    LATERAL VIEW explode(lines) l AS line
+    LATERAL VIEW explode(map_keys(line.attrs)) m AS k
+    GROUP BY k ORDER BY k
+    ```
+
+    ```
+    +--------------+---+
+    |k             |n  |
+    +--------------+---+
+    |color         |16 |
+    |engraving     |17 |
+    |gift_wrap     |6  |
+    |size          |14 |
+    |warranty_years|12 |
+    +--------------+---+
+    ```
+
+    Reading and reshaping maps:
+
+    | Expression | Result |
+    |------------|--------|
+    | `element_at(m, 'z')`, `m['z']` | value, or NULL for a missing key (no ANSI error for maps) |
+    | `map_contains_key(m, 'a')` (3.3) | true or false |
+    | `map_keys(m)`, `map_values(m)`, `map_entries(m)` | arrays |
+    | `map_filter(map('a',1,'b',2), (k, v) -> v > 1)` | `{b -> 2}` |
+    | `transform_values(map('a',1), (k, v) -> v * 10)` | `{a -> 10}` |
+    | `transform_keys(map('a',1), (k, v) -> upper(k))` | `{A -> 1}` |
+    | `map_from_arrays(array('a','b'), array(1,2))` | `{a -> 1, b -> 2}` |
+    | `map_from_entries(array(struct('a', 1), struct('b', 2)))` | `{a -> 1, b -> 2}` |
+    | `str_to_map('color=red;size=M', ';', '=')` | `{color -> red, size -> M}` |
+    | `map_zip_with(m1, m2, (k, v1, v2) -> ...)` | merge two maps key by key |
+
+    A map keeps its entries in insertion order:
+    `map_keys(map('b', 1, 'a', 2))` is `[b, a]`.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Map Rules That Fail Queries
+
+    Maps have two hard rules, and messy data breaks both.
+
+    **Keys must be unique.** By default (`spark.sql.mapKeyDedupPolicy`
+    is `EXCEPTION`), building a map with a repeated key fails at run
+    time:
+
+    ```
+    [DUPLICATED_MAP_KEY] Duplicate map key a was found, please check the
+    input data. If you want to remove the duplicated keys, you can set
+    "spark.sql.mapKeyDedupPolicy" to "LAST_WIN" so that the key inserted
+    at last takes precedence.
+    ```
+
+    In 4.2.0 every one of these raises it: `map('a', 1, 'a', 2)`,
+    `map_from_arrays(array('a', 'a'), ...)`, `map_concat(map('a', 1),
+    map('a', 2))`, `str_to_map('a=1;a=2', ';', '=')`, and the sneaky one,
+    `transform_keys(map('a', 1, 'A', 2), (k, v) -> upper(k))`, where
+    cleaning the keys creates the duplicate. `LAST_WIN` makes
+    `map_concat` give `{a -> 2}`; decide whether "last wins" is really
+    what your data means before you turn it on.
+
+    **Keys cannot be NULL.** `map_from_arrays(array('a', NULL), ...)`
+    fails with `[NULL_MAP_KEY] Cannot use null as map key`. Filter or
+    `coalesce` keys before building a map from data.
+
+    And maps are not comparable. `map('a', 1) = map('a', 1)` fails with
+    `DATATYPE_MISMATCH.INVALID_ORDERING_TYPE`, so does `ORDER BY` on a
+    map, and `distinct()` on a DataFrame with a map column fails with
+    `UNSUPPORTED_FEATURE.SET_OPERATION_ON_MAP_TYPE`. `GROUP BY` on a
+    map column does work since 4.0 (SPARK-47430: Spark sorts each map's
+    keys before grouping). To compare or deduplicate maps, compare
+    `to_json(map_from_entries(array_sort(map_entries(m))))` or another
+    canonical string.
+
+- Class: mult_question
+  Depth: all
+  Output: "`transform_keys(attrs, (k, v) -> lower(k))` fails on some rows with DUPLICATED_MAP_KEY. What is the most likely cause?"
+  AnswerChoices: "Some maps have keys that differ only by case, such as Color and color;A key is NULL;The map has more than 100 keys;transform_keys only works on MAP<INT, ...>"
+  CorrectAnswer: "Some maps have keys that differ only by case, such as Color and color"
+  Hint: "The original keys were unique. What could make two of them equal after the lambda?"
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    `orders` has an array column `lines`, whose elements have a map
+    field `attrs`. Assign to `keys` a DataFrame with one row per
+    distinct attrs key in a column called `key`.
+  CorrectAnswer: |
+    keys = orders.select(F.explode("lines").alias("line")).select(F.explode(F.map_keys("line.attrs")).alias("key")).distinct()
+  Hint: "Explode lines into rows, then explode map_keys(line.attrs), then distinct()."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Rows Back to Arrays, in Order
+
+    After exploding, you often need to build the arrays again.
+    `collect_list` gathers values into an array, but **it promises no
+    order**: the elements arrive in whatever order the tasks deliver
+    them, and after a shuffle that is not the original order. (It also
+    skips NULLs; in 4.2 SQL, `collect_list(x) RESPECT NULLS` keeps them,
+    so `(1), (NULL), (2)` gives `[1, NULL, 2]` instead of `[1, 2]`.)
+
+    The fix is to carry the position with the value, sort, and drop the
+    position:
+
+    ```python
+    pairs = (orders.select("order_id", F.posexplode("lines").alias("pos", "line"))
+             .groupBy("order_id")
+             .agg(F.array_sort(F.collect_list(F.struct("pos", "line.sku"))).alias("pairs")))
+    pairs.select("order_id", F.transform("pairs", lambda p: p.sku).alias("skus"))
+    ```
+
+    `array_sort` orders the structs by `pos` first (struct ordering
+    again), so `skus` comes back in line order no matter how the rows
+    travelled. On a small local run, a plain `collect_list` often
+    happens to give the right order too; that is luck, not a guarantee,
+    and it is exactly the kind of bug that appears only on a cluster.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## to_json and from_json With Nested Values
+
+    `to_json` turns any struct, array or map into JSON text, and
+    `from_json` with the same type turns it back:
+
+    ```python
+    orders.select(F.to_json("customer")).first()[0]
+    # {"id":"C2","name":"Linh Tran","email":"user0@example.com",
+    #  "address":{"city":"Toronto","country":"ca","geo":{"lat":47.8056,"lon":10.9042}}}
+
+    t = orders.schema["customer"].dataType
+    orders.select("customer", F.from_json(F.to_json("customer"), t).alias("c2")) \
+          .filter("customer <=> c2").count()        # 24 of 24: a lossless round trip
+    ```
+
+    Details worth knowing:
+
+    - **NULL fields are left out.** `to_json(named_struct('a', 1, 'b',
+      NULL))` is `{"a":1}`. Pass `{"ignoreNullFields": "false"}` as
+      options to get `{"a":1,"b":null}`.
+    - **A NULL array gives NULL**, not `"null"`; `[]` gives `"[]"`.
+    - **Timestamps are written in the session time zone** with an
+      offset: `{"placed_at":"2026-10-05T08:00:00.000Z"}` with
+      `spark.sql.session.timeZone` set to `UTC`.
+    - **Maps become JSON objects**: `{"engraving":"Happy 30th"}`.
+
+    `schema_of_json` on one sample is how you got a DDL string in "JSON
+    Drift and Quarantine". On nested data it has a quiet failure mode.
+    The first order's lines only have an `engraving` attribute, so:
+
+    ```
+    lines: ARRAY<STRUCT<attrs: STRUCT<engraving: STRING>, ...>>
+    ```
+
+    Parse the file with that DDL and O-1002's `color` and `size` are
+    gone, without an error: `{Happy 30th}` instead of
+    `{color -> red, size -> S, engraving -> Happy 30th}`. A schema
+    inferred from one record knows only that record's keys. Use it as a
+    starting point, then fix the parts with open-ended keys by hand (a
+    `MAP`).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Flattening a Nested Schema
+
+    Many tools downstream (a CSV export, a spreadsheet, some BI tools,
+    a relational database) want flat columns. Writing
+    `customer.address.geo.lat AS customer_address_geo_lat` by hand for
+    every field is tedious and breaks when the schema changes. Instead,
+    walk the schema: `df.schema` is a `StructType` whose `fields` each
+    have a `name` and a `dataType`, and a struct column's `dataType` is
+    itself a `StructType`.
+
+    One level deep, the idea looks like this:
+
+    ```python
+    from pyspark.sql.types import StructType
+
+    cols = []
+    for field in orders.schema.fields:
+        if isinstance(field.dataType, StructType):
+            for sub in field.dataType.fields:
+                cols.append(F.col(f"`{field.name}`.`{sub.name}`").alias(f"{field.name}_{sub.name}"))
+        else:
+            cols.append(F.col(f"`{field.name}`"))
+    ```
+
+    Make it recursive (a function that takes a schema and the path so
+    far) and it reaches every depth; the exercise asks you to. On the
+    orders, the result has `customer_id`, `customer_name`,
+    `customer_email`, `customer_address_city`, `customer_address_country`,
+    `customer_address_geo_lat`, `customer_address_geo_lon`, and the
+    array columns untouched.
+
+    The limits are real, and worth stating in your code:
+
+    - **Arrays and maps do not flatten into columns.** An order has any
+      number of lines, so there is no fixed set of columns to make. You
+      either explode (one row per element) or keep the array, as the
+      exercise does.
+    - **Names can collide.** A struct `a` with a field `b` and a
+      top-level column `a_b` both flatten to `a_b`; Spark allows the
+      duplicate names in `select`, then fails with
+      `[AMBIGUOUS_REFERENCE] Reference `a_b` is ambiguous` when you use
+      one. Check for duplicates after flattening.
+    - **Quote every part with backticks**, or a field called `x.y` is
+      read as a path. With backticks, a struct `geo.v1` with a field
+      `x.y` flattens to a column called `geo.v1_x.y`.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Nested Data and Performance
+
+    Columnar formats store each leaf field of a struct as its own
+    column, and Spark reads only the leaves a query uses (nested schema
+    pruning, `spark.sql.optimizer.nestedSchemaPruning.enabled`, on by
+    default). Write the orders to Parquet and look at `ReadSchema` in
+    `explain()`:
+
+    | Query on the Parquet copy | ReadSchema |
+    |---------------------------|------------|
+    | `select("customer.address.city")` | `struct<customer:struct<address:struct<city:string>>>` |
+    | `select("lines.sku")` | `struct<lines:array<struct<sku:string>>>` |
+    | `select(F.transform("lines", lambda l: l.qty))` | all of `lines`, every field |
+    | `filter("customer.address.country = 'CA'")` | only `country`, and `PushedFilters: [IsNotNull(customer.address.country), EqualTo(customer.address.country,CA)]` |
+
+    So a dot path into a struct is as cheap as a top-level column, and a
+    filter on a nested field can be pushed into the Parquet reader. A
+    lambda over an array of structs reads every field of those structs
+    in 4.2.0, even the ones the lambda never touches; if that array is
+    large, select the fields you need first (`lines.qty`) and run the
+    higher-order function on the smaller array.
+
+    On the JSON file itself, `ReadSchema` lists the whole `customer`
+    struct even when you select one field: JSON is text and every line
+    is parsed anyway. That is one reason the raw layer is JSON and the
+    next layer is a columnar format.
+
+    Exploding costs more than it looks: every element becomes a row, so
+    the data grows and any later join or group by shuffles all of those
+    rows, while a higher-order function works inside each row and keeps
+    the row count the same. The rule of thumb: stay inside the array
+    with higher-order functions unless you need to join or group by
+    individual elements.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## When Structs Stop Being the Right Tool
+
+    Structs, arrays and maps all need you to know the **shape** in
+    advance, even when you do not know the keys (a map still fixes the
+    value type). That is fine for data that changes slowly and for the
+    tables you publish. It is painful when:
+
+    - the same field has different types in different records (the
+      events' `amount`: number, string, object);
+    - objects nest to unknown depth, or values inside a map are
+      themselves objects of varying shape;
+    - you want to keep the full record exactly as received, and decide
+      later which fields matter.
+
+    For that, Spark 4.0 added a type that carries its shape inside each
+    value: **VARIANT**. It is the subject of the next lesson. Everything
+    you learned here still applies after you extract fields from a
+    VARIANT: you get ordinary structs, arrays and maps back, and you
+    work on them with the same functions.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Summarize, Redact and Reshape Nested Orders
+
+    Work on `data/messy/nested/orders.json`. `ORDER_SCHEMA` is given in
+    the starter (it is the one from this lesson, with `attrs` as a map).
+
+    1. `read_orders(spark, path)`: read the file with `ORDER_SCHEMA`.
+    2. `order_summary(orders)`: one row per order, **without exploding**:
+       `order_id`, `n_lines`, `total_qty` (a NULL qty counts as 0),
+       `gross` (sum of qty times unit_price, a double), `skus` (sorted,
+       distinct), `clean_tags` (trimmed, lower case, no NULLs or
+       duplicates, sorted), `latest_status` (the status with the latest
+       `at`) and `has_engraving` (any line with an `engraving` key).
+       Orders with missing or empty arrays get `0`, `0.0`, `[]` and
+       `false`, never NULL.
+    3. `redact_customer(orders)`: drop `customer.email` and upper-case
+       `customer.address.country`, keeping everything else.
+    4. `attr_profile(orders)`: one row per attrs key with `key`, `n`
+       (the number of lines that have it) and `values` (sorted distinct
+       values), sorted by key.
+    5. `flatten_structs(df)`: a generic function that turns every
+       struct field at any depth into a column named `a_b_c`, keeps
+       arrays and maps as they are, and survives names with dots and
+       spaces.
+    6. `lines_long(orders)`: one row per line with `order_id`,
+       `line_no` (1-based), `sku`, `qty`, `unit_price` and
+       `discount_pct` (the sum of the line's discounts), keeping orders
+       without lines as one row of NULLs.
+    7. `skus_in_line_order(lines)`: from `lines_long`'s output, one row
+       per order (with lines) and its `skus` array in line order.
+
+    The harness reads the file with Python's `json` module, computes
+    every expected value, and checks each function on every order,
+    including the planted problems (the NULL qty, the empty and missing
+    arrays, the out-of-order histories). `flatten_structs` is also
+    checked on a small DataFrame with awkward field names.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Summary: lines = F.coalesce('lines', F.array()); F.aggregate(lines, F.lit(0), lambda acc, l: acc + F.coalesce(l.qty, F.lit(0))); clean tags with F.array_sort(F.array_distinct(F.filter(F.transform(tags, lambda t: F.lower(F.trim(t))), lambda t: t.isNotNull()))). Latest: F.element_at(F.array_sort('status_history', lambda a, b: F.when(a.at < b.at, -1).when(a.at > b.at, 1).otherwise(0)), -1).status. Redact: F.col('customer').dropFields('email').withField('address.country', F.upper('customer.address.country')). Lines: F.posexplode_outer('lines').alias('pos', 'line'). Rebuild: F.array_sort(F.collect_list(F.struct('line_no', 'sku')))."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    In this lesson you learned:
+
+    - **Structs**: dot paths at any depth (`FIELD_NOT_FOUND` for fields
+      not in the schema, backticks for names with dots); a NULL struct
+      is not a struct of NULLs; structs compare and sort field by field.
+    - **Editing structs**: `withField` and `dropFields` (3.1) take
+      dotted paths, leave NULL structs NULL, cannot drop every field,
+      and work on arrays of structs only through `transform`.
+    - **Arrays**: a path goes through one array level (`flatten` for
+      arrays of arrays); `size(NULL)` is NULL under ANSI;
+      `array_contains`, `exists` and `forall` can return NULL;
+      `sort_array` and `array_sort` place NULLs at opposite ends;
+      `arr[0]` fails on an empty array, `get` does not.
+    - **Generators**: `posexplode` keeps positions, `inline` explodes
+      structs into columns, a map explodes into `key` and `value`, two
+      generators in one `SELECT` multiply rows, and a generator cannot
+      be nested in an expression.
+    - **Higher-order functions**: Python lambdas build Column
+      expressions once (no Python `if`, no UDFs inside); SQL uses
+      `x -> ...`; `aggregate`'s zero sets the type (`0D` in SQL, not
+      `0.0`), and one NULL element poisons the fold.
+    - **Maps** for objects with open-ended keys, declared explicitly
+      (inference never makes a map); `DUPLICATED_MAP_KEY` and
+      `NULL_MAP_KEY` fail at run time; maps cannot be compared or
+      deduplicated, but can be grouped since 4.0.
+    - **Order after collecting** is not guaranteed; collect
+      `(position, value)` structs and `array_sort`.
+    - **Flattening** by walking `df.schema`, with its limits (arrays,
+      maps, collisions).
+
+    Next: **VARIANT Basics: Profiling and Nested Data**, where the same
+    drifting events are loaded with no field-level schema at all.

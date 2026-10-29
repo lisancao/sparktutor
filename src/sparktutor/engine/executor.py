@@ -28,6 +28,11 @@ _SDP_DRY_RUN = re.compile(r"^\s*#\s*spark-pipelines:\s*dry-run\s*$", re.MULTILIN
 # A lesson can ask for connectors that pyspark does not ship: `# spark-connectors: delta`
 _CONNECTORS = re.compile(r"^\s*#\s*spark-connectors:\s*(.+?)\s*$", re.MULTILINE)
 
+# A lesson whose script builds its own session with static settings (spark.jars,
+# spark.sql.extensions) asks to run as plain Python instead of under spark-submit,
+# which would start the JVM before the script runs: `# spark-run: python`
+_RUN_WITH_PYTHON = re.compile(r"^\s*#\s*spark-run:\s*python\s*$", re.MULTILINE)
+
 MAVEN_CENTRAL = "https://repo1.maven.org/maven2"
 
 
@@ -68,6 +73,14 @@ CONNECTORS = {
     # Spark's own test catalog with MERGE support, published in the
     # spark-catalyst tests jar. In memory only: it stands in for a table format
     # until one with a Spark 4.2 build supports row-level operations.
+    # Avro itself ships with pyspark; only the Spark module is missing.
+    "avro": Connector(
+        jars=("org/apache/spark/spark-avro_2.13/4.2.0/spark-avro_2.13-4.2.0.jar",),
+    ),
+    # The module shades protobuf-java, so it needs no other jar.
+    "protobuf": Connector(
+        jars=("org/apache/spark/spark-protobuf_2.13/4.2.0/spark-protobuf_2.13-4.2.0.jar",),
+    ),
     "test-catalog": Connector(
         jars=("org/apache/spark/spark-catalyst_2.13/4.2.0/spark-catalyst_2.13-4.2.0-tests.jar",),
         session_conf=(
@@ -121,6 +134,11 @@ def connector_args(names: list[str], jars: list[str], in_pipeline: bool) -> list
         for key, value in confs:
             args += ["--conf", f"{key}={value}"]
     return args
+
+
+def runs_with_python(code: str) -> bool:
+    """True if the exercise asks to run as plain Python (it starts its own JVM)."""
+    return bool(_RUN_WITH_PYTHON.search(code))
 
 
 def is_pipeline_source(code: str) -> bool:
@@ -355,6 +373,12 @@ class Executor:
         container = self.settings.docker.container_name
         if is_pipeline_source(code):
             return await self._lakehouse_pipeline_exec(code, on_output)
+        if runs_with_python(code):
+            return ExecResult(
+                mode=ExecMode.LAKEHOUSE, exit_code=1, stdout="",
+                stderr=("[sparktutor] This exercise starts its own local Spark session "
+                        "('# spark-run: python'). Switch the execution mode to local."),
+            )
         try:
             extra = await self._lakehouse_connector_args(code, in_pipeline=False)
         except (OSError, ValueError) as e:
@@ -495,13 +519,21 @@ class Executor:
             names, jars = await self._connector_jars(code)
         except (OSError, ValueError) as e:
             return self._connector_error(ExecMode.LOCAL, e)
+        if names and runs_with_python(code):
+            return self._connector_error(ExecMode.LOCAL, ValueError(
+                "'# spark-run: python' exercises build their own session; "
+                "pass connector jars with spark.jars instead of '# spark-connectors:'"))
 
         with tempfile.TemporaryDirectory(prefix="sparktutor_") as tmp:
             root = Path(tmp)
             script = write_script_project(code, root)
+            if runs_with_python(code):
+                launcher = [sys.executable]
+            else:
+                launcher = [spark_bin("spark-submit"),
+                            *connector_args(names, [str(jar) for jar in jars], in_pipeline=False)]
             proc = await asyncio.create_subprocess_exec(
-                spark_bin("spark-submit"),
-                *connector_args(names, [str(jar) for jar in jars], in_pipeline=False),
+                *launcher,
                 str(script),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,

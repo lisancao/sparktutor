@@ -1,0 +1,469 @@
+- Class: meta
+  Lesson: "XML"
+  EstimatedMinutes: 40
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    XML is older than JSON and still everywhere: bank and insurance
+    feeds, government data, invoices (UBL), product catalogues, office
+    documents, RSS. Since Spark 4.0, reading it needs no extra package:
+    the XML data source is built in (SPARK-44265), along with the
+    `from_xml` and `schema_of_xml` functions.
+
+    "Setup, a First Session and a Tour of the Sample Data" already read
+    `xml/orders.xml` with `rowTag`, the element that marks one row. This
+    lesson recaps the rest of the basics (`rootTag` for writing, the `_`
+    prefix for attributes) and then turns to the parts of XML that make
+    it messier than JSON.
+
+    By the end of this lesson you will be able to:
+
+    - Explain how elements, attributes and text map to columns
+      (`attributePrefix`, `_VALUE`)
+    - Predict when a repeated element becomes an array and when it does
+      not, in both struct and VARIANT mode
+    - Normalize "one child or many" so no rows go missing
+    - Parse XML that sits inside a string column with `from_xml` and
+      `schema_of_xml`
+    - Know how malformed XML behaves in 4.2.0, and why one broken tag can
+      cost you more than one record
+
+    The sample file is `data/messy/xml/orders.xml`: ten orders, each with
+    attributes, a customer, one to three items, and sometimes a coupon.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Reading XML: rowTag
+
+    ```xml
+    <orders>
+      <order id="0" channel="store"><customer>C0</customer><items>
+          <item sku="P8"><qty>2</qty></item><item sku="P7"><qty>3</qty></item>
+        </items><coupon>SAVE0</coupon></order>
+      <order id="2" channel="store"><customer>C2</customer><items>
+          <item sku="P1"><qty>3</qty></item>
+        </items></order>
+      ...
+    </orders>
+    ```
+
+    A JSON Lines file has one record per line. An XML file is one big
+    tree, so you tell Spark which element is a record:
+
+    ```python
+    orders = spark.read.option("rowTag", "order").xml("data/messy/xml/orders.xml")
+    ```
+
+    `rowTag` is required. Without it, both `spark.read.xml(path)` and
+    `format("xml").load(path)` fail with `XML_ROW_TAG_MISSING` ("`rowTag`
+    option is required for reading/writing files in XML format"). Writing
+    needs it too, and `rootTag` names the element that wraps the rows:
+
+    ```python
+    orders.write.option("rowTag", "order").option("rootTag", "orders").xml(out)
+    ```
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Elements, Attributes and Text
+
+    ```
+    root
+     |-- _channel: string (nullable = true)
+     |-- _id: long (nullable = true)
+     |-- coupon: string (nullable = true)
+     |-- customer: string (nullable = true)
+     |-- items: struct (nullable = true)
+     |    |-- item: array (nullable = true)
+     |    |    |-- element: struct (containsNull = true)
+     |    |    |    |-- _sku: string (nullable = true)
+     |    |    |    |-- qty: long (nullable = true)
+    ```
+
+    The mapping rules:
+
+    - **Child elements** become fields: `<customer>C0</customer>` is
+      `customer`.
+    - **Attributes** become fields with a prefix, `_` by default:
+      `id="0"` is `_id`. Change the prefix with
+      `option("attributePrefix", "@")` (giving `@id`), or drop attributes
+      with `option("excludeAttribute", True)`.
+    - **Types are inferred** from the text: `_id` and `qty` are `long`.
+      `option("inferSchema", False)` keeps everything as strings.
+    - **Optional elements** are NULL where absent: 4 of the 10 orders have
+      a `coupon`.
+    - **Wrapper elements stay**: `<items>` holding `<item>`s is a struct
+      with one field, `item`, so the path is `items.item`.
+
+    One case has no JSON equivalent: an element with **both text and
+    attributes**, such as `<total cur="CAD">4.5</total>`. Its text goes
+    into a field called `_VALUE`, next to the attributes:
+
+    ```
+     |-- total: struct
+     |    |-- _VALUE: double
+     |    |-- _cur: string
+    ```
+
+    `option("valueTag", "amount")` renames `_VALUE`. Once one row has an
+    attribute on `<total>`, the column is a struct for every row: a plain
+    `<total>3</total>` elsewhere becomes `{3.0, NULL}`.
+
+- Class: mult_question
+  Depth: all
+  Output: "With default options, what column does the attribute in `<order id=\"7\">` become?"
+  AnswerChoices: "_id;id;@id;order.id"
+  CorrectAnswer: "_id"
+  Hint: "Attributes get a prefix so they cannot collide with child elements of the same name."
+
+- Class: text
+  Depth: beginner
+  Output: |
+    In JSON, a list always looks like a list: `"items": [ ... ]`. XML
+    has no list syntax. A list is just the same element written several
+    times in a row:
+
+    ```xml
+    <items><item>A</item><item>B</item></items>   <!-- two items -->
+    <items><item>A</item></items>                 <!-- one item -->
+    ```
+
+    Looking at the second line alone, nobody can tell whether `<item>` is
+    "a list with one entry" or "a single thing". Spark has to guess, and
+    the next two sections are about how it guesses.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## One Child or Many: Struct Mode
+
+    Orders 2 and 6 have one `<item>`; the others have two or three. In struct
+    mode, inference looks at **all** rows, sees that `item` repeats
+    somewhere, and makes it an array everywhere. Order 2 simply gets an
+    array of one:
+
+    ```python
+    orders.select("_id", F.size("items.item").alias("n"))   # order 2: n = 1
+    items = (orders
+        .select(F.col("_id").alias("order_id"), F.explode("items.item").alias("it"))
+        .select("order_id", F.col("it._sku").alias("sku"), "it.qty"))
+    ```
+
+    That is convenient, and also a trap: the schema depends on the data
+    in the folder. Read a file in which **every** order has exactly one
+    item, and `items.item` is inferred as a struct, not an array:
+
+    ```
+     |-- items: struct
+     |    |-- item: struct
+     |    |    |-- _sku: string
+     |    |    |-- qty: long
+    ```
+
+    Now `explode("items.item")` fails, because you cannot explode a
+    struct, and a job that worked yesterday breaks on today's file. For a
+    pipeline, declare the schema with `ARRAY` where you know a child can
+    repeat:
+
+    ```python
+    schema = """_id BIGINT, _channel STRING, customer STRING, coupon STRING,
+                items STRUCT<item: ARRAY<STRUCT<_sku: STRING, qty: BIGINT>>>"""
+    spark.read.schema(schema).option("rowTag", "order").xml(path)
+    ```
+
+    With an explicit array type, a single child is read as an array of
+    one, whatever the rest of the file looks like.
+
+- Class: mult_question
+  Depth: all
+  Output: "Yesterday's XML file had orders with several <item>s each. Today's file happens to have exactly one <item> per order, and explode('items.item') fails. Why?"
+  AnswerChoices: "Inference saw no repetition, so items.item became a struct instead of an array;The XML source cannot read files with one child per row;rowTag must be changed to item;explode only works on VARIANT columns"
+  CorrectAnswer: "Inference saw no repetition, so items.item became a struct instead of an array"
+  Hint: "Inference only knows what is in the files it reads."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## One Child or Many: VARIANT Mode
+
+    `singleVariantColumn` works for XML too, giving one VARIANT per row
+    and no inference:
+
+    ```python
+    ov = (spark.read.option("rowTag", "order")
+          .option("singleVariantColumn", "v")
+          .xml("data/messy/xml/orders.xml"))
+    ```
+
+    VARIANT has no cross-row schema, so each order is converted on its
+    own. An order with several `<item>`s gets an array; an order with one
+    gets **a single object**:
+
+    ```sql
+    SELECT v:_id::int AS id, schema_of_variant(v:items.item) AS t FROM ov
+    ```
+
+    ```
+    +---+----------------------------------------+
+    |id |t                                       |
+    +---+----------------------------------------+
+    |0  |ARRAY<OBJECT<_sku: STRING, qty: BIGINT>>|
+    |1  |ARRAY<OBJECT<_sku: STRING, qty: BIGINT>>|
+    |2  |OBJECT<_sku: STRING, qty: BIGINT>       |
+    ...
+    ```
+
+    And `schema_of_variant_agg(v)` merges that to `items: OBJECT<item:
+    VARIANT>`: the "more than one type" signal from "VARIANT Basics: Profiling and
+    Nested Data".
+
+    Each quick fix loses orders 2 and 6:
+
+    - `v:items.item::array<variant>` fails the query with
+      `INVALID_VARIANT_CAST` ("The variant value {"_sku":"P1","qty":3}
+      cannot be cast into "ARRAY<VARIANT>"").
+    - `try_variant_get(v:items.item, '$', 'array<variant>')` returns
+      NULL for them, so they silently vanish from an explode.
+    - `v:items.item[0]` returns NULL for a single object, for the same
+      reason.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Normalizing: Always an Array
+
+    Decide per row: if it is already an array, cast it; otherwise wrap
+    the single object in a one-element array:
+
+    ```sql
+    WITH norm AS (
+      SELECT v:_id::bigint AS order_id,
+             CASE WHEN schema_of_variant(v:items.item) LIKE 'ARRAY%'
+                  THEN v:items.item::array<variant>
+                  ELSE array(v:items.item)
+             END AS items
+      FROM ov
+    )
+    SELECT order_id, size(items) AS n,
+           transform(items, i -> i:_sku::string) AS skus
+    FROM norm
+    ```
+
+    ```
+    +--------+---+------------+
+    |order_id|n  |skus        |
+    +--------+---+------------+
+    |0       |2  |[P8, P7]    |
+    |1       |3  |[P9, P8, P4]|
+    |2       |1  |[P1]        |
+    ...
+    ```
+
+    `CASE` evaluates only the branch that applies, so the cast never sees
+    a single object. After this step every order has an
+    `array<variant>`, and an ordinary `explode` gives one row per item.
+    Missing elements still work: if `<items>` were absent,
+    `v:items.item` would be NULL, `array(NULL)` would give one NULL
+    item, and you would filter it out.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write the SQL expression (just the expression, as a Python string
+    assigned to `expr`) that turns the VARIANT `v:items.item` into an
+    `array<variant>` whether it holds one object or an array, as in this
+    lesson.
+  CorrectAnswer: |
+    expr = "CASE WHEN schema_of_variant(v:items.item) LIKE 'ARRAY%' THEN v:items.item::array<variant> ELSE array(v:items.item) END"
+  Hint: "Test the shape with schema_of_variant, cast arrays, and wrap single objects with array(...)."
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "In VARIANT mode, `try_variant_get(v:items.item, '$', 'array<variant>')` is exploded to count items. Orders with exactly one item are missing from the result. Why?"
+  AnswerChoices: "A single child is an OBJECT, which cannot be read as an array, so try_variant_get returns NULL;try_variant_get skips the first element;VARIANT mode drops attributes;explode ignores arrays of length one"
+  CorrectAnswer: "A single child is an OBJECT, which cannot be read as an array, so try_variant_get returns NULL"
+  Hint: "Run schema_of_variant on items.item for a single-item order."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## XML Inside a String Column
+
+    XML also turns up as a value inside other data: a SOAP payload in a
+    log, a column in a CSV export, a message on a queue. `from_xml`
+    (4.0) parses a string column with a schema, where the root element
+    of each string is the row:
+
+    ```python
+    prices = spark.createDataFrame(
+        [(1, '<price cur="CAD">4.5</price>'), (2, '<price>7.25</price>')], ["id", "xml"])
+
+    prices.select("id", F.from_xml("xml", "_VALUE DOUBLE, _cur STRING").alias("p"))
+    # {4.5, CAD} and {7.25, NULL}
+    ```
+
+    `schema_of_xml` (4.0) infers the DDL from one example:
+
+    ```python
+    lines = spark.read.text("data/messy/xml/orders.xml").filter(F.col("value").contains("<order "))
+    one = lines.first()[0].strip()
+    ddl = spark.range(1).select(F.schema_of_xml(F.lit(one))).first()[0]
+    # STRUCT<_channel: STRING, _id: BIGINT, coupon: STRING, customer: STRING,
+    #        items: STRUCT<item: ARRAY<STRUCT<_sku: STRING, qty: BIGINT>>>>
+
+    parsed = lines.select(F.from_xml(F.trim("value"), ddl).alias("o")).select("o.*")
+    ```
+
+    Like `schema_of_json`, `schema_of_xml` takes a **literal**. Pass a
+    column name as a plain string and it is parsed as XML text, which is
+    worse than an error: `F.schema_of_xml("value")` quietly returns a
+    schema with only a `_corrupt_record` field. Always wrap the sample in
+    `F.lit(...)`.
+
+    And `from_xml(col, 'variant')` parses into VARIANT instead of a
+    struct, with the same "one child is an object" rule:
+    `from_xml('<o><a>1</a><a>2</a></o>', 'variant')` is `{"a":[1,2]}`,
+    while `<o><a>1</a></o>` gives `{"a":1}`.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Malformed XML in 4.2.0: One Bad Tag, Many Lost Rows
+
+    The XML source supports the same `mode` and `_corrupt_record`
+    handling as JSON. But XML is a tree, not a list of lines, and a
+    broken tag can confuse the parser about where the next record
+    starts. Take this file, with a typo in the middle order:
+
+    ```xml
+    <orders>
+    <order id="1"><customer>C1</customer></order>
+    <order id="2"><customer>C2</custo></order>
+    <order id="3"><customer>C3</customer></order>
+    </orders>
+    ```
+
+    With default settings in 4.2.0, you get **two** rows, not three:
+
+    ```
+    +------------------------------------------------+----+--------+
+    |_corrupt_record                                 |_id |customer|
+    +------------------------------------------------+----+--------+
+    |NULL                                            |1   |C1      |
+    |<orders>\n<order id="1">...</orders>\n          |NULL|NULL    |
+    +------------------------------------------------+----+--------+
+    ```
+
+    Order 1 parsed; then the parser hit `</custo>`, gave up on the rest
+    of the file, and put the whole file text in the corrupt column. The
+    perfectly valid order 3 is gone, and it does not appear anywhere as
+    a row.
+
+    The default parser since 4.1 is a newer, more memory-efficient one.
+    The older parser is still available with
+    `option("useLegacyXMLParser", True)` (or the internal session setting
+    `spark.sql.legacy.useLegacyXMLParser`), and on this file it gives
+    three rows: order 1, a corrupt row holding only
+    `<order id="2"><customer>C2</custo></order>`, and order 3.
+
+    Practical advice: when XML comes from a source you do not trust,
+    count `rowTag` elements independently (for example, a quick
+    `regexp_count` on the raw text, or a Python check like the exercise
+    harness), compare with the rows you got, and try the legacy parser
+    when the numbers disagree.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "An XML file has 1,000 orders, and order 500 has a mistyped closing tag. With default settings in Spark 4.2.0, roughly how many orders come back as parsed rows?"
+  AnswerChoices: "About 499, the rest of the file ends up in one corrupt record;999, only order 500 is flagged;1,000, the parser repairs the tag;0, the whole read fails"
+  CorrectAnswer: "About 499, the rest of the file ends up in one corrupt record"
+  Hint: "In the lesson's example, the valid order after the broken one was lost."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## More XML Options Worth Knowing
+
+    A few options from the 4.2.0 `XmlOptions` that come up with real
+    feeds:
+
+    - `ignoreNamespace`: drop namespace prefixes such as `ns1:` from
+      element and attribute names (without it, `<a:row a:id="1">` gives
+      columns like `_a:id`, and `rowTag` must be `a:row`).
+    - `rowValidationXSDPath`: validate each row against an XSD schema;
+      rows that fail are handled by `mode` like any malformed record.
+    - `nullValue`: a string to read as NULL (for example `"N/A"`).
+    - `ignoreSurroundingSpaces`: trim whitespace around values (on by
+      default: `<name>  x  </name>` reads as `x`).
+    - `samplingRatio`: infer the schema from a fraction of rows.
+
+    And the design choice from "JSON Drift and Quarantine" and "VARIANT
+    Basics: Profiling and Nested Data" applies here too:
+    infer while exploring, then either pin an explicit schema (with
+    `ARRAY` where children can repeat) or land the rows as VARIANT and
+    normalize at read time.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Items Per Order, Two Ways
+
+    Get one row per ordered item from `data/messy/xml/orders.xml`, once
+    with an inferred struct schema and once with VARIANT, and parse XML
+    stored in a string column.
+
+    1. `read_orders(spark, path)`: one row per `<order>`.
+    2. `items_from_struct(orders)`: `order_id` (from the `id`
+       attribute), `sku` (from the `sku` attribute) and `qty` (an int),
+       one row per item.
+    3. `read_orders_variant(spark, path)`: one VARIANT column `v` per
+       order.
+    4. `items_from_variant(spark, ov)`: the same three columns from
+       VARIANT, normalizing "one item" (an object) and "several items"
+       (an array) to an array first.
+    5. `parse_prices(df)`: `df` has a column `xml` with values such as
+       `<price cur="CAD">4.5</price>`; add `amount` (double) and
+       `currency` (string) with `from_xml`.
+
+    The harness parses the file with Python's `xml.etree` to get the
+    expected items, then checks: 10 orders with attribute columns and 4
+    coupons, the same items (order, SKU, quantity) from both paths, the
+    single-item orders being OBJECTs in VARIANT mode, and the three
+    parsed prices, including one with no currency attribute.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Struct: orders.select(F.col('_id').alias('order_id'), F.explode('items.item').alias('it')). VARIANT: CASE WHEN schema_of_variant(v:items.item) LIKE 'ARRAY%' THEN v:items.item::array<variant> ELSE array(v:items.item) END, then LATERAL VIEW explode(items) t AS it. Prices: F.from_xml('xml', '_VALUE DOUBLE, _cur STRING')."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    In this lesson you learned:
+
+    - **The built-in XML source** (4.0) needs `rowTag` to read and to
+      write (`XML_ROW_TAG_MISSING` otherwise); `rootTag` wraps written
+      rows.
+    - **Mapping**: child elements are fields, attributes get the `_`
+      prefix (`attributePrefix`), and the text of an element that also
+      has attributes is `_VALUE` (`valueTag`).
+    - **One child or many**: struct inference makes a repeated element
+      an array only if some row repeats it, so pin `ARRAY` in an explicit
+      schema for pipelines. In VARIANT mode, one child is an `OBJECT`
+      and several are an `ARRAY`, so normalize with
+      `CASE WHEN schema_of_variant(...) LIKE 'ARRAY%' ... ELSE array(...)`.
+    - **XML in strings**: `from_xml` with a schema or `'variant'`, and
+      `schema_of_xml(F.lit(sample))`; a bare column name is parsed as XML
+      text and silently gives a `_corrupt_record`-only schema.
+    - **Malformed XML in 4.2.0**: with the default parser, a broken tag
+      can put the rest of the file into one corrupt record; the legacy
+      parser (`useLegacyXMLParser`) isolates the bad record. Count rows
+      independently when the source is untrusted.
+
+    Next: **Binary Records: Avro and Protobuf**, where records carry
+    their schema with them and arrive as bytes.

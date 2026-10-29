@@ -1,0 +1,45 @@
+customer_no,name,email,phone,city,last_order
+10006,CHLÉ SMITH, chloe.smith@mail.com ,+1 403 555 0492,Montreal,2024-10-26
+10037,Ivan Chen,,403.555.4965,Vancouver,2025-09-30
+10036,Sam Singh,samantha.singh@mail.com,416-555-7985,Halifax,2025-02-15
+10014,Mike Rossi,michael.rossi@example.ca,416-555-2795,Vancouver,2025-07-23
+10018,"Smith, José", jose.smith@mail.com ,5145554987,Vancouver,2025-08-23
+10024,"Tremblay, Jen",jennifer.tremblay@mail.com,+1 403 555 5642,Québec,2024-10-30
+10008,Minh Tuan Le,Minhtuan.le@example.ca,+1 416 555 2394,Ottawa,2026-04-02
+10012,"TREMBLAY, LIZ",ELIZABETHTREMBLAY@GMAIL.COM,902.555.7028,Vancouver,2024-01-04
+10015,Dantel Patel,daniel.patel@example.com,604-555-7275,Calgary,2024-05-28
+10028,Jon Bouchard,jonathan.bouchard@mail.com,+1 613 555 9210,Toronto,2025-03-16
+10034,Mateo Ahmed,mateo.ahmed@gmail.com,+1 416 555 9106,Vancouver,2024-05-16
+10026,alexander lefebvre,alexander.lefebvre@example.ca,4165555137,Toronto,2025-11-20
+10019,  Sam  Haddad ,,514-555-4824,Ottawa,2026-03-05
+10010,Priya Okafor,Priya.okafor@example.ca,4035554693,Montreal,2024-03-02
+10032,AIHSA WONG,Aisha.wong@example.ca,4165553223,Ottawa,2024-09-06
+10011,Chhloé Martin,,,Halifax,2025-09-17
+10022,Mike Tremblay,michael.tremblay@gmail.com,(403) 555-4627,Toronto,2026-07-27
+10017,"  Mrtin,  Alexander ",alexander.martin@example.ca,4165556718,Vancouver,2026-04-29
+10033,josé singh,jose.singh@mail.com,,Montreal,2025-03-22
+10041,"SMITH, ROB",Robert.smith36@example.ca,416-555-4807,QUÉBEC,2024-02-07
+10009,Léa Kim, Lea.kim@example.com ,+1 514 555 2266,Calgary,2025-02-16
+10044,Andy Garcia,Andy.garcia@example.ca,(416) 555-1245,Vancouver,2026-06-04
+10013,Priya Brown,priya.brown@mail.com,9025553998,Ottawa,2024-10-06
+10021,Ana Cohen,ANA.COHEN@EXAMPLE.COM,902.555.7102,Montréal,2025-12-04
+10001,Dev García,Dev.garcia@mail.com,9025556970,Halifax,2025-01-01
+10020,  Katherine  Brown ,katherine.brown@gmail.com,416-555-1838,Ottawa,2024-06-27
+10004,"Muller, Noah", noah.muller@mail.com ,,Montreal,2025-12-06
+10025,Mei Ahmed,Mei.ahmed@mail.com,(902) 555-4743,QUÉBEC,2026-06-07
+10023,"cohen, mateo",mateo.cohen@example.ca,514-555-1452,Montréal,2026-06-10
+10029,Thu Trang Pham,,9025559952,Montréal,2024-10-23
+10042,"Chen, Mei",mei.chen@gmail.com,,Halifax,2025-09-23
+10016,Sofia Lee,sofia.lee@mail.com,,Calgary,2026-04-23
+10043,Mei Chen,mei.chen41@mail.com,9025555398,Toronto,2026-05-18
+10031,"Smith, Priya",Priya.smith@gmail.com,4035558408,MONTRÉAL,2024-07-12
+10005,Samantha Lefebvre,samantha.lefebvre@mail.com,,Halifax,2024-04-19
+10007,Jon Tremblay,jonathan.tremblay+shop@gmail.com,6135557069,Vancouver,2024-05-30
+10035,"côté, michael",michael.cote@example.com,+1 613 555 3991,QUÉBEC,2025-03-03
+10030,"HADDAD, JEN",Jenniferhaddad+promo@gmail.com,+1 403 555 1952,Halifax,2025-07-06
+10003,"Ahmed, Robert",robert.ahmed@example.ca,613-555-4144,Ottawa,2024-03-17
+10040,Robert Smith,robert.smith@mail.com,604-555-4532,QUÉBEC,2026-02-18
+10039,"Patel, Dev",dev.patel@example.com,902.555.4983,Halifax,2026-05-13
+10002,  Mtaeo  García ,MATEO.GARCIA@GMAIL.COM,4165551245,HALIFAX,2025-12-30
+10027,"Côté, Will",william.cote@example.com,+1 902 555 9021,Toronto,2025-08-23
+10038,Thomas Garcia,,(613) 555-9662,Montreal,2024-10-18

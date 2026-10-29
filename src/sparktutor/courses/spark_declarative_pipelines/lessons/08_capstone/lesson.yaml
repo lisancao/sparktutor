@@ -131,6 +131,15 @@
     spark-pipelines --conf spark.sql.catalogImplementation=hive run --full-refresh-all
     ```
 
+    Before you rerun it, note SPARK-59663 (open in 4.2.0): on a second
+    run, a flow that applies `withColumn` to a pipeline dataset loses its
+    dependency on that dataset and can read it before it refreshes. With
+    no new files (as here) nothing changes; with new files, downstream
+    tables would silently miss them. For a pipeline you run for real,
+    replace `withColumn(name, expr)` with `select("*", expr.alias(name))`
+    in every flow that reads another pipeline dataset ("Silver: Types,
+    Duplicates and Quarantine" explains it).
+
     The `--conf` setting matters once you run more than once. With a pip
     install the local server otherwise uses an in-memory catalog that
     forgets the tables after each run while their files stay in

@@ -1,0 +1,10 @@
+{"event_id": "e023", "user_id": "u4", "event_type": "page_view", "page": "/search", "ts": "2026-10-05T09:25:15", "app_version": "2.0"}
+{"event_id": "e020", "user_id": "u3", "event_type": "page_view", "page": "/p/chair", "ts": "2026-10-05T09:26:22", "app_version": "2.0"}
+{"event_id": "e021", "user_id": "u3", "event_type": "add_to_cart", "page": "/search", "ts": "2026-10-05T09:27:26", "app_version": "2.0"}
+{"event_id": "e028", "user_id": "u1", "event_type": "page_view", "page": "/p/desk", "ts": "2026-10-05T09:16:40", "app_version": "2.0"}
+{"event_id": "e022", "user_id": "u3", "event_type": "page_view", "page": "/search", "ts": "2026-10-05T09:29:48", "app_version": "2.0"}
+{"event_id": "e025", "user_id": "u5", "event_type": "add_to_cart", "page": "/p/chair", "ts": "2026-10-05T09:30:55", "app_version": "2.0"}
+{"event_id": "e029", "user_id": "u4", "event_type": "add_to_cart", "page": "/p/lamp", "ts": "2026-10-05T09:22:10", "app_version": "2.0"}
+{"event_id": "e024", "user_id": "u4", "event_type": "page_view", "page": "/cart", "ts": "2026-10-05T09:31:31", "app_version": "2.0"}
+{"event_id": "e026", "user_id": "u5", "event_type": "add_to_cart", "page": "/cart", "ts": "2026-10-05T09:33:42", "app_version": "2.0"}
+{"event_id": "e027", "user_id": "u5", "event_type": "page_view", "page": "/p/lamp", "ts": "2026-10-05T09:36:06", "app_version": "2.0"}

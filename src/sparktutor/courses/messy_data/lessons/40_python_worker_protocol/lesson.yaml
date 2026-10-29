@@ -1,0 +1,776 @@
+- Class: meta
+  Lesson: The Python Worker Protocol
+  EstimatedMinutes: 80
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    "How Catalyst Plans Python" ended with an `ArrowEvalPython` node in
+    a physical plan. This lesson follows that node out of the JVM: which
+    process runs your function, how the process is started and reused,
+    and exactly which bytes go over the socket in each direction. You
+    will record those bytes yourself with a wire tap and decode them.
+
+    It builds on "Packaging, Registration, Testing and Debugging" (worker
+    logs with `python_worker_logs()`) and "Tuning Python on Spark" (the
+    cost of crossing into Python), and it explains the 4.2.0 hang you
+    met in the previous lesson.
+
+    By the end of this lesson you will be able to:
+
+    - Name the classes and modules involved: `PythonWorkerFactory`,
+      `pyspark/daemon.py`, `pyspark/worker.py`, `BasePythonRunner`,
+      `PythonWorkerUtils`, `SpecialLengths`
+    - Prove worker reuse with process IDs, and say when it is off
+    - Decode a UDF task's request and response byte by byte, for the
+      pickled and the Arrow protocols
+    - Measure a UDF's pickled closure, explain the 1 MiB broadcast
+      threshold, and shrink a closure with a broadcast variable
+    - Turn a silent hang into an error with an idle timeout, and see
+      where the worker is stuck with periodic traceback dumps
+    - Tell a Python exception, a crashed worker and a killed worker apart
+      from the error alone
+    - Explain what `spark.executor.pyspark.memory` really limits, and why
+      a small value crashes every Arrow UDF
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Processes
+
+    In local mode, the processes behind one `spark-submit` job are:
+
+    1. **Your driver Python process**, which talks to the JVM over Py4J.
+    2. **The JVM**, which in local mode is the driver and the only
+       executor.
+    3. **A Python daemon**, started by the JVM with
+       `python -m pyspark.daemon pyspark.worker` the first time a task
+       needs Python (`PythonWorkerFactory.startDaemon` in
+       `core/src/main/scala/org/apache/spark/api/python/PythonWorkerFactory.scala`).
+    4. **Python workers**, forked by the daemon, one per running task
+       that needs Python.
+
+    The daemon exists because forking a Python process that has already
+    imported PySpark is far cheaper than starting Python from the JVM.
+    Its loop in `pyspark/daemon.py` waits on a listening socket; for
+    each connection from the JVM it calls `os.fork()`, and the child
+    writes its PID back, authenticates the JVM with a shared secret and
+    then calls `pyspark.worker.main(infile, outfile)`. The worker module
+    is imported **after** the fork, so threads that pandas or PyArrow
+    start on import never exist in the daemon (a forked process only
+    keeps the forking thread).
+
+    An experiment: a UDF that returns `f"{os.getpid()}:{os.getppid()}"`,
+    run over `spark.range(0, 8, 1, 4)` in three jobs on `local[2]`:
+
+    ```text
+    reuse=true daemon=true driver_python=3478984 jvm=3478621
+      job 0: worker pids ['3479780', '3479782']
+      job 1: worker pids ['3479780', '3479782']
+      job 2: worker pids ['3479780', '3479782']
+      distinct pids over 3 jobs: 2; parents: ['3479718']
+    reuse=false daemon=true driver_python=3478984 jvm=3478621
+      job 0: worker pids ['3480463', '3480467', '3480546', '3480548']
+      ...
+      distinct pids over 3 jobs: 12; parents: ['3480412']
+    reuse=true daemon=false driver_python=3478984 jvm=3478621
+      job 0: worker pids ['3480922', '3480986', '3481069', '3481152']
+      ...
+      distinct pids over 3 jobs: 12; parents: ['3478621']
+    ```
+
+    Read it closely:
+
+    - With the defaults, the **same two workers** ran all twelve tasks:
+      two task slots, two workers, reused across jobs. Their parent is
+      the daemon, not the JVM and not your Python.
+    - With `spark.python.worker.reuse=false`, every task got a new
+      process.
+    - With `spark.python.use.daemon=false`, workers are children of the
+      JVM, and **reuse does not happen even though it is on**.
+      `PythonWorkerFactory.releaseWorker` only keeps idle workers in
+      daemon mode; otherwise it stops them. The daemon is also never used
+      on Windows (`!Utils.isWindows && useDaemonEnabled`), so on Windows
+      every task starts a fresh Python.
+
+    Both settings are core settings read when the factory and the runner
+    are created, so set them when the session starts, not with
+    `spark.conf.set`.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What Reuse Keeps
+
+    A reused worker runs `worker.main` again for the next task in the
+    same process. That has consequences you can use, and some that bite:
+
+    - **Imports and module globals survive.** A model loaded into a
+      module-level variable stays loaded for later tasks on that worker,
+      which is the trick behind loading a model "once per worker" in
+      "Model Inference in Production".
+    - **Broadcast variables are sent as differences.**
+      `PythonWorkerUtils.writeBroadcasts` asks `PythonRDD.getWorkerBroadcasts(worker)`
+      what the worker already has, and sends only new IDs, plus negative
+      IDs (`-bid - 1`) for broadcasts to forget. The values are not sent
+      over the socket at all: the worker receives a **file path** and
+      reads the broadcast from local disk.
+    - **The task context is reset.** `worker.main` sets
+      `TaskContext._setTaskContext(None)` at the end, so stale context
+      does not leak.
+    - **Memory is not returned.** A reused worker keeps whatever its
+      allocator kept. In one run below, a worker that had allocated
+      900 MiB in a previous task started the next task with a
+      virtual size of 1371 MiB instead of 302 MiB.
+    - **The pool can be bounded.** `spark.python.factory.idleWorkerMaxPoolSize`
+      (4.1) caps the number of idle workers kept, evicting the least
+      recently used.
+
+    The JVM decides whether to reuse at the end of each task: the worker
+    must answer the final `END_OF_STREAM` marker with `END_OF_STREAM`.
+    Any other ending, an exception or a crash destroys the worker.
+
+- Class: mult_question
+  Depth: all
+  Output: "On Linux you set spark.python.use.daemon=false and leave spark.python.worker.reuse=true. What happens to Python workers?"
+  AnswerChoices: "Every task gets a new worker, because only daemon-mode workers are kept for reuse;Workers are reused as usual;One worker serves all tasks of the application;Spark refuses to start"
+  CorrectAnswer: "Every task gets a new worker, because only daemon-mode workers are kept for reuse"
+  Hint: "PythonWorkerFactory.releaseWorker keeps idle workers only when the daemon is in use."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Runner on the JVM Side
+
+    `BasePythonRunner`
+    (`core/src/main/scala/org/apache/spark/api/python/PythonRunner.scala`)
+    is the JVM half of every UDF evaluation. Its `compute(inputIterator,
+    partitionIndex, context)`:
+
+    1. Builds the worker's environment: `SPARK_REUSE_WORKER`,
+       `PYTHON_UDF_BATCH_SIZE` (from
+       `spark.sql.execution.python.udf.maxRecordsPerBatch`, default 100),
+       `PYSPARK_EXECUTOR_MEMORY_MB`, `PYTHON_FAULTHANDLER_DIR`,
+       `OMP_NUM_THREADS` (set to `spark.task.cpus` unless you set it,
+       SPARK-42613), and more.
+    2. Gets a worker from `SparkEnv.createPythonWorker`, which goes
+       through the `PythonWorkerFactory` for that Python executable,
+       module and environment.
+    3. Writes the request: a header with everything the worker needs,
+       then the input rows, then a closing marker.
+    4. Returns an iterator that reads the worker's answers.
+
+    Since Spark 4.0 there is no writer thread. SPARK-44705 ("Make
+    PythonRunner single-threaded") replaced it with non-blocking sockets:
+    `ReaderInputStream` uses a `Selector` and, whenever the task asks for
+    output, writes pending input if the socket can take it and reads
+    output if there is some. That loop is also where the idle timeout
+    lives, which you will use below.
+
+    The subclasses decide the payload: `PythonUDFRunner` for pickled
+    UDFs (`BatchEvalPythonExec`), `ArrowPythonRunner` and its relatives
+    for Arrow (`ArrowEvalPythonExec`, `MapInBatchExec`, Python data
+    source reads), each with its own `writeUDF` and data writer.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Recording the Bytes: a Wire Tap
+
+    `spark.python.worker.module` (2.4) names the module whose `main` the
+    daemon calls for each task. A module that wraps `pyspark.worker.main`
+    and copies every byte it reads and writes to a file is a wire tap:
+
+    ```python
+    import io, os
+    from pyspark.worker import main as real_main
+
+    class TeeIn(io.RawIOBase):
+        def __init__(self, inner, log):
+            self.inner, self.log = inner, log
+        def readable(self):
+            return True
+        def readinto(self, b):
+            data = self.inner.read1(len(b))   # read1: never wait for more than is there
+            b[:len(data)] = data
+            self.log.write(data)
+            return len(data)
+
+    class TeeOut:
+        def __init__(self, inner, log):
+            self.inner, self.log = inner, log
+        def write(self, data):
+            self.log.write(data)
+            return self.inner.write(data)
+        def flush(self):
+            self.log.flush()
+            self.inner.flush()
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+    def main(infile, outfile):
+        d, pid = os.environ["TAP_DIR"], os.getpid()
+        with open(os.path.join(d, f"{pid}.in"), "ab") as i, \
+             open(os.path.join(d, f"{pid}.out"), "ab") as o:
+            real_main(io.BufferedReader(TeeIn(infile, i), 65536), TeeOut(outfile, o))
+    ```
+
+    ```python
+    spark = (SparkSession.builder.master("local[2]")
+             .config("spark.python.worker.reuse", "false")       # one task per file
+             .config("spark.python.worker.module", "pyspark_tap")
+             .config("spark.executorEnv.PYTHONPATH", tapdir)      # where pyspark_tap.py is
+             .config("spark.executorEnv.TAP_DIR", tapdir)
+             .getOrCreate())
+    ```
+
+    Three things went wrong while building it, and each teaches
+    something:
+
+    - **The module name must start with `pyspark`.** `daemon.py` imports
+      `sys.argv[1]` only `if sys.argv[1].startswith("pyspark")`, and
+      otherwise silently runs `pyspark.worker`. A tap called
+      `tapworker` produced no files and no error.
+    - **`read` instead of `read1` hung the job.** A buffered `read(65536)`
+      on a socket waits for 65536 bytes or end of file. The JVM sends a
+      few kilobytes and then waits for an answer, so both sides waited
+      forever. The real worker reads exact lengths for the same reason.
+    - **`spark.executorEnv.PYTHONPATH` is merged into the workers'
+      `PYTHONPATH`** (`PythonUtils.mergePythonPaths` in the factory), which
+      is how the daemon finds a module that is not installed.
+
+    The tap is in the exercise, ready to use. It is a debugging tool
+    for a laptop, not something to run on a cluster: it writes every
+    row to disk, and the request contains a secret.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Request, Byte by Byte
+
+    For `spark.range(0, 3, 1, 1).selectExpr("concat('ab', id) AS s")` and
+    `udf(lambda s: s.upper(), "string", useArrow=False)`, the tap
+    recorded 4849 bytes going into the worker. The first bytes:
+
+    ```text
+    000000  00 00 00 00 00 00 00 04 33 2e 31 32 00 00 0f 5c   ........3.12...\
+    000010  7b 22 73 65 63 72 65 74 22 3a 22 ...              {"secret":"...
+    ```
+
+    Every integer is big-endian (Java's `DataOutputStream`); strings
+    and byte arrays are a 4-byte length and then the bytes. In order,
+    from `BasePythonRunner.Writer.open` and Python's `worker.main`:
+
+    | Field | Encoding | In this request |
+    |---|---|---|
+    | partition index | int | `00 00 00 00` = 0 |
+    | Python version | string | `00 00 00 04` "3.12" (the worker checks it against its own) |
+    | task context | string (JSON) | 0x0f5c bytes: `attemptNumber`, `connInfo`, `cpus`, `isBarrier`, `localProperties`, `partitionId`, `resources`, `secret`, `stageId`, `taskAttemptId` |
+    | Spark files root | string | `/tmp/spark-.../userFiles-...` |
+    | includes | int count, strings | 0 |
+    | broadcasts | bool (decryption server), int count, then per broadcast a long ID and a path | false, 0 |
+    | eval type | int | 100 (`SQL_BATCHED_UDF`) |
+    | runner conf | int count, key and value strings | empty for this runner |
+    | eval conf | same | empty |
+    | UDFs | see below | one UDF |
+    | data | see below | three rows |
+    | end | int | -4 (`END_OF_STREAM`) |
+
+    Most of the task context is `localProperties`, which carries every
+    local property of the job (a lot of Spark configuration). The
+    `secret` is used by barrier tasks and broadcast decryption to call
+    back into the JVM.
+
+    The UDF section is written by `PythonUDFRunner.writeUDFs`
+    (`sql/core/.../execution/python/PythonUDFRunner.scala`) and read by
+    `read_udfs` and `read_single_udf` in `pyspark/worker.py`:
+
+    ```text
+    int    number of UDFs
+    per UDF:
+      int    number of arguments
+      per argument: int offset into the input row, bool named, [string name]
+      int    number of chained functions (2 for f(g(x)) fused into one node)
+      per function: bytes  the command, a cloudpickle of (function, return type)
+      long   result ID
+    ```
+
+    Here: 1 UDF, 1 argument at offset 0, not named, 1 function whose
+    command is 702 bytes, result ID 2.
+
+    The data section of the pickled protocol is a sequence of frames,
+    each a length and a pickle (written by the JVM with Pyrolite,
+    pickle protocol 2) of a batch of rows, ended by
+    `END_OF_DATA_SECTION`:
+
+    ```text
+    0012c1  1f 80 02 58 03 00 00 00 61 62 30 85 58 03 00 00   ...X....ab0.X...
+    0012d1  00 61 62 31 85 58 03 00 00 00 61 62 32 85 87 2e   .ab1.X....ab2...
+    0012e1  ff ff ff ff ff ff ff fc                           ........
+    ```
+
+    `80 02` is the pickle protocol 2 header, `58 03 00 00 00 61 62 30`
+    is the string "ab0", `85` makes a one-element tuple (a row), `87`
+    makes the tuple of three rows, `2e` ends the pickle. Then
+    `ff ff ff ff` (-1, `END_OF_DATA_SECTION`) and `ff ff ff fc` (-4,
+    `END_OF_STREAM`).
+
+    For an Arrow UDF (eval type 101) the header is the same, but the
+    runner conf carries the session time zone and pandas and Arrow
+    settings, and the **eval conf** carries the UDF's input schema:
+
+    ```text
+    eval_conf {'input_type': '{"type":"struct","fields":[{"name":"_0","type":"string","nullable":true,"metadata":{}}]}'}
+    ```
+
+    and the data section is a raw Arrow IPC stream (a schema message,
+    record batches, the end-of-stream marker `ff ff ff ff 00 00 00 00`)
+    with no length prefix, followed by -4.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Response, Byte by Byte
+
+    The worker answered with 102 bytes:
+
+    ```text
+    000000  00 00 00 22 80 05 95 17 00 00 00 00 00 00 00 5d   ..."...........]
+    000010  94 28 8c 03 41 42 30 94 8c 03 41 42 31 94 8c 03   .(..AB0...AB1...
+    000020  41 42 32 94 65 2e ff ff ff fd 00 00 01 a1 84 5a   AB2.e..........Z
+    000030  43 a7 00 00 01 a1 84 5a 44 12 00 00 01 a1 84 5a   C......ZD......Z
+    000040  44 12 00 00 00 00 00 00 00 00 00 00 00 00 00 00   D...............
+    000050  00 00 00 00 00 00 00 00 00 00 ff ff ff ff 00 00   ................
+    000060  00 00 ff ff ff fc                                 ......
+    ```
+
+    - `00 00 00 22`: a 34-byte frame, a pickle (protocol 5, `80 05`,
+      Python's own) of the list `['AB0', 'AB1', 'AB2']`.
+    - `ff ff ff fd`: -3, `TIMING_DATA`, followed by four longs written by
+      `report_times`: boot, init and finish times in milliseconds since
+      the epoch (`0x1a1845a43a7` and so on) and the processing time in
+      milliseconds (0).
+    - Two longs: memory and disk bytes spilled by the worker (0, 0).
+    - `ff ff ff ff`: -1, `END_OF_DATA_SECTION`, then the accumulator
+      updates: an int count (0 here) and one length-prefixed pickle per
+      update.
+    - `ff ff ff fc`: -4, `END_OF_STREAM`. The worker can be reused.
+
+    The special lengths, from `SpecialLengths` in `PythonRunner.scala`
+    (Python's copy is in `pyspark/serializers.py`):
+
+    | Value | Name | Meaning |
+    |---|---|---|
+    | -1 | `END_OF_DATA_SECTION` | no more data frames |
+    | -2 | `PYTHON_EXCEPTION_THROWN` | a string with the Python traceback follows |
+    | -3 | `TIMING_DATA` | timing longs follow |
+    | -4 | `END_OF_STREAM` | the task is over; echoed back to allow reuse |
+    | -5 | `NULL` | a null value where a frame was expected |
+    | -6 | `START_ARROW_STREAM` | an Arrow IPC stream follows (Python to JVM) |
+    | -7 | `END_OF_MICRO_BATCH` | defined only on the JVM side (no Python counterpart in 4.2.0) |
+
+    A frame length is just an int, so a negative number is how either
+    side says "this is not data". That is elegant and fragile: if the two
+    sides ever disagree about where they are in the stream, a byte of a
+    string can be read as a length, and nothing in the format notices.
+
+    For the Arrow UDF the response began with `ff ff ff fa` (-6), then
+    the Arrow stream of results, then the same timing tail; its
+    `processing_ms` was 147.
+
+- Class: mult_question
+  Depth: all
+  Output: "In a worker's response, the 4 bytes ff ff ff fd appear right after the last result frame. What follows them?"
+  AnswerChoices: "Four longs of timing data (boot, init, finish, processing time);The Python traceback of an exception;An Arrow IPC stream;Nothing, the task has ended"
+  CorrectAnswer: "Four longs of timing data (boot, init, finish, processing time)"
+  Hint: "-3 is TIMING_DATA in SpecialLengths."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## A Desync in the Wild: SPARK-58241
+
+    Now the 4.2.0 hang from "How Catalyst Plans Python" makes sense.
+    Spark 4.2.0 moved the Arrow UDF's input schema out of the UDF
+    section into the eval conf (SPARK-56340, "Move input type schema
+    transmit to eval conf"). `ArrowPythonWithNamedArgumentRunner` was
+    updated: its `evalConf` adds `input_type`. The new columnar runner
+    added in the same release, `ColumnarArrowPythonWithNamedArgumentRunner`
+    (`sql/core/.../execution/python/ColumnarArrowPythonRunner.scala`),
+    still wrote it the old way:
+
+    ```scala
+    override protected def writeUDF(dataOut: DataOutputStream): Unit = {
+      if (evalType == PythonEvalType.SQL_ARROW_BATCHED_UDF) {
+        PythonWorkerUtils.writeUTF(schema.json, dataOut)
+      }
+      PythonUDFRunner.writeUDFs(dataOut, funcs, argMetas)
+    }
+    ```
+
+    Follow the worker reading that stream:
+
+    1. `num_udfs = read_int(infile)` reads the **length of the schema
+       JSON** (about 90) as the number of UDFs.
+    2. `read_single_udf` reads `num_arg = read_int(infile)` from the first
+       four characters of the JSON, `{"ty`, that is `0x7b227479`, about
+       2 billion arguments.
+    3. For each "argument" it reads an offset and a flag, and when a flag
+       byte happens to be non-zero it reads a "name": a length taken from
+       more JSON text, then `stream.read(length)`, which blocks until that
+       many bytes arrive.
+    4. They never arrive. The JVM has sent everything and is waiting for
+       the first result. Neither side times out by default.
+
+    You can watch this happen. Three settings added in 4.0 and 4.1 turn
+    the hang into evidence:
+
+    ```python
+    spark = (SparkSession.builder.master("local[1]")
+             .config("spark.sql.execution.pyspark.udf.idleTimeoutSeconds", "5")
+             .config("spark.sql.execution.pyspark.udf.killOnIdleTimeout", "true")
+             .config("spark.sql.execution.pyspark.udf.tracebackDumpIntervalSeconds", "3")
+             .getOrCreate())
+    q = spark.read.parquet(p).select(F.udf(lambda s: s + "!", "string")("s"))
+    q.collect()
+    ```
+
+    ```text
+    Timeout (0:00:03)!
+    Thread 0x00007f4362b78080 (most recent call first):
+      File ".../pyspark/serializers.py", line 541 in loads
+      File ".../pyspark/worker.py", line 1072 in read_single_udf
+      File ".../pyspark/worker.py", line 2496 in read_udfs
+      File ".../pyspark/worker.py", line 3602 in main
+      File ".../pyspark/daemon.py", line 90 in worker
+      ...
+    WARN ColumnarArrowPythonWithNamedArgumentRunner: Idle timeout reached for Python worker
+      (timeout: 5 seconds). No data received from the worker process - handle.map(_.isAlive) =
+      Some(true), channel.isConnected = true, ... hasInputs = false - task 0.0 in stage 2 (TID 2)
+    WARN ColumnarArrowPythonWithNamedArgumentRunner: Terminating Python worker process due to
+      idle timeout (timeout: 5 seconds) - task 0.0 in stage 2 (TID 2)
+    ERROR Executor: Exception in task 0.0 in stage 2.0 (TID 2)
+    org.apache.spark.api.python.PythonWorkerException: Python worker process terminated due to
+      idle timeout (timeout: 5 seconds)
+    ```
+
+    The dump puts the worker in `read_single_udf` at line 1072, which is
+    `name = utf8_deserializer.loads(infile)`, inside `loads` at line 541,
+    `s = stream.read(length)`: exactly step 3. The runner's class name in
+    the warning tells you which JVM writer was talking. With
+    `spark.sql.execution.arrow.pythonUDF.columnarInput.enabled=false` the
+    same query returned `['0!', '1!', '2!']`.
+
+    SPARK-58241 ("Columnar Arrow Python UDF runner writes the input
+    schema in the legacy protocol position, hanging the worker") is
+    fixed in 4.2.1 and 4.3.0. The exercise rebuilds this exact desynced
+    request from a real one and has your parser reject it in
+    microseconds instead of blocking.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Debugging Settings
+
+    All of these exist at two levels: a core setting
+    `spark.python.worker.*` read when a runner starts, and a SQL
+    setting `spark.sql.execution.pyspark.udf.*` that falls back to it
+    and can be changed at runtime for DataFrame and SQL work.
+
+    | Setting | Since | Default | Effect |
+    |---|---|---|---|
+    | `spark.python.worker.faulthandler.enabled` / `...udf.faulthandler.enabled` | 3.2 / 4.0 | false | the worker enables `faulthandler` and writes a crash traceback to a file the JVM appends to the error |
+    | `spark.python.worker.idleTimeoutSeconds` / `...udf.idleTimeoutSeconds` | 4.0 | 0 (off) | log the socket state when no data arrives for this long |
+    | `spark.python.worker.killOnIdleTimeout` / `...udf.killOnIdleTimeout` | 4.1 | false | also kill the worker, failing the task |
+    | `spark.python.worker.tracebackDumpIntervalSeconds` / `...udf.tracebackDumpIntervalSeconds` | 4.1 | 0 (off) | the worker dumps all thread tracebacks to its stderr periodically |
+    | `spark.python.daemon.killWorkerOnFlushFailure` / `...udf.daemonKillWorkerOnFlushFailure` | 4.1 | true | a worker whose final flush fails dies instead of continuing in a broken protocol state |
+    | `spark.sql.pyspark.worker.logging.enabled` | 4.1 | false | collect worker logs into `python_worker_logs()` ("Packaging, Registration, Testing and Debugging") |
+
+    With an idle timeout but without `killOnIdleTimeout`, Spark only logs
+    the warning and the task keeps waiting. A sensible production
+    setting for jobs with Python is a timeout longer than any honest
+    pause of your function (a slow API call, a model load), with kill
+    enabled, so a hang fails the task and the scheduler can retry it.
+
+    In local mode the worker's stderr is your terminal, so the traceback
+    dumps appear there; on a cluster they land in the executor's stderr
+    log.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Telling Failures Apart
+
+    Four ways a UDF can fail, triggered on purpose in a classic session
+    (`spark.range(1).select(udf(f)("id")).collect()`):
+
+    | The UDF does | You get (driver side) | Key text |
+    |---|---|---|
+    | `raise ValueError("bad row 0")` | `PythonException`, `getCondition()` = `PYTHON_EXCEPTION` | `An exception was thrown from the Python worker:` and your traceback |
+    | `raise MemoryError(...)` | the same | `MemoryError` |
+    | `os._exit(3)` or `os.kill(os.getpid(), SIGKILL)` | `Py4JJavaError` (no condition) | `Python worker exited unexpectedly (crashed). Consider setting 'spark.sql.execution.pyspark.udf.faulthandler.enabled' or'spark.python.worker.faulthandler.enabled' ...`, caused by `java.io.EOFException` |
+    | a segmentation fault (`ctypes.string_at(0)`), faulthandler on | `Py4JJavaError` | `Python worker exited unexpectedly (crashed): Fatal Python error: Segmentation fault` and the Python stack, `File ".../ctypes/__init__.py", line 525 in string_at` |
+    | sleeps past an idle timeout with kill on | `Py4JJavaError` | `PythonWorkerException: Python worker process terminated due to idle timeout (timeout: 3 seconds)` |
+
+    (The missing space in `or'spark.python...` is in Spark's message.)
+    The reasons are in the protocol. A Python exception is **caught by
+    the worker** (`handle_worker_exception`), which writes
+    `PYTHON_EXCEPTION_THROWN` and the traceback, so the JVM can build a
+    proper error. A process that dies writes nothing: the JVM reads end
+    of file in the middle of a frame, `BasePythonRunner.ReaderIterator`
+    turns the `EOFException` into "exited unexpectedly (crashed)", and
+    all it can add is the faulthandler file, if there is one. With
+    faulthandler on, `os._exit` and `SIGKILL` still give
+    `(crashed): ` with nothing after the colon, because neither runs a
+    signal handler.
+
+    This is also what a **worker killed for memory** looks like. On
+    YARN or Kubernetes, Python workers live outside the JVM heap, in the
+    container's overhead (`spark.executor.memoryOverhead`, by default
+    `spark.executor.memoryOverheadFactor` 0.10 of executor memory with a
+    minimum of `spark.executor.minMemoryOverhead` 384m, and 0.40 for
+    non-JVM jobs on Kubernetes). When the kernel or the container
+    runtime kills a worker for memory, it sends `SIGKILL`, and you get
+    the second row of the table, with no Python traceback, even with
+    faulthandler on. When you see "crashed" with an empty message on a
+    cluster, check the node's kernel log and the container's memory
+    first.
+
+- Class: mult_question
+  Depth: all
+  Output: "A job fails with 'Python worker exited unexpectedly (crashed): ' and nothing after the colon, although faulthandler is enabled. Which cause fits best?"
+  AnswerChoices: "The worker was killed with SIGKILL, for example by the out-of-memory killer;The UDF raised a ValueError;The UDF returned the wrong type;The JVM ran out of heap"
+  CorrectAnswer: "The worker was killed with SIGKILL, for example by the out-of-memory killer"
+  Hint: "faulthandler can only write a traceback when a signal it handles reaches the process; SIGKILL cannot be handled."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## How Your Function Travels
+
+    A UDF's command is `CloudPickleSerializer().dumps((func, return_type))`.
+    Cloudpickle pickles the function **by value**: its code object, its
+    defaults, and every global and closure variable it uses. In a
+    classic session `pyspark.core.rdd._prepare_for_python_RDD` does the
+    pickling once, on the driver:
+
+    ```python
+    pickled_command = ser.dumps(command)
+    if len(pickled_command) > sc._jvm.PythonUtils.getBroadcastThreshold(sc._jsc):  # Default 1M
+        broadcast = sc.broadcast(pickled_command)
+        pickled_command = ser.dumps(broadcast)
+    ```
+
+    The threshold is `spark.broadcast.UDFCompressionThreshold` (3.0,
+    default 1 MiB). Below it, the command bytes are part of the plan:
+    they go into the stage's task binary (which the `DAGScheduler`
+    broadcasts once per stage), and the runner writes them into **every
+    task's request** to a worker, which unpickles them for every task.
+    Above it, the command becomes a broadcast and the request carries
+    only a small pickled reference.
+    Measured with a set of stop words captured by the closure, reading
+    the command length through
+    `udf._unwrapped._judf.func().command().length()`:
+
+    | Closure | Command bytes per task | Broadcast vars |
+    |---|---|---|
+    | set of 300 000 words (3 790 622 bytes pickled), default threshold | 56 | 1 (made for you) |
+    | the same, threshold raised to 100m | 3 790 663 | 0 |
+    | set of 60 000 words, default threshold | 709 766 | 0 |
+    | 300 000 words in an explicit `sc.broadcast`, read with `bc.value` | 745 | 1 |
+
+    With the threshold raised, the driver logged
+    `WARN DAGScheduler: Broadcasting large task binary with size 3.6 MiB`
+    (`DAGScheduler` warns above `TaskSetManager.TASK_SIZE_TO_WARN_KIB`,
+    1000 KiB). The 60 000-word case is the one to worry about: just
+    under the threshold, so 700 KB is written into every task's request
+    and unpickled by a worker for every task.
+
+    Fixes, best first:
+
+    - **Broadcast explicitly** (`bc = sc.broadcast(obj)`, use
+      `bc.value` inside). The worker reads it from a local file once per
+      worker and keeps it across reused tasks.
+    - **Load inside the worker**: read the data from a file or a model
+      store in a module-level cache, so nothing large is pickled at all.
+    - **Watch what the closure captures.** A method of an object
+      captures `self`, and every attribute with it; a function that
+      refers to a DataFrame or the SparkSession fails to pickle.
+      `len(cloudpickle.dumps(f))` before you register a UDF is a cheap
+      check.
+
+    On Spark Connect the command bytes travel inside the plan protobuf
+    (the `command` field you saw in "How Catalyst Plans Python"), so a
+    large closure also makes every request large.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    `f` is a Python function you are about to wrap in a UDF. Using
+    `pyspark.cloudpickle` (already imported as `cloudpickle`), set
+    `size` to the number of bytes its pickled form takes.
+  CorrectAnswer: |
+    size = len(cloudpickle.dumps(f))
+  Hint: "cloudpickle.dumps returns bytes; len gives their number."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What spark.executor.pyspark.memory Really Limits
+
+    `spark.executor.pyspark.memory` (2.4) sets a memory limit for the
+    Python workers of an executor. The runner divides it by the
+    executor's cores (`getWorkerMemoryMb`: `mem / cores`) and passes it
+    as `PYSPARK_EXECUTOR_MEMORY_MB`; `worker.main` calls
+    `setup_memory_limits` in `pyspark/worker_util.py`, which sets
+    `resource.RLIMIT_AS` on Linux. Windows does not support it and macOS
+    does not enforce it.
+
+    `RLIMIT_AS` limits **virtual address space**, not resident memory,
+    and that matters. From workers in local mode (one core, so the
+    worker gets the whole value), with `/proc/self/status` read inside
+    the UDF:
+
+    | Limit | UDF | Worker at start | Allocate 100 / 400 / 900 MiB |
+    |---|---|---|---|
+    | 300m | pickled (`useArrow=False`) | VmSize 66 MiB, RSS 50 MiB | ok / `MemoryError` / `MemoryError` |
+    | 300m | Arrow (the 4.2 default) | does not start | every query fails: `Python worker exited unexpectedly (crashed)`, caused by `IOException: Unexpected end of input. Missing schema.` |
+    | 1g | pickled | 66 MiB | ok / ok / ok |
+    | 1g | Arrow | VmSize 302 MiB, RSS 84 MiB | ok / ok / `MemoryError` |
+    | 2g | Arrow, fresh worker | 302 MiB | 900 MiB ok, VmSize 1202 MiB after |
+    | 2g | Arrow, the **reused** worker | 1371 MiB | 900 MiB fails: `MemoryError` |
+
+    An Arrow worker maps about 300 MiB of address space just by
+    importing PyArrow and pandas, while using under 100 MiB of real
+    memory. A limit of 300m leaves it nothing, so it dies before it can
+    read its input, and the JVM sees an Arrow stream that ends before
+    its schema. The worker even prints its limits to stderr when it
+    sets them (`Current mem limits: -1 of max -1`,
+    `Setting mem limits to 314572800 of max 314572800`).
+
+    A `MemoryError` raised inside your UDF is an ordinary Python
+    exception (`PYTHON_EXCEPTION`); hitting the limit while PySpark's own
+    code allocates can instead kill the worker. Practical advice: if you
+    set `spark.executor.pyspark.memory`, start at 1g per core or more
+    for Arrow UDFs, measure, and remember the limit is per worker
+    process, while reused workers keep their address space between
+    tasks. The driver-side planning workers (Python data source planning,
+    UDTF analysis) have their own setting,
+    `spark.sql.planner.pythonExecution.memory` (4.0, in MiB), passed as
+    `PYSPARK_PLANNER_MEMORY_MB`.
+
+    On YARN, `spark.executor.pyspark.memory` is also added to the
+    container request (`pysparkWorkerMemory` in
+    `resource-managers/yarn/.../deploy/yarn/Client.scala`), so the limit
+    and the container agree; without it, Python workers silently share
+    the overhead.
+
+- Class: mult_question
+  Depth: all
+  Output: "You set spark.executor.pyspark.memory=300m and every Arrow-optimized UDF now fails with 'Python worker exited unexpectedly (crashed)'. Why?"
+  AnswerChoices: "RLIMIT_AS limits virtual address space, and importing PyArrow alone maps more than 300 MiB;The JVM heap is too small;Arrow UDFs are not allowed a memory limit;The limit applies to the driver, which cannot start"
+  CorrectAnswer: "RLIMIT_AS limits virtual address space, and importing PyArrow alone maps more than 300 MiB"
+  Hint: "Compare the worker's VmSize with its VmRSS."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Planning Workers Speak the Same Language
+
+    The driver-side workers that plan a Python data source, analyze a
+    UDTF or look up registered sources use a simpler exchange in
+    `PythonPlannerRunner.runInPython`: Python version, Spark files,
+    broadcasts and the runner conf, then a request specific to the
+    module (`pyspark.sql.worker.plan_data_source_read`,
+    `data_source_pushdown_filters`, `create_data_source`,
+    `analyze_udtf`, ...), then `END_OF_STREAM`; the answer ends with
+    accumulator updates and `END_OF_STREAM`, and the worker is released
+    for reuse like any other. Its I/O wrapper, `WorkerInputStream`, is
+    "a port and simplified version of `PythonRunner.ReaderInputStream`"
+    and honours the same idle timeout settings.
+
+    `plan_data_source_read` receives, among other things,
+    `max_arrow_batch_size` (an int) and an `enable_pushdown` flag, and
+    returns the pickled partitions and the pickled read function. Those
+    pickled partitions are what `PythonPartitionReaderFactory` later
+    sends, one per task, as the single input row of an eval-type-207
+    worker. So the `InputPartition` objects your `partitions()` returns
+    travel twice: from a planning worker to the JVM, and from the JVM to
+    an executor worker. Keep them small: paths and offsets, never data.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Workers, Closures, Failures and the Wire
+
+    The harness runs two sessions. The first uses the defaults; the
+    second turns reuse off and installs the wire tap. `FrameReader`
+    (a strict reader over bytes: `int()`, `long()`, `bool()`, `bytes()`,
+    `utf()`, raising `ProtocolError` on a short read), `read_conf`, the
+    tap module and the header part of `parse_request` are given.
+    Complete:
+
+    1. `worker_pids(spark, jobs=3)`: per job, the set of worker PIDs that
+       ran a UDF over `spark.range(0, 8, 1, 4)`.
+    2. `shrink_closure(spark, stop_words)`: an `is_stop(word)` UDF whose
+       command stays under 4096 bytes.
+    3. `classify_failure(exc)`: `"python_exception"`, `"worker_crashed"`,
+       `"idle_timeout"` or `"other"`.
+    4. The UDF and data sections of `parse_request(data)`, all of
+       `parse_response(data)`, and `rebuild_udf(command)`.
+
+    The checks: at most two workers serve three jobs with reuse on and
+    twelve with reuse off; a 700 KB closure shrinks below 4 KB and still
+    answers correctly; a raised exception, an `os._exit` and a hang are
+    classified; the tapped request decodes to the right eval type, UDF
+    argument and input rows, the rebuilt function upper-cases a string,
+    the response decodes to the same results Spark returned with
+    sensible timing, the Arrow request carries `input_type` in its eval
+    conf, and the SPARK-58241 layout raises `ProtocolError` instead of
+    hanging.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "classify_failure: check getattr(exc, 'getCondition', None) first, then search str(exc) for 'terminated due to idle timeout' and 'Python worker exited unexpectedly (crashed)'. parse_response: loop reading ints; a positive one is a frame length, -6 starts an Arrow stream (read it like the request's), -3 ends the results; then four longs, two longs, -1, an int count of accumulator frames, and -4."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - The JVM starts `python -m pyspark.daemon pyspark.worker` once;
+      the daemon forks a worker per task slot. With
+      `spark.python.worker.reuse` (default true) workers serve many
+      tasks, but only in daemon mode, never on Windows.
+    - `BasePythonRunner` writes one request per task: partition, Python
+      version, task context JSON, files, broadcast IDs and paths, eval
+      type, runner and eval conf, the UDFs (offsets, chained commands,
+      result IDs), the data (pickled frames or a raw Arrow stream),
+      `END_OF_STREAM`. Since 4.0 the runner is single-threaded with
+      non-blocking I/O (SPARK-44705).
+    - The worker answers with results (frames, or -6 and an Arrow
+      stream), `TIMING_DATA`, spill counters, `END_OF_DATA_SECTION`,
+      accumulator updates and `END_OF_STREAM`. Negative lengths are the
+      control codes of `SpecialLengths`.
+    - In 4.2 the Arrow UDF input schema moved to the eval conf
+      (SPARK-56340); the columnar runner kept the old position and the
+      worker read JSON as counts and lengths, hanging the task
+      (SPARK-58241, fixed in 4.2.1 and 4.3.0).
+    - `idleTimeoutSeconds` with `killOnIdleTimeout` turns hangs into
+      `PythonWorkerException`s; `tracebackDumpIntervalSeconds` shows
+      where the worker is stuck; faulthandler adds tracebacks to crashes
+      it can catch.
+    - Raised exceptions arrive as `PYTHON_EXCEPTION`; dead workers as
+      "exited unexpectedly (crashed)" with an `EOFException`; `SIGKILL`
+      (including the out-of-memory killer) leaves no Python traceback.
+    - Commands over `spark.broadcast.UDFCompressionThreshold` (1 MiB)
+      are broadcast for you; anything just under it is sent and unpickled with every task.
+      Broadcast large objects yourself.
+    - `spark.executor.pyspark.memory` becomes `RLIMIT_AS` per worker,
+      a limit on virtual memory: about 300 MiB are gone before an Arrow
+      UDF starts.
+
+    Next: **Memory, Spill and Very Large Files**, which looks at the
+    other side of memory: the JVM's unified memory manager, spilling,
+    and how to read files far larger than any task should hold.

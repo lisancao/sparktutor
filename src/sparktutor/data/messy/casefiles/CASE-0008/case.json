@@ -1,0 +1,10 @@
+{
+  "schema": 2,
+  "case_id": "CASE-0008",
+  "opened": "2026-03-20T09:00:00Z",
+  "status": "open",
+  "priority": "P2",
+  "tags": [
+    "callback"
+  ],
+  "att

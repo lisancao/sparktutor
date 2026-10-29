@@ -1,0 +1,839 @@
+- Class: meta
+  Lesson: "Deduplication and Entity Resolution"
+  EstimatedMinutes: 65
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    "Columns and Expressions: Cleaning Values" taught you to trim,
+    lower-case, strip accents and standardize values, and "Feature
+    Vectors and Similarity Search" found the files most like each other,
+    with an exact search that compares every pair and the warning that
+    it does not scale. This lesson applies both to the oldest messy-data
+    problem there is: **the same customer recorded several times**, in
+    several systems, never quite the same way.
+
+    *Deduplication* removes copies inside one table. *Entity resolution*
+    (also called record linkage) decides which records, from any number
+    of sources, describe the same real-world thing, and builds one
+    trustworthy record for it. The pipeline has five steps, and you will
+    build each one in Spark:
+
+    1. **Standardize**: one schema, then normalized matching keys.
+    2. **Block**: propose candidate pairs cheaply instead of comparing
+       every pair.
+    3. **Score**: compare each candidate pair field by field.
+    4. **Cluster**: turn matched pairs into groups (entities) with
+       connected components.
+    5. **Survive**: build a golden record per entity with explicit
+       rules.
+
+    By the end of this lesson you will be able to:
+
+    - Remove exact duplicates and keep the latest row per key with
+      `dropDuplicates` and `row_number`
+    - Build matching keys for names (accents, case, word order,
+      nicknames), e-mails (Gmail dots and plus tags) and phones
+    - Use `levenshtein` (with its 3.5 threshold argument), `soundex`, a
+      Jaro-Winkler Python UDF and array set functions, and know where
+      each one fails
+    - Block with several passes, and measure what blocking costs in
+      missed pairs
+    - Choose a match threshold from labelled pairs with precision and
+      recall, and see how clustering changes both
+    - Cluster matches with iterative label propagation, and keep the
+      lineage short with `localCheckpoint()`
+    - Write survivorship rules with `max_by`, `mode` and `collect_set`
+      that never let a NULL or a typo win
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Imagine three address books kept by three people at the same
+    company. One writes "Bob Ahmed", another "Robert Ahmed", the third
+    "Rob Ahmd" with a typo, and one of them has an old phone number. A
+    person reading them would say "these are all Robert", and also "but
+    these two Robert Smiths are different people, they live in different
+    cities". Entity resolution is teaching Spark to make those calls,
+    and to show how often it gets them wrong.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Data: Three Systems, One Set of Customers
+
+    `data/messy/entities/` holds the same customers as three systems
+    recorded them:
+
+    - `crm.csv`: `crm_id, first_name, last_name, email, phone, city,
+      updated_at`. A few customers were entered twice.
+    - `shop.csv`: `customer_no, name, email, phone, city, last_order`.
+      The name is one field, sometimes written `Last, First`.
+    - `support.jsonl`: `contact_id, name, email, phone, seen` (a
+      timestamp). The support desk never asks for a city.
+    - `truth.csv`: `source, record_id, entity_id`, the answer key. Real
+      projects rarely have one for every record; here it lets you
+      measure every step. Never use it to *decide* a match.
+
+    Every record is a noisy copy of a true person: nicknames, typos,
+    missing accents, any case, Vietnamese names in both orders, Gmail
+    addresses with and without dots, phones in five formats, missing
+    values, and people who moved city. The hard cases are planted on
+    purpose: different people with the same full name (two Robert
+    Smiths, two Mei Chens, two José Garcías), and family members who
+    share a surname, a phone number and a city.
+
+    ```python
+    from pyspark.sql import functions as F
+
+    records = load_records(spark)          # you write it in the exercise
+    records.groupBy("source").count().orderBy("source").show()
+    ```
+
+    ```text
+    +-------+-----+
+    | source|count|
+    +-------+-----+
+    |    crm|   55|
+    |   shop|   44|
+    |support|   40|
+    +-------+-----+
+    ```
+
+    139 records describe 62 people. 105 pairs of records belong
+    together; that is the number every later step is measured against.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Step 1: One Schema
+
+    Matching starts by giving every source the same columns. The
+    mapping is plain DataFrame code, and each line handles one quirk:
+
+    ```python
+    crm = (spark.read.option("header", True).csv("data/messy/entities/crm.csv")
+           .select(F.lit("crm").alias("source"), F.col("crm_id").alias("record_id"),
+                   F.concat_ws(" ", "first_name", "last_name").alias("name"),
+                   "email", "phone", "city", F.to_date("updated_at").alias("updated_at")))
+
+    parts = F.split("name", ",")
+    shop = (spark.read.option("header", True).csv("data/messy/entities/shop.csv")
+            .select(F.lit("shop").alias("source"), F.col("customer_no").alias("record_id"),
+                    F.when(F.col("name").contains(","),
+                           F.concat_ws(" ", F.trim(parts[1]), F.trim(parts[0])))
+                     .otherwise(F.col("name")).alias("name"),
+                    "email", "phone", "city", F.to_date("last_order").alias("updated_at")))
+
+    support = (spark.read.schema("contact_id string, name string, email string, phone string, seen timestamp")
+               .json("data/messy/entities/support.jsonl")
+               .select(F.lit("support").alias("source"), F.col("contact_id").alias("record_id"),
+                       "name", "email", "phone", F.lit(None).cast("string").alias("city"),
+                       F.to_date("seen").alias("updated_at")))
+
+    records = crm.unionByName(shop).unionByName(support)
+    ```
+
+    ```text
+    +-------+---------+------------+-------------------------+---------------+---------+----------+
+    |source |record_id|name        |email                    |phone          |city     |updated_at|
+    +-------+---------+------------+-------------------------+---------------+---------+----------+
+    |crm    |CRM-0005 |Bill Singh  |William.singh@example.ca |9025555794     |Vancouver|2024-09-15|
+    |crm    |CRM-0006 |Bob Ahmed   | robert.ahmed@example.ca |+1 613 555 4144|Ottawa   |2024-01-03|
+    |shop   |10018    |José Smith  | jose.smith@mail.com     |5145554987     |Vancouver|2025-08-23|
+    |shop   |10008    |Minh Tuan Le|Minhtuan.le@example.ca   |+1 416 555 2394|Ottawa   |2026-04-02|
+    |support|S-004    |Rob Ahmd    |NULL                     |613.555.4144   |NULL     |2026-04-19|
+    +-------+---------+------------+-------------------------+---------------+---------+----------+
+    ```
+
+    - `record_id` is only unique **within** a source (a shop number
+      could collide with a support id), so later steps use `id =
+      source:record_id`.
+    - The missing city is an explicit typed NULL (`cast("string")`), so
+      the column has the same type in every input of `unionByName`.
+    - Keep the raw values. Normalized keys go in *new* columns, because
+      the golden record at the end wants the original spellings.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Exact Duplicates First
+
+    The cheap win comes first: rows that are identical.
+    `dropDuplicates()` with no arguments compares whole rows;
+    `dropDuplicates([cols])` compares only those columns:
+
+    ```python
+    print(records.count(), records.dropDuplicates().count(),
+          records.dropDuplicates(["name", "email", "phone"]).count())
+    ```
+
+    ```text
+    139 139 137
+    ```
+
+    No two rows are identical (their ids differ), and two pairs agree on
+    name, e-mail and phone: `Thomas Garcia` and `alexander lefebvre`
+    each appear in the shop and in support with the same values. Which
+    row `dropDuplicates` keeps is **not defined**; when it matters (keep
+    the newest), rank explicitly:
+
+    ```python
+    from pyspark.sql import Window
+
+    key = ["source", "name_key", "email_key", "phone_key"]
+    w = Window.partitionBy(key).orderBy(F.desc("updated_at"), "record_id")
+    latest = norm.withColumn("rn", F.row_number().over(w)).filter("rn = 1").drop("rn")
+    ```
+
+    On the normalized keys built next, the CRM has no exact copies
+    left: its double entries differ by a typo, a nickname or a missing
+    phone. That is typical. Exact deduplication is a first pass; nearly
+    all the real duplicates need fuzzy matching.
+
+- Class: mult_question
+  Depth: all
+  Output: "You call df.dropDuplicates(['email']) on a table where two rows share an e-mail but have different updated_at values. Which row is kept?"
+  AnswerChoices: "Either one, Spark does not define which;Always the first row in the file;Always the row with the latest updated_at;Both, because the rows differ in other columns"
+  CorrectAnswer: "Either one, Spark does not define which"
+  Hint: "dropDuplicates promises one row per key, not which one. Use row_number over a window to choose."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Step 2: Matching Keys
+
+    A matching key is a value two records of the same person are
+    *likely to share*, whatever the source did to it. You met the tools
+    in "Columns and Expressions: Cleaning Values"; here they are
+    combined per field:
+
+    ```python
+    nick = F.create_map(*[F.lit(x) for pair in NICKNAMES.items() for x in pair])   # {"bob": "robert", ...}
+    raw_tokens = F.split(F.regexp_replace(F.lower(unaccent("name")), "[^a-z ]", ""), " +")
+    tokens = F.transform(F.filter(raw_tokens, lambda t: t != ""),
+                         lambda t: F.coalesce(F.element_at(nick, t), t))
+
+    email = F.nullif(F.lower(F.trim("email")), F.lit(""))
+    local, domain = F.split(email, "@")[0], F.split(email, "@")[1]
+    gmail_local = F.regexp_replace(F.split(local, "\\+")[0], "\\.", "")
+
+    norm = (records
+        .withColumn("id", F.concat_ws(":", "source", "record_id"))
+        .withColumn("tokens", F.array_sort(tokens))
+        .withColumn("name_key", F.array_join("tokens", " "))
+        .withColumn("email_key", F.when(domain == "gmail.com", F.concat(gmail_local, F.lit("@gmail.com")))
+                                  .otherwise(email))
+        .withColumn("phone_key", F.nullif(F.right(F.regexp_replace("phone", "[^0-9]", ""), F.lit(10)), F.lit("")))
+        .withColumn("city_key", F.lower(unaccent("city"))))
+    ```
+
+    ```text
+    +-------------+--------------+--------------+------------------------+----------+
+    |id           |name          |name_key      |email_key               |phone_key |
+    +-------------+--------------+--------------+------------------------+----------+
+    |crm:CRM-0004 |Mateo García  |garcia mateo  |mateogarcia@gmail.com   |4165551245|
+    |crm:CRM-0005 |Bill Singh    |singh william |william.singh@example.ca|9025555794|
+    |crm:CRM-0006 |Bob Ahmed     |ahmed robert  |robert.ahmed@example.ca |6135554144|
+    |shop:10008   |Minh Tuan Le  |le minh tuan  |minhtuan.le@example.ca  |4165552394|
+    |shop:10029   |Thu Trang Pham|pham thu trang|NULL                    |9025559952|
+    |support:S-028|Phạm Thu Trang|pham thu trang|thutrangpham@gmail.com  |9025559952|
+    +-------------+--------------+--------------+------------------------+----------+
+    ```
+
+    What each piece buys:
+
+    - **Accents**: Spark 4.2 has no function that removes accents (see
+      "Columns and Expressions: Cleaning Values"), so `unaccent` is a small pandas UDF around
+      `unicodedata`. Vietnamese `Đ` is its own letter and needs a manual
+      mapping.
+    - **Sorted tokens** make word order irrelevant: `Thu Trang Pham` and
+      `Phạm Thu Trang` get the same key.
+    - **Nicknames** come from a mapping table. `element_at` on a map
+      returns NULL for a missing key (checked with ANSI mode on in
+      4.2.0), so `coalesce` keeps every non-nickname as it is. A real
+      nickname list has thousands of entries; load it as a DataFrame and
+      broadcast it, or keep it as a map literal as here while it is
+      small.
+    - **E-mail**: trimmed and lower-cased, and for `gmail.com` only,
+      dots and `+tags` removed, because Gmail delivers `m.a.teo+shop`
+      to `mateo`. Do not apply that rule to other domains, where a dot
+      may be significant.
+    - **Phone**: digits only, the last 10, so `+1 613 555 4144` and
+      `613.555.4144` agree. Use a proper phone library for
+      international numbers.
+    - **Empty means unknown**: `nullif` turns `""` into NULL, so two
+      blank e-mails never count as a match.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Add a column `phone_key` to `records` holding the last 10 digits of
+    `phone` (remove every character that is not a digit first), in a
+    DataFrame called `keyed`.
+  CorrectAnswer: |
+    keyed = records.withColumn("phone_key", F.right(F.regexp_replace("phone", "[^0-9]", ""), F.lit(10)))
+  Hint: "regexp_replace with the pattern [^0-9] removes everything but digits; F.right(col, F.lit(10)) keeps the last 10 characters."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Comparing Strings
+
+    Keys catch the easy cases. Typos need a *similarity*: a number that
+    says how close two strings are.
+
+    **`levenshtein(a, b)`** (1.5) counts the single-character edits
+    (insert, delete, substitute) that turn one string into the other.
+    Since 3.5 an optional third argument is a threshold: the result is
+    the distance if it is at most the threshold, and `-1` otherwise,
+    which lets Spark stop early:
+
+    ```python
+    spark.sql("""SELECT levenshtein('García','Garcia') a, levenshtein('Trembley','Tremblay') b,
+      levenshtein('Bob','Robert') c, levenshtein('Tremblay','Trembley', 1) d,
+      levenshtein('Tremblay','Smith', 2) e""").show()
+    ```
+
+    ```text
+    +---+---+---+---+---+
+    |  a|  b|  c|  d|  e|
+    +---+---+---+---+---+
+    |  1|  1|  4|  1| -1|
+    +---+---+---+---+---+
+    ```
+
+    It counts characters, not bytes (`í` to `i` is one edit), and
+    collations do not change it: `levenshtein('Côté' COLLATE
+    UNICODE_CI_AI, 'cote')` is still 3. `Bob` and `Robert` are 4 edits
+    apart, which is why nicknames need a table, not a distance.
+
+    **`soundex(s)`** codes how an English surname sounds, so
+    `Tremblay`/`Trembley` and `Smith`/`Smyth` share a code:
+
+    ```text
+    +----+----+----+----+----+----+-----+----+
+    |   a|   b|   c|   d|   e|   f|    g|   h|
+    +----+----+----+----+----+----+-----+----+
+    |T651|T651|S530|S530|N250|Đặng|Émile|D520|
+    +----+----+----+----+----+----+-----+----+
+    ```
+
+    (for `Tremblay, Trembley, Smith, Smyth, Nguyễn, Đặng, Émile,
+    Dang`). Look at `f` and `g`: when the **first** character is not an
+    ASCII letter, Spark's `soundex` returns the input unchanged (the
+    4.2.0 source says "first character must be a letter"), and non-ASCII
+    characters later in the word are skipped. Strip accents before
+    calling it.
+
+    **Jaro-Winkler** is the classic similarity for short names: 1.0 for
+    identical strings, close to 1 for a transposed or dropped letter, a
+    bonus for a common prefix. Spark 4.2.0 has **no built-in** for it,
+    so the exercise gives you a plain Python version, used in a pandas
+    UDF. The textbook values come out as expected
+    (`martha`/`marhta` 0.9611, `dixon`/`dicksonx` 0.8133), and
+    `tremblay`/`trembley` scores 0.95.
+
+    **Token sets** handle word order and extra words. With arrays,
+    Jaccard similarity is built in:
+
+    ```python
+    F.size(F.array_intersect("a", "b")) / F.size(F.array_union("a", "b"))
+    ```
+
+    For `[an, tran, van]` against `[an, tran]` that is 2/3. The
+    exercise's `name_similarity` combines both ideas: each token is
+    matched to its most similar token in the other name with
+    Jaro-Winkler, averaged in both directions, keeping the lower. A
+    reordered name with a typo (`[mateo, garcia]` against `[garccia,
+    mateo]`) scores 0.9857; two people of one family (`[chen,
+    nicholas]` against `[chen, linh]`) score 0.7986.
+
+- Class: mult_question
+  Depth: all
+  Output: "What does soundex('Émile') return in Spark 4.2.0?"
+  AnswerChoices: "Émile, unchanged, because the first character is not an ASCII letter;E540;An empty string;It fails with an invalid character error"
+  CorrectAnswer: "Émile, unchanged, because the first character is not an ASCII letter"
+  Hint: "Spark's soundex only codes strings that start with A to Z (either case)."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Step 3: Blocking Instead of N Squared
+
+    139 records make 139 x 138 / 2 = 9591 pairs. Scoring all of them is
+    fine here and hopeless at a million customers (500 billion pairs).
+    **Blocking** compares only records that share a *block key*, a
+    cheap value true matches usually share. No single key catches
+    everything, so run several passes and take the union:
+
+    ```python
+    def pairs_on(keyed):                         # keyed: columns id, bk
+        k = keyed.filter(F.col("bk").isNotNull())
+        return (k.alias("a").join(k.alias("b"), "bk")
+                .filter(F.col("a.id") < F.col("b.id"))
+                .select(F.col("a.id").alias("l"), F.col("b.id").alias("r")))
+
+    by_email = pairs_on(norm.select("id", F.col("email_key").alias("bk")))
+    by_phone = pairs_on(norm.select("id", F.col("phone_key").alias("bk")))
+    by_name = pairs_on(norm.select("id", F.explode(F.filter("tokens", lambda t: F.length(t) > 1)).alias("t"))
+                           .select("id", F.soundex("t").alias("bk")))
+    candidates = by_email.unionByName(by_phone).unionByName(by_name).distinct()
+    ```
+
+    Measured against the answer key:
+
+    | Pass | Candidate pairs | True pairs among them (of 105) |
+    |---|---|---|
+    | same `email_key` | 75 | 75 |
+    | same `phone_key` | 78 | 70 |
+    | a name token with the same soundex | 880 | 105 |
+    | **union** | **882** (9.2% of 9591) | **105** |
+
+    - E-mail is precise but misses every record without one. Phone
+      catches more and also pairs family members (8 of its 78 pairs are
+      wrong). The soundex pass alone finds everything here, at ten times
+      the work.
+    - `a.id < b.id` keeps each pair once and drops self pairs, and
+      `distinct()` removes pairs found by several passes.
+    - **Blocking recall is a hard ceiling**: a pair no pass proposes can
+      never be matched later. Measure it on labelled data whenever you
+      change a block key.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Big Blocks Are the Cost
+
+    A block of `n` records makes `n (n - 1) / 2` pairs, so the work
+    is dominated by the biggest blocks:
+
+    ```python
+    sx = (norm.select("id", F.explode(F.filter("tokens", lambda t: F.length(t) > 1)).alias("t"))
+              .select("id", F.soundex("t").alias("code"), "t"))
+    (sx.groupBy("code")
+       .agg(F.count_distinct("id").alias("records"), F.array_sort(F.collect_set("t")).alias("tokens"))
+       .orderBy(F.desc("records")).show(5, truncate=60))
+    ```
+
+    ```text
+    +----+-------+--------------------------------+
+    |code|records|                          tokens|
+    +----+-------+--------------------------------+
+    |C500|     20| [chen, chne, coen, cohen, cohn]|
+    |G620|     17|[garca, garcai, garccia, garcia]|
+    |S530|     13|                         [smith]|
+    |A530|     12|             [ahmd, ahmed, andy]|
+    |J200|     10|                          [jose]|
+    +----+-------+--------------------------------+
+    ```
+
+    Soundex is coarse: `Chen` and `Cohen` share `C500`, and `Ahmed` and
+    `Andy` share `A530`. In a national customer base, a block for
+    `Smith` or `Nguyen` holds hundreds of thousands of records, and its
+    join becomes the one task that never finishes ("Tuning Python on
+    Spark" covers skew). Standard remedies: block on combinations
+    (soundex of the surname **and** the first initial, or the city),
+    skip blocks above a size limit and log them, or cap each record's
+    candidates. Each one trades recall for work, so measure both.
+
+- Class: mult_question
+  Depth: all
+  Output: "Your blocking passes propose 2 percent of all pairs and contain 90 percent of the true pairs. What is the best possible recall of the final matcher?"
+  AnswerChoices: "90 percent, because pairs never proposed can never be matched;100 percent, if the scoring is good enough;2 percent;It cannot be known without clustering"
+  CorrectAnswer: "90 percent, because pairs never proposed can never be matched"
+  Hint: "Scoring only ever sees candidate pairs."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Step 4: Scoring Pairs
+
+    Each candidate pair gets a score from the evidence:
+
+    ```python
+    def evidence(key, agree, disagree):
+        left, right = F.col(f"l_{key}"), F.col(f"r_{key}")
+        return (F.when(left.isNull() | right.isNull(), F.lit(0.0))
+                .when(left == right, F.lit(agree)).otherwise(F.lit(-disagree)))
+
+    scored = (pairs        # candidates joined to l_ and r_ copies of norm
+        .withColumn("name_sim", similarity("l_tokens", "r_tokens"))       # pandas UDF
+        .withColumn("score", F.col("name_sim") + evidence("email_key", 0.5, 0.3)
+                    + evidence("phone_key", 0.3, 0.2) + evidence("city_key", 0.1, 0.05)))
+    ```
+
+    The design choice that matters most is **missing is not a
+    disagreement**. A support contact without an e-mail is not evidence
+    against a match, so a NULL on either side adds 0. A *different*
+    e-mail is evidence against (people do have two addresses, so it
+    subtracts less than an equal one adds).
+
+    The first version of this lesson used a plain weighted sum (`0.5 *
+    name similarity + 0.3 * email_equal + 0.15 * phone_equal + 0.05 *
+    city_equal`, with Jaro-Winkler on the sorted name key), where a
+    missing value counted the same as a mismatch. At a threshold of 0.6
+    it reached precision 0.989 at recall 0.876, and every true match it
+    missed was a pair with no shared e-mail or phone. The evidence
+    version reaches precision 0.991 at recall 1.0 on the same
+    candidates.
+
+    The weights here were set by hand and checked on the labels. With
+    more labelled pairs you can learn them: the per-field comparisons
+    are exactly the features of a classifier (MLlib's
+    `LogisticRegression` takes them through `VectorAssembler`, as in
+    the learning_spark course's MLlib lesson), and the classic Fellegi-Sunter
+    model learns them from match and non-match frequencies.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Choosing a Threshold
+
+    Calling a pair a match when `score >= threshold` makes two kinds of
+    mistakes, and two numbers measure them against labelled pairs:
+
+    - **Precision**: of the pairs called matches, the fraction that
+      really are. Low precision merges different people.
+    - **Recall**: of the pairs that really match, the fraction called
+      matches. Low recall leaves duplicates behind.
+
+    ```python
+    predicted = scored.filter(F.col("score") >= threshold).select("l", "r")
+    tp = predicted.join(true_pairs, ["l", "r"]).count()
+    precision, recall = tp / predicted.count(), tp / true_pairs.count()
+    ```
+
+    | Threshold | Predicted | Correct | Precision | Recall |
+    |---|---|---|---|---|
+    | 0.7 | 156 | 105 | 0.673 | 1.000 |
+    | 0.8 | 115 | 105 | 0.913 | 1.000 |
+    | 0.9 | 106 | 105 | 0.991 | 1.000 |
+    | 1.0 | 102 | 101 | 0.990 | 0.962 |
+    | 1.1 | 96 | 96 | 1.000 | 0.914 |
+
+    At 0.9 the single false match is two different people called **Mei
+    Chen**: the support record has no e-mail and no phone, so nothing
+    but the name speaks, and the name is identical. No threshold fixes
+    that pair without losing true matches; only more evidence does (an
+    address, an order history), or a human.
+
+    Labels in practice: the full answer key here is a luxury. Label a
+    few hundred candidate pairs, sampled more densely near the
+    threshold where the decisions are hard, and keep them as a test set
+    you rerun after every change to keys, blocks or weights.
+
+- Class: mult_question
+  Depth: all
+  Output: "You raise the match threshold. What usually happens?"
+  AnswerChoices: "Precision rises and recall falls;Both rise;Recall rises and precision falls;Neither changes, only the run time"
+  CorrectAnswer: "Precision rises and recall falls"
+  Hint: "A higher bar accepts fewer pairs: fewer wrong ones, and also fewer right ones."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Step 5: From Pairs to Entities
+
+    Matches are pairs, but you want groups. If A matches B and B matches
+    C, all three are one person even when A and C were never compared
+    (or scored too low). In graph terms, records are nodes, matches are
+    edges, and each entity is a **connected component**.
+
+    **Label propagation** finds components with joins: every record
+    starts with its own id as its label; in each round it takes the
+    smallest label among itself and its neighbours; when a round changes
+    nothing, every component carries the smallest id in it.
+
+    ```python
+    def connected_components(ids, edges, max_iterations=20):
+        both = (edges.select(F.col("l").alias("src"), F.col("r").alias("dst"))
+                .unionByName(edges.select(F.col("r").alias("src"), F.col("l").alias("dst"))))
+        labels = ids.select("id", F.col("id").alias("label")).localCheckpoint()
+        for rounds in range(1, max_iterations + 1):
+            incoming = (both.join(labels.withColumnRenamed("id", "src"), "src")
+                        .groupBy(F.col("dst").alias("id")).agg(F.min("label").alias("offer")))
+            updated = (labels.join(incoming, "id", "left")
+                       .select("id", F.least("label", F.coalesce("offer", "label")).alias("label"))
+                       .localCheckpoint())
+            changed = (updated.join(labels.withColumnRenamed("label", "old"), "id")
+                       .filter(F.col("label") != F.col("old")).count())
+            labels = updated
+            if changed == 0:
+                return labels, rounds
+        raise RuntimeError("did not converge")
+    ```
+
+    On the 106 matched pairs it takes **4 rounds** (three that change
+    labels and one that confirms nothing changes) and finds 61
+    entities. The number of rounds grows with the longest chain of
+    matches in a component (its *diameter*): a chain of 1000 records
+    linked one after another needs about 1000 rounds. Customer data
+    rarely forms long chains, which is why this simple loop is fine
+    here; the advanced lesson "Distributed Connected Components" builds
+    the large-star/small-star algorithm, which needs far fewer rounds on
+    bad graphs, and tests it against union-find. GraphFrames, a separate
+    package, also ships a connected components implementation.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Why the Loop Needs localCheckpoint
+
+    A DataFrame is a plan, not data ("Plans, Partitions and Caching").
+    Each round's `labels` is built from the previous round's, so without
+    a checkpoint the plan contains every earlier round, and it doubles
+    each time:
+
+    | Round | Optimized plan lines (no checkpoint) |
+    |---|---|
+    | 1 | 14 |
+    | 2 | 38 |
+    | 3 | 86 |
+    | 4 | 182 |
+    | 5 | 374 |
+
+    After a few dozen rounds the plan is too large to analyse and
+    optimize in reasonable time, long before any data is processed.
+    `localCheckpoint()` (2.3) materializes the DataFrame and returns a
+    new one whose plan is just a scan of the stored blocks:
+
+    ```text
+    LogicalRDD [id#68, label#1320], false
+    ```
+
+    Two kinds of checkpoint, both supported on Spark Connect since 4.0:
+
+    - **`localCheckpoint()`** stores the data in the executors' block
+      managers. Fast, needs no setup, but **not fault tolerant**: if an
+      executor is lost, the job fails instead of recomputing. Right for
+      a loop whose result you write out at the end.
+    - **`checkpoint()`** writes to reliable storage and needs a
+      checkpoint directory. In classic mode call
+      `spark.sparkContext.setCheckpointDir(path)`; otherwise it fails
+      with `Checkpoint directory has not been set in the SparkContext`.
+      On Spark Connect there is no `sparkContext`, and setting
+      `spark.checkpoint.dir` (4.0) at runtime fails with
+      `[CANNOT_MODIFY_CONFIG] Cannot modify the value of the Spark
+      config: "spark.checkpoint.dir"`. It is a static setting: pass it
+      when the session (server) starts, for example
+      `SparkSession.builder.remote("local[2]").config("spark.checkpoint.dir", d)`,
+      which we checked works.
+
+    The same loop also shows why `cache()` alone is not enough: caching
+    keeps the data, but the plan still grows.
+
+- Class: mult_question
+  Depth: all
+  Output: "An iterative job rebuilds a DataFrame from the previous one 50 times without checkpointing. What goes wrong first?"
+  AnswerChoices: "The plan grows with every round, so planning becomes slow and memory hungry;The data is lost after 10 rounds;Spark refuses to run more than 20 joins;Nothing, Spark reuses the previous result automatically"
+  CorrectAnswer: "The plan grows with every round, so planning becomes slow and memory hungry"
+  Hint: "Each round's plan contains every earlier round. localCheckpoint() cuts it."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Clustering Changes the Score
+
+    Measure again after clustering, now over every pair of records that
+    ended up in the same cluster:
+
+    | | Pairs called matches | Correct | Precision | Recall |
+    |---|---|---|---|---|
+    | pair scores at 0.9 | 106 | 105 | 0.991 | 1.000 |
+    | clusters from those pairs | 114 | 105 | 0.921 | 1.000 |
+
+    One wrong edge joined the two Mei Chens, whose records (three and
+    three) became one cluster of six, and every cross pair inside it
+    counts as a false match: 9 false pairs from 1 wrong edge.
+    **Transitivity amplifies mistakes**, and it does so most in the big,
+    common-name clusters you care about most. Defences:
+
+    - Raise the threshold for *edges* above the one you use for
+      reporting, or require two independent kinds of evidence.
+    - Check clusters, not just pairs: a cluster with two different
+      e-mail keys and two different phone keys is suspicious; so is a
+      cluster much bigger than the rest.
+    - Send borderline edges to a review queue rather than to the
+      clustering.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Step 6: The Golden Record
+
+    Each cluster becomes one row, built by **survivorship rules**: for
+    every field, an explicit rule that picks which record's value
+    survives. Write them down, because "which address do we believe" is
+    a business decision, not a technical one.
+
+    ```python
+    def latest(col):
+        """The value of col on the most recent row where col is not NULL."""
+        return F.max_by(col, F.when(col.isNotNull(), F.col("updated_at")))
+
+    rest = (rows.groupBy("label")
+            .agg(latest(F.col("email_key")).alias("email"),
+                 F.mode("phone_key", deterministic=True).alias("phone"),
+                 latest(F.col("city")).alias("city"),
+                 F.array_sort(F.collect_set("source")).alias("sources"),
+                 F.count("*").alias("records"),
+                 F.max("updated_at").alias("last_seen")))
+    ```
+
+    The functions, and the traps checked on 4.2.0:
+
+    - **`max_by(value, ordering)`** (SQL since 3.0, `F.max_by` since
+      3.3; 4.2 adds an optional `k` for the top k values) returns the
+      value from the row
+      with the largest ordering. It **returns a NULL value** if that row
+      has one (`max_by(v, d)` over `('x', 1), (NULL, 2)` is NULL), and
+      it **ignores rows whose ordering is NULL**. So making the ordering
+      NULL wherever the value is NULL (`when(col.isNotNull(),
+      updated_at)`) gives "the latest known value", which is what you
+      want for a customer who moved.
+    - **`mode(col)`** (3.4) returns the most frequent non-NULL value;
+      on a tie it returns any of them. `deterministic=True` (4.0) picks
+      the smallest of the tied values instead, so reruns agree.
+    - **`collect_set`** has no defined order; sort it.
+
+    The name needs two steps, because "most recent" would let a typo
+    win: first vote with `mode(name_key, deterministic=True)` so a one-off
+    misspelling loses, then among the records with the winning key
+    prefer a name written in full (no nickname), then one with accents
+    (a system that strips accents loses information; none adds it), then
+    the most recent, using `max_by` over a struct, which compares field
+    by field:
+
+    ```python
+    F.max_by("clean", F.struct(written_in_full, has_accent, F.col("updated_at")))
+    ```
+
+    ```text
+    +------------+-------------+---------------------------+----------+---------+--------------------+-------+----------+
+    |label       |name         |email                      |phone     |city     |sources             |records|last_seen |
+    +------------+-------------+---------------------------+----------+---------+--------------------+-------+----------+
+    |crm:CRM-0049|Mei Chen     |meichen@gmail.com          |9025555398|Toronto  |[crm, shop, support]|6      |2026-08-04|
+    |crm:CRM-0013|Priya Okafor |priya.okafor@example.ca    |4035554693|Montréal |[crm, shop, support]|4      |2026-04-20|
+    |crm:CRM-0043|Ivan Chen    |ivanchen@gmail.com         |4035554965|Vancouver|[crm, shop, support]|4      |2026-06-01|
+    ...
+    ```
+
+    The Mei Chen merge is plain to see: six records, in a library where
+    nobody else has more than four. Two-record clusters show the limit
+    of voting: with one correct spelling and one typo there is no
+    majority, and the deterministic tie-break picks by alphabet, which is
+    how `José Garcaí` became the golden name of one cluster. Small
+    clusters need a better tie rule (prefer the source you trust most)
+    or review.
+
+- Class: mult_question
+  Depth: all
+  Output: "In a group, the row with the latest updated_at has city NULL. What does F.max_by('city', 'updated_at') return for that group?"
+  AnswerChoices: "NULL, the city of the latest row;The latest non-NULL city;The most frequent city;It fails because the value is NULL"
+  CorrectAnswer: "NULL, the city of the latest row"
+  Hint: "max_by returns the value from the row with the largest ordering, whatever that value is. Make the ordering NULL where the value is NULL to skip such rows."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Stable Entity Ids Across Runs
+
+    The label of a cluster is its smallest record id. That is
+    convenient and **unstable**: tomorrow a new record with a smaller
+    id joins a cluster and its label changes, and every table that
+    stored the old label points nowhere. Production systems keep a
+    separate entity id:
+
+    1. Keep last run's mapping `record id -> entity_id`.
+    2. After clustering, give each new cluster the entity id held by
+       most of its records last time (a join and a `mode`), and a new
+       id (for example `uuid()`, stored, never recomputed) when none of
+       its records had one.
+    3. When two old entities merge, keep one id and record the other as
+       an alias; when one splits, keep the id on the larger part.
+
+    Write the mapping with the golden records in a table format that
+    supports `MERGE` ("Landing Messy Data in Delta Lake") so that
+    downstream tables join on an id that survives reruns.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## On Spark Connect
+
+    The whole pipeline, including the pandas UDFs, the `localCheckpoint`
+    loop, `max_by`, `mode(deterministic=True)` and `soundex`, ran
+    unchanged under a local Spark Connect session on 4.2.0 with the
+    same 4 rounds and 61 entities. Two differences to plan for:
+    `checkpoint()` needs `spark.checkpoint.dir` set when the session
+    starts (above), and the exercise's lineage check reads the plan
+    through `df._jdf`, which exists only in classic mode (on Connect,
+    compare `df.explain()` text instead).
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: One Record per Customer
+
+    `NICKNAMES`, `strip_accents`, `jaro_winkler` and `name_similarity`
+    are written for you. Implement:
+
+    1. `load_records(spark)`: the three systems with columns `source,
+       record_id, name, email, phone, city, updated_at`.
+    2. `normalize(records)`: add `id`, `tokens`, `name_key`,
+       `email_key`, `phone_key` and `city_key` as described in the
+       docstring.
+    3. `candidate_pairs(norm)`: the union of the e-mail, phone and
+       soundex blocking passes, as `l, r` with `l < r`.
+    4. `score_pairs(norm, candidates)`: `l, r, name_sim, score` with the
+       evidence weights in the docstring.
+    5. `precision_recall(scored, true_pairs, threshold)`.
+    6. `connected_components(ids, edges)`: label propagation with
+       `localCheckpoint()`, returning `(labels, rounds)`.
+    7. `golden_records(norm, labels)`: the survivorship rules.
+
+    The harness checks the load and key edge cases, that blocking keeps
+    every true pair with under 15 percent of all pairs, every
+    `name_sim` against plain Python, that precision rises and recall
+    falls with the threshold, that your components equal a union-find
+    on the driver in at most 10 rounds with a short final plan, and the
+    golden records' counts, latest city, latest e-mail, sources and
+    accents.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Nicknames: F.transform(tokens, lambda t: F.coalesce(F.element_at(nick_map, t), t)) with nick_map = F.create_map(*[F.lit(x) for pair in NICKNAMES.items() for x in pair]). Blocking: self-join (id, bk) on bk with a.id < b.id, three times, then unionByName and distinct. Golden: F.max_by(col, F.when(col.isNotNull(), F.col('updated_at'))) for latest known values."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - **Standardize** sources into one schema with a globally unique
+      `id`, keep the raw values, and put normalized **matching keys** in
+      new columns: sorted tokens without accents and with nicknames
+      mapped, Gmail-aware e-mails, digit-only phones; empty means NULL.
+    - **Exact duplicates** are a first pass (`dropDuplicates` keeps an
+      undefined row; rank with `row_number` to choose); most real
+      duplicates need fuzzy matching.
+    - **String similarity**: `levenshtein` (threshold argument since
+      3.5, returns -1 above it), `soundex` (returns non-ASCII-initial
+      strings unchanged: strip accents first), Jaro-Winkler as a Python
+      UDF (no built-in), Jaccard with `array_intersect`/`array_union`.
+    - **Block** with several passes and measure blocking recall; it caps
+      everything after it. The biggest blocks are the cost.
+    - **Score** with evidence where a missing value is neutral, and pick
+      the threshold from **precision and recall** on labelled pairs.
+    - **Cluster** with label propagation; rounds grow with the chain
+      length; **`localCheckpoint()`** each round or the plan doubles.
+      Transitivity amplifies false matches: check clusters too.
+    - **Golden records** come from explicit survivorship rules:
+      `max_by` with a NULL ordering for "latest known value",
+      `mode(..., deterministic=True)`, sorted `collect_set`, and a vote
+      before recency for names.
+
+    Next: **Model Inference in Production**, where a model (or a remote
+    service) runs over every row, and reruns, retries and failures have
+    to cost nothing extra.

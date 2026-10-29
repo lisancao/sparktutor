@@ -1,0 +1,849 @@
+- Class: meta
+  Lesson: "A DSv2 Connector in Java"
+  EstimatedMinutes: 75
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    In the intermediate level you built `docs`, a Python data source
+    that lists a folder and reads file headers ("Reading a Custom File
+    Format, in Parallel"), and taught it to skip files with
+    `pushFilters` ("Filter Pushdown"). "How Catalyst Plans Python"
+    showed that a Python data source is planned by JVM classes
+    (`PythonDataSourceV2`, `PythonScanBuilder`, `PythonScan`). Those
+    classes implement Spark's Java connector API, **DataSource V2**
+    (DSv2), and they implement only a small part of it.
+
+    This lesson writes `jdocs`, the same source, directly against DSv2
+    in Java. You compile it from inside a Python exercise, load it with
+    `spark.jars`, and prove what it does with plans and counters read
+    from the JVM. The Java side can do things the Python API cannot:
+    prune columns, answer `COUNT(*)` without a task, push `LIMIT`,
+    accept `OR` and function predicates, report statistics and
+    partitioning to the optimizer, and take runtime filters from a join.
+
+    By the end of this lesson you will be able to:
+
+    - Name every class on the DSv2 read path in Spark 4.2.0 and say
+      where each one runs (driver or executor) and when (load, optimize
+      or execute)
+    - Register a source by short name with `DataSourceRegister` and a
+      `META-INF/services` file, and read `DATA_SOURCE_NOT_FOUND`
+    - Produce `InternalRow`s with Spark's internal value types
+      (`UTF8String`, microseconds, `null`)
+    - Implement `SupportsPushDownV2Filters` with the `Predicate` API,
+      `SupportsPushDownRequiredColumns`, `SupportsPushDownLimit` and
+      `SupportsPushDownAggregates`, and check each one in `explain()`
+    - Report `Statistics` and `KeyGroupedPartitioning`, and see Spark
+      drop an `Exchange` because of it
+    - Receive dynamic partition pruning filters with
+      `SupportsRuntimeV2Filtering`
+    - Build the same connector with Maven for a real project
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What the Python API Leaves Out
+
+    A Python data source is a DSv2 source whose Java half Spark wrote
+    for you. The 4.2.0 files are in
+    `sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/v2/python/`.
+    The scan builder is short enough to quote its declaration:
+
+    ```scala
+    class PythonScanBuilder(
+        ds: PythonDataSourceV2,
+        shortName: String,
+        outputSchema: StructType,
+        options: CaseInsensitiveStringMap)
+        extends ScanBuilder
+        with SupportsPushDownFilters {
+    ```
+
+    One mix-in, `SupportsPushDownFilters`, which uses the older V1
+    `org.apache.spark.sql.sources.Filter` classes (that is where the
+    `EqualTo` and `StringEndsWith` of "Filter Pushdown" come from).
+    Everything else in the read API is left at its default:
+
+    | DSv2 capability (Java interface) | Python data source in 4.2.0 | Java source |
+    |---|---|---|
+    | Filters (`SupportsPushDownV2Filters`) | V1 filters, AND-ed parts only | V2 `Predicate`s, including `OR`, `NOT`, functions |
+    | Column pruning (`SupportsPushDownRequiredColumns`) | no: `reader(schema)` always gets the full schema | yes |
+    | `LIMIT`, top N, `OFFSET` (`SupportsPushDownLimit`, `...TopN`, `...Offset`) | no | yes |
+    | Aggregates (`SupportsPushDownAggregates`) | no | yes, complete or partial |
+    | Statistics (`SupportsReportStatistics`) | no | yes |
+    | Partitioning (`SupportsReportPartitioning`) | no | yes, avoids shuffles |
+    | Runtime filters (`SupportsRuntimeV2Filtering`) | no | yes |
+    | Columnar reads (`PartitionReaderFactory.supportColumnarReads`) | rows only | `ColumnarBatch` |
+    | Rows | Python tuples, converted through Arrow | `InternalRow`, no conversion |
+
+    None of this makes Python sources bad. For an API or a folder of
+    odd files, Python is usually the right tool. Java earns its place
+    when the optimizer has to know things about your data: how many
+    rows, which columns, how it is partitioned, or when the source can
+    answer part of the query itself.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Think of the Python API as a form with a few boxes: the planner
+    fills in "filters" and your code reads them. The Java API is a
+    conversation. The planner asks a series of questions ("can you
+    filter by this? can you count for me? which columns do you need?
+    how many rows will you return?") and plans the rest of the query
+    around your answers.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Java From a Python Exercise
+
+    This lesson's exercise starts with the line `# spark-run: python`.
+    SparkTutor then runs it as plain `python exercise.py` instead of
+    under `spark-submit`, so the script can create its own session with
+    settings that must be known before the JVM starts. `spark.jars` is
+    one of those: the jar has to be on the driver's classpath when the
+    session is created.
+
+    You need a **JDK** (not only a Java runtime): run `javac -version`
+    and expect `javac 17` or later. The exercise keeps the Java sources
+    as strings in a dict, writes them to a temporary folder, and
+    compiles them against the jars that ship inside pyspark:
+
+    ```python
+    import glob, os, subprocess, tempfile, pyspark
+    from pathlib import Path
+
+    def build_jar(java, resources, name="jdocs"):
+        work = Path(tempfile.mkdtemp(prefix=name + "_"))
+        for rel, code in java.items():                 # "jdocs/DocsSource.java": "..."
+            f = work / "src" / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(code)
+        classes = work / "classes"
+        for rel, text in resources.items():            # the META-INF/services file
+            f = classes / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(text)
+        jars = glob.glob(os.path.join(os.path.dirname(pyspark.__file__), "jars", "*.jar"))
+        subprocess.run(["javac", "--release", "17", "-d", str(classes),
+                        "-cp", os.pathsep.join(jars),
+                        *map(str, sorted((work / "src").rglob("*.java")))], check=True)
+        jar = work / f"{name}.jar"
+        subprocess.run(["jar", "cf", str(jar), "-C", str(classes), "."], check=True)
+        return str(jar)
+
+    jar = build_jar(JAVA, RESOURCES)
+    spark = (SparkSession.builder.master("local[2]")
+             .config("spark.jars", jar)
+             .getOrCreate())
+    ```
+
+    `pyspark/jars/` holds every jar of Spark 4.2.0 (Scala 2.13), so the
+    Java code compiles against exactly the classes it will run with.
+    Compiling the connector took about a second on the machine used for
+    this lesson; starting the session takes a few more.
+
+    In local mode the driver and the executors are one JVM, and PySpark
+    talks to it through Py4J. That gives tests a back door:
+    `spark._jvm.jdocs.Audit.opened()` calls a static method of your
+    class in the same JVM the tasks ran in. It only works in a classic
+    session in local mode; on a cluster each executor has its own JVM,
+    and Spark Connect has no `_jvm` at all ("Spark Connect Plugins"
+    deals with that).
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## The Same Build With Maven
+
+    A real connector is a Maven (or sbt, or Gradle) project. This
+    `pom.xml` built the lesson's sources into a jar that
+    `spark-submit --jars target/jdocs-0.1.0.jar` loaded by its short
+    name:
+
+    ```xml
+    <project xmlns="http://maven.apache.org/POM/4.0.0">
+      <modelVersion>4.0.0</modelVersion>
+      <groupId>com.example</groupId>
+      <artifactId>jdocs</artifactId>
+      <version>0.1.0</version>
+
+      <properties>
+        <maven.compiler.release>17</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <spark.version>4.2.0</spark.version>
+      </properties>
+
+      <dependencies>
+        <!-- provided: Spark is on the cluster's classpath already, do not bundle it -->
+        <dependency>
+          <groupId>org.apache.spark</groupId>
+          <artifactId>spark-sql_2.13</artifactId>
+          <version>${spark.version}</version>
+          <scope>provided</scope>
+        </dependency>
+      </dependencies>
+
+      <build>
+        <plugins>
+          <!-- Pin the compiler plugin: the old default ignores maven.compiler.release -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-compiler-plugin</artifactId>
+            <version>3.13.0</version>
+          </plugin>
+        </plugins>
+      </build>
+    </project>
+    ```
+
+    Sources go in `src/main/java/jdocs/`, and the service file in
+    `src/main/resources/META-INF/services/`. Two details matter:
+
+    - **`provided` scope.** Spark's own jars are on every cluster
+      already. Bundling them makes a huge jar and, worse, two copies of
+      Spark classes on one classpath.
+    - **Pin `maven-compiler-plugin`.** Without the `<plugin>` block,
+      Maven 3.8 used its built-in compiler plugin 3.1, which ignores
+      `maven.compiler.release` and failed with `Source option 5 is no
+      longer supported. Use 7 or later.`
+
+    The artifact name ends in `_2.13` because Spark 4 is built only
+    for Scala 2.13. If your connector has its own dependencies, build a
+    shaded jar (the `maven-shade-plugin`) and relocate libraries that
+    Spark also ships, such as Guava or Jackson, so the two versions do
+    not collide.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Read Path, Class by Class
+
+    Every interface below is in
+    `sql/catalyst/src/main/java/org/apache/spark/sql/connector/`
+    (`catalog/` and `read/`), except `DataSourceRegister`, which lives
+    in `org.apache.spark.sql.sources`.
+
+    | Class in jdocs | Implements | Runs on | Called when |
+    |---|---|---|---|
+    | `DocsSource` | `TableProvider`, `DataSourceRegister` | driver | `load()`: `inferSchema`, then `getTable` |
+    | `DocsTable` | `Table`, `SupportsRead` | driver | `load()` keeps it in a `DataSourceV2Relation` |
+    | `DocsScanBuilder` | `ScanBuilder` + `SupportsPushDown*` | driver | optimization: `newScanBuilder`, pushdown, `build()` |
+    | `DocsScan` | `Scan`, `Batch`, `SupportsReportStatistics` | driver | physical planning: `toBatch`, `planInputPartitions` |
+    | `DocsPartition` | `InputPartition` (`Serializable`) | serialized into each task | |
+    | `DocsReaderFactory` | `PartitionReaderFactory` (`Serializable`) | serialized to executors | once per task: `createReader` |
+    | `DocsReader` | `PartitionReader<InternalRow>` | executor | `next()` / `get()` per row, then `close()` |
+
+    The rule that turns the relation into a scan is
+    `V2ScanRelationPushDown`
+    (`sql/core/.../datasources/v2/V2ScanRelationPushDown.scala`). Its
+    `apply` runs these steps in order in 4.2.0:
+
+    ```scala
+    createScanBuilder, pushDownSample, pushDownFilters, pushDownJoin,
+    pushDownAggregates, pushDownVariants, pushDownLimitAndOffset,
+    buildScanWithPushedAggregate, buildScanWithPushedJoin,
+    buildScanWithPushedVariants, pruneColumns
+    ```
+
+    `createScanBuilder` calls `table.newScanBuilder(options)` for every
+    scan, so each scan gets a **fresh** builder, and pushdown state kept
+    in the builder and its `Scan` cannot leak. The 4.2.0 Python data
+    source gets fresh builders too, but its builder stores the planned
+    read on the provider, which every scan of the relation shares, so
+    it leaks across queries and within one query ("From Wrong Results
+    to a Fix: An Upstream Case Study" traces it).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Registering a Short Name
+
+    `spark.read.format("jdocs")` works because the jar contains a
+    service file, `META-INF/services/org.apache.spark.sql.sources.DataSourceRegister`,
+    with one line: `jdocs.DocsSource`. Spark loads every class listed
+    in such files with Java's `ServiceLoader` and picks the one whose
+    `shortName()` returns `"jdocs"`.
+
+    Without the service file the short name fails at `load()`:
+
+    ```text
+    org.apache.spark.SparkClassNotFoundException: [DATA_SOURCE_NOT_FOUND] Failed to find the
+    data source: jdocs. Make sure the provider name is correct and the package is properly
+    registered and compatible with your Spark version. SQLSTATE: 42K02
+    Caused by: java.lang.ClassNotFoundException: jdocs.DefaultSource
+    ```
+
+    The `Caused by` line shows the fallback: after the service lookup
+    Spark tries the name as a class, then `<name>.DefaultSource`. So
+    `format("jdocs.DocsSource")` (the full class name) works without
+    any service file, and so would a class called
+    `jdocs.DefaultSource`. Short names are for users; the class name is
+    handy in tests.
+
+    SQL uses the same lookup:
+
+    ```python
+    spark.sql(f"CREATE TEMPORARY VIEW images USING jdocs OPTIONS (path '{root}')")
+    spark.sql("SELECT kind, count(*) AS files FROM images GROUP BY kind").show()
+    ```
+
+    ```text
+    +-----+-----+
+    | kind|files|
+    +-----+-----+
+    |image|    5|
+    | text|    1|
+    +-----+-----+
+    ```
+
+    (`root` is the absolute path of `data/messy/images`, which holds
+    five PNGs and a `readme.txt`.)
+
+- Class: mult_question
+  Depth: all
+  Output: "Your jar has the class jdocs.DocsSource but no META-INF/services file. Which call works?"
+  AnswerChoices: "spark.read.format('jdocs.DocsSource').load();spark.read.format('jdocs').load();spark.read.format('DocsSource').load();None of them, a DSv2 source always needs the service file"
+  CorrectAnswer: "spark.read.format('jdocs.DocsSource').load()"
+  Hint: "Without the service file, Spark tries the name as a class name and then <name>.DefaultSource."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## When Each Method Runs
+
+    In a classic session `load()` analyzes the plan right away, which
+    calls `inferSchema` and `getTable`. The scan builder is not created
+    until the plan is **optimized**, at the first action or `explain()`.
+    That decides when your errors appear. `jdocs` checks its `path`
+    option while listing, in `build()`:
+
+    ```python
+    df = spark.read.format("jdocs").option("path", "/nope").load()
+    print("load() returned", df.columns)
+    df.explain()
+    ```
+
+    ```text
+    load() returned ['path', 'name', 'kind', 'size', 'modified', 'width', 'height']
+    ...
+    pyspark.errors.exceptions.captured.IllegalArgumentException: option 'path' must be an
+    existing folder, got '/nope'
+    ```
+
+    `load()` succeeded and `explain()` failed. If you want bad options
+    to fail at `load()`, check them in `getTable` (or `inferSchema`).
+    Notice also that PySpark turned the Java
+    `IllegalArgumentException` into its own `IllegalArgumentException`
+    with the message intact. Spark's error classes (`[SOME_CLASS] ...`)
+    need an entry in Spark's error registry, so a connector that throws
+    standard Java exceptions with clear messages is doing the right
+    thing.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Rows the Way Spark Stores Them
+
+    A `PartitionReader<InternalRow>` hands Spark rows in its **internal**
+    format, with no conversion step. You must use Spark's internal value
+    types, which `InternalRow` and `SpecificInternalRow`
+    (`sql/catalyst/.../InternalRow.scala`) list per data type:
+
+    | Spark type | Java value in an `InternalRow` |
+    |---|---|
+    | `StringType` | `org.apache.spark.unsafe.types.UTF8String` |
+    | `IntegerType`, `DateType` | `int` (a date is days since 1970-01-01) |
+    | `LongType`, `TimestampType`, `TimestampNTZType` | `long` (timestamps are microseconds since the epoch) |
+    | `DoubleType`, `BooleanType`, `BinaryType` | `double`, `boolean`, `byte[]` |
+    | `DecimalType` | `org.apache.spark.sql.types.Decimal` |
+    | `ArrayType`, `MapType`, `StructType` | `ArrayData`, `MapData`, `InternalRow` |
+    | any nullable column | `null` |
+
+    The reader in `jdocs` fills an `Object[]` in the order of the read
+    schema and wraps it in a `GenericInternalRow`:
+
+    ```java
+    values[c] = switch (columns[c]) {
+      case "name" -> UTF8String.fromString(f.name);
+      case "size" -> f.size;                         // long
+      case "modified" -> f.modifiedMicros;           // microseconds
+      case "width" -> wh == null ? null : wh[0];     // int or null
+      ...
+    };
+    current = new GenericInternalRow(values);
+    ```
+
+    Get a type wrong and nothing checks it until a task touches the
+    value. Putting a `java.lang.String` in the `name` slot compiles and
+    plans fine, then every query that reads `name` fails in the task:
+
+    ```text
+    java.lang.ClassCastException: class java.lang.String cannot be cast to class
+    org.apache.spark.unsafe.types.UTF8String
+    ```
+
+    The modification time comes from
+    `BasicFileAttributes.lastModifiedTime().to(TimeUnit.MICROSECONDS)`,
+    which is exactly what a `TimestampType` slot needs. The exercise
+    compares every row with a Python data source that computes the same
+    value from `os.stat(...).st_mtime_ns // 1000`; a float `st_mtime`
+    can differ from it by a microsecond.
+
+- Class: mult_question
+  Depth: all
+  Output: "A PartitionReader<InternalRow> for a column of type DATE should put which value in the row?"
+  AnswerChoices: "An int, the number of days since 1970-01-01;A java.time.LocalDate;A java.sql.Date;A UTF8String like 2026-10-28"
+  CorrectAnswer: "An int, the number of days since 1970-01-01"
+  Hint: "InternalRow uses compact internal representations: dates are ints, timestamps are longs."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Filters as V2 Predicates
+
+    `SupportsPushDownV2Filters` has two methods:
+
+    ```java
+    Predicate[] pushPredicates(Predicate[] predicates);   // return what Spark must still evaluate
+    Predicate[] pushedPredicates();                       // what you took over, for explain and rules
+    ```
+
+    A `Predicate` (`connector/expressions/filter/Predicate.java`) is a
+    `GeneralScalarExpression`: an upper-case `name()` and `children()`.
+    Children are `NamedReference`s (columns), `Literal`s, or other
+    expressions. This is what arrived in `jdocs` for some conditions,
+    printed from inside `pushPredicates` (4.2.0, with `width` and
+    `height` nullable and the other columns declared non-null):
+
+    | Condition | `name()` and children | `toString()` |
+    |---|---|---|
+    | `kind = 'image' AND width > 12` | `IS_NOT_NULL(width)`, `=(kind, lit)`, `>(width, lit)` | `width IS NOT NULL`, `kind = 'image'`, `width > 12` |
+    | `kind IN ('a','b')` | `IN(kind, lit, lit)` | `kind IN ('a', 'b')` |
+    | `name LIKE '%.png'` | `ENDS_WITH(name, lit)` | `name LIKE '%.png' ESCAPE '\'` |
+    | `name LIKE 'red%'` | `STARTS_WITH(name, lit)` | `name LIKE 'red%' ESCAPE '\'` |
+    | `name LIKE '%ra%'` | `CONTAINS(name, lit)` | `name LIKE '%ra%' ESCAPE '\'` |
+    | `kind <> 'image'` | `NOT(=(kind, lit))` | `NOT (kind = 'image')` |
+    | `size BETWEEN 10 AND 100` | `>=(size, lit)`, `<=(size, lit)` | `size >= 10`, `size <= 100` |
+    | `width IS NULL` | `IS_NULL(width)` | `width IS NULL` |
+    | `lower(kind) = 'image'` | `=(LOWER(kind), lit)` | `LOWER(kind) = 'image'` |
+    | `kind = 'audio' OR size < 100` | `OR(pred, pred)` | `(kind = 'audio') OR (size < 100)` |
+    | `size % 2 = 1` | `=(%(size, lit), lit)` | `(size % 2) = 1` |
+    | `width > height` | two `IS_NOT_NULL`s, `>(width, height)` | `width > height` |
+    | `modified > TIMESTAMP '2020-01-01 00:00:00'` | `>(modified, lit)` | `modified > 1577865600000000` |
+
+    (`lit` is a `LiteralValue`, `pred` a nested `Predicate`, and
+    `LOWER(...)` or `%` a `GeneralScalarExpression`.)
+
+    Compare it with the table in "Filter Pushdown": the V2 API also
+    carries `OR`, functions, arithmetic and column-to-column
+    comparisons. Three details matter when you translate them:
+
+    - **Literal values are internal values.** A string literal's
+      `value()` is a `UTF8String`, a `bigint` literal is a `Long`, and a
+      timestamp is a `Long` in microseconds, already converted with the
+      session time zone (the run above used `America/Los_Angeles`, so
+      midnight on 2020-01-01 is `1577865600000000`).
+    - **Spark casts literals to the column's type** during analysis:
+      `size > 4000` arrives with a `Long` 4000 because `size` is a
+      `bigint`, while `width > 12` arrives with an `Integer`.
+    - **Non-null columns get no `IS_NOT_NULL`.** Spark infers
+      `isnotnull(col)` from a comparison only for nullable columns. For
+      nullable ones it is offered like any other predicate; `jdocs`
+      accepts `IS_NOT_NULL` on columns it knows are never null and
+      returns the rest.
+
+    The contract is the one from "Filter Pushdown": return every
+    predicate you do not apply **exactly**, unchanged. If you keep it
+    and ignore it, the query silently returns too many rows.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Seeing Pushdown in the Plan
+
+    ```python
+    q = jdocs().filter("kind = 'image'").select("name", "width")
+    q.explain()
+    ```
+
+    ```text
+    == Physical Plan ==
+    *(1) Project [name#1, width#5]
+    +- BatchScan jdocs[name#1, width#5] jdocs[files=5, pushed=[kind = 'image']] RuntimeFilters: []
+    ```
+
+    Read the scan line from left to right:
+
+    - `jdocs[name#1, width#5]`: the scan's output. Column pruning
+      worked: `pruneColumns` received only `name` and `width`. The query
+      also uses `kind`, but only in a filter the scan took over, so the
+      scan does not have to return it.
+    - `jdocs[files=5, pushed=[kind = 'image']]`: this part is
+      **yours**. `BatchScanExec` prints `scan.description()` there, and
+      nothing else about pushdown. Without overriding `description()`
+      the plan says `class jdocs.DocsScan`. The `PushedFilters:` line
+      you saw for Python sources comes from `PythonScan` implementing an
+      internal trait, `SupportsMetadata`; a third-party Java scan should
+      put what it pushed into `description()`.
+    - No `Filter` node: Spark trusts the scan for `kind = 'image'`.
+
+    The audit counter agrees: only the five PNGs were opened, because
+    `width` needs the header bytes. A query that selects only
+    `name, size` opens nothing at all.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    In a classic session, `df` is a DataFrame over `jdocs`. Store the
+    text of its physical plan in a variable `p`, reading it from the
+    JVM `QueryExecution` instead of printing it.
+  CorrectAnswer: |
+    p = df._jdf.queryExecution().executedPlan().toString()
+  Hint: "df._jdf is the JVM Dataset; queryExecution() has analyzed(), optimizedPlan() and executedPlan()."
+
+- Class: mult_question
+  Depth: all
+  Output: "Your scan builder keeps the predicate size > 4000 and also returns it from pushPredicates. What happens?"
+  AnswerChoices: "The result is correct and Spark evaluates size > 4000 again after the scan;Spark fails because a predicate cannot be both pushed and returned;The rows are filtered twice and come out empty;Spark ignores pushedPredicates and reads every file"
+  CorrectAnswer: "The result is correct and Spark evaluates size > 4000 again after the scan"
+  Hint: "Returned predicates are post-scan filters. Pushing one and returning it is allowed, Parquet does it for row groups."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## LIMIT, and the Order of Pushdown
+
+    `SupportsPushDownLimit.pushLimit(int)` returns whether the source
+    takes the limit; `isPartiallyPushed()` (default `true`) says whether
+    Spark must apply it again. In `jdocs` one file is one row and every
+    pushed filter is exact, so the scan can cut the listing to `n`
+    files and say it is complete:
+
+    ```text
+    BatchScan jdocs[name#1] jdocs[files=3, pushed=[], limit=3] RuntimeFilters: []
+    ```
+
+    There is no `Limit` node left in the plan. Spark only pushes a
+    limit when **no** filter remains to be evaluated after the scan
+    (`pushDownLimit` matches `PhysicalOperation(_, Nil, ...)`): a limit
+    applied before an unpushed filter would return too few rows. The
+    same rule guards aggregates, and it is why the order on the
+    previous page matters. Filters go first; whatever they leave behind
+    decides whether aggregate and limit pushdown can happen at all.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## COUNT(*) Without Reading a File
+
+    `SupportsPushDownAggregates` has two methods. Spark calls
+    `supportCompletePushDown(agg)` first; if it returns `true` and
+    `pushAggregation(agg)` accepts, Spark **removes its own Aggregate**
+    and uses the scan's rows as the final answer. With `false`, a
+    source can still return partial results (one count per partition)
+    that Spark aggregates again.
+
+    An `Aggregation` (a Java `record` in 4.2.0) has
+    `aggregateExpressions()` (`CountStar`, `Count`, `Sum`, `Min`, `Max`,
+    `Avg`, or `GeneralAggregateFunc`) and `groupByExpressions()`.
+    `jdocs` accepts exactly one `CountStar`, with no grouping or
+    grouped by `kind`, because the listing alone answers both. Its
+    scan is a `LocalScan`, which returns `InternalRow[]` on the driver:
+
+    ```java
+    public class CountScan implements LocalScan {
+      @Override public StructType readSchema() {        // grouping columns first, then aggregates
+        StructType s = new StructType();
+        if (byKind) s = s.add("kind", DataTypes.StringType, false);
+        return s.add("count", DataTypes.LongType, false);
+      }
+      @Override public InternalRow[] rows() { ... }     // counted from the listing
+    }
+    ```
+
+    ```python
+    jdocs().groupBy("kind").count().explain()
+    ```
+
+    ```text
+    == Physical Plan ==
+    *(1) Project [kind#65, count#66L AS count(1)#62L AS count#54L]
+    +- *(1) LocalTableScan [kind#65, count#66L]
+    ```
+
+    No `BatchScan`, no `HashAggregate`, no `Exchange`, no task: a
+    `LocalTableScan` of the rows `CountScan` computed while planning.
+    `count(*) WHERE kind = 'image'` works too, because the filter was
+    fully pushed first. `sum(size)` is refused (`pushAggregation`
+    returns `false`) and Spark plans a normal scan and aggregate.
+
+    One subtlety: if `jdocs` had returned a predicate (for example an
+    `IS_NOT_NULL` it did not need to return), a post-scan filter would
+    remain and Spark would not even ask about the aggregate. Accepting
+    predicates that are trivially true for your data is what keeps the
+    rest of the pushdown chain open.
+
+- Class: mult_question
+  Depth: all
+  Output: "A query is SELECT count(*) FROM jdocs_view WHERE width > 12. jdocs returns width > 12 from pushPredicates. Will pushAggregation be called?"
+  AnswerChoices: "No, aggregates are only pushed when no filter is left to evaluate after the scan;Yes, and CountScan returns the number of images;Yes, but only with supportCompletePushDown false;No, because COUNT(*) can never be pushed"
+  CorrectAnswer: "No, aggregates are only pushed when no filter is left to evaluate after the scan"
+  Hint: "Look at rewriteAggregate in V2ScanRelationPushDown: it matches PhysicalOperation(project, Nil, holder)."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Statistics for the Optimizer
+
+    `SupportsReportStatistics.estimateStatistics()` returns
+    `sizeInBytes` and `numRows` (and optional `columnStats`). Spark asks
+    **after** pushdown, so the numbers can reflect the pushed filters.
+    `explain("cost")` shows them on the relation:
+
+    ```text
+    == Optimized Logical Plan ==
+    RelationV2[path#49, name#50, kind#51, size#52L, modified#53, width#54, height#55] jdocs,
+      Statistics(sizeInBytes=240.0 B, rowCount=2)
+    ```
+
+    That was `kind = 'pdf'`: two files times the 120 bytes per row that
+    `jdocs` estimates. The optimizer uses `sizeInBytes` to decide
+    whether a side of a join is small enough to broadcast
+    (`spark.sql.autoBroadcastJoinThreshold`, 10 MB by default). A
+    source with no statistics gets the default size, which is
+    enormous, so it is never broadcast. Report the size of the data
+    your scan **returns**, not the size of the files it reads: `jdocs`
+    returns metadata rows, not file contents.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Reporting Partitioning: Removing a Shuffle
+
+    A `groupBy("kind")` normally needs an `Exchange` so that all rows of
+    a kind meet in one task. If the source already put each kind in its
+    own partition, it can say so: the scan implements
+    `SupportsReportPartitioning` and returns a `KeyGroupedPartitioning`,
+    and every partition implements `HasPartitionKey`.
+
+    ```java
+    @Override public Partitioning outputPartitioning() {
+      return new KeyGroupedPartitioning(
+          new Expression[] {Expressions.identity("kind")}, numberOfKinds);
+    }
+
+    public class KindPartition extends DocsPartition implements HasPartitionKey {
+      @Override public InternalRow partitionKey() {
+        return new GenericInternalRow(new Object[] {UTF8String.fromString(kind)});
+      }
+    }
+    ```
+
+    Here are both plans for `groupBy("kind").agg(sum("size"))`, first
+    with the usual size-balanced partitions, then with an option that
+    plans one partition per kind:
+
+    ```text
+    +- HashAggregate(keys=[kind#2], functions=[sum(size#3L)])
+       +- Exchange hashpartitioning(kind#2, 200), ENSURE_REQUIREMENTS, [plan_id=13]
+          +- HashAggregate(keys=[kind#2], functions=[partial_sum(size#3L)])
+             +- Project [kind#2, size#3L]
+                +- BatchScan jdocs[kind#2, size#3L] jdocs[files=55, pushed=[]] RuntimeFilters: []
+    ```
+
+    ```text
+    +- HashAggregate(keys=[kind#22], functions=[sum(size#23L)])
+       +- HashAggregate(keys=[kind#22], functions=[partial_sum(size#23L)])
+          +- Project [kind#22, size#23L]
+             +- BatchScan jdocs[kind#22, size#23L] jdocs[files=55, pushed=[]] RuntimeFilters: []
+    ```
+
+    The `Exchange` is gone. (`files=55` is the number of files in
+    `data/messy` when this ran; the folder grows as the course adds
+    data.) The same reporting lets two sources partitioned the same way
+    join without a shuffle (storage-partitioned join, behind
+    `spark.sql.sources.v2.bucketing.enabled`, `true` by default since
+    3.3).
+
+    The promise is yours to keep: the javadoc of `HasPartitionKey` says
+    "Spark doesn't check this property". A partition that claims
+    `kind = 'image'` and holds a PDF row gives wrong results with no
+    error. Every partition must implement `HasPartitionKey`, or Spark
+    cannot use the partitioning at all.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Runtime Filters From a Join
+
+    Dynamic partition pruning (DPP) lets a join pass the keys of its
+    small, filtered side to the scan of the big side **while the query
+    runs**. A DSv2 scan joins in by implementing
+    `SupportsRuntimeV2Filtering`:
+
+    ```java
+    @Override public NamedReference[] filterAttributes() {
+      return new NamedReference[] {Expressions.column("kind")};
+    }
+    @Override public void filter(Predicate[] predicates) {
+      // drop the files whose kind cannot match, before planInputPartitions runs again
+    }
+    ```
+
+    Joined with a small Parquet table filtered on `grp = 'media'`:
+
+    ```text
+    +- Project [kind#6, path#4, name#5, size#7L, modified#8, width#9, height#10, grp#3]
+       +- BroadcastHashJoin [kind#6], [kind#2], Inner, BuildRight, false, false
+          :- Project [path#4, name#5, kind#6, size#7L, modified#8, width#9, height#10]
+          :  +- BatchScan jdocs[path#4, name#5, kind#6, size#7L, modified#8, width#9, height#10] jdocs[files=55, pushed=[]] RuntimeFilters: [dynamicpruningexpression(kind#6 IN dynamicpruning#19)]
+          :        +- SubqueryAdaptiveBroadcast dynamicpruning#19, [0], true, Filter ((isnotnull(grp#3) AND (grp#3 = media)) AND isnotnull(kind#2)), [kind#2]
+          :           +- AdaptiveSparkPlan isFinalPlan=false
+    ```
+
+    and inside `filter()` the scan received:
+
+    ```text
+    RUNTIME FILTER: [kind IN ('image', 'audio')]
+    ```
+
+    The conditions come from the `PartitionPruning` rule
+    (`sql/core/.../dynamicpruning/PartitionPruning.scala`): the join key
+    must be one of the `filterAttributes`, and the other side must
+    contain a predicate that `isLikelySelective` accepts (a comparison,
+    `IN`, `LIKE`; a bare boolean column such as `WHERE media` does not
+    count). With the default
+    `spark.sql.optimizer.dynamicPartitionPruning.reuseBroadcastOnly=true`
+    the filter is only added when it can reuse the join's broadcast. In
+    the runs for this lesson, a filtered in-memory `VALUES` table did
+    not trigger it: the optimizer had already evaluated the filter
+    into a `LocalTableScan`, leaving no `Filter` to find.
+
+    4.2.0 adds `supportsIterativePushdown()` and `pushedPredicates()`
+    to this interface (both `@since 4.2.0`), so Spark can push a second
+    round of `PartitionPredicate`s. Leave them at their defaults unless
+    your source has partition transforms.
+
+- Class: mult_question
+  Depth: advanced
+  Output: "Your scan reports KeyGroupedPartitioning on kind, but one partition holds files of two kinds. What does Spark do?"
+  AnswerChoices: "It trusts the partitioning, skips the shuffle and can return wrong groups without an error;It detects the mixed partition and adds an Exchange;It fails the query with a partitioning error;It reads that partition twice"
+  CorrectAnswer: "It trusts the partitioning, skips the shuffle and can return wrong groups without an error"
+  Hint: "The HasPartitionKey javadoc: Spark doesn't check this property."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## The Rest of the Read API
+
+    You will meet these in other connectors; all are in
+    `connector/read/` in 4.2.0:
+
+    - **`SupportsPushDownTopN`** (`ORDER BY ... LIMIT n`),
+      **`SupportsPushDownOffset`** and **`SupportsPushDownTableSample`**:
+      the same pattern as `pushLimit`. JDBC implements them so a
+      database does the sorting.
+    - **`SupportsPushDownJoin`** (`@since 4.1.0`): push a join of two
+      scans of the same source into the source, for JDBC sources on the
+      same database.
+    - **`SupportsPushDownVariantExtractions`** (`@since 4.1.0`,
+      `@Experimental`): receive the `variant_get` paths a query
+      extracts, so a source can read only those fields ("VARIANT
+      Shredding and Performance" explains why that matters).
+    - **Columnar reads**: a `PartitionReaderFactory` whose
+      `supportColumnarReads(partition)` returns `true` implements
+      `createColumnarReader` and returns `ColumnarBatch`es. Parquet and
+      ORC do this; it skips row-by-row work entirely.
+    - **Custom metrics**: `Scan.supportedCustomMetrics()` declares
+      metrics (`CustomSumMetric`, `CustomAvgMetric` in
+      `connector/metric/`) and `PartitionReader.currentMetricsValues()`
+      reports them per task. They appear on the scan node in the SQL
+      tab of the Spark UI, which is how you would show "files opened" in
+      production instead of a static counter.
+    - **`SupportsPushDownFilters`**: the V1 filter version, still
+      supported, and what Python sources use. Prefer V2 in new code; the
+      javadoc of `SupportsPushDownV2Filters` notes V1 "is less
+      efficient due to the internal -> external data conversion".
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: jdocs, the docs Source in Java
+
+    The exercise file holds the whole connector as Java strings in a
+    dict called `JAVA`: entry point, table, scan builder, scans, reader
+    factory and reader, plus a counter class `Audit`. The harness
+    compiles it, starts a local session with the jar, registers a small
+    Python data source over the same folder, and compares the two.
+    Complete three TODOs in the Java:
+
+    1. **`Filters.accept(Predicate p)`**: take over `IS_NOT_NULL` on the
+       never-null columns, `=` and `IN` on `kind` (string values), `=`
+       and the four comparisons on `size`, and `ENDS_WITH` on `name`, by
+       recording them with the helpers (`keepKinds`, `sizeTest`,
+       `nameSuffixes`). Return `false` for everything else.
+       `matches()` already applies what you record.
+    2. **`DocsScanBuilder.answerable(Aggregation agg)`**: `true` for a
+       single `CountStar` with no grouping, or grouped by the column
+       `kind` only.
+    3. **`DocsReader.next()`**: advance to the next file and build its
+       `InternalRow` in the order of the read schema, with the internal
+       types from the table above. Open a PNG only when `width` or
+       `height` was asked for.
+
+    The harness checks, in order: one row per file, identical to the
+    Python source (types and values); a pruned scan output for
+    `select("name", "size")` that opens no file; `kind = 'image'`
+    pushed with no Spark `Filter` and only the PNGs opened; `IN`,
+    `ENDS_WITH` and size ranges fully pushed with nothing opened;
+    `width > 12` and an `OR` left to Spark with correct results;
+    `COUNT(*)` answered by a `LocalTableScan` with nothing opened,
+    `GROUP BY kind` counts, `sum(size)` refused; and `limit(3)` pushed.
+
+    A `javac` error stops the script and prints the compiler's message
+    with the file and line inside the temporary source folder.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "In accept(): switch (p.name()) { case \"IS_NOT_NULL\": return NEVER_NULL.contains(col); case \"=\": if (col.equals(\"kind\") && value(c[1]) instanceof String s) { keepKinds(Set.of(s)); return true; } return sizeTest(col, \"=\", c[1]); ... }. In next(): if (++i >= files.size()) return false; then fill values[c] with a switch on columns[c] and wrap them in new GenericInternalRow(values)."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - A DSv2 read goes `TableProvider` -> `Table` (`SupportsRead`) ->
+      `ScanBuilder` -> `Scan` -> `Batch` -> `InputPartition`s and a
+      `PartitionReaderFactory` -> `PartitionReader<InternalRow>`. The
+      first four run on the driver; partitions and the factory are
+      serialized into tasks.
+    - `load()` calls `inferSchema` and `getTable`; the scan builder is
+      created fresh for every optimization, at the first action or
+      `explain()`, and that is when pushdown and `build()` run.
+    - Short names come from `DataSourceRegister` plus a
+      `META-INF/services` file; otherwise `DATA_SOURCE_NOT_FOUND`, and
+      the full class name still works.
+    - `InternalRow`s carry internal values: `UTF8String`, `int` days,
+      `long` microseconds, `Decimal`, `ArrayData`. Wrong types fail in
+      tasks with `ClassCastException`.
+    - V2 `Predicate`s are richer than Python's filters (`OR`, functions,
+      column comparisons); literals arrive as internal values; return
+      everything you do not apply exactly.
+    - Column pruning, `LIMIT` and `COUNT(*)` pushdown are Java-only in
+      4.2.0. Limits and aggregates are pushed only when no filter is
+      left after the scan. A `LocalScan` answers on the driver.
+    - `description()` is the only pushdown information `explain()` shows
+      for your scan.
+    - Statistics feed join planning; `KeyGroupedPartitioning` removes
+      shuffles (unchecked by Spark); `SupportsRuntimeV2Filtering`
+      receives DPP filters at run time.
+    - For real projects: Maven with `spark-sql_2.13:4.2.0` as
+      `provided`, and a pinned `maven-compiler-plugin`.
+
+    Next: **Catalyst Extensions: Rules and Native Functions**, where you
+    stay in Java and change Spark's optimizer itself: a native
+    expression, a rule that rewrites a Python UDF into it, and a check
+    rule that rejects a bad query pattern.

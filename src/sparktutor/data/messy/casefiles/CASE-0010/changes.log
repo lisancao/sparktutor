@@ -1,0 +1,6 @@
+2026-03-25T09:00:00Z | status | new -> open | emma
+2026-03-25T09:07:00Z | status | open -> triage | emma
+
+2026-03-25T09:30:00Z | status | open triage | dev
+2026-03-25T09:14:00Z | priority | P2 -> P1 | emma
+2026-03-25T09:21:00Z | status | waiting -> open | ana

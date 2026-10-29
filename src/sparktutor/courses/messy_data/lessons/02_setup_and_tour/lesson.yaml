@@ -1,0 +1,1059 @@
+- Class: meta
+  Lesson: "Setup, a First Session and a Tour of the Sample Data"
+  EstimatedMinutes: 60
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    "Why Spark for Messy Data, and How It Runs Your Code" explained what
+    Spark does with your code. This lesson gets you working: it installs
+    Spark from nothing, opens a first session, teaches the everyday tools
+    for looking at a DataFrame, and walks through every folder of the
+    sample data that the rest of the course uses. It follows chapter 2 of
+    *Learning Spark* (getting started).
+
+    By the end of this lesson you will be able to:
+
+    - Install Java, Python and PySpark 4.2.0 on macOS, Linux or Windows,
+      check the install, and fix the failures people hit most
+    - Start and stop a `SparkSession`, and know what its start-up output
+      means
+    - Look at a DataFrame with `show`, `printSchema`, `columns`, `dtypes`
+      and `count`, and work with `Row` objects
+    - Get data out safely: `take`, `first`, `limit`, `collect` and
+      `toPandas`, and why `collect` can take down your program
+    - Query DataFrames with SQL through temporary views, and see that SQL
+      and the DataFrame API produce the same plan
+    - Open each folder of `data/messy/` with the right reader and know
+      which lesson handles it
+    - Read a Spark error: the error condition, the SQLSTATE and the
+      message parameters, in code
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Installing From Zero
+
+    You need three things: **Java**, because Spark's engine runs on the
+    JVM; **Python 3.10 or newer**; and the **PySpark** package, which
+    contains Spark itself (all of Spark's jars are inside it, so there is
+    nothing else to download).
+
+    **1. Java (a JDK, version 17 or 21; 25 also works).** Check first:
+
+    ```bash
+    java -version
+    ```
+
+    ```
+    openjdk version "17.0.20.1" 2026-08-18
+    OpenJDK Runtime Environment (build 17.0.20.1+1-1-24.04-Ubuntu)
+    OpenJDK 64-Bit Server VM (build 17.0.20.1+1-1-24.04-Ubuntu, mixed mode, sharing)
+    ```
+
+    If that fails or shows a version below 17, install one:
+
+    - **macOS** (with Homebrew): `brew install openjdk@17`, then point
+      `JAVA_HOME` at it, for example
+      `export JAVA_HOME=$(/usr/libexec/java_home -v 17)` in your shell
+      profile.
+    - **Linux** (Debian or Ubuntu): `sudo apt install openjdk-17-jdk`.
+      Other distributions have an equivalent package.
+    - **Windows**: install a JDK such as Eclipse Temurin 17 with its
+      installer, tick the option that sets `JAVA_HOME`, and open a new
+      terminal. Many people find it simpler to run Spark inside WSL 2
+      (the Linux environment built into Windows) and follow the Linux
+      steps there.
+
+    Spark 4 is compiled for Java 17: its classes have class file version
+    61, which older Java versions refuse to load.
+
+    **2. A virtual environment.** Many systems refuse a global
+    `pip install`, and a virtual environment keeps this course's
+    packages separate from everything else:
+
+    ```bash
+    python3 -m venv .venv
+    source .venv/bin/activate          # macOS and Linux
+    .venv\Scripts\activate             # Windows (Command Prompt or PowerShell)
+    ```
+
+    **3. PySpark.**
+
+    ```bash
+    pip install "pyspark[connect,pipelines]==4.2.0" "pandas<3"
+    ```
+
+    The extras add what Spark Connect and Declarative Pipelines need
+    (gRPC, PyArrow, pandas and more). Inside the SparkTutor repository,
+    `pip install -e '.[spark]'` installs exactly these. Then check:
+
+    ```bash
+    pyspark --version
+    ```
+
+    ```
+    Welcome to
+          ____              __
+         / __/__  ___ _____/ /__
+        _\ \/ _ \/ _ `/ __/  '_/
+       /___/ .__/\_,_/_/ /_/\_\   version 4.2.0
+          /_/
+
+    Using Scala version 2.13.18, OpenJDK 64-Bit Server VM, 17.0.20.1
+    ```
+
+    That banner proves the whole chain works: the `pyspark` launcher
+    found Java, and Java ran Spark 4.2.0. `spark-submit --version` prints
+    the same.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## When the Install Goes Wrong
+
+    These are the failures seen most often, each reproduced on PySpark
+    4.2.0.
+
+    **No Java found.** With no `java` on the `PATH` and no `JAVA_HOME`,
+    creating a session prints `JAVA_HOME is not set` and then fails in
+    Python with:
+
+    ```
+    pyspark.errors.exceptions.base.PySparkRuntimeError: [JAVA_GATEWAY_EXITED] Java gateway
+    process exited before sending its port number.
+    ```
+
+    `JAVA_GATEWAY_EXITED` only says "the Java process died before it got
+    going". The reason is always in the lines printed **above** the
+    Python traceback, so scroll up.
+
+    **`JAVA_HOME` points to the wrong place.** With `JAVA_HOME=/nope`:
+
+    ```
+    .../pyspark/bin/spark-class: line 71: /nope/bin/java: No such file or directory
+    ```
+
+    followed by the same `JAVA_GATEWAY_EXITED`. Fix `JAVA_HOME` (it must
+    be the folder that contains `bin/java`) or unset it so the `java` on
+    your `PATH` is used.
+
+    **Java too old.** On Java 11 or older, the JVM cannot load Spark's
+    class files (version 61, Java 17); it reports an
+    `UnsupportedClassVersionError` above the same `JAVA_GATEWAY_EXITED`.
+    Install Java 17 or 21.
+
+    **The launchers can't find Spark.** Running
+    `.venv/bin/spark-submit` without activating the virtual environment
+    gave:
+
+    ```
+    Could not find valid SPARK_HOME while searching [...]
+    .../.venv/bin/spark-submit: line 27: /bin/spark-class: No such file or directory
+    ```
+
+    The launcher scripts ask `python3` where PySpark is installed, and
+    without the venv activated, `python3` is a different Python. Activate
+    the environment first. (`python my_script.py` with the venv's own
+    `python` works either way.)
+
+    **Python versions differ.** If the Python that runs your UDFs (set by
+    `PYSPARK_PYTHON`) is a different minor version from your script's
+    Python, plain DataFrame queries still work, because they never start
+    Python workers. The first Python UDF fails with a `PythonException`
+    whose text contains:
+
+    ```
+    [PYTHON_VERSION_MISMATCH] Python in worker has different version: 3.11 than that in
+    driver: 3.12, PySpark cannot run with different minor versions.
+    ```
+
+    Unset `PYSPARK_PYTHON`, or point it at the same Python as the venv.
+
+    **Windows: `winutils.exe`.** Spark's Hadoop libraries look for a
+    helper program, `winutils.exe`, on Windows. Without it they log
+    messages naming `winutils.exe` and `HADOOP_HOME` and pointing to the
+    Hadoop "WindowsProblems" wiki page, and writing files can fail. WSL
+    2 avoids the issue entirely; otherwise follow that page.
+
+    **Harmless warnings.** These appear on many machines and need no
+    action:
+
+    ```
+    WARN Utils: Your hostname, ..., resolves to a loopback address: 127.0.1.1; using 192.168.50.13 instead
+    WARN Utils: Set SPARK_LOCAL_IP if you need to bind to another address
+    WARN NativeCodeLoader: Unable to load native-hadoop library for your platform... using builtin-java classes where applicable
+    WARN Utils: Service 'SparkUI' could not bind on port 4040. Attempting port 4041.
+    ```
+
+- Class: mult_question
+  Depth: all
+  Output: "Creating a session fails with `[JAVA_GATEWAY_EXITED] Java gateway process exited before sending its port number.` Where do you find the actual cause?"
+  AnswerChoices: "In the lines printed above the Python traceback, written by the Java launcher;In the Spark UI;In the SQLSTATE of the error;Nowhere, the error has no cause"
+  CorrectAnswer: "In the lines printed above the Python traceback, written by the Java launcher"
+  Hint: "The Python side only knows that Java died. Java said why before it died."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## A First Session
+
+    Every program starts by building a `SparkSession`:
+
+    ```python
+    from pyspark.sql import SparkSession
+
+    spark = (SparkSession.builder
+             .master("local[*]")                               # local mode, all cores
+             .appName("FirstSession")                          # the name in the Spark UI
+             .config("spark.sql.session.timeZone", "UTC")      # any setting, by name
+             .getOrCreate())
+
+    print(spark.version)      # 4.2.0
+    spark.sparkContext.setLogLevel("ERROR")
+    ```
+
+    - `.master(...)` picks where Spark runs ("Why Spark for Messy Data,
+      and How It Runs Your Code" explained local mode).
+    - `.config(key, value)` sets any Spark setting. Every exercise in
+      this course sets the session time zone to UTC so times print the
+      same on every laptop.
+    - `getOrCreate()` returns the session that already exists, if there
+      is one, instead of making a second. After the session above, a
+      later
+      `SparkSession.builder.master("local[4]").appName("Other").config("spark.sql.shuffle.partitions", "7").getOrCreate()`
+      returned the same object: `spark.sparkContext.master` was still
+      `local[*]` and `spark.sparkContext.appName` still `FirstSession`.
+      Only the SQL setting passed with `.config` (here
+      `spark.sql.shuffle.partitions`, now `7`) was applied to it.
+    - `setLogLevel("ERROR")` hides Spark's `INFO` and `WARN` log lines
+      for the rest of the session. Lines printed before it (the start-up
+      warnings) still appear.
+    - `spark.stop()` ends the session and releases its memory and ports.
+      Scripts should call it at the end, in a `finally:` block so it runs
+      even after an error, which is what every exercise harness does.
+
+    While a query runs you may also see a progress bar on the terminal:
+
+    ```
+    [Stage 1:>                                                          (0 + 1) / 1]
+    ```
+
+    It is stage 1, with 0 tasks finished, 1 running, and 1 in total.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## DataFrames, Columns and Schemas
+
+    A **DataFrame** is a table with named, typed columns, spread over
+    partitions. You almost always get one from a reader:
+
+    ```python
+    events = spark.read.json("data/messy/events")
+    print(events.count(), len(events.columns))
+    print(events.columns)
+    print(events.dtypes[:4])
+    ```
+
+    ```
+    61 8
+    ['_corrupt_record', 'amount', 'event', 'event_type', 'items', 'ts', 'user', 'user_id']
+    [('_corrupt_record', 'string'), ('amount', 'string'), ('event', 'string'), ('event_type', 'string')]
+    ```
+
+    - `count()` is an action: it runs a job and returns the number of
+      rows.
+    - `columns` is the list of names; `dtypes` pairs each name with its
+      type as a short string. Both come from the schema and run nothing.
+    - `printSchema()` prints the schema as a tree, nested fields
+      included. "Schemas for Data You Don't Control" is all about what
+      you see there; for now, notice that Spark found eight columns in
+      three files whose records all look different.
+
+    `show()` prints rows as a table. By default 20 rows, with values cut
+    to 20 characters:
+
+    ```python
+    events.select("event", "event_type", "user", "amount").show(3)
+    ```
+
+    ```
+    +-----+----------+--------------+--------------------+
+    |event|event_type|          user|              amount|
+    +-----+----------+--------------+--------------------+
+    | NULL|  purchase|{{US}, 0, pro}|{"value": 29.93, ...|
+    | NULL|  purchase|{{CA}, 1, pro}|{"value": 8.19, "...|
+    | NULL|  purchase|{{CA}, 2, pro}|{"value": 8.03, "...|
+    +-----+----------+--------------+--------------------+
+    only showing top 3 rows
+    ```
+
+    `truncate=False` shows whole values, and `vertical=True` prints one
+    row per block, which is far easier to read for wide or nested rows:
+
+    ```python
+    events.select("event_type", "user", "amount", "ts").show(2, truncate=False, vertical=True)
+    ```
+
+    ```
+    -RECORD 0-----------------------------------------
+     event_type | purchase
+     user       | {{US}, 0, pro}
+     amount     | {"value": 29.93, "currency": "CAD"}
+     ts         | 2026-10-03T12:00:00
+    -RECORD 1-----------------------------------------
+     event_type | purchase
+     user       | {{CA}, 1, pro}
+     amount     | {"value": 8.19, "currency": "CAD"}
+     ts         | 2026-10-03T12:01:00
+    only showing top 2 rows
+    ```
+
+    Structs print as `{...}` with their values in field order (here
+    `geo`, `id`, `plan`), and `NULL` means no value.
+
+    Notice that the first rows came from the **third** day's file.
+    Unless you sort, a DataFrame has no row order: Spark reads partitions
+    in whatever order it planned them, and in 4.2.0 the largest file
+    happened to come first. Use `orderBy` whenever order matters.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Print the first 5 rows of the DataFrame `events` without cutting
+    long values short.
+  CorrectAnswer: |
+    events.show(5, truncate=False)
+  Hint: "show takes the number of rows first, and a truncate argument."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Rows
+
+    Actions that return data give you `Row` objects. A `Row` works like
+    a tuple and like a dict:
+
+    ```python
+    r = events.filter("event IS NOT NULL").first()
+    print(r.event, r["amount"], r[1])
+    print(r.user)
+    print(list(r.asDict().keys()))
+    ```
+
+    ```
+    purchase 32.83 32.83
+    Row(geo=None, id=0, plan='pro')
+    ['_corrupt_record', 'amount', 'event', 'event_type', 'items', 'ts', 'user', 'user_id']
+    ```
+
+    - `r.event` (attribute), `r["amount"]` (key) and `r[1]` (position)
+      all work. Use the key form when a column name has spaces or
+      clashes with a `Row` method such as `count`.
+    - A struct column comes back as a nested `Row`, an array as a
+      `list`.
+    - `asDict()` turns the row into a dict (`asDict(recursive=True)`
+      converts the nested rows too).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Getting Data Out, Safely
+
+    There are several ways to bring rows from Spark into your Python
+    program, and they differ in how much they fetch:
+
+    | Call | Returns | Fetches |
+    |------|---------|---------|
+    | `df.first()` / `df.head()` | one `Row` (or `None`) | one row |
+    | `df.take(n)` / `df.head(n)` | a `list` of `Row` | n rows |
+    | `df.limit(n)` | a **DataFrame** (lazy, nothing fetched yet) | n rows when an action runs |
+    | `df.collect()` | a `list` of every `Row` | **everything** |
+    | `df.toPandas()` | a pandas DataFrame | **everything** |
+
+    `collect()` and `toPandas()` copy the whole result into the driver,
+    the one process that runs your script. On a real dataset that is an
+    out-of-memory crash waiting to happen. Spark has a guard,
+    `spark.driver.maxResultSize` (default `1g`): when the results sent to
+    the driver add up to more than that, the job is aborted. With the
+    guard lowered to `1m`, collecting 3 million numbers failed with:
+
+    ```
+    Job aborted due to stage failure: Total size of serialized results of 1 tasks (3.6 MiB)
+    is bigger than spark.driver.maxResultSize (1024.0 KiB)
+    ```
+
+    (In classic PySpark that reaches Python as a `Py4JJavaError`.) The
+    guard protects the driver, but only after the work was done. The
+    habit that protects you is: aggregate or filter in Spark, then bring
+    back only the small answer, and use `take(n)` or `show(n)` to look.
+
+    `toPandas()` converts through Apache Arrow, a columnar format shared
+    by Spark and pandas; in 4.2 that is on by default
+    (`spark.sql.execution.arrow.pyspark.enabled` is `true`). It is the
+    fast way to hand a **small** result to pandas or a plotting library:
+
+    ```python
+    pdf = events.select("event", "amount").toPandas()
+    print(type(pdf), pdf.shape)     # <class 'pandas.core.frame.DataFrame'> (61, 2)
+    ```
+
+- Class: mult_question
+  Depth: all
+  Output: "You want to look at a few rows of a DataFrame that may hold a billion rows. Which call is safe?"
+  AnswerChoices: "df.take(5);df.collect()[:5];df.toPandas().head(5);list(df.collect())"
+  CorrectAnswer: "df.take(5)"
+  Hint: "Three of these bring every row to the driver first and slice afterwards."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Transformations and Actions, Again
+
+    "Why Spark for Messy Data, and How It Runs Your Code" showed that
+    transformations build a plan and actions run it. The everyday split:
+
+    - **Transformations** (return a DataFrame, run nothing): `select`,
+      `filter` / `where`, `withColumn`, `withColumns`, `drop`,
+      `groupBy(...).agg(...)`, `join`, `orderBy`, `limit`, `distinct`,
+      `union`.
+    - **Actions** (run a job, return a value or write): `show`, `count`,
+      `first`, `take`, `head`, `collect`, `toPandas`, `foreach`,
+      `write...save()`.
+    - **Neither**: `columns`, `dtypes`, `schema`, `printSchema()` and
+      `explain()` only look at the plan (but reading JSON or CSV without
+      a schema may already have run a job to infer it).
+
+    A useful consequence: you can build a long chain step by step, and
+    check it with `printSchema()` or `explain()` before spending any time
+    running it.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## SQL and Temporary Views
+
+    Spark speaks SQL as well as Python. To query a DataFrame with SQL,
+    give it a name as a **temporary view**:
+
+    ```python
+    logs = spark.read.text("data/messy/logs").withColumn("file", F.col("_metadata.file_name"))
+    logs.createOrReplaceTempView("logs")
+
+    spark.sql("""
+        SELECT file, count(*) AS n
+        FROM logs
+        WHERE value LIKE '%ERROR%'
+        GROUP BY file
+        ORDER BY file
+    """).show()
+    ```
+
+    ```
+    +-------+---+
+    |   file|  n|
+    +-------+---+
+    |app.log| 18|
+    +-------+---+
+    ```
+
+    (`F` is `pyspark.sql.functions`, imported as
+    `from pyspark.sql import functions as F`; the whole course uses that
+    convention.)
+
+    - A temporary view is just a name for a DataFrame's plan. It stores
+      no data, belongs to this session, and disappears when the session
+      stops. `createOrReplaceTempView` replaces a view of the same name;
+      `spark.catalog.listTables()` lists the views.
+    - `spark.sql(...)` returns a DataFrame, so you can keep going in
+      Python (`.filter(...)`, `.show()`), and `spark.table("logs")` turns
+      a view name back into a DataFrame.
+    - SQL can also read files directly, with the format as a prefix and
+      the path in backticks:
+      ``spark.sql("SELECT count(*) FROM json.`data/messy/events`")``
+      gave 61.
+
+    **Gotcha: the hidden `_metadata` column does not pass through a
+    view.** `SELECT _metadata.file_name FROM events` on a view made from
+    `spark.read.json(...)` failed with
+    `[UNRESOLVED_COLUMN.WITH_SUGGESTION]`. Select it into a normal column
+    (`file` above) **before** you register the view. On a direct file
+    query (``FROM json.`...` ``) `_metadata.file_name` does work.
+
+- Class: mult_question
+  Depth: all
+  Output: "You registered `spark.read.json('data/messy/events')` as the view `events`. Why does `SELECT _metadata.file_name FROM events` fail?"
+  AnswerChoices: "The hidden _metadata column is not exposed through a temporary view, so add it as a column before registering;JSON files have no metadata;Temporary views can't be queried with SQL;The column must be written _METADATA in SQL"
+  CorrectAnswer: "The hidden _metadata column is not exposed through a temporary view, so add it as a column before registering"
+  Hint: "The same column works on the DataFrame itself and in a direct file query."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## SQL or Python? Both Make the Same Plan
+
+    The same question in the DataFrame API:
+
+    ```python
+    by_file = (logs.filter(F.col("value").like("%ERROR%"))
+                   .groupBy("file").agg(F.count("*").alias("n"))
+                   .orderBy("file"))
+    by_file.show()
+    ```
+
+    It prints the same table, and more importantly the same plan. After
+    removing the internal id numbers, the `explain()` output of the SQL
+    version and of this one were identical:
+
+    ```
+    AdaptiveSparkPlan isFinalPlan=false
+    +- Sort [file ASC NULLS FIRST], true, 0
+       +- Exchange rangepartitioning(file ASC NULLS FIRST, 200), ...
+          +- HashAggregate(keys=[file], functions=[count(1)])
+             +- Exchange hashpartitioning(file, 200), ...
+                +- HashAggregate(keys=[file], functions=[partial_count(1)])
+                   +- Project [_metadata.file_name AS file]
+                      +- Filter (isnotnull(value) AND Contains(value, ERROR))
+                         +- ...
+                            +- FileScan text [value,file_name] ... PushedFilters: [IsNotNull(value), StringContains(value,ERROR)] ...
+    ```
+
+    Both go through the same optimizer, which even rewrote
+    `LIKE '%ERROR%'` into a simple `Contains` and pushed it to the file
+    reader. So choose by readability, not speed: SQL is often clearer for
+    joins and aggregations, Python for logic you build in a loop or
+    reuse as functions. Mixing them is normal; this course does both,
+    and `F.expr("...")` and `selectExpr(...)` let you drop a SQL
+    expression into DataFrame code ("Columns and Expressions: Cleaning
+    Values" uses them).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## A Tour of the Sample Data
+
+    The sample data lives in `data/messy/`. Every file is synthetic and
+    made by scripts in the SparkTutor repository
+    (`scripts/gen_messy_data.py` and `scripts/messy_gen/`) with fixed
+    random seeds, so your files are byte for byte the ones the lessons
+    describe. Start with an inventory that reads only file listings,
+    never the bytes:
+
+    ```python
+    inventory = (spark.read.format("binaryFile")
+        .option("recursiveFileLookup", "true")
+        .load("data/messy")
+        .select(F.regexp_extract("path", r"/data/messy/([^/]+)/", 1).alias("folder"), "length"))
+    (inventory.groupBy("folder")
+        .agg(F.count("*").alias("files"), F.sum("length").alias("bytes"))
+        .orderBy("folder").show(30))
+    ```
+
+    ```
+    +---------------+-----+-----+
+    |         folder|files|bytes|
+    +---------------+-----+-----+
+    |          audio|    3|16132|
+    |         binary|    6| 9262|
+    |      casefiles|   35|49092|
+    |checkout_events|    4| 3229|
+    |       cleaning|    2| 3505|
+    |    clickstream|    4| 5411|
+    |      delimited|    7| 2636|
+    |           docs|    5| 1215|
+    |         events|    3| 8907|
+    | geo_deliveries|    2| 6556|
+    |         images|    6| 2079|
+    |           logs|    2|31285|
+    |           mail|    4| 1007|
+    |         nested|    1|15515|
+    |            pdf|    2| 1481|
+    |        quality|    5|13024|
+    |   service_logs|    1| 8565|
+    |support_tickets|    6|49163|
+    |            xml|    1| 1669|
+    +---------------+-----+-----+
+    ```
+
+    - `binaryFile` gives one row per file, with its `path`, `length` and
+      bytes ("Files as Files: binaryFile, Globs and Metadata" teaches it
+      properly). Because this query never uses the bytes, Spark never
+      opens the files.
+    - `recursiveFileLookup` walks into subfolders; without it a folder
+      that contains only folders reads as empty.
+    - `regexp_extract` pulls the folder name out of the path.
+
+    The whole set is a few hundred kilobytes. The lessons are about the
+    **shape** of messy data, which these files have plenty of; nothing
+    here needs a big machine. The data grows as lessons are added, so
+    your table may have extra rows.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Folders, One by One
+
+    | Folder | What is in it | Read it with | Main lessons |
+    |--------|---------------|--------------|--------------|
+    | `events/` | three days of order events as JSON Lines; the shape changes every day, and the last line is cut off | `spark.read.json` | "Schemas for Data You Don't Control", "JSON Drift and Quarantine", "VARIANT Basics: Profiling and Nested Data", "VARIANT Shredding and Performance" |
+    | `xml/` | ten orders with attributes, optional elements and one to three items | `spark.read.option("rowTag", "order").xml` | "XML" |
+    | `logs/` | `access.log` (a web server log) and `app.log` (an application log with stack traces that switches to JSON half way) | `spark.read.text` | "Text and Logs" |
+    | `docs/` | four Markdown policy documents and one text file in the Latin-1 encoding | `spark.read.text(..., wholetext=True)` | "Text and Logs", "Documents to Rows", "Text Analytics Without an LLM" |
+    | `mail/` | four support e-mails (`.eml`) | `text` with `wholetext`, or `binaryFile` | "Documents to Rows", "Text Analytics Without an LLM" |
+    | `pdf/` | two small hand-made PDF invoices | `binaryFile` | "Documents to Rows" |
+    | `images/` | `products/` and `scans/`: PNGs in RGB, RGBA and gray, a corrupt PNG, and a text file posing as an image | `binaryFile` (recursive), `image` | "Files as Files: binaryFile, Globs and Metadata", "Images and Audio" |
+    | `audio/` | three short WAV recordings: a tone, a quiet tone, silence | `binaryFile` | "Images and Audio" |
+    | `cleaning/` | a customer export where every value is messy, and a country code table | `csv` | "Columns and Expressions: Cleaning Values" |
+    | `delimited/` | CSV, semicolon and tab files with quotes, comments, encodings and a fixed-width file | `csv`, `text` | "CSV and Delimited Files" |
+    | `nested/` | web shop orders nested several levels deep | `json` | "Complex Types and Higher-Order Functions" |
+    | `binary/` | two Kafka-style topic dumps holding Avro and Protobuf messages, and their schemas | `json`, then `from_avro` / `from_protobuf` | "Binary Records: Avro and Protobuf" |
+    | `support_tickets/` | labelled tickets for training and an unlabelled inbox | `csv`, `json` | "Running a Model over Your Data with pandas UDFs" |
+    | `geo_deliveries/` | stores and messy delivery coordinates and city names | `csv` | "What Spark 4.x Adds for Messy Data" |
+    | `service_logs/` | a `key=value` log from two hosts | `text` | "Python UDTFs in Depth" (intermediate) |
+    | `clickstream/` | four drops of web events for streaming, with duplicates, late events and a field rename | `json` | "Streaming Messy Data: Drift, Dead Letters and State" (intermediate) |
+    | `quality/` | customers and orders CSVs with planted quality problems, and rules as JSON | `csv`, `json` | "Production Ingestion: Quality Rules, Quarantine and Pipelines" (intermediate) |
+    | `checkout_events/` | four drops of checkout clicks for sessionizing | `json` | "Streaming Internals: Checkpoints, State and Real-Time Mode" (advanced) |
+    | `casefiles/` | a made-up "case file" export: a folder per case with an index, attachments and a change log | your own connector | "Final Project: Your Own Connector" (advanced) |
+
+    Some lessons make extra data inside their exercise instead (an SQLite
+    database, large synthetic files), so not every lesson has a folder.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Semi-Structured Folders: events and xml
+
+    `events/` is the course's running example. You have already seen
+    its eight inferred columns and that rows from three files look
+    different; each day really does have its own shape:
+
+    ```
+    day 1: {"event": "view", "user_id": 0, "amount": 6.13, ...}
+    day 2: {"event": "purchase", "user": {"id": 0, "plan": "pro"}, "amount": "32.83", "items": [...], ...}
+    day 3: {"event_type": "purchase", "user": {..., "geo": {"country": "US"}}, "amount": {"value": 29.93, "currency": "CAD"}, ...}
+    ```
+
+    `xml/orders.xml` holds one `<order>` element per order. The XML
+    source (built in since Spark 4.0) needs to know which element is one
+    row, the `rowTag`:
+
+    ```python
+    orders = spark.read.option("rowTag", "order").xml("data/messy/xml")
+    orders.printSchema()
+    orders.show(3, truncate=False)
+    ```
+
+    ```
+    root
+     |-- _channel: string (nullable = true)
+     |-- _id: long (nullable = true)
+     |-- coupon: string (nullable = true)
+     |-- customer: string (nullable = true)
+     |-- items: struct (nullable = true)
+     |    |-- item: array (nullable = true)
+     |    |    |-- element: struct (containsNull = true)
+     |    |    |    |-- _sku: string (nullable = true)
+     |    |    |    |-- qty: long (nullable = true)
+
+    +--------+---+------+--------+-----------------------------+
+    |_channel|_id|coupon|customer|items                        |
+    +--------+---+------+--------+-----------------------------+
+    |store   |0  |SAVE0 |C0      |{[{P8, 2}, {P7, 3}]}         |
+    |web     |1  |NULL  |C1      |{[{P9, 3}, {P8, 1}, {P4, 2}]}|
+    |store   |2  |NULL  |C2      |{[{P1, 3}]}                  |
+    +--------+---+------+--------+-----------------------------+
+    only showing top 3 rows
+    ```
+
+    Attributes become columns starting with `_` (`_id`, `_channel`), and
+    the optional `<coupon>` is NULL where it is missing. "XML" goes from
+    here.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Text Folders: logs, docs and mail
+
+    The `text` source gives one row per line, in a column called
+    `value`:
+
+    ```python
+    logs = spark.read.text("data/messy/logs")
+    logs.filter(F.col("_metadata.file_name") == "app.log").show(8, truncate=70)
+    ```
+
+    ```
+    +----------------------------------------------------------------------+
+    |                                                                 value|
+    +----------------------------------------------------------------------+
+    |2026-10-01 10:00:00,123 WARN [worker-0] order.Service - processed o...|
+    |2026-10-01 10:01:00,123 INFO [worker-1] order.Service - processed o...|
+    |2026-10-01 10:02:00,123 ERROR [worker-2] order.Service - processed ...|
+    |        java.lang.IllegalStateException: inventory negative for sku=P3|
+    |                       \tat order.Inventory.reserve(Inventory.java:88)|
+    |                           \tat order.Service.process(Service.java:41)|
+    |2026-10-01 10:03:00,123 ERROR [worker-0] order.Service - processed ...|
+    |        java.lang.IllegalStateException: inventory negative for sku=P3|
+    +----------------------------------------------------------------------+
+    only showing top 8 rows
+    ```
+
+    One error is spread over three lines, which is exactly the kind of
+    thing "Text and Logs" teaches you to stitch back together.
+
+    For whole documents, `wholetext=True` gives one row per **file**:
+
+    ```python
+    docs = spark.read.text("data/messy/docs", wholetext=True)
+    (docs.select(F.col("_metadata.file_name").alias("file"),
+                 F.length("value").alias("chars"),
+                 F.substring("value", 1, 30).alias("starts_with"))
+         .orderBy("file").show(truncate=False))
+    ```
+
+    ```
+    +----------------+-----+--------------------------------+
+    |file            |chars|starts_with                     |
+    +----------------+-----+--------------------------------+
+    |notes_latin1.txt|19   |Caf� cr�me, r�sum�: d�j� vu.\n  |
+    |privacy.md      |290  |# Privacy policy\n\nWe store ord|
+    |returns.md      |305  |# Returns policy\n\nCustomers ca|
+    |shipping.md     |315  |# Shipping policy\n\nStandard sh|
+    |warranty.md     |276  |# Warranty policy\n\nElectronics|
+    +----------------+-----+--------------------------------+
+    ```
+
+    The `�` marks are your first encoding problem: `notes_latin1.txt` is
+    not UTF-8, the text source assumes UTF-8, and each accented letter
+    became a replacement character. "Text and Logs" shows how to read
+    it properly.
+
+    `mail/` holds e-mails in the standard `.eml` format: headers, a blank
+    line, the body:
+
+    ```python
+    mail = spark.read.text("data/messy/mail", wholetext=True)
+    print(mail.filter(F.col("_metadata.file_name") == "ticket_0.eml").first()["value"])
+    ```
+
+    ```
+    From: customer0@example.com
+    To: support@example.com
+    Subject: Broken item
+    Date: Thu, 01 Oct 2026 09:00:00 +0000
+    Content-Type: text/plain; charset="utf-8"
+    Content-Transfer-Encoding: 7bit
+    MIME-Version: 1.0
+
+    Hello, order 1000 has a problem. Please help.
+    ```
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Binary Folders: images, audio and pdf
+
+    Images, recordings and PDFs are bytes, so `binaryFile` is the way
+    in. The first bytes of each file already say what it is:
+
+    ```python
+    media = (spark.read.format("binaryFile")
+        .option("recursiveFileLookup", "true")
+        .load(["data/messy/images", "data/messy/audio", "data/messy/pdf"]))
+    (media.select(F.col("_metadata.file_name").alias("file"), "length",
+                  F.hex(F.substring("content", 1, 4)).alias("first_4_bytes"))
+          .orderBy("file").show(truncate=False))
+    ```
+
+    ```
+    +-------------------+------+-------------+
+    |file               |length|first_4_bytes|
+    +-------------------+------+-------------+
+    |corrupt.png        |24    |89504E47     |
+    |gradient_32x32.png |1795  |89504E47     |
+    |gray_20x10.png     |90    |89504E47     |
+    |invoice_1001.pdf   |878   |25504446     |
+    |invoice_1002.pdf   |603   |25504446     |
+    |logo_rgba_12x12.png|81    |89504E47     |
+    |readme.txt         |13    |6E6F7420     |
+    |red_16x8.png       |76    |89504E47     |
+    |silence.wav        |8044  |52494646     |
+    |tone_440.wav       |4044  |52494646     |
+    |tone_880_quiet.wav |4044  |52494646     |
+    +-------------------+------+-------------+
+    ```
+
+    `89504E47` is `\x89PNG`, `25504446` is `%PDF`, `52494646` is `RIFF`
+    (the start of a WAV file), and `6E6F7420` is the text `not `. A
+    24-byte "PNG" is suspicious too. "Files as Files: binaryFile, Globs
+    and Metadata" turns these clues into a file inventory, and "Images
+    and Audio" decodes the pixels and samples.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Folders for Later Lessons
+
+    The other folders each belong to one lesson, which introduces them
+    properly. A glance at how they open:
+
+    - **Tables as CSV** (`cleaning/`, `delimited/`, `geo_deliveries/`,
+      `quality/`, `support_tickets/train.csv`):
+      `spark.read.option("header", True).csv(path)` gives the columns
+      named in the first line, every value as a string until you choose
+      types. `delimited/` is deliberately hard (semicolons, decimal
+      commas, a byte order mark, Latin-1, fixed-width lines) and is the
+      subject of "CSV and Delimited Files".
+    - **More JSON Lines** (`nested/`, `clickstream/`,
+      `checkout_events/`, `support_tickets/inbox/`, `binary/`):
+      `spark.read.json(path)`. The `binary/` files are JSON wrappers
+      around base64 message bytes; the real content is Avro or Protobuf
+      inside.
+    - **A key=value log** (`service_logs/kv.log`): `spark.read.text`,
+      one line per row, such as
+      `ts=2026-10-07T09:00:44Z level=INFO user=u2 action=add_to_cart ms=37 region=vn-north`.
+    - **A folder of folders** (`casefiles/`): one folder per case, each
+      with a pretty-printed `case.json` (one JSON document over many
+      lines, so it needs `option("multiLine", True)`), a change log and
+      attachments of every type. No built-in reader understands the
+      whole thing, which is the point of the final project.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Hidden Files and Folders
+
+    The inventory found 35 files in `casefiles/`, but there are more on
+    disk: a `.DS_Store` file and a `_staging` folder. Spark's file
+    listing skips any file or folder whose name starts with `.`, or
+    starts with `_` and contains no `=` (so a partition folder such as
+    `_day=1` is kept), except `_metadata` and `_common_metadata`, which
+    Parquet needs. Names ending in `._COPYING_` (files still being
+    copied) are skipped too. The rule is
+    `HadoopFSUtils.shouldFilterOutPathName` in the 4.2.0 source.
+
+    This is deliberate: tools write `_SUCCESS` markers, `_temporary`
+    folders and `.crc` checksum files next to data, and you don't want
+    them read as data. But it also means a producer that names files
+    `_part1.json` will see them silently ignored. The exercise compares
+    Spark's counts with a Python walk of the folders that applies the
+    same rule.
+
+    Two related facts about paths:
+
+    - A **glob that matches nothing is an error.**
+      `spark.read.json("data/messy/events/*.csv")` and
+      `spark.read.format("binaryFile").load("data/messy/*/nothing*")`
+      both failed with `[PATH_NOT_FOUND]`, the same as a misspelled
+      folder.
+    - A **folder that exists but has no matching files is not.**
+      `binaryFile` on `data/messy/images` without `recursiveFileLookup`
+      returned 0 rows, and so does a `pathGlobFilter` that matches no
+      file name.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Reading Error Messages
+
+    Spark 4 errors follow one format. A misspelled column:
+
+    ```python
+    events.select("evnt")
+    ```
+
+    ```
+    pyspark.errors.exceptions.captured.AnalysisException: [UNRESOLVED_COLUMN.WITH_SUGGESTION]
+    A column, variable, or function parameter with name `evnt` cannot be resolved. Did you
+    mean one of the following? [`event`, `ts`, `amount`, `items`, `user`]. SQLSTATE: 42703;
+    ```
+
+    Read it in four parts:
+
+    1. **The exception class**, `AnalysisException`: Spark rejected the
+       query while checking it, before running anything. Other common
+       ones are `PythonException` (your Python code failed inside a
+       worker), `ArithmeticException` (for example an overflow under
+       ANSI mode), `IllegalArgumentException` and `PySparkRuntimeError`.
+    2. **The error condition** in brackets,
+       `UNRESOLVED_COLUMN.WITH_SUGGESTION`: a stable name you can search
+       for in the Spark documentation and match on in code. A dot
+       separates a condition from its sub-condition.
+    3. **The message**, with the details filled in, often including a
+       "Did you mean" list of similar names.
+    4. **The SQLSTATE**, `42703`: a five-character code from the SQL
+       standard. The first two characters are the class: `42` means the
+       query itself is wrong (syntax or names), `22` means a data value
+       is wrong (a bad cast, an overflow), `0A` means a feature is not
+       supported.
+
+    A missing path looks like this:
+
+    ```
+    [PATH_NOT_FOUND] Path does not exist: file:/.../data/messy/event. SQLSTATE: 42K03
+    ```
+
+    Note the `file:/` and the full path: Spark resolved the relative path
+    against the current folder, so this is also how you find out where
+    it was looking.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Errors in Code
+
+    Every Spark error raised in Python is a `PySparkException`, which
+    has methods for each part:
+
+    ```python
+    from pyspark.errors import PySparkException
+
+    try:
+        events.select("evnt")
+    except PySparkException as e:
+        print(e.getCondition())
+        print(e.getSqlState())
+        print(e.getMessageParameters())
+    ```
+
+    ```
+    UNRESOLVED_COLUMN.WITH_SUGGESTION
+    42703
+    {'objectName': '`evnt`', 'proposal': '`event`, `ts`, `amount`, `items`, `user`'}
+    ```
+
+    Match on `getCondition()`, never on the message text: messages can
+    be reworded between releases, conditions are meant to stay. Some
+    errors that start deep in the JVM still reach classic PySpark as a
+    plain `Py4JJavaError` without a condition (the `maxResultSize` error
+    above is one); for those, the condition is in the text, after
+    `Caused by:`.
+
+    **Gotcha: the JSON line on stderr.** Since 4.0, PySpark also logs
+    each such error as one JSON line, through its own Python logger, the
+    moment the exception is created, even if your code catches it:
+
+    ```
+    {"ts": "...", "level": "ERROR", "logger": "DataFrameQueryContextLogger", "msg": "[UNRESOLVED_COLUMN.WITH_SUGGESTION] ...", "context": {...}, "exception": {...}}
+    ```
+
+    (`SQLQueryContextLogger` for errors in `spark.sql` text.)
+    `setLogLevel` doesn't hide it, because that controls the JVM's logs
+    and this is Python's `logging`. If you expect and handle errors,
+    quiet it the Python way, as this lesson's exercise does:
+
+    ```python
+    import logging
+    for name in ["DataFrameQueryContextLogger", "SQLQueryContextLogger"]:
+        logging.getLogger(name).setLevel(logging.CRITICAL)
+    ```
+
+- Class: mult_question
+  Depth: all
+  Output: "An error ends with `SQLSTATE: 22003`. What kind of problem is it?"
+  AnswerChoices: "A data value is wrong, such as an overflow or a bad cast;The query names a column or table that doesn't exist;Java is not installed;The feature is not supported"
+  CorrectAnswer: "A data value is wrong, such as an overflow or a bad cast"
+  Hint: "Class 42 is a wrong query, class 22 is a wrong value, class 0A is an unsupported feature."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Long Tracebacks
+
+    A failure inside a task (say, a Python UDF that raises) produces a
+    long report: the Python traceback of your script, then Spark's
+    summary, then the worker's own Python traceback, and in the logs a
+    JVM stack trace. To find what went wrong:
+
+    - Look for the error condition in brackets first
+      (`[PYTHON_EXCEPTION]`, `[CAST_INVALID_INPUT]`, ...).
+    - For a `PythonException`, the useful part is the **last** Python
+      traceback, the one from the worker, which ends with your
+      exception and the line of your function that raised it.
+    - For JVM errors, read the `Caused by:` lines from the bottom up;
+      the last one is the root cause.
+
+    By default classic PySpark leaves the JVM stack trace out of the
+    Python exception (`spark.sql.pyspark.jvmStacktrace.enabled` is
+    `false`); setting it to `true` adds it, which is mostly useful when
+    reporting a bug in Spark itself.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: A Guided Tour in Code
+
+    Turn the tour into checks. Implement:
+
+    1. `files_per_folder(spark, root)`: a dict from each top-level folder
+       of `data/messy` to its number of files at any depth, using
+       `binaryFile` with `recursiveFileLookup` and `regexp_extract` on
+       `path`. Don't read `content`.
+    2. `register_views(spark, root)`: temporary views `events` (the JSON
+       in `events/`) and `logs` (the text in `logs/`), each with a `file`
+       column taken from `_metadata.file_name` **before** registering.
+    3. `lines_per_file_sql(spark)`: lines per file of `logs`, as SQL,
+       with columns `file` and `n`, ordered by `file`.
+    4. `lines_per_file_df(spark)`: the same with the DataFrame API.
+    5. `first_rows(df, n)`: the first n rows as a list, safely.
+    6. `tour_facts(spark, root)`: the number of XML orders (rowTag
+       `order`), of documents in `docs/` (one row per file), of files
+       under `images/`, and of files in `audio/` whose first 4 bytes are
+       `RIFF`.
+    7. `error_condition(action)`: run `action()`, and return
+       `(condition, sqlstate)` of the `PySparkException` it raises, or
+       `None`.
+
+    The checks: your folder counts equal a Python walk of the same
+    folders (skipping hidden names as Spark does) and the core folders
+    hold the expected files; the views exist and the events view has 20,
+    20 and 21 rows per file; SQL and the DataFrame API both give
+    `access.log 200, app.log 134`; `first_rows` returns 3 `Row` objects;
+    the facts are 10 orders, 5 documents, 6 images and 3 WAV files; and
+    a missing folder and a misspelled column give `PATH_NOT_FOUND` /
+    `42K03` and `UNRESOLVED_COLUMN.WITH_SUGGESTION` / `42703`.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "files_per_folder: spark.read.format('binaryFile').option('recursiveFileLookup', 'true').load(root).select(F.regexp_extract('path', r'/data/messy/([^/]+)/', 1).alias('folder')).groupBy('folder').count(), then a dict from the collected rows. SQL: SELECT file, count(*) AS n FROM logs GROUP BY file ORDER BY file. first_rows: df.take(n). error_condition: try: action() except PySparkException as e: return (e.getCondition(), e.getSqlState()), and return None after the try."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    In this lesson you learned:
+
+    - **Installing**: a JDK 17 or 21, Python 3.10+, a virtual
+      environment, and `pip install "pyspark[connect,pipelines]==4.2.0"
+      "pandas<3"`; `pyspark --version` proves the chain works.
+    - **Failures**: `JAVA_GATEWAY_EXITED` means Java died (the reason is
+      printed above it); "Could not find valid SPARK_HOME" means the venv
+      isn't active; `PYTHON_VERSION_MISMATCH` appears only when a UDF
+      runs.
+    - **Sessions**: `SparkSession.builder...getOrCreate()` returns an
+      existing session if there is one; `setLogLevel`; `spark.stop()` in
+      a `finally:` block.
+    - **Looking at data**: `count`, `columns`, `dtypes`, `printSchema`,
+      `show(n, truncate=False, vertical=True)`, and `Row` access by
+      attribute, key or position. Without `orderBy` there is no row
+      order.
+    - **Getting data out**: `take`, `first` and `limit` fetch a few rows;
+      `collect` and `toPandas` fetch everything, guarded by
+      `spark.driver.maxResultSize` (1g).
+    - **SQL**: temporary views, `spark.sql`, `spark.table`, direct file
+      queries; `_metadata` doesn't pass through a view; SQL and the
+      DataFrame API compile to the same plan.
+    - **The sample data**: every folder of `data/messy/`, how to open it,
+      and which lesson uses it; hidden names are skipped by the file
+      listing, and a glob that matches nothing is `PATH_NOT_FOUND`.
+    - **Errors**: exception class, condition, message and SQLSTATE;
+      `getCondition()`, `getSqlState()`, `getMessageParameters()`; the
+      JSON error line from PySpark's own logger.
+
+    Next: **Schemas for Data You Don't Control**, which looks hard at the
+    schemas you printed here: Spark's types, nullability, inference and
+    its instability, and how to keep a contract with data that keeps
+    changing shape.

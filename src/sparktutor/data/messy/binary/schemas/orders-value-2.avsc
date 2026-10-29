@@ -1,0 +1,63 @@
+{
+  "type": "record",
+  "name": "Order",
+  "namespace": "shop",
+  "fields": [
+    {
+      "name": "order_id",
+      "type": "string"
+    },
+    {
+      "name": "user_id",
+      "type": "long"
+    },
+    {
+      "name": "total",
+      "type": "double",
+      "aliases": [
+        "amount"
+      ]
+    },
+    {
+      "name": "ts",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    },
+    {
+      "name": "currency",
+      "type": "string",
+      "default": "CAD"
+    },
+    {
+      "name": "coupon",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "items",
+      "default": [],
+      "type": {
+        "type": "array",
+        "items": {
+          "type": "record",
+          "name": "Item",
+          "fields": [
+            {
+              "name": "sku",
+              "type": "string"
+            },
+            {
+              "name": "qty",
+              "type": "int"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

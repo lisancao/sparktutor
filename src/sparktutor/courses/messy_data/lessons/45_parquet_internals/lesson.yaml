@@ -1,0 +1,1266 @@
+- Class: meta
+  Lesson: Parquet from the Inside
+  EstimatedMinutes: 75
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    Every messy-data pipeline in this course ends in Parquet, directly or
+    under a table format. "Plans, Partitions and Caching" showed you
+    `PushedFilters` in a plan, "Filter Pushdown" taught you what a source
+    can be told, and "VARIANT Shredding and Performance" (intermediate
+    level) used pyarrow to peek at a footer. Those lessons trusted the
+    plan. This one opens the file.
+
+    You will read Parquet the way a reader does, byte by byte: the magic
+    number, the footer length, the Thrift-encoded metadata, the page
+    headers, the RLE/bit-packed runs of a dictionary-encoded column and
+    the repetition and definition levels of a nested one. Then you will
+    follow a pushed filter from the plan into parquet-mr and measure,
+    with Spark's own scan metric, how many rows each skipping mechanism
+    really avoids.
+
+    By the end you will be able to:
+
+    - Decode a Parquet footer with a hand-written Thrift compact protocol
+      reader and cross-check it with pyarrow
+    - Walk the pages of a column chunk and decode dictionary indices and
+      levels by hand
+    - Name the code path from `PushedFilters` to a skipped row group in
+      Spark 4.2.0 and parquet-mr 1.17.0, and the four independent
+      skipping mechanisms (statistics, dictionaries, bloom filters, the
+      column index)
+    - Prove skipping with the `number of output rows` metric of the scan
+    - Recognize the layouts and types that silently defeat skipping:
+      INT96 timestamps, expressions, repeated fields, shredded VARIANT
+      fields, oversized bloom filters, and a `partitionBy` that discards
+      your sort order
+    - Design a file layout for a set of queries and prove it works
+
+    Everything here runs in classic mode: the scan metric is read from
+    the JVM plan through `df._jdf`, as in "How Catalyst Plans Python".
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The File from End to End
+
+    A Parquet file is written front to back and read back to front:
+
+    ```text
+    "PAR1"                                  4 bytes of magic
+    row group 0
+      column chunk user_id    [dictionary page] data page, data page, ...
+      column chunk event      [dictionary page] data page, ...
+      ...
+    row group 1
+      ...
+    column indexes and offset indexes       (page-level statistics)
+    bloom filters                           (if enabled)
+    FileMetaData                            Thrift compact protocol
+    footer length                           4 bytes, little-endian
+    "PAR1"                                  4 bytes of magic
+    ```
+
+    The writer cannot know the metadata until every row group is
+    flushed, so the metadata goes last. A reader seeks to the end, reads
+    8 bytes, and knows where the footer starts. Write the day-one events
+    and look:
+
+    ```python
+    import glob, struct
+    from pyspark.sql import functions as sf
+
+    day1 = (spark.read.json("data/messy/events/events_2026-10-01.json")
+            .withColumn("ts", sf.to_timestamp("ts")))
+    day1.coalesce(1).write.mode("overwrite").parquet("/tmp/pq_day1")
+    f = glob.glob("/tmp/pq_day1/*.parquet")[0]
+    data = open(f, "rb").read()
+    print(len(data), data[:4], data[-4:])
+    print(data[-12:].hex(" "))
+    (footer_len,) = struct.unpack("<I", data[-8:-4])
+    print("footer:", footer_len, "bytes, starting at offset", len(data) - 8 - footer_len)
+    ```
+
+    ```text
+    1619 b'PAR1' b'PAR1'
+    1c 00 00 00 88 03 00 00 50 41 52 31
+    footer: 904 bytes, starting at offset 707
+    ```
+
+    `88 03 00 00` is 904 in little-endian, and `50 41 52 31` is `PAR1`.
+    The 20 rows of data take about 700 bytes; the metadata describing
+    them takes 904. For tiny files the footer dominates, which is one
+    more reason small files hurt: every reader of every file pays a seek
+    to the end and a footer parse before it reads a single value.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Decoding the Footer Yourself
+
+    The footer is a `FileMetaData` struct from `parquet.thrift` (the
+    parquet-format project), serialized with Thrift's **compact
+    protocol**. The protocol is small enough to read by hand:
+
+    - A struct is a sequence of fields ending with a `0x00` byte (STOP).
+    - Each field starts with one byte: the high nibble is the field id
+      **delta** from the previous field (1 to 15), the low nibble the
+      type. A delta of 0 means the full id follows as a zigzag varint.
+    - Types: 1 and 2 are booleans (the value lives in the type nibble),
+      3 is i8, 4, 5 and 6 are i16, i32 and i64 as zigzag varints, 7 a
+      little-endian double, 8 binary (varint length, then bytes), 9 a
+      list, 11 a map, 12 a nested struct.
+    - A list header byte holds the size in its high nibble (15 means a
+      varint size follows) and the element type in its low nibble.
+
+    Here is a complete reader for everything a Parquet footer uses. It
+    returns each struct as a `{field_id: value}` dict:
+
+    ```python
+    class Compact:
+        def __init__(self, buf, pos=0):
+            self.buf, self.pos = buf, pos
+
+        def byte(self):
+            b = self.buf[self.pos]
+            self.pos += 1
+            return b
+
+        def varint(self):
+            shift = result = 0
+            while True:
+                b = self.byte()
+                result |= (b & 0x7F) << shift
+                if not b & 0x80:
+                    return result
+                shift += 7
+
+        def zigzag(self):
+            n = self.varint()
+            return (n >> 1) ^ -(n & 1)
+
+        def value(self, t):
+            if t in (1, 2):
+                return t == 1
+            if t == 3:
+                return struct.unpack("b", bytes([self.byte()]))[0]
+            if t in (4, 5, 6):
+                return self.zigzag()
+            if t == 7:
+                v = struct.unpack_from("<d", self.buf, self.pos)[0]
+                self.pos += 8
+                return v
+            if t == 8:
+                n = self.varint()
+                v = bytes(self.buf[self.pos:self.pos + n])
+                self.pos += n
+                return v
+            if t in (9, 10):
+                h = self.byte()
+                size, et = h >> 4, h & 0x0F
+                if size == 15:
+                    size = self.varint()
+                if et in (1, 2):          # booleans in a list: one byte each
+                    return [self.byte() == 1 for _ in range(size)]
+                return [self.value(et) for _ in range(size)]
+            if t == 11:
+                size = self.varint()
+                if size == 0:
+                    return {}
+                kv = self.byte()
+                return {self.value(kv >> 4): self.value(kv & 0x0F) for _ in range(size)}
+            if t == 12:
+                return self.struct()
+            raise ValueError(f"unknown compact type {t} at byte {self.pos}")
+
+        def struct(self):
+            fields, last = {}, 0
+            while True:
+                h = self.byte()
+                if h == 0:
+                    return fields
+                delta, t = h >> 4, h & 0x0F
+                fid = last + delta if delta else self.zigzag()
+                fields[fid] = self.value(t)
+                last = fid
+
+    meta = Compact(data, len(data) - 8 - footer_len).struct()
+    print(sorted(meta))
+    print("version", meta[1], "num_rows", meta[3], "row groups", len(meta[4]))
+    print(meta[6].decode())
+    for element in meta[2]:
+        print(element)
+    for kv in meta[5]:
+        print(kv[1].decode(), "=", kv[2][:60].decode(), "...")
+    ```
+
+    ```text
+    [1, 2, 3, 4, 5, 6, 7]
+    version 1 num_rows 20 row groups 1
+    parquet-mr version 1.17.0 (build fac0c746532e133beb928a7f6a7e57b510b477a1)
+    {4: b'spark_schema', 5: 4}
+    {1: 5, 3: 1, 4: b'amount'}
+    {1: 6, 3: 1, 4: b'event', 6: 0, 10: {1: {}}}
+    {1: 3, 3: 1, 4: b'ts'}
+    {1: 2, 3: 1, 4: b'user_id'}
+    org.apache.spark.version = 4.2.0 ...
+    org.apache.spark.sql.parquet.row.metadata = {"type":"struct","fields":[{"name":"amount","type":"double", ...
+    ```
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Reading the Numbers
+
+    The field ids are not guesses. The Thrift classes inside
+    `parquet-format-structures-1.17.0.jar` (shipped in pyspark's `jars/`)
+    list them; this is what they say for the structs you need:
+
+    | Struct | Fields |
+    |---|---|
+    | FileMetaData | 1 version, 2 schema, 3 num_rows, 4 row_groups, 5 key_value_metadata, 6 created_by, 7 column_orders |
+    | SchemaElement | 1 type, 3 repetition_type, 4 name, 5 num_children, 6 converted_type, 7 scale, 8 precision, 10 logicalType |
+    | RowGroup | 1 columns, 2 total_byte_size, 3 num_rows, 5 file_offset, 6 total_compressed_size, 7 ordinal |
+    | ColumnChunk | 3 meta_data, 4/5 offset index offset/length, 6/7 column index offset/length |
+    | ColumnMetaData | 1 type, 2 encodings, 3 path_in_schema, 4 codec, 5 num_values, 7 total_compressed_size, 9 data_page_offset, 11 dictionary_page_offset, 12 statistics, 14/15 bloom filter offset/length |
+    | Statistics | 1 max, 2 min (deprecated), 3 null_count, 5 max_value, 6 min_value |
+    | PageHeader | 1 type, 2 uncompressed size, 3 compressed size, 5 data page header, 7 dictionary page header, 8 data page header v2 |
+
+    And the enums: physical type 0 BOOLEAN, 1 INT32, 2 INT64, 3 INT96,
+    4 FLOAT, 5 DOUBLE, 6 BYTE_ARRAY, 7 FIXED_LEN_BYTE_ARRAY; repetition 0
+    REQUIRED, 1 OPTIONAL, 2 REPEATED; encoding 0 PLAIN, 2
+    PLAIN_DICTIONARY, 3 RLE, 4 BIT_PACKED, 5 DELTA_BINARY_PACKED, 7
+    DELTA_BYTE_ARRAY, 8 RLE_DICTIONARY; codec 0 UNCOMPRESSED, 1 SNAPPY,
+    2 GZIP, 6 ZSTD, 7 LZ4_RAW.
+
+    So `{1: 2, 3: 1, 4: b'user_id'}` is an OPTIONAL INT64 named
+    `user_id`; `{1: 3, 3: 1, 4: b'ts'}` is an OPTIONAL **INT96**. The
+    root element has `num_children` 4 and no type: it is a group. Spark
+    also stores its own schema as JSON in the key-value metadata
+    (`org.apache.spark.sql.parquet.row.metadata`), and its reader
+    (`ParquetReadSupport`) uses it to restore Spark types and column
+    metadata that the Parquet types alone don't carry: the INT96 `ts`
+    comes back as a Spark `timestamp` because the JSON says so.
+
+    pyarrow gives the same facts, decoded:
+
+    ```python
+    import pyarrow.parquet as pq
+    md = pq.ParquetFile(f).metadata
+    print(md.num_rows, md.num_row_groups, md.serialized_size, md.created_by)
+    col = md.row_group(0).column(3)
+    print(col.path_in_schema, col.physical_type, col.encodings, col.compression)
+    print(col.statistics.min, col.statistics.max, col.statistics.null_count)
+    ts = md.row_group(0).column(2)
+    print(ts.path_in_schema, ts.physical_type, ts.statistics.has_min_max)
+    ```
+
+    ```text
+    20 1 904 parquet-mr version 1.17.0 (build fac0c746532e133beb928a7f6a7e57b510b477a1)
+    user_id INT64 ('BIT_PACKED', 'PLAIN_DICTIONARY', 'RLE') SNAPPY
+    0 4 0
+    ts INT96 False
+    ```
+
+    Hold on to that last line: the timestamp column has **no min/max**.
+    It comes back later as a performance bug.
+
+- Class: mult_question
+  Depth: all
+  Output: "A reader opens a 2 GB Parquet file to answer `SELECT count(*)`. In what order does it read the file?"
+  AnswerChoices: "The last 8 bytes, then the footer, then nothing else if row counts are enough;From the first byte to the last, decoding every page;The first 4 bytes, then the first row group header, then each row group in turn;A separate index file written next to the Parquet file"
+  CorrectAnswer: "The last 8 bytes, then the footer, then nothing else if row counts are enough"
+  Hint: "Where is the footer length stored, and what does RowGroup field 3 contain?"
+
+- Class: text
+  Depth: all
+  Output: |
+    ## A Bigger File to Work With
+
+    Twenty rows don't show row groups or pages. From here on the lesson
+    uses a scaled-up copy of the day-one events built inside Spark from
+    hashes, so it is the same on every run: 200,000 rows over ten days
+    (2026-10-01 to 2026-10-10) and 5000 users, in random arrival order,
+    with a 16-character hex `session_id` added. The exercise uses the
+    same function:
+
+    ```python
+    def make_events(spark, n=200_000):
+        h = lambda salt: sf.pmod(sf.hash("id", sf.lit(salt)), sf.lit(1 << 30))
+        return spark.range(n).select(
+            (h(1) % 5000).cast("bigint").alias("user_id"),
+            sf.substring(sf.sha2(sf.col("id").cast("string"), 256), 1, 16).alias("session_id"),
+            sf.element_at(sf.array(*[sf.lit(e) for e in ["view", "cart", "purchase"]]),
+                          (h(2) % 3 + 1).cast("int")).alias("event"),
+            ((h(3) % 5000) / 100).cast("decimal(9,2)").alias("amount"),
+            sf.timestamp_seconds(sf.lit(1790812800) + (h(4) % 10) * 86400 + h(5) % 86400).alias("ts"),
+        )
+
+    events = make_events(spark).cache()
+    ```
+
+    The writer settings that shape a file, with their defaults in
+    parquet-mr 1.17.0 (`ParquetOutputFormat` and `ParquetProperties`) and
+    Spark 4.2.0 (`SQLConf`):
+
+    | Setting | Default | Controls |
+    |---|---|---|
+    | `parquet.block.size` | 128 MB | target row group size in bytes |
+    | `parquet.block.row.count.limit` | unlimited | maximum rows per row group |
+    | `parquet.page.size` | 1 MB | target page size |
+    | `parquet.page.row.count.limit` | 20,000 | maximum rows per page |
+    | `parquet.dictionary.page.size` | 1 MB | dictionary size before falling back to PLAIN |
+    | `parquet.enable.dictionary` | true | dictionary encoding |
+    | `parquet.writer.version` | v1 | page format and encodings |
+    | `spark.sql.parquet.compression.codec` | snappy | codec |
+    | `spark.sql.parquet.outputTimestampType` | INT96 | timestamp encoding |
+
+    Any of them can be passed as a writer option for one write.
+    `DataFrameWriter` options are copied into the Hadoop configuration of
+    the write job, and `ParquetUtils.prepareWrite` fills in Spark's own
+    keys only with `DataSourceUtils.setConfIfAbsent`, so an option wins
+    over the session value:
+
+    ```python
+    df.write.option("spark.sql.parquet.outputTimestampType", "TIMESTAMP_MICROS") \
+        .option("parquet.block.row.count.limit", 10000).parquet(path)
+    ```
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Pages, Byte by Byte
+
+    A column chunk is a sequence of pages, each a Thrift `PageHeader`
+    followed by `compressed_page_size` bytes. Walk them with the same
+    reader (written uncompressed so the bytes are readable):
+
+    ```python
+    (events.coalesce(1).sortWithinPartitions("user_id").write.mode("overwrite")
+        .option("compression", "none").parquet("/tmp/pq_pages"))
+    f = glob.glob("/tmp/pq_pages/*.parquet")[0]
+    data = open(f, "rb").read()
+    (n,) = struct.unpack("<I", data[-8:-4])
+    meta = Compact(data, len(data) - 8 - n).struct()
+    PAGE_TYPES = {0: "DATA_PAGE", 2: "DICTIONARY_PAGE", 3: "DATA_PAGE_V2"}
+
+    def pages(chunk):
+        md = chunk[3]
+        pos = md.get(11, md[9])                 # dictionary page first, if any
+        end = pos + md[7]                       # total_compressed_size
+        while pos < end:
+            r = Compact(data, pos)
+            header = r.struct()
+            yield pos, r.pos, header            # header start, body start, header
+            pos = r.pos + header[3]             # skip compressed_page_size bytes
+
+    for chunk in meta[4][0][1]:
+        name = chunk[3][3][0].decode()
+        for start, body, h in pages(chunk):
+            detail = h.get(5) or h.get(7)       # data or dictionary page header
+            print(f"{name:10} {PAGE_TYPES[h[1]]:15} at {start:8} size {h[3]:7} "
+                  f"values {detail[1]:6} encoding {detail[2]}")
+    ```
+
+    An excerpt of the output:
+
+    ```text
+    user_id    DICTIONARY_PAGE at        4 size   40000 values   5000 encoding 2
+    user_id    DATA_PAGE       at    40028 size    1494 values  20000 encoding 2
+    user_id    DATA_PAGE       at    41548 size    1488 values  20000 encoding 2
+    ...
+    session_id DATA_PAGE       at    55444 size  400008 values  20000 encoding 0
+    session_id DATA_PAGE       at   455481 size  400008 values  20000 encoding 0
+    ...
+    event      DICTIONARY_PAGE at  4055813 size      28 values      3 encoding 2
+    event      DATA_PAGE       at  4055860 size    5042 values  20000 encoding 2
+    ...
+    ts         DICTIONARY_PAGE at  4452348 size  916044 values  76337 encoding 2
+    ts         DATA_PAGE       at  5368416 size   37549 values  20000 encoding 2
+    ts         DATA_PAGE       at  5405994 size   40049 values  20000 encoding 2
+    ts         DATA_PAGE       at  5446072 size   40049 values  20000 encoding 2
+    ts         DATA_PAGE       at  5486150 size   42549 values  20000 encoding 2
+    ts         DATA_PAGE       at  5528728 size  240008 values  20000 encoding 0
+    ts         DATA_PAGE       at  5768765 size  240008 values  20000 encoding 0
+    ...
+    ```
+
+    Every column has ten data pages of 20,000 values: the page row
+    limit, not the 1 MB page size, cut them. Three encoding stories are
+    visible in the headers:
+
+    - **user_id, event, amount**: a dictionary page (PLAIN values) and
+      data pages of dictionary indices (encoding 2, PLAIN_DICTIONARY,
+      which is the v1 name for dictionary indices).
+    - **session_id**: no dictionary page at all, PLAIN pages of
+      `4 + 16` bytes per value. 200,000 distinct random strings would
+      make the dictionary bigger than the data, so the writer's
+      fallback (`FallbackValuesWriter` in parquet-mr) switched to PLAIN
+      before the first page was written.
+    - **ts**: the most instructive one. The first four pages are
+      dictionary indices; then the dictionary reached the 1 MB
+      `parquet.dictionary.page.size` limit (76,337 distinct INT96 values
+      of 12 bytes) and the writer **fell back mid-chunk**. The remaining
+      six pages are PLAIN (`240008` bytes = 20,000 x 12 + 8). Encoding is
+      decided page by page, which is why `ColumnMetaData.encodings` is a
+      list.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The RLE/Bit-Packed Hybrid
+
+    Dictionary indices and repetition/definition levels use one encoding,
+    a hybrid of run-length and bit-packing. A ULEB128 varint header
+    starts each run: if its low bit is 0, `header >> 1` repeats of one
+    value follow (the value in `ceil(bit_width / 8)` bytes); if it is 1,
+    `header >> 1` groups of 8 values follow, packed at `bit_width` bits
+    each, least significant bit first.
+
+    ```python
+    def rle_hybrid(buf, pos, end, bit_width, count):
+        out, byte_width = [], (bit_width + 7) // 8
+        while len(out) < count and pos < end:
+            header = shift = 0
+            while True:
+                b = buf[pos]; pos += 1
+                header |= (b & 0x7F) << shift; shift += 7
+                if not b & 0x80:
+                    break
+            if header & 1 == 0:
+                value = int.from_bytes(buf[pos:pos + byte_width], "little"); pos += byte_width
+                out += [value] * (header >> 1)
+            else:
+                n = (header >> 1) * 8
+                bits = int.from_bytes(buf[pos:pos + n * bit_width // 8], "little")
+                pos += n * bit_width // 8
+                out += [(bits >> (i * bit_width)) & ((1 << bit_width) - 1) for i in range(n)]
+        return out[:count], pos
+    ```
+
+    A v1 data page of an OPTIONAL top-level column holds: a 4-byte length
+    and the definition levels, then one byte with the bit width of the
+    indices, then the indices. Decode the first `user_id` page:
+
+    ```python
+    user_chunk = meta[4][0][1][0]
+    _, body, h = list(pages(user_chunk))[1]          # the first data page
+    print(data[body:body + 24].hex(" "))
+    (def_len,) = struct.unpack_from("<I", data, body)
+    defs, _ = rle_hybrid(data, body + 4, body + 4 + def_len, 1, h[5][1])
+    pos = body + 4 + def_len
+    bit_width = data[pos]
+    ids, _ = rle_hybrid(data, pos + 1, body + h[3], bit_width, h[5][1])
+    print("def levels:", set(defs), "bit width:", bit_width)
+    runs = []
+    for i in ids:
+        if runs and runs[-1][0] == i:
+            runs[-1][1] += 1
+        else:
+            runs.append([i, 1])
+    print("runs (id, count):", runs[:5], "...", len(runs), "runs")
+    dict_start, dict_body, dh = list(pages(user_chunk))[0]
+    dictionary = struct.unpack_from(f"<{dh[7][1]}q", data, dict_body)
+    print("dictionary[0:5]:", dictionary[:5])
+    ```
+
+    ```text
+    04 00 00 00 c0 b8 02 01 09 3e 00 00 66 01 00 48 02 00 50 03 00 36 04 00
+    def levels: {1} bit width: 9
+    runs (id, count): [[0, 31], [1, 51], [2, 36], [3, 40], [4, 27]] ... 495 runs
+    dictionary[0:5]: (0, 1, 2, 3, 4)
+    ```
+
+    Read the hex yourself: `04 00 00 00` is the length of the level
+    section. `c0 b8 02` is the varint 40,000, even, so a run of 20,000
+    copies of the 1-byte value `01`: every value is defined (no nulls).
+    `09` is the bit width; the page only refers to ids up to 494, and
+    9 bits reach 511. Then `3e 00 00` is a run of 31 copies of id 0,
+    `66 01 00` 51 copies of id 1, and so on: 20,000 values in about
+    1,500 bytes, because the column is sorted. The same data in arrival
+    order needs bit-packing for nearly every value. That is the physical
+    reason sorting shrinks files: it turns bit-packed groups into runs.
+
+    `event` is REQUIRED (it came from a non-null expression), so its
+    page has no level section, and with only 3 dictionary entries it is
+    bit-packed at width 2:
+
+    ```text
+    02 7f 40 04 08 2a 48 89
+    [0, 0, 0, 1, 0, 1, 0, 0, 0, 2, 0, 0]
+    ```
+
+    `02` is the width, `7f` the header 127 (odd: 63 groups of 8 values
+    bit-packed), and the indices point into the dictionary
+    `['view', 'purchase', 'cart']`.
+
+- Class: mult_question
+  Depth: all
+  Output: "In a v1 data page of a dictionary-encoded OPTIONAL column, the run header byte is 0x14 and the bit width is 11. What follows?"
+  AnswerChoices: "A 2-byte value repeated 10 times;20 bit-packed values of 11 bits;10 groups of 8 bit-packed values;A 1-byte value repeated 20 times"
+  CorrectAnswer: "A 2-byte value repeated 10 times"
+  Hint: "0x14 is 20, which is even. The run length is header >> 1, and the value takes ceil(bit_width / 8) bytes."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Encodings and Codecs, Measured
+
+    `parquet.writer.version=v2` switches to `DATA_PAGE_V2` pages and the
+    newer encodings. Spark's vectorized reader has decoded them since 3.3
+    (SPARK-36879: `VectorizedDeltaBinaryPackedReader`,
+    `VectorizedDeltaByteArrayReader` and friends in
+    `sql/core/src/main/java/org/apache/spark/sql/execution/datasources/parquet/`).
+
+    ```python
+    events.coalesce(1).sortWithinPartitions("user_id").write.mode("overwrite") \
+        .option("parquet.writer.version", "v2").parquet("/tmp/pq_v2")
+    md = pq.ParquetFile(glob.glob("/tmp/pq_v2/*.parquet")[0]).metadata
+    for j in range(md.num_columns):
+        c = md.row_group(0).column(j)
+        print(f"{c.path_in_schema:10} {c.encodings}")
+    ```
+
+    ```text
+    user_id    ('PLAIN', 'RLE_DICTIONARY')
+    session_id ('DELTA_BYTE_ARRAY',)
+    event      ('PLAIN', 'RLE_DICTIONARY')
+    amount     ('PLAIN', 'RLE_DICTIONARY')
+    ts         ('PLAIN', 'RLE_DICTIONARY')
+    ```
+
+    The page header type is 3 (`DATA_PAGE_V2`) and the file drops from
+    5,545,507 to 5,384,067 bytes (snappy, sorted). `session_id` now uses
+    `DELTA_BYTE_ARRAY` (shared prefixes plus suffixes) instead of PLAIN.
+    Before you switch a table to v2, check that every engine that reads
+    it supports v2 data pages.
+
+    The codec, for the same sorted data in one file
+    (`.option("compression", codec)`):
+
+    | Codec | Bytes |
+    |---|---|
+    | none | 6,971,721 |
+    | snappy (default) | 5,545,507 |
+    | lz4_raw | 5,615,703 |
+    | gzip | 3,881,559 |
+    | zstd | 3,654,035 |
+
+    The random hex session ids dominate the bytes: zstd and gzip find
+    their 4 bits of entropy per character, snappy and LZ4 mostly don't.
+    Compression applies **per page** after encoding, so a page must be
+    decompressed whole even when one value is needed. That is one more
+    reason the page index (below) matters.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Statistics and the Page Index
+
+    Each column chunk carries `Statistics` in its metadata. For a
+    10,000-row-group, user-sorted file:
+
+    ```python
+    (events.coalesce(1).sortWithinPartitions("user_id").write.mode("overwrite")
+        .option("parquet.block.row.count.limit", 10000).parquet("/tmp/pq_sorted"))
+    f = glob.glob("/tmp/pq_sorted/*.parquet")[0]
+    data = open(f, "rb").read()
+    (n,) = struct.unpack("<I", data[-8:-4])
+    meta = Compact(data, len(data) - 8 - n).struct()
+    for rg in meta[4][:3]:
+        user, session, event, amount, ts = (c[3] for c in rg[1])
+        print(rg[3], "user_id", user[12], "| ts", ts[12])
+    ```
+
+    ```text
+    10000 user_id {1: b'\xf9\x00\x00\x00\x00\x00\x00\x00', 2: b'\x00\x00\x00\x00\x00\x00\x00\x00', 3: 0, 5: b'\xf9\x00\x00\x00\x00\x00\x00\x00', 6: b'\x00\x00\x00\x00\x00\x00\x00\x00'} | ts {3: 0}
+    10000 user_id {1: b'\xee\x01\x00\x00\x00\x00\x00\x00', 2: b'\xf9\x00\x00\x00\x00\x00\x00\x00', 3: 0, 5: b'\xee\x01\x00\x00\x00\x00\x00\x00', 6: b'\xf9\x00\x00\x00\x00\x00\x00\x00'} | ts {3: 0}
+    ...
+    ```
+
+    Values are PLAIN-encoded: `f9 00 ... 00` is the INT64 249. The
+    writer fills both the deprecated `min`/`max` (fields 2 and 1) and
+    the newer `min_value`/`max_value` (6 and 5) for signed integers.
+    The old pair was defined with an ambiguous sort order, so readers
+    only trust it where signed comparison is the right one; for strings
+    only the new pair is written. And `ts`, an INT96, has only a null
+    count: the Parquet format leaves INT96's sort order undefined, and
+    parquet-mr writes no min/max for it.
+
+    Row-group statistics are coarse. parquet-mr also stores a **column
+    index** (min/max per page) and an **offset
+    index** (where each page starts and its first row), after the row
+    groups. In a single 200,000-row group sorted by user:
+
+    ```python
+    f = glob.glob("/tmp/pq_sorted_1_row_group/*.parquet")[0]   # written in the next section
+    data = open(f, "rb").read()
+    (n,) = struct.unpack("<I", data[-8:-4])
+    meta = Compact(data, len(data) - 8 - n).struct()
+    user_chunk = meta[4][0][1][0]
+    ci = Compact(data, user_chunk[6]).struct()
+    oi = Compact(data, user_chunk[4]).struct()
+    print("boundary order", ci[4], "null pages", ci[1])
+    print("page min/max", [(struct.unpack("<q", lo)[0], struct.unpack("<q", hi)[0])
+                           for lo, hi in zip(ci[2], ci[3])])
+    print("pages (offset, size, first row)", [(p[1], p[2], p[3]) for p in oi[1]])
+    print("ts has a column index:", 6 in meta[4][0][1][4])
+    ```
+
+    ```text
+    boundary order 1 null pages [False, False, False, False, False, False, False, False, False, False]
+    page min/max [(0, 494), (494, 986), (986, 1481), (1481, 1984), (1984, 2492), (2492, 2987), (2987, 3491), (3491, 3989), (3989, 4495), (4495, 4999)]
+    pages (offset, size, first row) [(20047, 1526, 0), (21573, 1520, 20000), (23093, 1529, 40000), (24622, 1562, 60000), (26184, 1568, 80000), (27752, 1529, 100000), (29281, 1566, 120000), (30847, 1538, 140000), (32385, 1562, 160000), (33947, 1567, 180000)]
+    ts has a column index: False
+    ```
+
+    Boundary order 1 is ASCENDING: the writer noticed the pages are
+    sorted, which lets a reader binary-search them. The INT96 column has
+    no column index either. Long strings are truncated to 64 bytes in
+    the column index (`parquet.columnindex.truncate.length`), while
+    row-group statistics keep the full value by default
+    (`parquet.statistics.truncate.length` is unlimited), so a column of
+    long, similar URLs can have exact chunk statistics and nearly useless
+    page statistics.
+
+- Class: mult_question
+  Depth: all
+  Output: "Why does a TIMESTAMP column that Spark 4.2 wrote with default settings never let a range filter skip a row group?"
+  AnswerChoices: "It is written as INT96, which gets no min/max statistics and no column index;Spark never pushes timestamp filters to Parquet;Timestamps are always dictionary-encoded, and dictionaries can't answer range filters;The session time zone makes the statistics unreliable, so Spark ignores them"
+  CorrectAnswer: "It is written as INT96, which gets no min/max statistics and no column index"
+  Hint: "Look at spark.sql.parquet.outputTimestampType's default and at the ts Statistics struct you decoded."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## From PushedFilters to a Skipped Row Group
+
+    The plan's `PushedFilters` is a promise, not a result. Here is the
+    path a filter takes in 4.2.0 (file paths under
+    `sql/core/src/main/` in the Spark repo):
+
+    1. `FileSourceStrategy` splits the filter into partition filters and
+       data filters, and translates the data filters into
+       `org.apache.spark.sql.sources.Filter` objects. Those are the
+       `PushedFilters` you see. The `Filter` node stays in the plan above
+       the scan, always, because skipping is coarse.
+    2. In each task, `ParquetFileFormat.buildReaderWithPartitionValues`
+       (`scala/.../datasources/parquet/ParquetFileFormat.scala`) reads
+       **that file's** footer and builds a `ParquetFilters` from the
+       file's own schema. `ParquetFilters.createFilter` converts each
+       source filter into a parquet-mr `FilterPredicate`, or drops it
+       when it can't (`flatMap`): a column missing from this file, an
+       unsupported type, a type that has been disabled.
+    3. The predicate goes into the Hadoop conf with
+       `ParquetInputFormat.setFilterPredicate`.
+    4. parquet-mr's `ParquetFileReader` drops whole row groups with
+       three independent tests (`RowGroupFilter`): statistics
+       (`parquet.filter.stats.enabled`), dictionaries
+       (`parquet.filter.dictionary.enabled`) and bloom filters
+       (`parquet.filter.bloom.enabled`). All default to true.
+    5. In the surviving row groups, `ColumnIndexFilter` turns page
+       statistics into row ranges (`parquet.filter.columnindex.enabled`,
+       default true), and `readNextFilteredRowGroup` returns only the
+       matching pages. Spark's `VectorizedParquetRecordReader` has
+       handled those row ranges since 3.2 (SPARK-26345, with
+       SPARK-34859 for synchronizing pages across columns).
+    6. Rows inside surviving pages are **not** filtered by parquet-mr:
+       record-level filtering (`spark.sql.parquet.recordLevelFilter.enabled`)
+       is off by default and only applies to the non-vectorized reader.
+       The `Filter` node above the scan does that work.
+
+    Step 6 gives you a measuring instrument. The vectorized reader
+    returns every row of every surviving page, so the scan's
+    `number of output rows` metric counts exactly what skipping left.
+    (Its `size of files read` metric is no help: it is the size of the
+    files, not the bytes read.) In classic mode you can read it from the
+    executed plan after an action:
+
+    ```python
+    def rows_scanned(df):
+        rows = df.collect()
+        plan = df._jdf.queryExecution().executedPlan()
+        total = 0
+
+        def walk(node):
+            nonlocal total
+            name = node.getClass().getSimpleName()
+            if name == "AdaptiveSparkPlanExec":
+                return walk(node.executedPlan())
+            if name == "FileSourceScanExec":
+                total += node.metrics().apply("numOutputRows").value()
+            children = node.children().iterator()
+            while children.hasNext():
+                walk(children.next())
+
+        walk(plan)
+        return rows, total
+    ```
+
+    (A plan with a shuffle wraps stages in `QueryStageExec` leaves after
+    AQE runs; the lookups in this lesson have no shuffle, so the walk
+    stays simple.)
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Measuring Each Mechanism
+
+    The same 200,000 events, four layouts, one query
+    (`user_id = 1234`, 38 matching rows):
+
+    ```python
+    for name, w in [
+            ("arrival order, 1 row group", events.coalesce(1).write),
+            ("arrival order, 20 row groups", events.coalesce(1).write.option("parquet.block.row.count.limit", 10000)),
+            ("sorted, 20 row groups", events.coalesce(1).sortWithinPartitions("user_id").write.option("parquet.block.row.count.limit", 10000)),
+            ("sorted, 1 row group", events.coalesce(1).sortWithinPartitions("user_id").write)]:
+        path = "/tmp/pq_" + name.replace(" ", "_").replace(",", "")
+        w.mode("overwrite").parquet(path)
+        rows, scanned = rows_scanned(spark.read.parquet(path).filter("user_id = 1234"))
+        print(f"{name:30} rows {len(rows):3}  scanned {scanned:7,}")
+    ```
+
+    ```text
+    arrival order, 1 row group     rows  38  scanned 200,000
+    arrival order, 20 row groups   rows  38  scanned 140,000
+    sorted, 20 row groups          rows  38  scanned  20,000
+    sorted, 1 row group            rows  38  scanned  20,000
+    ```
+
+    Each line has its own explanation:
+
+    - **Arrival order, one row group**: min/max is 0 to 4999 and the
+      dictionary contains 1234. Nothing to skip.
+    - **Arrival order, 20 row groups**: min/max is still useless, yet 6
+      row groups were dropped. That is **dictionary filtering**: with
+      5000 users and 10,000 rows per group, some groups never see user
+      1234, and their dictionary proves it.
+    - **Sorted, 20 row groups**: two row groups, not one. Ask the footer
+      which ones overlap, with the `row_group_stats` you write in the
+      exercise: `[(4, 986, 1234), (5, 1234, 1481)]`. User 1234's rows
+      straddle a boundary.
+    - **Sorted, one row group**: the row group can't be skipped, but the
+      **column index** keeps one page of 20,000 rows.
+
+    Switching the mechanisms off one at a time, on the sorted
+    one-row-group file (`spark.read.option(key, "false")`, which reaches
+    the Hadoop conf of the scan):
+
+    | Disabled | Rows scanned |
+    |---|---|
+    | nothing | 20,000 |
+    | `parquet.filter.stats.enabled` | 20,000 |
+    | `parquet.filter.dictionary.enabled` | 20,000 |
+    | `parquet.filter.columnindex.enabled` | 200,000 |
+    | all three | 200,000 |
+
+    And for a value that never occurs, `event = 'refund'` on the
+    arrival-order file: 0 rows scanned, and 200,000 with
+    `parquet.filter.dictionary.enabled=false`. Min/max (`cart` to `view`)
+    can't exclude `refund`; only the dictionary can.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Read `/tmp/pq_sorted` with the column index filter of parquet-mr
+    switched off for this read only, and keep the rows where
+    `user_id = 1234`. Name the result `q`.
+  CorrectAnswer: |
+    q = spark.read.option("parquet.filter.columnindex.enabled", "false").parquet("/tmp/pq_sorted").filter("user_id = 1234")
+  Hint: "Reader options reach the scan's Hadoop configuration. The key is parquet.filter.columnindex.enabled."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Bloom Filters: When Min/Max Can't Help
+
+    `session_id` is random, so every row group's min/max spans almost
+    the whole key space and dictionary filtering is off the table (no
+    dictionary). A **split-block bloom filter** per column chunk
+    answers "definitely not here" with a configurable false-positive
+    rate. Spark has used them on read since 3.2 (SPARK-34562); on write
+    you enable them per column with parquet-mr's options:
+
+    ```python
+    key = events.filter("user_id = 4321").select("session_id").first()[0]
+
+    def write(path, **options):
+        w = events.coalesce(1).write.mode("overwrite").option("parquet.block.row.count.limit", 2000)
+        for k, v in options.items():
+            w = w.option(k, v)
+        w.parquet(path)
+        f = glob.glob(path + "/*.parquet")[0]
+        chunk = pq.ParquetFile(f).metadata.row_group(0).column(1)
+        _, scanned = rows_scanned(spark.read.parquet(path).filter(sf.col("session_id") == key))
+        print(f"{path:18} {os.path.getsize(f):>12,} bytes  bloom/row group {chunk.bloom_filter_length}  scanned {scanned:,}")
+
+    write("/tmp/pq_nobloom")
+    write("/tmp/pq_bloom_1mb", **{"parquet.bloom.filter.enabled#session_id": "true"})
+    write("/tmp/pq_bloom", **{"parquet.bloom.filter.enabled#session_id": "true",
+                              "parquet.bloom.filter.expected.ndv#session_id": "2000"})
+    ```
+
+    ```text
+    /tmp/pq_nobloom       7,086,877 bytes  bloom/row group None  scanned 200,000
+    /tmp/pq_bloom_1mb   111,947,277 bytes  bloom/row group 1048594  scanned 2,000
+    /tmp/pq_bloom         7,498,877 bytes  bloom/row group 4112  scanned 2,000
+    ```
+
+    Both bloom layouts find the one row group. The middle line is the
+    trap: without `parquet.bloom.filter.expected.ndv#col`, parquet-mr
+    sizes every filter at `parquet.bloom.filter.max.bytes` (1 MiB), so
+    100 row groups add 100 MiB to a 7 MB file. Size the filter for the
+    distinct values **per row group**, not per table. With the expected
+    NDV set to 2000 and the default false-positive probability
+    (`parquet.bloom.filter.fpp`, 0.01) each filter is 4 KiB. Reading
+    with `parquet.filter.bloom.enabled=false` scans all 200,000 rows
+    again.
+
+    Bloom filters only answer equality and `IN`. They are worth their
+    bytes on high-cardinality columns that queries look up by value
+    (ids, hashes, emails) and that you can't sort by.
+
+- Class: mult_question
+  Depth: all
+  Output: "A table has 400 row groups per file. You enable `parquet.bloom.filter.enabled#order_id` and nothing else. What happens?"
+  AnswerChoices: "Each row group gets a 1 MiB bloom filter, adding about 400 MiB per file;Spark refuses the option because the NDV is missing;Each row group gets a filter sized from the column's actual distinct count;The option is ignored because Spark only reads bloom filters"
+  CorrectAnswer: "Each row group gets a 1 MiB bloom filter, adding about 400 MiB per file"
+  Hint: "Without an expected NDV, parquet-mr uses parquet.bloom.filter.max.bytes for every column chunk."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## INT96 Timestamps, and How the Plan Hides It
+
+    Sort by `ts`, write it both ways, and query a two-hour window:
+
+    ```python
+    window = (sf.col("ts") >= sf.lit("2026-10-05 08:00:00").cast("timestamp")) & \
+             (sf.col("ts") < sf.lit("2026-10-05 10:00:00").cast("timestamp"))
+    by_ts = events.coalesce(1).sortWithinPartitions("ts").write.mode("overwrite") \
+        .option("parquet.block.row.count.limit", 10000)
+    by_ts.parquet("/tmp/pq_ts_int96")
+    by_ts.option("spark.sql.parquet.outputTimestampType", "TIMESTAMP_MICROS").parquet("/tmp/pq_ts_micros")
+    for path in ["/tmp/pq_ts_int96", "/tmp/pq_ts_micros"]:
+        rows, scanned = rows_scanned(spark.read.parquet(path).filter(window))
+        print(path, len(rows), f"{scanned:,}")
+    ```
+
+    ```text
+    /tmp/pq_ts_int96 1644 200,000
+    /tmp/pq_ts_micros 1644 10,000
+    ```
+
+    The INT96 plan shows the timestamp filter in `PushedFilters` just
+    like the MICROS one. `ParquetFilters` only converts a timestamp
+    filter for TIMESTAMP_MICROS or TIMESTAMP_MILLIS columns (the doc of
+    the internal `spark.sql.parquet.filterPushdown.timestamp`), and the
+    INT96 file would have no statistics to test anyway, so the filter
+    is dropped per file in step 2, with no message.
+
+    While you are in the plan, look at the pushed values:
+
+    ```text
+    PushedFilters: [IsNotNull(ts), GreaterThanOrEqual(ts,2026-10-05 01:00:00.0), LessThan(ts,2026-10-05 03:00:00.0)]
+    ```
+
+    The session time zone is UTC and the query says 08:00. The pushed
+    filter holds a `java.sql.Timestamp`, whose `toString` uses the
+    **JVM default** time zone (this machine runs in PDT, UTC-7). The
+    instant is right; only the display is local. Don't "fix" a filter
+    because its plan string looks seven hours off.
+
+    For new tables, write `TIMESTAMP_MICROS`. INT96 is the default for
+    compatibility with older Hive and Impala readers.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What Never Reaches Parquet
+
+    On the user-sorted 20-row-group file:
+
+    ```python
+    import re
+    p = "/tmp/pq_sorted_20_row_groups"
+    for cond in ["user_id = 1234", "user_id + 1 = 1235", "cast(user_id as string) = '1234'",
+                 "user_id IN (0, 4999)", "user_id IN (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 4999)",
+                 "user_id BETWEEN 1230 AND 1240"]:
+        q = spark.read.parquet(p).filter(cond)
+        pushed = re.findall(r"PushedFilters: \[.*?\]", q._jdf.queryExecution().executedPlan().toString())
+        print(f"{cond:52} scanned {rows_scanned(q)[1]:>7,}  {pushed[0][15:]}")
+    ```
+
+    ```text
+    user_id = 1234                                       scanned  20,000  [IsNotNull(user_id), EqualTo(user_id,1234)]
+    user_id + 1 = 1235                                   scanned 200,000  [IsNotNull(user_id)]
+    cast(user_id as string) = '1234'                     scanned 200,000  [IsNotNull(user_id)]
+    user_id IN (0, 4999)                                 scanned  20,000  [In(user_id, [0,4999]
+    user_id IN (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 4999)      scanned  20,000  [In(user_id, [0,1,2,3,4,4999,5,6,7,8,9]
+    user_id BETWEEN 1230 AND 1240                        scanned  20,000  [IsNotNull(user_id), GreaterThanOrEqual(user_id,1230), LessThanOrEqual(user_id,1240)]
+    ```
+
+    (The non-greedy regex stops at the first `]`, which cuts the `In`
+    lists short.)
+
+    - **Expressions on the column** (`user_id + 1`, a cast, a UDF) are
+      not source filters. Rewrite them onto the bare column.
+    - **IN lists.** Up to `spark.sql.parquet.pushdown.inFilterThreshold`
+      (internal, default 10) values become an OR of equalities. Above
+      it, the config's own doc string says Spark pushes a min-to-max
+      range, which here would scan all 200,000 rows. The 4.2.0 code
+      does something better: it uses parquet-mr's native `in` predicate
+      (`makeInPredicate` in `ParquetFilters.scala`, SPARK-32792, 3.2),
+      so the 11-value list still reads only the first and last row
+      groups. The doc string is stale; trust the measurement.
+    - **Repeated fields.** `ParquetFilters` only maps non-repeated
+      primitive columns (SPARK-39393), so
+      `exists(items, i -> i.sku = 'P4')` pushes nothing at all
+      (`PushedFilters: []`).
+    - **Shredded VARIANT fields**, next.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Shredded VARIANT Fields Have Statistics Spark Doesn't Use
+
+    "VARIANT Shredding and Performance" showed that a typed extraction
+    is pushed into the scan. Does it skip row groups? Shred a VARIANT
+    built from the events, sorted by user:
+
+    ```python
+    v = events.select(
+        sf.parse_json(sf.to_json(sf.struct("event", sf.struct(sf.col("user_id").alias("id")).alias("user"), "amount"))).alias("v"),
+        "user_id")
+    (v.coalesce(1).sortWithinPartitions("user_id").drop("user_id").write.mode("overwrite")
+        .option("parquet.block.row.count.limit", 10000).parquet("/tmp/pq_variant"))
+    ```
+
+    The footer of row group 1 (pyarrow), and the query:
+
+    ```text
+      optional group field_id=-1 v (Variant(1)) {
+    v.metadata                                     BYTE_ARRAY
+    v.value                                        BYTE_ARRAY
+    v.typed_value.amount.value                     BYTE_ARRAY
+    v.typed_value.amount.typed_value               INT64      (Decimal('0.00'), Decimal('49.99'))
+    v.typed_value.event.value                      BYTE_ARRAY
+    v.typed_value.event.typed_value                BYTE_ARRAY ('cart', 'view')
+    v.typed_value.user.value                       BYTE_ARRAY
+    v.typed_value.user.typed_value.id.value        BYTE_ARRAY
+    v.typed_value.user.typed_value.id.typed_value  INT64      (249, 494)
+    ```
+
+    ```python
+    import re
+    q = spark.read.parquet("/tmp/pq_variant").filter(sf.try_variant_get("v", "$.user.id", "int") == 1234)
+    print(re.findall(r"PushedFilters: \[.*?\]", q._jdf.queryExecution().executedPlan().toString()))
+    rows, scanned = rows_scanned(q)
+    print(len(rows), f"{scanned:,}")
+    ```
+
+    ```text
+    ['PushedFilters: [IsNotNull(v), EqualTo(v.`1`,1234)]']
+    38 200,000
+    ```
+
+    The shredded `user.id` column has perfect per-row-group statistics
+    (249 to 494 in row group 1), the plan shows a pushed `EqualTo`, and
+    nothing is skipped. Step 2 explains it: the pushed filter names
+    `v.1`, the numbered field of the scan's request struct, while
+    `ParquetFilters` maps names to the file's **physical** columns
+    (`v.typed_value.user.typed_value.id.typed_value`). No column matches,
+    so `createFilter` drops it. In 4.2.0 shredding saves decoding and
+    I/O for the columns you read; it does not give you data skipping on
+    VARIANT fields. The 4.1 group annotation `Variant(1)` comes from
+    `spark.sql.parquet.variant.annotateLogicalType.enabled` (internal,
+    default true). For skipping, promote the field to a real column, as
+    that lesson recommends.
+
+- Class: mult_question
+  Depth: all
+  Output: "A plan shows `PushedFilters: [IsNotNull(v), EqualTo(v.`1`,42)]` for a filter on a shredded VARIANT field. What does that tell you about row group skipping in 4.2.0?"
+  AnswerChoices: "Nothing: PushedFilters lists candidates, and this one is dropped per file because no physical column is named v.1;Row groups whose shredded column excludes 42 are skipped;Pages are skipped through the column index but row groups are not;Only files written by Spark 4.2 are skipped"
+  CorrectAnswer: "Nothing: PushedFilters lists candidates, and this one is dropped per file because no physical column is named v.1"
+  Hint: "ParquetFilters is built from each file's own Parquet schema and silently drops filters it can't map."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Nested Columns: Repetition and Definition Levels
+
+    Parquet stores `items[].sku` as one flat column of leaf values plus
+    two small integers per entry. The schema Spark writes for
+    `items array<struct<sku:string,qty:bigint>>` is the three-level LIST
+    layout:
+
+    ```text
+    optional group items (List) {          level 1: items is defined
+      repeated group list {                level 2: at least one element; repeats
+        optional group element {           level 3: the element is not null
+          optional binary sku (String);    level 4: sku is not null
+          optional int64 qty;
+        }
+      }
+    }
+    ```
+
+    The **definition level** of an entry says how deep the path is
+    defined (0 to 4 here); the **repetition level** says at which
+    repeated level this entry starts a new element (0 means a new row,
+    1 another element in the same list). Decode them from a real page:
+    read a v1 data page header, then the repetition levels and the
+    definition levels, each preceded by a 4-byte length and encoded
+    with `rle_hybrid` at `max_level.bit_length()` bits:
+
+    ```python
+    def levels(path, leaf, max_rep, max_def):
+        data = open(glob.glob(path + "/*.parquet")[0], "rb").read()
+        (n,) = struct.unpack("<I", data[-8:-4])
+        meta = Compact(data, len(data) - 8 - n).struct()
+        chunk = next(c[3] for c in meta[4][0][1] if c[3][3][-1] == leaf.encode())
+        r = Compact(data, chunk[9]); header = r.struct(); pos = r.pos
+        count = header[5][1]
+        out = []
+        for max_level in (max_rep, max_def):     # v1 page: rep levels, then def levels
+            (length,) = struct.unpack_from("<I", data, pos)
+            lv, _ = rle_hybrid(data, pos + 4, pos + 4 + length, max_level.bit_length(), count)
+            out.append(lv)
+            pos += 4 + length
+        return count, out[0], out[1]
+    ```
+
+    On the three days of events (sorted by `ts`, uncompressed), the sku
+    column has 81 entries for 60 rows. Entries 18 to 23 cover the last
+    two day-one rows (no `items`) and the first two day-two rows (three
+    items, then one):
+
+    ```text
+    entries 18-23 rep: [0, 0, 0, 1, 1, 0]
+    entries 18-23 def: [0, 0, 4, 4, 4, 4]
+    ```
+
+    The events have no empty lists or null elements, so build the full
+    set of cases:
+
+    ```python
+    demo = spark.createDataFrame(
+        [(1, None), (2, []), (3, [None]), (4, [("P1", None), (None, 2)]), (5, [("P4", 3), ("P2", 1)])],
+        "id int, items array<struct<sku:string,qty:bigint>>")
+    ```
+
+    ```text
+    sku rep [0, 0, 0, 0, 1, 0, 1] def [0, 1, 2, 4, 3, 4, 4]
+    qty rep [0, 0, 0, 0, 1, 0, 1] def [0, 1, 2, 3, 4, 4, 4]
+    ```
+
+    | Row | items | sku entries (rep, def) |
+    |---|---|---|
+    | 1 | NULL | (0, 0) |
+    | 2 | `[]` | (0, 1) |
+    | 3 | `[NULL]` | (0, 2) |
+    | 4 | `[{P1, NULL}, {NULL, 2}]` | (0, 4), (1, 3) |
+    | 5 | `[{P4, 3}, {P2, 1}]` | (0, 4), (1, 4) |
+
+    Each null, empty list and missing field costs one entry with a low
+    definition level and no value. Two consequences for messy data: a
+    reader must decode levels for every entry even when it wants one
+    field, and a leaf has no per-row statistics that a row filter could
+    use, which is the root of SPARK-39393.
+
+- Class: mult_question
+  Depth: all
+  Output: "With the same schema, what are the sku entries (rep, def) for a row whose items are `[{NULL, 5}]`?"
+  AnswerChoices: "One entry (0, 3);One entry (0, 2);Two entries (0, 3) and (1, 4);One entry (0, 4) with a NULL value"
+  CorrectAnswer: "One entry (0, 3)"
+  Hint: "The list has one element, so one entry starting a new row. The element is defined (level 3), its sku is not (level 4 is not reached)."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Splits Are Byte Ranges, Row Groups Are Not
+
+    A file bigger than `spark.sql.files.maxPartitionBytes` (128 MB by
+    default) is split into byte ranges, one task each. Row groups don't
+    line up with those ranges, so `ParquetFooterReader.buildFilter`
+    passes the task's range to parquet-mr (`withRange`), which keeps
+    the row groups whose **midpoint** falls inside it. With a 1 MB
+    split size on the 6 MB, 20-row-group file:
+
+    ```python
+    spark.conf.set("spark.sql.files.maxPartitionBytes", "1m")
+    d = spark.read.parquet("/tmp/pq_sorted_20_row_groups")
+    print(d.rdd.getNumPartitions())
+    print(d.groupBy(sf.spark_partition_id().alias("task")).count().orderBy("task").collect())
+    ```
+
+    ```text
+    6
+    [Row(task=0, count=30000), Row(task=1, count=40000), Row(task=2, count=30000), Row(task=3, count=40000), Row(task=4, count=30000), Row(task=5, count=30000)]
+    ```
+
+    Every task gets whole row groups (multiples of 10,000 rows). If a
+    row group is bigger than the split size, some tasks get none at all
+    and finish instantly: a row group is the unit of parallelism for
+    Parquet. Writing 1 GB row groups doesn't make reads faster; it
+    makes them serial.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Aggregates from the Footer
+
+    `spark.sql.parquet.aggregatePushdown` (default false, since 3.3)
+    answers MIN, MAX and COUNT from footer statistics. It only exists in
+    the DSv2 Parquet scan, and Spark 4.2 still reads Parquet through the
+    V1 `FileSourceScanExec` by default
+    (`spark.sql.sources.useV1SourceList` defaults to
+    `avro,csv,json,kafka,orc,parquet,text`). Setting the flag alone
+    changes nothing; the plan keeps a `FileScan parquet` that reads
+    every value. Remove `parquet` from the V1 list as well:
+
+    ```python
+    spark.conf.set("spark.sql.parquet.aggregatePushdown", "true")
+    spark.conf.set("spark.sql.sources.useV1SourceList", "avro,csv,json,kafka,orc,text")
+    spark.read.parquet("/tmp/pq_sorted_20_row_groups") \
+        .agg(sf.min("user_id"), sf.max("user_id"), sf.count("*")).explain()
+    ```
+
+    ```text
+    +- BatchScan parquet file:/tmp/pq_sorted_20_row_groups[min(user_id)#767L, max(user_id)#768L, count(*)#769L] ParquetScan ... PushedAggregation: [MIN(user_id), MAX(user_id), COUNT(*)], ...
+    ```
+
+    The result is the same (`0, 4999, 200000`), computed from 20 row
+    group footers. The config doc warns that a file without statistics
+    makes the query fail, and the switch to the V2 scan changes other
+    behaviour too, so treat this as a targeted tool, not a default.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Designing for Skipping
+
+    Everything above turns into a short list of layout rules:
+
+    - **Sort by what you look up.** Statistics and the column index
+      only skip when values are clustered. A sort costs one shuffle at
+      write time and pays back on every read; it also shrinks the file
+      (runs instead of bit-packing).
+    - **You get one sort order.** Two lookup columns compete. Cluster by
+      the coarse one (a day) and sort by the fine one inside it, or put
+      a bloom filter on the column you can't sort by.
+    - **Size row groups for the lookups and the parallelism.** Smaller
+      row groups skip more finely; each one costs footer space, a seek
+      and less compression. 128 MB is a throughput default, not a law.
+    - **Use types that have statistics.** TIMESTAMP_MICROS, not INT96.
+    - **Size bloom filters per row group** with
+      `parquet.bloom.filter.expected.ndv#col`.
+    - **Check `partitionBy`.** The planned-write rule `V1Writes`
+      (`sql/core/.../datasources/V1Writes.scala`) requires the data to
+      be sorted by the partition columns. If your sort doesn't start
+      with them, it adds its own `Sort` on the partition columns and
+      your order inside each partition is gone:
+
+      ```python
+      for order in [["user_id"], ["day", "user_id"]]:
+          path = "/tmp/pq_by_day_" + "_".join(order)
+          (events.withColumn("day", sf.to_date("ts")).repartition("day").sortWithinPartitions(*order)
+              .write.mode("overwrite").partitionBy("day").option("parquet.block.row.count.limit", 1000).parquet(path))
+          f = glob.glob(path + "/day=2026-10-05/*.parquet")[0]
+          stats = row_group_stats(f, "user_id")
+          print(order, "row groups", len(stats), "first ranges", [(lo, hi) for _, lo, hi in stats[:3]])
+      ```
+
+      ```text
+      ['user_id'] row groups 21 first ranges [(1, 4997), (5, 4999), (1, 4997)]
+      ['day', 'user_id'] row groups 21 first ranges [(0, 229), (229, 476), (476, 707)]
+      ```
+
+      Same data, same row groups; only the first layout's statistics are
+      useless. Always sort by the partition columns first.
+    - **Verify with the footer and the metric**, never with the plan
+      alone.
+
+- Class: mult_question
+  Depth: all
+  Output: "You write `df.repartition(\"day\").sortWithinPartitions(\"user_id\").write.partitionBy(\"day\")`. Why are the user_id statistics of each file useless?"
+  AnswerChoices: "V1Writes adds a sort on day because your ordering doesn't start with it, which discards the user_id order;partitionBy disables statistics;repartition shuffles after the sort;Parquet sorts every file by the first column"
+  CorrectAnswer: "V1Writes adds a sort on day because your ordering doesn't start with it, which discards the user_id order"
+  Hint: "A partitioned write needs rows grouped by the partition columns. If the existing order doesn't provide that, Spark sorts again."
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: A Layout That Skips
+
+    The exercise builds the 200,000 scaled events, writes a naive
+    one-file copy, and grades your code against it. The `Compact`
+    reader and `rows_scanned` are provided.
+
+    1. `footer_bytes(path)`: return the raw Thrift footer of a Parquet
+       file. Check both `PAR1` magics and that the length fits; raise
+       `ValueError` otherwise (the harness feeds it a PNG, a Markdown
+       file and a Parquet file with its last byte cut off).
+    2. `row_group_stats(path, column)`: decode the footer with `Compact`
+       and return `[(num_rows, min, max), ...]` per row group for an
+       INT64 column, from `min_value`/`max_value`. It must agree with
+       pyarrow exactly.
+    3. `write_layout(events, path)`: write the events so that three
+       queries read little. The harness counts rows scanned, out of
+       200,000:
+
+       | Query | Target |
+       |---|---|
+       | `user_id = 1234` | at most 15% |
+       | `session_id = <one random id>` | at most 5% |
+       | `ts` in a two-hour window on 2026-10-05 | at most 15% |
+
+       Constraints: every row kept, at most 16 files, at most 400 row
+       groups, at most 1.5 times the bytes of the naive file. Every
+       query must return exactly the naive file's rows.
+
+    There is no single answer. Work out the arithmetic before you code:
+    with 20,000 rows per day and a user present on every day, how big
+    can a row group be so that a user lookup reads 15% at most?
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "One file, sorted by (to_date(ts), user_id), with parquet.block.row.count.limit around 1000 meets the user and window targets. Add parquet.bloom.filter.enabled#session_id with parquet.bloom.filter.expected.ndv#session_id set to the row group size, and write ts as TIMESTAMP_MICROS (spark.sql.parquet.outputTimestampType works as a writer option). In row_group_stats, unpack Statistics fields 6 and 5 with struct.unpack('<q', ...)."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - A Parquet file is `PAR1`, row groups of column chunks of pages,
+      page indexes and bloom filters, a Thrift compact `FileMetaData`,
+      a 4-byte little-endian length and `PAR1`. You can decode all of
+      it with a hundred lines of Python.
+    - Pages carry their own encoding: dictionary indices in the
+      RLE/bit-packed hybrid, PLAIN after a dictionary overflows
+      (`parquet.dictionary.page.size`, 1 MB) or when values are too
+      distinct, `DELTA_BYTE_ARRAY` and `RLE_DICTIONARY` with the v2
+      writer. Sorting turns bit-packing into runs.
+    - `PushedFilters` are candidates. Each task rebuilds
+      `ParquetFilters` from its file's schema and drops what it can't
+      map; parquet-mr then skips row groups by statistics, dictionaries
+      and bloom filters, and pages by the column index. The scan's
+      `number of output rows` measures what is left.
+    - Silent defeats in 4.2.0: INT96 timestamps (the default output
+      type) have no statistics; expressions and casts on a column;
+      repeated fields (SPARK-39393); shredded VARIANT fields (their
+      statistics are never consulted); `partitionBy` with a sort that
+      doesn't start with the partition columns.
+    - Bloom filters need `parquet.bloom.filter.expected.ndv#col`, or
+      each costs 1 MiB per row group.
+    - Above 10 values, an `IN` list is pushed as parquet-mr's `in`
+      predicate, not as the min/max range the config doc describes.
+    - Row groups are the unit of parallelism; splits keep the row
+      groups whose midpoint they contain.
+
+    Next: **The VARIANT Binary Format**, where you go one level deeper
+    and decode the bytes inside those `v.value` and `v.metadata`
+    columns by hand.

@@ -1,0 +1,937 @@
+- Class: meta
+  Lesson: "Production Ingestion: Quality Rules, Quarantine and Pipelines"
+  EstimatedMinutes: 90
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    You have quarantined bad rows before: in "JSON Drift and
+    Quarantine" with a corrupt record column, in "Landing Messy Data in
+    Delta Lake" with a quarantine table, and in "Streaming Messy Data:
+    Drift, Dead Letters and State" with a dead-letter folder. Those were
+    one-off rules written into the code. A production ingestion job
+    needs more:
+
+    - a **profile** of what arrived, before deciding what "bad" means
+    - **rules as data**, applied in one pass, that say *which* rules a
+      row broke, not just that it is bad
+    - **dataset-level checks** that no single row can answer:
+      uniqueness, referential integrity, freshness, volume
+    - **metrics** collected while the data is written, not by a second
+      pass
+    - a **quality gate**: a threshold that stops a bad file from
+      reaching the tables people trust
+    - writes that are safe to **re-run**, and tables that **refuse**
+      bad data on their own
+    - the same design as a **Declarative Pipeline**
+
+    You will build it twice: as a script that lands daily order files
+    into Delta tables, and as a pipeline graded by `check_*` views. The
+    script needs "Landing Messy Data in Delta Lake"; the pipeline needs
+    "Bronze: Ingesting Raw Data", "Silver: Types, Duplicates and
+    Quarantine" and "Gold: Aggregates for the Business" in the
+    Declarative Pipelines course.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Sample Data
+
+    `data/messy/quality/` holds a customer list and order files from a
+    shop's export, with problems planted at known rows:
+
+    | File | Contents |
+    |---|---|
+    | `customers.csv` | 41 rows for 40 customers: `C017` twice, an e-mail without `@`, a blank e-mail, a blank country, a signup date in month 13 |
+    | `orders/orders_2026-10-01.csv` | 60 orders: a blank and an unknown customer, quantity `0` and blank, price `N/A`, status `SHIPPED`, currency `EUR` |
+    | `orders/orders_2026-10-02.csv` | 60 orders: an unknown and a blank customer, quantity `-2` and `two`, a blank price, price `1,299.00`, status `shiped`, an order dated 2027, two orders re-sent from day 1 and one listed twice |
+    | `incoming/orders_2026-10-03.csv` | 60 orders from a broken export: 45 have no price |
+    | `rules.json` | the row-level rules for orders |
+
+    Every column is read as a string. That is deliberate, as in the
+    Declarative Pipelines course's bronze lesson: under ANSI mode (the
+    default since 4.0, SPARK-44444) a strict cast of one bad value
+    fails the whole job:
+
+    ```text
+    [CAST_INVALID_INPUT] The value '1,299.00' of the type "STRING" cannot be cast
+    to "DECIMAL(10,2)" because it is malformed. Correct the value as per the
+    syntax, or change its target type. Use `try_cast` to tolerate malformed input
+    ```
+
+    Strings in, rules over strings, types only for the rows that pass.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Profiling Before Rules
+
+    A **profile** answers "what is in this column?" before you write a
+    rule about it. `summary()` is the quick look:
+
+    ```python
+    customers = spark.read.option("header", True).csv("data/messy/quality/customers.csv")
+    customers.summary().show()
+    ```
+
+    ```text
+    +-------+-----------+-----------+--------------------+-------+-----------+
+    |summary|customer_id|       name|               email|country|signup_date|
+    +-------+-----------+-----------+--------------------+-------+-----------+
+    |  count|         41|         41|                  40|     40|         41|
+    |   mean|       NULL|       NULL|                NULL|   NULL|       NULL|
+    | stddev|       NULL|       NULL|                NULL|   NULL|       NULL|
+    |    min|       C001|    Ana Kim|ana.kim6@example.com|     CA| 2025-01-01|
+    |    25%|       NULL|       NULL|                NULL|   NULL|       NULL|
+    |    50%|       NULL|       NULL|                NULL|   NULL|       NULL|
+    |    75%|       NULL|       NULL|                NULL|   NULL|       NULL|
+    |    max|       C040|Tuan Nguyen|tuan.nguyen9@exam...|     VN| 2025-13-01|
+    +-------+-----------+-----------+--------------------+-------+-----------+
+    ```
+
+    Already useful: `max(signup_date)` is `2025-13-01`, because strings
+    sort as text. `count` of `email` is 40: the CSV reader turned the
+    blank e-mail into NULL. (`describe()` is the same without the
+    percentiles.) What `summary()` does not give you is the rest of a
+    profile, so build it yourself, **in one pass**:
+
+    ```python
+    missing = customers.select([
+        F.count_if(F.col(c).isNull() | (F.trim(c) == "")).alias(c) for c in customers.columns])
+    ```
+
+    ```text
+    +-----------+----+-----+-------+-----------+
+    |customer_id|name|email|country|signup_date|
+    +-----------+----+-----+-------+-----------+
+    |          0|   0|    1|      1|          0|
+    +-----------+----+-----+-------+-----------+
+    ```
+
+    A loop of `df.filter(...).count()` per column would read the file
+    once per column; one `select` of aggregates reads it once. The same
+    goes for the other profile measures:
+
+    | Measure | Function | Notes |
+    |---|---|---|
+    | missing | `count_if(isNull or blank)` | `count_if` is in `pyspark.sql.functions` since 3.5 |
+    | distinct | `approx_count_distinct(c, rsd)` | HyperLogLog++; `rsd` is the relative standard deviation, default 0.05 |
+    | most frequent | `mode(c, deterministic)` | 3.4; `deterministic=True` (4.0) returns the lowest value on ties |
+    | top k | SQL `approx_top_k(c, k)` | 4.1; SQL only, no Python function in 4.2.0 |
+    | quantiles | `percentile_approx(c, [0.5, 0.9, 0.99])` | 3.1 |
+
+    "Approximate" is not a figure of speech. On 40 distinct customer
+    ids:
+
+    ```text
+    approx_count_distinct("customer_id")        -> 37
+    approx_count_distinct("customer_id", 0.01)  -> 40
+    count_distinct("customer_id")               -> 40
+    ```
+
+    At the default `rsd` of 0.05, off by 3 on 40 is within the error
+    bound. For a profile that is fine; for a uniqueness check it is
+    not, so those use exact counts (below).
+
+    `approx_top_k` found the countries and their counts:
+
+    ```text
+    SELECT approx_top_k(country, 3) AS top FROM c
+    [{US, 15}, {CA, 14}, {VN, 11}]
+    ```
+
+    And `percentile_approx` over `try_cast(unit_price AS DOUBLE)`,
+    for all 120 orders, gave `[60.42, 112.63, 119.85]` for the median,
+    90th and 99th percentiles. A 99th percentile of 119.85 when prices
+    are generated up to 120 is what you want to see; `1,299.00` did not
+    move it because `try_cast` turned it into NULL, which is itself a
+    reason to count NULLs next to every quantile.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Sketches for Profiles You Keep
+
+    A profile of one file is a query; a profile you keep for every file
+    and combine later wants **sketches**: small binary summaries that
+    can be merged. `hll_sketch_agg` (3.5) builds a HyperLogLog sketch
+    per group, `hll_union_agg` merges them, and `hll_sketch_estimate`
+    reads the count:
+
+    ```python
+    per_file = orders.groupBy(F.col("_metadata.file_name").alias("file")) \
+                     .agg(F.hll_sketch_agg("customer_id").alias("sk"))
+    per_file.select(F.hll_sketch_estimate(F.hll_union_agg("sk")).alias("customers_both_days")).show()
+    ```
+
+    ```text
+    +-------------------+
+    |customers_both_days|
+    +-------------------+
+    |                 40|
+    +-------------------+
+    ```
+
+    Store `sk` (a BINARY column) per day, and a weekly distinct count is
+    a union of seven small values, without touching the raw files. Spark
+    4.1 added theta sketches (with intersections) and KLL quantile
+    sketches; "Sketches: HLL, Theta and KLL from the Inside" in the
+    advanced level takes them apart.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Rules as Data
+
+    Hard-coding rules as `when(...)` chains, as earlier lessons did,
+    works until the rules change weekly or another team owns them. Keep
+    them as data instead. `rules.json`:
+
+    ```json
+    {"name": "quantity_positive", "severity": "error",
+     "check": "try_cast(quantity AS INT) > 0"},
+    {"name": "status_lowercase", "severity": "warn",
+     "check": "status = lower(trim(status))"},
+    {"name": "customer_known", "severity": "error",
+     "check": "_customer_known"},
+    ```
+
+    Each rule is a name, a severity and a SQL boolean that is true for
+    a good row. `error` rules send the row to quarantine; `warn` rules
+    keep it (after normalizing) and count it. Rules may use columns the
+    job adds, like `_customer_known` (from a join) and `_file_date`
+    (the date in the file name).
+
+    One pass over the rows turns them into an array of the broken
+    rules' names:
+
+    ```python
+    def names(severity):
+        return F.array_compact(F.array(*[
+            F.when(~F.coalesce(F.expr(r["check"]), F.lit(False)), F.lit(r["name"]))
+            for r in rules if r["severity"] == severity]))
+
+    checked = df.withColumn("failed_rules", names("error")).withColumn("warnings", names("warn"))
+    ```
+
+    `F.array(...)` holds one element per rule: the rule's name if it is
+    broken, else NULL. `array_compact` (3.4) removes the NULLs. Every
+    rule is evaluated for every row in the same projection, so ten
+    rules cost one scan, and the result says *everything* wrong with a
+    row, which is what the person fixing the producer needs:
+
+    ```text
+    |O0004   |NULL       |...|[customer_id_present, customer_known]   |[]                |
+    |O0032   |C014       |...|[]                                      |[status_lowercase]|
+    |O0041   |C021       |...|[quantity_is_integer, quantity_positive]|[]                |
+    ```
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The NULL Trap
+
+    Why `coalesce(check, false)`? Because SQL has three truth values.
+    `try_cast(q AS INT) > 0` is NULL when `q` is NULL or not a number,
+    and `NOT NULL` is still NULL:
+
+    ```sql
+    SELECT q, try_cast(q AS INT) > 0 AS check_value,
+           NOT (try_cast(q AS INT) > 0) AS naive_broken,
+           NOT coalesce(try_cast(q AS INT) > 0, false) AS broken
+    FROM VALUES ('3'), ('0'), (NULL), ('two') AS t(q)
+    ```
+
+    ```text
+    +----+-----------+------------+------+
+    |   q|check_value|naive_broken|broken|
+    +----+-----------+------------+------+
+    |   3|       true|       false| false|
+    |   0|      false|        true|  true|
+    |NULL|       NULL|        NULL|  true|
+    | two|       NULL|        NULL|  true|
+    +----+-----------+------------+------+
+    ```
+
+    With the naive form, `when(NULL, name)` takes the "otherwise" branch
+    and a blank or non-numeric quantity passes the rule it should fail.
+    Decide what NULL means for each rule and write it down; "a check
+    that cannot be evaluated is broken" is the safe default.
+
+    Delta Lake's CHECK constraints (later in this lesson) take the same
+    position: a NULL `quantity` violates `CHECK (quantity > 0)`.
+
+- Class: mult_question
+  Depth: all
+  Output: "A rule is written as F.when(~F.expr('try_cast(quantity AS INT) > 0'), F.lit('quantity_positive')). Which quantity passes the rule by mistake?"
+  AnswerChoices: "A blank quantity, because the check is NULL and NOT NULL is NULL;'0', because 0 is not positive;'3', because it is a string;None, the rule is correct"
+  CorrectAnswer: "A blank quantity, because the check is NULL and NOT NULL is NULL"
+  Hint: "try_cast('' AS INT) is NULL. What is NULL > 0, and what is NOT of that?"
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Checks No Single Row Can Answer
+
+    Some problems are only visible across rows. Each is a small
+    aggregate or join:
+
+    **Uniqueness.** Group by the key and keep groups with more than one
+    row:
+
+    ```python
+    orders.groupBy("order_id").count().where("count > 1").orderBy("order_id").show()
+    ```
+
+    ```text
+    +--------+-----+
+    |order_id|count|
+    +--------+-----+
+    |   O0006|    2|
+    |   O0007|    2|
+    |   O0073|    2|
+    +--------+-----+
+    ```
+
+    A window count shows *where* the copies are, which tells re-sends
+    across files apart from a duplicate inside one file:
+
+    ```text
+    +--------+-------------------+------+---------------------+
+    |order_id|order_ts           |copies|file                 |
+    +--------+-------------------+------+---------------------+
+    |O0006   |2026-10-01 08:35:00|2     |orders_2026-10-01.csv|
+    |O0006   |2026-10-01 08:35:00|2     |orders_2026-10-02.csv|
+    |O0007   |2026-10-01 09:42:00|2     |orders_2026-10-01.csv|
+    |O0007   |2026-10-01 09:42:00|2     |orders_2026-10-02.csv|
+    |O0073   |2026-10-02 10:24:00|2     |orders_2026-10-02.csv|
+    |O0073   |2026-10-02 10:24:00|2     |orders_2026-10-02.csv|
+    +--------+-------------------+------+---------------------+
+    ```
+
+    **Referential integrity.** Orders whose customer does not exist: a
+    left anti join keeps the rows of the left side with no match on the
+    right. The exercise's `dataset_checks` finds `O0012` (`C099`) and
+    `O0063` (`C100`), and the duplicate customer key `C017`.
+
+    **Freshness.** The newest event time tells you whether the data is
+    current, and catches the opposite problem too:
+
+    ```python
+    orders.select(F.max(F.try_to_timestamp("order_ts")).alias("newest")).show()
+    ```
+
+    ```text
+    +-------------------+
+    |             newest|
+    +-------------------+
+    |2027-01-15 09:00:00|
+    +-------------------+
+    ```
+
+    An order "from the future" is the same clock problem as in
+    "Streaming Messy Data: Drift, Dead Letters and State". Here the rule `order_ts_not_after_file_day`
+    (`to_date(order_ts) <= _file_date`) quarantines it, while letting
+    the re-sent day-1 orders in the day-2 file through to deduplication.
+
+    **Volume.** Rows per file against what is normal. Both order files
+    have 60 rows; a file with 6 or 6000 deserves a look before anything
+    else runs.
+
+    Row rules decide where a row goes. Dataset checks decide whether
+    the *file* can be trusted at all, which leads to the quality gate.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Metrics While You Write: observe and Observation
+
+    The gate needs counts (rows, quarantined, warned). Counting with
+    separate `count()` calls reads the data again for each number.
+    `DataFrame.observe` (3.3) attaches named aggregates to a query; they
+    are computed by the next action that runs it, at no extra pass, and
+    an `Observation` object holds the result:
+
+    ```python
+    from pyspark.sql import Observation
+
+    obs = Observation("orders_quality")
+    checked = orders.withColumn("bad_price", F.col("unit_price").try_cast("decimal(10,2)").isNull())
+    observed = checked.observe(obs, F.count(F.lit(1)).alias("rows"),
+                               F.count_if("bad_price").alias("bad_price"))
+    observed.write.mode("overwrite").parquet(out + "/o")
+    print("observation:", obs.get)
+    ```
+
+    ```text
+    observation: {'rows': 120, 'bad_price': 3}
+    ```
+
+    What else the runs showed, the same in Spark Classic and on Spark
+    Connect (`SparkSession.builder.remote("local[2]")`):
+
+    - `obs.get` waits for the action and returns a dict. Calling it
+      before any action raises `PySparkAssertionError:
+      [NO_OBSERVE_BEFORE_GET] Should observe by calling
+      DataFrame.observe before get.`
+    - The metrics count the rows that flowed **through the observe
+      point**. Put `observe` before the `where` that picks the
+      quarantined rows, and it counts the whole file while the write
+      only writes the bad rows. The exercise does exactly that.
+    - A second action on the same observed DataFrame did not change the
+      values (`{'rows': 120, 'bad_price': 3}` again). An `Observation`
+      is meant for one action; create a new one per run.
+    - On a stream, pass a string name instead: `observe("quality",
+      ...)`. The values arrive per micro-batch in the query's progress
+      (`[p.observedMetrics for p in q.recentProgress]` gave
+      `[{'quality': Row(rows=60, bad_price=1)}]` for day 1). An
+      `Observation` object is refused when the query starts:
+
+    ```text
+    IllegalArgumentException: Observation does not support streaming Datasets.This is
+    because there will be multiple observed metrics as microbatches are constructed.
+    Please register a StreamingQueryListener and get the metric for each microbatch
+    in QueryProgressEvent.progress, or use query.lastProgress or query.recentProgress.
+    ```
+
+- Class: mult_question
+  Depth: all
+  Output: "df.observe(obs, F.count(F.lit(1)).alias('rows')).where('bad').write.parquet(p) runs on 60 rows, 6 of them bad. What is obs.get['rows']?"
+  AnswerChoices: "60, because observe sits before the filter;6, because only 6 rows are written;0, because observe needs a separate action;It raises NO_OBSERVE_BEFORE_GET"
+  CorrectAnswer: "60, because observe sits before the filter"
+  Hint: "Observed metrics count what passes through the observe point in the plan."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Quality Gate
+
+    A gate is a decision made on the metrics: if more than a set share
+    of a file is bad, **stop**, before the tables people read change. In
+    a script it is an ordinary exception:
+
+    ```python
+    class QualityGateError(Exception):
+        """Raised when a file has too many bad rows to publish."""
+
+    ratio = m["quarantined"] / m["rows"] if m["rows"] else 1.0
+    if ratio > max_error_ratio:
+        raise QualityGateError(
+            f"{file_name}: {m['quarantined']} of {m['rows']} rows ({ratio:.0%}) broke a rule; "
+            f"the limit is {max_error_ratio:.0%}. Silver was not changed; see the quarantine.")
+    ```
+
+    For day 3:
+
+    ```text
+    gate: orders_2026-10-03.csv: 45 of 60 rows (75%) broke a rule; the limit is 20%.
+    Silver was not changed; see the quarantine.
+    ```
+
+    Design choices that matter:
+
+    - **Where the gate sits.** After bronze and quarantine are written,
+      before silver. The evidence (raw rows, the reasons) is kept for
+      whoever investigates; the trusted table is untouched.
+    - **The threshold.** These sample files are deliberately dirty
+      (10% and 13% bad), so the limit is 20%. Set yours from the
+      profile of normal days, and alert well below the limit.
+    - **An empty file is a failure**: `rows == 0` gives ratio 1.0 here,
+      not a division by zero.
+    - **A job that fails loudly** is what schedulers, on-call people
+      and CI understand. Exit non-zero; do not log and continue.
+
+    Inside SQL the same decision is `raise_error` (or `assert_true`,
+    which raises when its argument is false), both 3.1:
+
+    ```text
+    SELECT CASE WHEN count(*) < 100 THEN raise_error('too few rows') END FROM ...
+    [USER_RAISED_EXCEPTION] too few rows SQLSTATE: P0001
+    ```
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Gate That Never Ran
+
+    `assert_true` in a DataFrame has a trap. A gate computed as a
+    one-row DataFrame and cross-joined to the data looks like it guards
+    the data:
+
+    ```python
+    rows = spark.range(10).withColumn("bad", F.col("id") > 2)       # 70% bad
+    gate = rows.agg(F.assert_true(F.avg(F.col("bad").cast("int")) <= 0.2, "gate failed").alias("_gate"))
+    rows.crossJoin(gate).select("id").count()
+    ```
+
+    ```text
+    unused 10 rows: gate NOT enforced
+    ```
+
+    Spark's optimizer prunes columns nobody uses. `_gate` is not
+    selected, so the plan computes an aggregate with no functions at
+    all, and the assertion is never evaluated:
+
+    ```text
+    +- HashAggregate(keys=[], functions=[])
+    ```
+
+    Even keeping `_gate` in the DataFrame is not enough if the action
+    does not need it: `rows.crossJoin(gate).count()` also passed. Make
+    the result depend on the gate, for example by filtering on it
+    (`assert_true` returns NULL when it passes):
+
+    ```python
+    rows.crossJoin(gate).where(F.col("_gate").isNull()).select("id").count()
+    ```
+
+    ```text
+    where isNull raised: [USER_RAISED_EXCEPTION] gate failed SQLSTATE: P0001
+    ```
+
+    The `check_*` views of the Declarative Pipelines course do not have
+    this problem because they *write* the asserted column into a table,
+    and a write evaluates every output column. A gate in front of
+    another table needs the filter.
+
+- Class: mult_question
+  Depth: all
+  Output: "silver = data.crossJoin(gate).select(*data.columns), where gate is a one-row DataFrame with an assert_true column. The assertion should fail. What happens when silver is written?"
+  AnswerChoices: "The write succeeds: the unused assert_true column is pruned and never evaluated;The write fails with USER_RAISED_EXCEPTION;The write fails with an analysis error about the cross join;The write succeeds but logs a warning"
+  CorrectAnswer: "The write succeeds: the unused assert_true column is pruned and never evaluated"
+  Hint: "Look at what the optimizer does with columns the output does not need."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Landing in Delta, Safely
+
+    "Landing Messy Data in Delta Lake" introduced bronze, silver and
+    quarantine tables in Delta Lake 4.4.1. For production you also want
+    every step to be **safe to run again**: schedulers retry, people
+    re-run a day after fixing a bug, and a re-run must not duplicate
+    anything.
+
+    **Bronze and quarantine: replace one file's rows.** `replaceWhere`
+    overwrites only the rows matching a predicate, atomically:
+
+    ```python
+    (raw.write.format("delta").mode("overwrite")
+        .option("replaceWhere", "_source_file = 'orders_2026-10-01.csv'")
+        .save(f"{root}/bronze"))
+    ```
+
+    Run it twice and bronze still has 60 rows for that file. It also
+    works on a path that is not a table yet (it creates it). If the
+    DataFrame contains a row that does not match the predicate, Delta
+    refuses the whole write:
+
+    ```text
+    [DELTA_REPLACE_WHERE_MISMATCH] Written data does not conform to partial table
+    overwrite condition or constraint '_source_file = 'orders_2026-10-01.csv''.
+    [DELTA_VIOLATE_CONSTRAINT_WITH_VALUES] CHECK constraint ... violated by row with values:
+     - _source_file : x.csv
+    ```
+
+    **Silver: MERGE on the business key.**
+
+    ```sql
+    MERGE INTO delta.`.../silver` AS t
+    USING incoming_orders AS s
+    ON t.order_id = s.order_id
+    WHEN NOT MATCHED THEN INSERT *
+    ```
+
+    Re-sent orders match and are skipped, so day 2 inserts 49 of its 52
+    valid rows, and running day 2 again inserts 0 (and, as "Landing
+    Messy Data in Delta Lake" showed, writes no new version). That
+    lesson's other `MERGE` trap applies too: an insert-only `MERGE`
+    inserts both copies of a new key, so the exercise keeps one row per
+    `order_id` with `row_number()` before merging (O0073 is listed
+    twice in day 2).
+
+    **Appends that might repeat: transaction ids.** For a plain append
+    that may be retried, Delta's writer options `txnAppId` and
+    `txnVersion` make the second write with the same pair a no-op:
+
+    ```python
+    df.write.format("delta").mode("append") \
+      .option("txnAppId", "ingest").option("txnVersion", 7).save(path)
+    ```
+
+    Writing the same 60 rows twice with `txnVersion` 7 left 60 rows.
+    In `foreachBatch`, the batch id is the natural `txnVersion`, which
+    is the Delta answer to the replay problem from "Streaming Messy
+    Data: Drift, Dead Letters and State".
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Tables That Refuse Bad Data
+
+    Rules in the job can have bugs. A **CHECK constraint** on the Delta
+    table is a last line of defence that every writer must pass:
+
+    ```sql
+    ALTER TABLE delta.`.../silver` ADD CONSTRAINT quantity_positive CHECK (quantity > 0)
+    ```
+
+    "Landing Messy Data in Delta Lake" showed how these behave on Delta
+    4.4.1 (a violating write fails as a whole, NULL violates, existing
+    rows are checked, the error arrives as a `Py4JJavaError`, constraints
+    are stored as table properties), along with schema enforcement and
+    why a Delta folder must never be read as plain Parquet. One more
+    restriction matters when you script table creation:
+    `CREATE TABLE ... (..., CONSTRAINT c CHECK (...)) USING delta` fails
+    with `UNSUPPORTED_FEATURE.TABLE_OPERATION` ("does not support table
+    constraint"), so create the table first and add constraints with
+    `ALTER TABLE`, as the exercise's `create_tables` does.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Quality in the Table History
+
+    The counts the gate used belong with the data. Delta records a
+    free-form `userMetadata` string in each commit: the writer option
+    `userMetadata` for DataFrame writes, or the session setting
+    `spark.databricks.delta.commitInfo.userMetadata` for SQL such as
+    `MERGE`:
+
+    ```python
+    spark.conf.set("spark.databricks.delta.commitInfo.userMetadata", json.dumps(metadata))
+    try:
+        spark.sql("MERGE INTO ...")
+    finally:
+        spark.conf.unset("spark.databricks.delta.commitInfo.userMetadata")
+    ```
+
+    ```text
+    +-------+--------------+----------------------------------------------------------------------------+
+    |version|operation     |userMetadata                                                                |
+    +-------+--------------+----------------------------------------------------------------------------+
+    |0      |CREATE TABLE  |NULL                                                                        |
+    |1      |ADD CONSTRAINT|NULL                                                                        |
+    |2      |ADD CONSTRAINT|NULL                                                                        |
+    |3      |MERGE         |{"file": "orders_2026-10-01.csv", "rows": 60, "quarantined": 6, "warned": 1}|
+    |4      |MERGE         |{"file": "orders_2026-10-02.csv", "rows": 60, "quarantined": 8, "warned": 0}|
+    +-------+--------------+----------------------------------------------------------------------------+
+    ```
+
+    Unset it in `finally`: the setting applies to every later commit
+    in the session until you do. The re-run of day 2 and the gated day
+    3 left no MERGE versions, so the history says exactly which files
+    reached silver, and with what quality.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write the DataFrame `raw` to the Delta table at `bronze_path`,
+    replacing only the rows whose `_source_file` is
+    `'orders_2026-10-02.csv'`, so the write can be repeated safely.
+  CorrectAnswer: |
+    (raw.write.format("delta").mode("overwrite")
+        .option("replaceWhere", "_source_file = 'orders_2026-10-02.csv'")
+        .save(bronze_path))
+  Hint: "mode('overwrite') plus the replaceWhere option with a SQL predicate on _source_file."
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise 1: The Ingestion Job
+
+    The starter (first line `# spark-connectors: delta`) has
+    `create_tables` (silver with two CHECK constraints) and most of
+    `land_day`. Complete:
+
+    1. `profile(df)`: one row per column with `rows`, `missing`,
+       `distinct` (`approx_count_distinct` with rsd 0.01) and `top`
+       (`mode(c, True)` as a string), from a single aggregation.
+    2. `apply_rules(df, rules)`: `failed_rules` and `warnings` arrays,
+       with a NULL check counted as broken.
+    3. `dataset_checks(customers, orders)`: duplicate customer ids and
+       orphan orders.
+    4. In `land_day`: the bronze write with `replaceWhere`, the
+       observed quarantine write, the gate, and the `MERGE` with
+       `userMetadata`.
+
+    The harness profiles the customers (C017 is the top id, one missing
+    e-mail and country), checks the rules on day 1 (6 bad rows, a blank
+    quantity breaks two rules, `SHIPPED` is only a warning), then lands
+    day 1 (54 inserted), day 2 (49 inserted), day 2 again (nothing
+    inserted, no new silver version, bronze 120 and quarantine 14), and
+    day 3, which must raise `QualityGateError` without a silver commit.
+    It reads the `userMetadata` of each MERGE and finally checks that
+    silver rejects a row with quantity 0.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "profile: aggregate F.count_if(missing), F.approx_count_distinct(c, 0.01), F.mode(c, True) per column, then F.inline(F.array(*[F.struct(...)])). apply_rules: F.array_compact(F.array(*[F.when(~F.coalesce(F.expr(check), F.lit(False)), F.lit(name)) ...])). land_day: checked.observe(stats, ...) before .where(F.size('failed_rules') > 0) on the quarantine write; then stats.get."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Same Design as a Declarative Pipeline
+
+    Does open source Spark 4.2.0's `pyspark.pipelines` have expectation
+    decorators like Databricks' `@dlt.expect`, `expect_or_drop` and
+    `expect_or_fail`? No. The module's public names in 4.2.0 are:
+
+    ```text
+    ['api', 'append_flow', 'create_auto_cdc_flow', 'create_sink',
+     'create_streaming_table', 'flow', 'graph_element_registry',
+     'materialized_view', 'output', 'source_code_location', 'table',
+     'temporary_view', 'type_error_utils']
+    ```
+
+    and the pipelines module of the Spark source (`sql/pipelines`) has
+    no expectation concept. Quality is built from datasets, as the
+    Declarative Pipelines course does, and the design above maps onto
+    them directly:
+
+    | Script | Pipeline dataset |
+    |---|---|
+    | bronze write | `bronze_orders`, a streaming table (`@dp.table`) over the CSV folder |
+    | customers | `customers_dim`, one row per id (window `row_number`, since `dropDuplicates` on a pipeline dataset fails at registration in 4.2.0) |
+    | `apply_rules` | `orders_checked`, a temporary view with `failed_rules` and `warnings` |
+    | Observation counts | `quality_report`, a materialized view: rows, quarantined, warned, error ratio per file |
+    | the gate | `quality_gate`, a temporary view with one `assert_true` |
+    | silver MERGE | `silver_orders`, a materialized view computed *through* the gate |
+    | quarantine write | `quarantine_orders` |
+    | harness asserts | `check_*` views |
+
+    The rules file is read with plain Python at the top of the pipeline
+    file, so the pipeline's rules are the same data as the script's:
+
+    ```python
+    RULES = json.load(open(f"{QUALITY}/rules.json"))
+    ```
+
+    The gate has to sit in silver's dependency path, filtered on, for
+    the reason in "The Gate That Never Ran":
+
+    ```python
+    @dp.temporary_view
+    def quality_gate() -> DataFrame:
+        report = spark.read.table("quality_report")
+        return report.agg(
+            F.assert_true(F.max("error_ratio") <= MAX_ERROR_RATIO,
+                          f"quality gate: a file has more than {MAX_ERROR_RATIO:.0%} bad rows; "
+                          "see quality_report").alias("_gate"))
+
+    @dp.materialized_view
+    def silver_orders() -> DataFrame:
+        return (spark.read.table("orders_checked")
+                .crossJoin(spark.read.table("quality_gate"))
+                .where(F.col("_gate").isNull())
+                .where(F.size("failed_rules") == 0)
+                ...)
+    ```
+
+    The first version of this pipeline had the cross join without the
+    filter. With the broken day 3 included, the log said `Flow
+    spark_catalog.default.silver_orders has COMPLETED`, with the 75%
+    bad file in it. With the filter:
+
+    ```text
+    Flow spark_catalog.default.bronze_orders has COMPLETED.
+    Flow spark_catalog.default.quality_report has COMPLETED.
+    Flow spark_catalog.default.quarantine_orders has COMPLETED.
+    Flow 'spark_catalog.default.silver_orders' has FAILED.
+    Error: [USER_RAISED_EXCEPTION] quality gate: a file has more than 20% bad rows; see quality_report SQLSTATE: P0001
+    Flow 'spark_catalog.default.check_silver' SKIPPED due to upstream failure(s).
+    ```
+
+    The run fails, silver's flow fails, and everything that depends on
+    silver is skipped, while the quarantine and the report, which do
+    not depend on the gate, are still refreshed for whoever
+    investigates. (In that run the fixed-number checks on bronze,
+    quarantine and the report failed too, since a third file changes
+    every count; the gate is the check that holds for any input.)
+
+- Class: mult_question
+  Depth: all
+  Output: "Which statement about data quality in open source Spark 4.2.0 Declarative Pipelines is true?"
+  AnswerChoices: "There are no expectation decorators, so quality is built with quarantine datasets and assert_true checks;@dp.expect_or_drop drops rows that fail a condition;@dp.expect_or_fail stops the run when a row fails;Expectations exist but only in SQL pipeline files"
+  CorrectAnswer: "There are no expectation decorators, so quality is built with quarantine datasets and assert_true checks"
+  Hint: "List the public names of pyspark.pipelines in 4.2.0."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Running It Twice: Two 4.2.0 Traps
+
+    In SparkTutor each run starts empty. A real pipeline runs every day
+    against the tables of the day before (the Declarative Pipelines
+    capstone shows how: `spark-pipelines --conf
+    spark.sql.catalogImplementation=hive run`). Running this pipeline
+    twice that way, with day 3 added to the landing folder before the
+    second run, showed two things the single run cannot.
+
+    **withColumn on a pipeline dataset loses its dependency.** The
+    first version of `orders_checked` and `quality_report` added
+    columns with `withColumn`. The first run was correct. In the second
+    run the log showed `quality_report` and `quarantine_orders`
+    finishing *before* `bronze_orders` and `customers_dim`, and the
+    report was stale and wrong:
+
+    ```text
+    +--------------------+----+-----------+------+-----------+
+    |        _source_file|rows|quarantined|warned|error_ratio|
+    +--------------------+----+-----------+------+-----------+
+    |orders_2026-10-02...|  60|         60|     0|        1.0|
+    |orders_2026-10-01...|  60|         60|     1|        1.0|
+    +--------------------+----+-----------+------+-----------+
+    ```
+
+    Only two files (bronze had three), and every row quarantined with
+    `customer_known` among its failed rules. A minimal
+    pipeline isolates it: after a second run with one new bronze row,
+    `select`, `where` and `groupBy().agg()` over `bronze` saw 2 rows,
+    while `withColumn` (alone, or after an `agg`) saw the old 1. It is
+    reported upstream as SPARK-59663 (open), "withColumn on an in-graph
+    table read silently drops the dependency edge once the upstream
+    table exists". It is the same family as the `drop()` problem in the
+    Declarative Pipelines course's silver lesson: the Spark Connect
+    planner analyzes the input of these operations immediately. On the
+    first run the table does not exist and the edge survives; once it
+    exists, the edge is lost and the flow runs early, on old data. The pipeline in this lesson therefore adds
+    columns with `select("*", expr.alias(name))`, which ran in the
+    right order with fresh data on the second run:
+
+    ```text
+    +--------------------+----+-----------+------+-----------+
+    |        _source_file|rows|quarantined|warned|error_ratio|
+    +--------------------+----+-----------+------+-----------+
+    |orders_2026-10-03...|  60|         45|     0|       0.75|
+    |orders_2026-10-02...|  60|          8|     0|     0.1333|
+    |orders_2026-10-01...|  60|          6|     1|        0.1|
+    +--------------------+----+-----------+------+-----------+
+    ```
+
+    **A failed refresh can leave the table empty.** The gate stopped
+    the second run, as it should. But afterwards:
+
+    ```text
+    bronze_orders 180
+    silver_orders 0
+    quarantine_orders 59
+    ```
+
+    Silver had 103 rows after the first run and **0** after the failed
+    second one. A materialized view refresh overwrites its table, and
+    the default (Parquet) table is emptied before the new data is
+    written, so a refresh that fails part way leaves nothing. The gate
+    kept bad data out; it did not keep the good data in. Two ways to
+    get both:
+
+    - Store silver in a table format with atomic overwrites, so a failed
+      write leaves the previous version (Delta Lake behaves that way
+      for the script in Exercise 1: a rejected write left the table
+      unchanged). Test it in your own deployment before relying on it.
+    - Or gate *before* the pipeline: run the quality job from Exercise 1
+      first and let the pipeline read only files that passed (for
+      example, move them from `incoming/` to `orders/`).
+
+    Either way, downstream readers should treat "silver is empty" as an
+    incident, which is one more reason for a volume check.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise 2: The Quality Pipeline
+
+    This exercise is a Declarative Pipelines file; SparkTutor runs it
+    with `spark-pipelines` and grades it by the exit status. The
+    starter has `bronze_orders`, `customers_dim`, the rules helper
+    `failed(severity)`, `quality_report` and the checks. Add:
+
+    1. `orders_checked` (temporary view): bronze left-joined to the
+       customer ids, `_customer_known` never NULL, `failed_rules` and
+       `warnings`.
+    2. `quality_gate` (temporary view): one `assert_true` on the largest
+       `error_ratio` in `quality_report`.
+    3. `silver_orders`: through the gate (cross join, then
+       `where _gate IS NULL`), valid rows only, one per `order_id`,
+       typed.
+    4. `quarantine_orders`: the rows with `failed_rules`.
+
+    Until all four exist, the run fails with `TABLE_OR_VIEW_NOT_FOUND`
+    for the missing ones. The checks expect 120 bronze rows, 14
+    quarantined rows with the right rule names, 103 unique silver
+    orders (with `SHIPPED` kept, normalized, and warned) and a report
+    with one row per file.
+
+    Then break it on purpose: change bronze's path to
+    `f"{QUALITY}/{{orders,incoming}}"` (a glob over both folders) and
+    watch the gate fail `silver_orders` while the quarantine fills up.
+    Remove the `.where(F.col("_gate").isNull())` and watch silver
+    "succeed" with the broken file in it.
+  StarterFile: pipeline_starter.py
+  SolutionFile: pipeline_solution.py
+  RequiresExecution: true
+  Validation:
+    - "ast_contains(function='orders_checked')"
+    - "ast_contains(function='quality_gate')"
+    - "ast_contains(function='silver_orders')"
+    - "ast_contains(function='quarantine_orders')"
+    - execution
+  Hint: "orders_checked: spark.read.table('bronze_orders').join(known, 'customer_id', 'left') with known = customers_dim's customer_id plus F.lit(True), then F.coalesce('_customer_known', F.lit(False)) and withColumn('failed_rules', failed('error')). quality_gate: report.agg(F.assert_true(F.max('error_ratio') <= MAX_ERROR_RATIO, '...').alias('_gate'))."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Taking It Further
+
+    - **Rules with owners.** Add `owner` and `since` to each rule, and
+      write a per-rule count table per run (explode `failed_rules`,
+      group by rule). A rule whose count jumps is a producer change; a
+      rule that never fires may be dead.
+    - **Contracts.** Combine rules with the schema contract from
+      "Schemas for Data You Don't Control": the producer publishes both,
+      and your job refuses files whose header does not match before any
+      row rule runs.
+    - **Quarantine replay.** Once a producer fixes their export, replay
+      quarantined rows through the same rules and MERGE the ones that
+      now pass; `failed_rules` tells you which rows to expect back.
+    - **Streaming ingestion.** The same rules run inside the
+      `foreachBatch` of "Streaming Messy Data: Drift, Dead Letters and
+      State", with Delta's
+      `txnAppId`/`txnVersion` keyed by the batch id, and the gate
+      raising an exception that stops the stream.
+    - **Sketch history.** Keep a `hll_sketch_agg` of customer ids per
+      file and alert when today's distinct count falls far outside the
+      last weeks', without rereading old files.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - Read messy files as strings; under ANSI mode a strict cast of one
+      bad value fails the job. Type only the rows that pass.
+    - Profile in one pass (`count_if`, `approx_count_distinct` with an
+      explicit `rsd`, `mode`, `approx_top_k`, `percentile_approx`), and
+      remember approximate means approximate (37 for 40 at the default
+      rsd).
+    - Keep rules as data and evaluate all of them in one projection
+      into a `failed_rules` array. Count a NULL check as broken.
+    - Uniqueness, referential integrity (left anti join), freshness and
+      volume are dataset checks; they decide whether a file is trusted.
+    - `observe` with an `Observation` collects metrics during the write
+      (Classic and Connect alike); place it before the filter.
+    - A quality gate stops a bad file after bronze and quarantine and
+      before silver. An `assert_true` nobody uses is pruned: filter on
+      it.
+    - In Delta: `replaceWhere` per file, `MERGE` on the key after
+      deduplicating the source, `txnAppId`/`txnVersion` for repeatable
+      appends, CHECK constraints (NULL violates; add them with `ALTER
+      TABLE`), and quality counts in `userMetadata`.
+    - Open source SDP 4.2.0 has no expectations; build quality from a
+      checked view, a report, a gate in silver's dependency path, a
+      quarantine and `check_*` views.
+
+    Next: **Feature Vectors and Similarity Search**, which turns the
+    images, audio and text from earlier lessons into vectors and finds
+    their nearest neighbours.

@@ -144,8 +144,10 @@
 
     `AQEShuffleRead coalesced` means the exchange wrote eight partitions
     and AQE read them back as fewer. `isFinalPlan=true` appears only once
-    the query has executed; call `explain()` after an action to see what
-    AQE actually did.
+    the DataFrame's own plan has executed. Call `explain()` after
+    `collect()` (or `toPandas()`) to see what AQE actually did; `count()`,
+    `show()` and writes run a derived plan, so the DataFrame's plan still
+    says `isFinalPlan=false` after them.
 
     Use `repartition` yourself when you need a specific layout (for
     example, to control file counts or to partition by a key before a

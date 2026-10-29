@@ -1,0 +1,766 @@
+- Class: meta
+  Lesson: "Landing Messy Data in Delta Lake"
+  EstimatedMinutes: 60
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    "JSON Drift and Quarantine" turned three days of drifting events
+    into one clean DataFrame. "Plans, Partitions and Caching" showed why
+    you want that result stored as Parquet instead of re-parsing JSON on
+    every query, and "Streaming Files: Your First Structured Streaming
+    Job" read each new file exactly once. What is still missing is a
+    place to put the results that does not fall apart when the data
+    misbehaves: a second delivery of the same file, a field that
+    changes type, a job that dies halfway through a write, a question
+    about what the table looked like yesterday.
+
+    That place is a **table format**. This lesson follows chapter 9 of
+    *Learning Spark* (building reliable data lakes) with Delta Lake 4.4.1
+    on Spark 4.2. By the end you will be able to:
+
+    - Say what a table format adds to a folder of Parquet files, and see
+      it in the `_delta_log`
+    - Avoid the silent trap of reading a Delta folder without
+      `format("delta")`
+    - Lay out bronze (raw), silver (typed and cleaned), quarantine and
+      gold tables for messy input
+    - Make a second delivery of the same file harmless with `MERGE`
+    - Read the schema enforcement errors (`DELTA_METADATA_MISMATCH`,
+      `DELTA_FAILED_TO_MERGE_FIELDS`), and evolve a schema on purpose
+      with `mergeSchema` and `MERGE WITH SCHEMA EVOLUTION`
+    - Guard a table with `NOT NULL` and `CHECK` constraints, and know how
+      Delta treats NULL in a check
+    - Time travel with `versionAsOf` and `timestampAsOf`, read `DESCRIBE
+      HISTORY`, and `RESTORE`
+    - Read a table's change data feed
+
+    The "Data Lakes & Lakehouses" lesson of the learning_spark course
+    compares Delta, Iceberg and Hudi and covers Spark 4.2's new change
+    data capture API. This lesson stays with Delta and with what messy
+    data does to a table.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    A folder of Parquet files is like a shared drive where everyone
+    drops files: nobody can tell a finished upload from a half-copied
+    one, nothing stops someone from dropping a spreadsheet with the
+    columns in a different order, and deleted files are gone for good. A
+    table format adds a librarian with a ledger. A file only counts once
+    the ledger says so, every change is a numbered entry, and the
+    librarian refuses deliveries that do not match the catalog card.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Why a Folder of Parquet Is Not Enough
+
+    Take a silver folder with `amount DOUBLE` and append a batch where a
+    producer sent `amount` as text:
+
+    ```python
+    p = "/tmp/silver_parquet"
+    spark.createDataFrame([("a", "purchase", 12.5)], "event_id string, kind string, amount double") \
+        .write.parquet(p)
+    spark.createDataFrame([("b", "purchase", "12.50 CAD")], "event_id string, kind string, amount string") \
+        .write.mode("append").parquet(p)
+    ```
+
+    The append succeeds. Nothing checked it against the existing files.
+    The damage shows up later, for whoever reads the folder:
+
+    ```
+    struct<event_id:string,kind:string,amount:string>
+    [FAILED_READ_FILE.PARQUET_COLUMN_DATA_TYPE_MISMATCH] ...
+    ```
+
+    Spark took the schema from one file and failed on the other. With
+    `mergeSchema` the read fails earlier, with
+    `CANNOT_MERGE_SCHEMAS`/`CANNOT_MERGE_INCOMPATIBLE_DATA_TYPE`. Either
+    way the folder is broken until someone finds and deletes the bad
+    file. Plain folders have the other problems too: a job that dies
+    halfway leaves some of its files behind, a reader during a write sees
+    some of the new files, and an overwrite destroys the old version.
+
+    A **table format** keeps a transaction log next to the data files.
+    Data files only count once a commit in the log lists them, so a
+    write is all or nothing (atomic), readers see one committed version
+    (isolation), the log records the schema and rejects data that does
+    not match it (enforcement), and old versions stay readable (time
+    travel).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Delta Lake With Spark 4.2
+
+    Delta Lake is not part of Apache Spark; it is a connector with a
+    build per Spark version. For Spark 4.2 use Delta 4.4.1. Outside
+    SparkTutor:
+
+    ```bash
+    spark-submit \
+      --packages io.delta:delta-spark_4.2_2.13:4.4.1 \
+      --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension \
+      --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog \
+      my_job.py
+    ```
+
+    `delta-spark_4.2_2.13` names the Spark version (4.2) and Scala
+    version (2.13) the jar was built for. The extension adds `MERGE`,
+    `DESCRIBE HISTORY`, `RESTORE` and friends; the catalog lets
+    `CREATE TABLE ... USING delta` work. In a SparkTutor exercise, the
+    first line `# spark-connectors: delta` does all of that. The
+    learning_spark course's "Data Lakes & Lakehouses" lesson also shows
+    the `pip install delta-spark` route.
+
+    Every example here uses **path tables**: the table is a folder,
+    named in SQL as ``delta.`/path/to/table` ``. That keeps exercises
+    self-contained; with a metastore you would use names like
+    `lake.silver` instead.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Transaction Log
+
+    Write day 1's raw lines as a Delta table and look inside:
+
+    ```python
+    from pyspark.sql import SparkSession, functions as F
+
+    lines = (spark.read.text("data/messy/events/events_2026-10-01.json")
+             .select(F.col("_metadata.file_name").alias("file"), F.col("value").alias("raw")))
+    lines.write.format("delta").save(path)
+    ```
+
+    ```
+    . ['part-00000-5df065a0-...-c000.snappy.parquet']
+    _delta_log ['00000000000000000000.json']
+    _delta_log/_staged_commits []
+    ```
+
+    (checksum files left out). The data is ordinary Parquet. The log is
+    one JSON file per commit, numbered from 0, each line one **action**:
+
+    ```
+    commitInfo {"timestamp": 1793221269903, "operation": "WRITE", "operationParameters": {"mode": "ErrorIfExists", ...
+    metaData   {"id": "df0ab44c-...", "format": {"provider": "parquet", "options": {}}, "schemaString": "{\"type\":\"struct\", ...
+    protocol   {"minReaderVersion": 1, "minWriterVersion": 2}
+    add        {"path": "part-00000-5df065a0-...-c000.snappy.parquet", "partitionValues": {}, "size": 1571, ...
+    ```
+
+    - `metaData` holds the schema: this is what enforcement checks
+      against.
+    - `add` says "this file is part of the table from now on" (with
+      row counts and min/max statistics in `stats`). Later commits add
+      `remove` actions for files that an update or delete replaced.
+    - `commitInfo` is what `DESCRIBE HISTORY` shows.
+
+    Committing is writing the next numbered JSON file, and only one
+    writer can create it. That single step is what makes a write
+    atomic.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Trap: Always Say format("delta")
+
+    Change a few rows, then read the folder three ways:
+
+    ```python
+    spark.sql(f"UPDATE delta.`{path}` SET raw = upper(raw) WHERE raw LIKE '%\"user_id\": 1,%'")
+    print(spark.read.format("delta").load(path).count(),
+          spark.read.load(path).count(),
+          spark.read.parquet(path).count())
+    ```
+
+    ```
+    20 40 40
+    ```
+
+    The table has 20 rows. The `UPDATE` wrote a new Parquet file with
+    all 20 (the old file had to be rewritten to change 4 of them) and
+    logged a `remove` for the old one. The old file is still in the
+    folder, so it is still there for time travel. `spark.read.load(path)`
+    without a format uses the default source, which is Parquet
+    (`spark.sql.sources.default`), lists every Parquet file in the
+    folder and returns both copies, with no error and no warning. The
+    same happens with `spark.read.parquet(path)` and with any tool that
+    reads the folder as plain Parquet.
+
+    Read Delta tables with `format("delta")` or by table name, every
+    time.
+
+- Class: mult_question
+  Depth: all
+  Output: "After an UPDATE on a 20-row Delta table, spark.read.load(path).count() returns 40. Why?"
+  AnswerChoices: "Without format('delta') Spark reads every Parquet file in the folder, including the ones the log removed;The UPDATE duplicated the rows;Delta keeps two replicas of every row;count() counts the log files too"
+  CorrectAnswer: "Without format('delta') Spark reads every Parquet file in the folder, including the ones the log removed"
+  Hint: "The default data source is Parquet, and it knows nothing about _delta_log."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Bronze, Silver, Gold, and Quarantine
+
+    The usual way to land messy data is in layers, each a table:
+
+    | Layer | Holds | For messy events |
+    |-------|-------|------------------|
+    | **bronze** | the input as it arrived, plus where and when it came from | one row per raw line: `record_id`, `file`, `raw`, `ingested_at` |
+    | **silver** | typed, cleaned, one row per real thing | one row per event: `event_id`, `kind`, `user_id`, `plan`, `amount`, `ts`, `file` |
+    | **quarantine** | what could not become silver, with the reason | the truncated line of day 3 |
+    | **gold** | small tables shaped for a question | events and revenue per day |
+
+    Bronze keeps the raw text on purpose. When the parsing rules
+    change (a new field, a bug fix in how `amount` is read), you rebuild
+    silver from bronze instead of asking for the files again, and you
+    can always show a doubter the exact line an event came from.
+
+    Create the tables up front with explicit schemas, so the first write
+    does not decide them by accident:
+
+    ```python
+    def table(root, name):
+        return f"delta.`{os.path.join(root, name)}`"
+
+    spark.sql(f"""
+        CREATE TABLE IF NOT EXISTS {table(root, 'bronze')} (
+            record_id STRING NOT NULL, file STRING, raw STRING, ingested_at TIMESTAMP)
+        USING delta""")
+    ```
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Landing Bronze Twice Without Duplicates
+
+    Files get delivered twice: a retry after a timeout, a partner who
+    resends the whole week. An `append` would store every line twice.
+    Give each line an id that depends only on its content and origin,
+    and `MERGE` it in, inserting only ids the table does not have:
+
+    ```python
+    def land_bronze(spark, root, files):
+        lines = (spark.read.text(files)
+                 .select(F.col("_metadata.file_name").alias("file"), F.col("value").alias("raw"))
+                 .withColumn("record_id", F.sha2(F.concat_ws("|", "file", "raw"), 256))
+                 .withColumn("ingested_at", F.current_timestamp())
+                 .dropDuplicates(["record_id"]))
+        lines.createOrReplaceTempView("incoming_lines")
+        return spark.sql(f"""
+            MERGE INTO {table(root, 'bronze')} AS t
+            USING incoming_lines AS s
+            ON t.record_id = s.record_id
+            WHEN NOT MATCHED THEN INSERT *""")
+
+    land_bronze(spark, root, days[:2]).show()     # day 1 and 2
+    land_bronze(spark, root, days[1:]).show()     # day 2 again, and day 3
+    land_bronze(spark, root, days[1:]).show()     # the same again
+    ```
+
+    ```
+    +-----------------+----------------+----------------+-----------------+
+    |num_affected_rows|num_updated_rows|num_deleted_rows|num_inserted_rows|
+    +-----------------+----------------+----------------+-----------------+
+    |               40|               0|               0|               40|
+    +-----------------+----------------+----------------+-----------------+
+    ... 21 inserted ...
+    ... 0 inserted ...
+    ```
+
+    And the history (`DESCRIBE HISTORY`, with two of the
+    `operationMetrics`):
+
+    ```
+    0 CREATE TABLE {}
+    1 MERGE {'numSourceRows': '40', 'numTargetRowsInserted': '40'}
+    2 MERGE {'numSourceRows': '41', 'numTargetRowsInserted': '21'}
+    ```
+
+    61 rows in bronze, no duplicates. Details:
+
+    - The third `MERGE` changed nothing and **made no commit**: there is
+      no version 3. An empty append behaves the same way.
+    - `dropDuplicates(["record_id"])` matters. An insert-only `MERGE`
+      does not deduplicate its *source*: two identical source rows that
+      both find no match are both inserted (checked: a source with `d`
+      twice inserted `d` twice). The `MERGE` protects you from the table's
+      past, not from duplicates inside today's delivery.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## MERGE Errors and Silent Drops
+
+    More `MERGE` behaviour to know before you rely on it.
+
+    **Two source rows for one target row** fail, when the merge would
+    update or delete:
+
+    ```
+    UnsupportedOperationException: [DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW_IN_MERGE]
+    Cannot perform Merge as multiple source rows matched and attempted to modify the same
+    target row in the Delta table in possibly conflicting ways. ...
+    ```
+
+    Which of the two values should win is ambiguous, so Delta refuses.
+    Deduplicate the source first, keeping the row you mean (the latest
+    by timestamp, for example).
+
+    **A new column in the source is dropped** by `INSERT *` unless you
+    ask for schema evolution. A source with an extra `country` column:
+
+    ```python
+    spark.sql(f"MERGE INTO {t} t USING wider s ON t.event_id = s.event_id "
+              "WHEN NOT MATCHED THEN INSERT *")
+    ```
+
+    succeeds, inserts the row, and leaves the table's columns as
+    `['event_id', 'amount']`. The country value is gone, without an
+    error. Add `WITH SCHEMA EVOLUTION` (Spark 4.0 SQL, SPARK-47627) and
+    the column is added; rows that existed before get NULL:
+
+    ```python
+    spark.sql(f"MERGE WITH SCHEMA EVOLUTION INTO {t} t USING wider2 s "
+              "ON t.event_id = s.event_id WHEN NOT MATCHED THEN INSERT *")
+    ```
+
+    ```
+    +--------+------+-------+
+    |event_id|amount|country|
+    +--------+------+-------+
+    |       a|   1.0|   NULL|
+    |       d|   4.0|   NULL|
+    |       d|   4.0|   NULL|
+    |       e|   5.0|   NULL|
+    |       f|   6.0|     VN|
+    +--------+------+-------+
+    ```
+
+    (The two `d` rows are the duplicate-source insert from the previous
+    section; `e` came through the plain merge, which dropped its `CA`.)
+
+    The DataFrame form, `DataFrame.mergeInto` (4.0), works on Delta
+    4.4.1 too, but with a path table you have to spell the target's
+    columns with its full name, as in
+    ``F.expr(f"{t}.event_id = s.event_id")``, since the target cannot be
+    aliased. A wrong name there failed in our run with a confusing
+    `[INTERNAL_ERROR] Cannot find main error class
+    'DELTA_MERGE_UNRESOLVED_EXPRESSION'`: Delta raised its own error
+    class, and Spark's error formatter did not know it. For path tables
+    the SQL form is simpler.
+
+- Class: mult_question
+  Depth: all
+  Output: "A MERGE ... WHEN NOT MATCHED THEN INSERT * runs with a source that has a column the target lacks, and no schema evolution. What happens?"
+  AnswerChoices: "The rows are inserted and the extra column is silently dropped;The MERGE fails with DELTA_METADATA_MISMATCH;The column is added automatically;The rows are skipped"
+  CorrectAnswer: "The rows are inserted and the extra column is silently dropped"
+  Hint: "Only MERGE WITH SCHEMA EVOLUTION (or the autoMerge setting) changes the target's schema."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Schema Enforcement on Writes
+
+    A DataFrame `write.format("delta").mode("append")` is checked against
+    the table schema in the log. On a table with `event_id STRING, kind
+    STRING, user_id BIGINT, amount DOUBLE`:
+
+    | Append | Result |
+    |--------|--------|
+    | an extra column `country` | `DELTA_METADATA_MISMATCH` |
+    | the same, `.option("mergeSchema", "true")` | OK, `country` added |
+    | `amount` as a string, even with `mergeSchema` | `DELTA_FAILED_TO_MERGE_FIELDS` |
+    | `user_id` as `int` (narrower) | `DELTA_FAILED_TO_MERGE_FIELDS` |
+    | the same after `.cast("bigint")` | OK |
+    | only `event_id` and `kind` | OK, the other columns NULL |
+    | `mode("overwrite")` with `amount` as a string | `DELTA_FAILED_TO_MERGE_FIELDS` |
+    | the same, `.option("overwriteSchema", "true")` | OK, table schema replaced |
+
+    The `DELTA_METADATA_MISMATCH` message tells you exactly what
+    differs and how to proceed:
+
+    ```
+    [DELTA_METADATA_MISMATCH] A metadata mismatch was detected when writing to the Delta table.
+    - A schema mismatch detected when writing to the Delta table (Table ID: e61e08b4-...).
+    To enable schema migration using DataFrameWriter or DataStreamWriter, please set: '.option("mergeSchema", "true")'.
+    For other operations, set the session configuration spark.databricks.delta.schema.autoMerge.enabled to "true". ...
+
+    Table schema:
+    root
+     |-- event_id: string (nullable = true)
+     ...
+    Data schema:
+    root
+     |-- event_id: string (nullable = true)
+     ...
+     |-- country: string (nullable = true)
+    ```
+
+    What this means for messy data:
+
+    - **New fields** are the safe kind of drift. Decide per table
+      whether they may arrive on their own (`mergeSchema`) or need a
+      code change first.
+    - **Type changes** are refused even with `mergeSchema`. That is the
+      day 3 `amount` object: it cannot land in a `DOUBLE` column, and
+      that is a feature. Handle it in the code that builds silver (the
+      `coalesce` of `try_cast` and `get_json_object` from "JSON Drift
+      and Quarantine"), so silver keeps one meaning per column.
+    - **No silent widening on DataFrame appends**: an `int` column does
+      not go into a `bigint` one. Cast to the table's types before
+      writing. (SQL `INSERT INTO ... VALUES` does cast: inserting `3`
+      into a `DOUBLE` column works.)
+    - A missing column is filled with NULL, which can hide a producer
+      that stopped sending a field. A `NOT NULL` or `CHECK` constraint
+      turns that into an error.
+
+- Class: mult_question
+  Depth: all
+  Output: "Day 3 sends amount as an object where silver has amount DOUBLE. You append the raw-shaped rows with mergeSchema=true. What happens?"
+  AnswerChoices: "The write fails with DELTA_FAILED_TO_MERGE_FIELDS;amount becomes a struct column;amount is written as NULL;The rows go to a rescue column"
+  CorrectAnswer: "The write fails with DELTA_FAILED_TO_MERGE_FIELDS"
+  Hint: "mergeSchema can add columns. It cannot change the type of an existing one."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Append the DataFrame `df` to the Delta table at `silver_path`,
+    allowing new columns to be added to the table's schema.
+  CorrectAnswer: |
+    df.write.format("delta").mode("append").option("mergeSchema", "true").save(silver_path)
+  Hint: "format('delta'), mode('append'), and the writer option mergeSchema set to 'true'."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Constraints: NOT NULL and CHECK
+
+    Declare `NOT NULL` in `CREATE TABLE`, and add `CHECK` constraints
+    with `ALTER TABLE`:
+
+    ```python
+    spark.sql(f"CREATE TABLE {t} (event_id STRING NOT NULL, kind STRING, amount DOUBLE) USING delta")
+    spark.sql(f"ALTER TABLE {t} ADD CONSTRAINT positive_amount CHECK (amount > 0)")
+    ```
+
+    Then:
+
+    | Insert | Result |
+    |--------|--------|
+    | `('a', 'purchase', -5.0)` | `DELTA_VIOLATE_CONSTRAINT_WITH_VALUES`: `CHECK constraint positive_amount (amount > 0) violated by row with values: - amount : -5.0` |
+    | `('b', 'view', NULL)` | `DELTA_VIOLATE_CONSTRAINT_WITH_VALUES` ... `- amount : null` |
+    | `(NULL, 'view', 1.0)` | `DELTA_NOT_NULL_CONSTRAINT_VIOLATED`: `NOT NULL constraint violated for column: event_id.` |
+
+    The middle row surprises people who know SQL: in standard SQL a
+    `CHECK` that evaluates to NULL passes, but Delta 4.4.1 rejects the
+    row. If NULL is allowed, say so:
+    `CHECK (amount IS NULL OR amount > 0)`. (Adding a constraint that
+    existing rows violate fails too, with
+    `DELTA_NEW_CHECK_CONSTRAINT_VIOLATION`, which is how this was first
+    noticed: one old row had a NULL amount.)
+
+    Practical notes:
+
+    - The violation is found by a task while it writes, and in Python it
+      arrives as a plain `Py4JJavaError`, not as a PySpark exception with
+      a condition you can read with `getCondition()`. Its first line is
+      `An error occurred while calling o54.save.` and the second names
+      Delta's `DeltaInvariantViolationException: [DELTA_VIOLATE_CONSTRAINT_WITH_VALUES] ...`.
+      Search the message for the condition name; the exercise harness
+      does exactly that.
+    - `NOT NULL` cannot be added later: `ALTER TABLE ... ALTER COLUMN
+      kind SET NOT NULL` fails with `Cannot change nullable column to
+      non-nullable: kind.` (`_LEGACY_ERROR_TEMP_2330`). Decide at
+      `CREATE TABLE`.
+    - Constraints live in the table properties
+      (`delta.constraints.positive_amount` in `SHOW TBLPROPERTIES`),
+      and a column a constraint refers to cannot change type: appending
+      a string `amount` to such a table fails with
+      `DELTA_CONSTRAINT_DATA_TYPE_MISMATCH` instead of
+      `DELTA_FAILED_TO_MERGE_FIELDS`.
+
+    A failed write adds no version and leaves no rows: the commit never
+    happened.
+
+- Class: mult_question
+  Depth: all
+  Output: "A Delta table has CHECK (amount > 0). You insert a row whose amount is NULL. What happens in Delta 4.4.1?"
+  AnswerChoices: "The insert fails with DELTA_VIOLATE_CONSTRAINT_WITH_VALUES;The row is inserted because NULL passes a CHECK;The amount is set to 0;The row goes to a quarantine table"
+  CorrectAnswer: "The insert fails with DELTA_VIOLATE_CONSTRAINT_WITH_VALUES"
+  Hint: "Delta treats a check that is not true as a violation. Write amount IS NULL OR amount > 0 to allow NULL."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Silver and Quarantine From Bronze
+
+    Silver parses bronze's raw lines with `from_json` and the
+    drift-absorbing schema from "JSON Drift and Quarantine", with a
+    corrupt record column so a line that does not parse is caught
+    instead of becoming a row of NULLs:
+
+    ```python
+    parsed = (spark.read.format("delta").load(os.path.join(root, "bronze"))
+              .withColumn("e", F.from_json("raw", EVENT_SCHEMA,
+                                           {"columnNameOfCorruptRecord": "_corrupt"})))
+    amount = F.coalesce(F.col("e.amount").try_cast("double"),
+                        F.get_json_object("e.amount", "$.value").try_cast("double"))
+    good = (parsed.filter(F.col("e._corrupt").isNull())
+            .select(F.col("record_id").alias("event_id"),
+                    F.coalesce("e.event_type", "e.event").alias("kind"),
+                    F.coalesce(F.col("e.user.id"), F.col("e.user_id")).alias("user_id"),
+                    F.col("e.user.plan").alias("plan"),
+                    amount.alias("amount"),
+                    F.col("e.ts").alias("ts"),
+                    "file"))
+    bad = (parsed.filter(F.col("e._corrupt").isNotNull())
+           .select("record_id", "file", "raw", F.lit("malformed").alias("reason"),
+                   F.current_timestamp().alias("quarantined_at")))
+    ```
+
+    Both go in with an insert-only `MERGE` keyed by the bronze
+    `record_id`, so rebuilding silver from all of bronze after every
+    delivery is safe: rows already there are skipped. Reusing the bronze
+    id as the silver key also gives you lineage for free: join silver
+    back to bronze on it to see the raw line.
+
+    Quarantine is a table, not a log message. It can be counted,
+    alerted on, fixed and replayed, and its `raw` column holds exactly
+    what arrived:
+
+    ```
+    +----------------------+---------+-------------------------------------------+
+    |file                  |reason   |raw                                        |
+    +----------------------+---------+-------------------------------------------+
+    |events_2026-10-03.json|malformed|{"event_type": "purchase", "user": {"id": 9|
+    +----------------------+---------+-------------------------------------------+
+    ```
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Day 3: Evolving Silver on Purpose
+
+    Day 3 brings `user.geo.country`, which silver did not have. The
+    producer's new field is wanted, so the silver code adds a `country`
+    column, and the `MERGE` into silver gets `WITH SCHEMA EVOLUTION`.
+    Without it, as shown above, the column would be silently dropped.
+
+    After day 3 (and the second delivery of day 2), the silver history:
+
+    ```
+    [(0, 'CREATE TABLE'), (1, 'ADD CONSTRAINT'), (2, 'MERGE'), (3, 'MERGE')]
+    ```
+
+    Version 2 is days 1 and 2 (40 rows, no `country`), version 3 adds
+    day 3 and the column. Running the refinement again adds no version,
+    for the reason above: nothing changed.
+
+    This is the difference between drift and evolution. Drift is what
+    the producer does to you; evolution is what you decide to do about
+    it, in code, with a version in the history that shows when.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Time Travel and History
+
+    Every commit is a version you can read:
+
+    ```python
+    spark.read.format("delta").option("versionAsOf", 2).load(silver_path)
+    spark.sql(f"SELECT * FROM {table(root, 'silver')} VERSION AS OF 2")
+    spark.read.format("delta").option("timestampAsOf", "2026-10-28 21:04:38.118").load(silver_path)
+    ```
+
+    The errors are precise:
+
+    ```
+    [DELTA_VERSION_NOT_FOUND] Cannot time travel Delta table to version 99. Available versions: [0, 3].
+    [DELTA_TIMESTAMP_EARLIER_THAN_COMMIT_RETENTION] The provided timestamp (...) is before the earliest version available to this table (...).
+    ```
+
+    **Time zone gotcha.** Get the timestamp for `timestampAsOf` from
+    Spark as a string, not from a Python datetime:
+
+    ```python
+    ts = (spark.sql(f"DESCRIBE HISTORY {t}").filter("version = 1")
+          .select(F.col("timestamp").cast("string")).first()[0])
+    ```
+
+    As "Schemas for Data You Don't Control" showed, `collect()` turns
+    timestamps into Python datetimes in your computer's local time zone,
+    while Spark reads a timestamp string in the session time zone. With the session in UTC on a machine in
+    Pacific time, `str(row.timestamp)` was 7 hours off and the read failed
+    with `DELTA_TIMESTAMP_EARLIER_THAN_COMMIT_RETENTION` (whose message,
+    to add to the fun, prints times in the JVM's local zone).
+
+    `DESCRIBE HISTORY` is the table's audit log: `version`,
+    `timestamp`, `operation`, `operationParameters` (the `MERGE`
+    condition, the write mode) and `operationMetrics` (rows inserted,
+    files added and removed). When a number in gold looks wrong, start
+    there.
+
+    To undo a bad load, `RESTORE TABLE ... TO VERSION AS OF n` makes a
+    new version whose content equals version `n`. History is not
+    rewritten; the restore is itself a version (`RESTORE` in the
+    history), so you can undo the undo.
+
+    Old versions stay readable as long as their files exist. `VACUUM`
+    deletes files that no retained version needs (7 days by default);
+    after it, time travel to older versions stops working. The advanced
+    "Designing Tables for Blobs" covers `VACUUM` and `OPTIMIZE`.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## The Change Data Feed
+
+    Time travel shows whole versions. The **change data feed** shows
+    the rows that changed between them, which is what an incremental
+    gold job wants. Switch it on per table:
+
+    ```python
+    spark.sql(f"CREATE TABLE {cdf} (event_id STRING, amount DOUBLE) USING delta "
+              "TBLPROPERTIES (delta.enableChangeDataFeed = true)")
+    # version 1: insert a and b; version 2: MERGE updates a, inserts c; version 3: delete b
+
+    (spark.read.format("delta").option("readChangeFeed", "true").option("startingVersion", 2)
+     .load(cdf_path)
+     .select("event_id", "amount", "_change_type", "_commit_version")
+     .orderBy("_commit_version", "event_id", "_change_type").show())
+    ```
+
+    ```
+    +--------+------+----------------+---------------+
+    |event_id|amount|    _change_type|_commit_version|
+    +--------+------+----------------+---------------+
+    |       a|  10.0|update_postimage|              2|
+    |       a|   1.0| update_preimage|              2|
+    |       c|   3.0|          insert|              2|
+    |       b|   2.0|          delete|              3|
+    +--------+------+----------------+---------------+
+    ```
+
+    An update shows both the old row (`update_preimage`) and the new one
+    (`update_postimage`). The feed also works as a stream
+    (`spark.readStream.format("delta").option("readChangeFeed",
+    "true")`), and changes are recorded only from the version where the
+    feed was enabled. Applying a feed like this to keep another table in
+    sync is exactly what the Declarative Pipelines course's "Auto CDC:
+    Keeping a Table in Sync (Spark 4.2)" lesson does.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Streaming Into Delta
+
+    The streaming query from "Streaming Files: Your First Structured
+    Streaming Job" can write straight into a Delta table, with exactly
+    once semantics, by changing only the sink:
+
+    ```python
+    q = (spark.readStream.text(inbox)
+         .select(F.col("_metadata.file_name").alias("file"), F.col("value").alias("raw"))
+         .writeStream.format("delta")
+         .option("checkpointLocation", os.path.join(root, "checkpoints", "raw"))
+         .trigger(availableNow=True)
+         .start(os.path.join(root, "raw_stream")))
+    q.awaitTermination()
+    ```
+
+    Run it after day 1 arrives and again after day 2: the table has 40
+    rows, and its history shows one commit per micro-batch, each tagged
+    with the query id and batch number:
+
+    ```
+    0 STREAMING UPDATE {'epochId': '0', 'outputMode': 'Append', 'queryId': 'a37db5ef-...'}
+    1 STREAMING UPDATE {'epochId': '1', 'outputMode': 'Append', 'queryId': 'a37db5ef-...'}
+    ```
+
+    The Delta sink uses that query id and batch number to skip a batch
+    it has already committed when Spark replays it, which is the
+    idempotent write the streaming lesson asked for. For the `MERGE`
+    style of landing, call `MERGE` inside `foreachBatch`.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Land Three Days of Drift
+
+    This exercise uses Delta Lake 4.4.1 (first line
+    `# spark-connectors: delta`). Implement:
+
+    1. `create_tables(spark, root)`: empty Delta tables `bronze`,
+       `silver` and `quarantine` under `root` (the DDL is in the
+       starter), plus the CHECK constraint `positive_amount` on silver
+       that allows NULL.
+    2. `land_bronze(spark, root, files)`: raw lines with `record_id`
+       (`sha2` of file name, `|` and line), `file`, `raw`,
+       `ingested_at`, merged in so a file delivered twice adds nothing.
+    3. `refine(spark, root, with_country)`: bronze to silver and
+       quarantine, insert-only `MERGE`s keyed by `record_id`. With
+       `with_country=True`, silver also gets `country` from
+       `user.geo.country`, and the silver `MERGE` must evolve the schema.
+    4. `build_gold(spark, root)`: `day`, `events`, `revenue` (rounded to
+       2 places) from silver, overwritten each time, read back.
+    5. `history(spark, root, name)` and `silver_as_of(spark, root,
+       version)`.
+
+    The harness lands day 1 and 2, checks counts, then tries two bad
+    appends to your silver (a string `user_id`, a negative `amount`)
+    and expects `DELTA_FAILED_TO_MERGE_FIELDS` and
+    `DELTA_VIOLATE_CONSTRAINT_WITH_VALUES` and no new version. Then it
+    lands day 2 again with day 3, refines twice, and checks: 61 bronze
+    rows, 60 silver events with amounts for every shape, `country` on
+    exactly the 20 day 3 events, the truncated line in quarantine, gold
+    against totals computed with Python's `json`, and that the silver
+    version from before day 3 has 40 rows and no `country` column.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Constraint: ALTER TABLE ... ADD CONSTRAINT positive_amount CHECK (amount IS NULL OR amount > 0). Bronze: spark.read.text(files), sha2(concat_ws('|', 'file', 'raw'), 256), dropDuplicates(['record_id']), temp view, MERGE INTO ... WHEN NOT MATCHED THEN INSERT *. Silver: from_json('raw', EVENT_SCHEMA, {'columnNameOfCorruptRecord': '_corrupt'}); MERGE WITH SCHEMA EVOLUTION INTO when with_country. Time travel: option('versionAsOf', v)."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    In this lesson you learned:
+
+    - **A table format** adds a transaction log to Parquet files:
+      atomic commits, isolation, schema enforcement, versions. In Delta
+      the log is `_delta_log/NNNN.json` with `metaData`, `add`, `remove`
+      and `commitInfo` actions
+    - **Delta 4.4.1 for Spark 4.2**: `io.delta:delta-spark_4.2_2.13:4.4.1`
+      plus the extension and catalog settings, or
+      `# spark-connectors: delta`
+    - **Always `format("delta")`**: a plain or Parquet read of the folder
+      returns removed files too, silently
+    - **Layers**: bronze keeps raw lines with their origin, silver is
+      typed and cleaned, quarantine keeps what failed with a reason,
+      gold answers questions
+    - **`MERGE` on a content-based id** makes redelivery harmless;
+      deduplicate the source yourself; a merge that changes nothing makes
+      no commit; two source rows for one target row fail on update
+    - **Enforcement**: `DELTA_METADATA_MISMATCH` for new columns
+      (`mergeSchema` to allow), `DELTA_FAILED_TO_MERGE_FIELDS` for type
+      changes (always refused), no widening on DataFrame appends;
+      `MERGE ... INSERT *` drops new columns unless `WITH SCHEMA
+      EVOLUTION`
+    - **Constraints**: `NOT NULL` at create time only; Delta's `CHECK`
+      rejects NULL unless you allow it; violations arrive as task
+      failures carrying `DELTA_VIOLATE_CONSTRAINT_WITH_VALUES`
+    - **Time travel** with `versionAsOf` / `timestampAsOf` (pass Spark's
+      own timestamp string), `DESCRIBE HISTORY`, `RESTORE`
+    - **Change data feed** for row-level changes, and **streaming into
+      Delta** with one commit per micro-batch
+
+    Next: **Text Analytics Without an LLM**, where the clean text you
+    can now land reliably becomes a search index and a duplicate
+    detector.

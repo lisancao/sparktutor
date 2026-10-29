@@ -1,0 +1,13 @@
+store_id,name,city,lat,lon
+S01,Gastown,Vancouver,49.2840,-123.1090
+S02,Kitsilano,Vancouver,49.2680,-123.1680
+S03,Metrotown,Vancouver,49.2270,-123.0000
+S04,Plateau,Montréal,45.5220,-73.5800
+S05,Verdun,Montréal,45.4580,-73.5700
+S06,Queen West,Toronto,43.6480,-79.4000
+S07,North York,Toronto,43.7610,-79.4110
+S08,Hoàn Kiếm,Hà Nội,21.0285,105.8542
+S09,Cầu Giấy,Hà Nội,21.0333,105.7950
+S10,Bến Thành,Hồ Chí Minh,10.7725,106.6980
+S11,Thảo Điền,Hồ Chí Minh,10.8030,106.7350
+S12,Hải Châu,Đà Nẵng,16.0600,108.2200

@@ -1,30 +1,68 @@
 course:
   id: messy_data
-  title: "Messy Data and Python Data Sources in Spark 4.2"
-  description: "Semi-structured, unstructured and multimodal data with Spark 4.2: files as bytes, logs, drifting JSON, VARIANT, XML, documents, images and audio, then your own Python data sources, from a first reader to streaming, pushdown, writers and packaging"
-  version: "1.0.0"
+  title: "Messy Data with Apache Spark 4.2: Zero to Internals"
+  description: "Semi-structured, unstructured and multimodal data with Spark 4.2 at three levels. Basics follows the shape of Learning Spark: how Spark runs, schemas and cleaning, every built-in source from CSV to Avro, VARIANT, documents, images and audio, UDFs, your first Python data source, plans, streaming, Delta, text analytics and inference. Intermediate builds production Python data sources (files, APIs, databases, pushdown, writers, streaming, packaging), UDTFs, tuning, quality-checked ingestion, similarity search and entity resolution. Advanced goes inside the engine: Catalyst and the Python worker protocol, JVM DSv2 connectors, session extensions and Spark Connect plugins, Parquet and VARIANT internals, distributed algorithms, streaming state internals, reliability, deployment, observability and an upstream bug from repro to fix"
+  version: "2.0.0"
   requires_lakehouse: false
   prerequisites:
-    - "Python 3.10+"
-    - "Java 17 or 21 (Java 25 also works)"
+    - "Python 3.10+ and basic Python (functions, classes, dicts); no Spark experience needed"
+    - "Java 17 or 21 (Java 25 also works); the advanced Java lessons need a full JDK with javac"
     - 'pip install "pyspark[connect,pipelines]==4.2.0" "pandas<3" (SparkTutor installs both)'
-    - "DataFrames, Spark SQL and UDFs (learning_spark lessons 1 to 5); the capstone also uses Declarative Pipelines (spark_declarative_pipelines lessons 4 to 6)"
+    - "Recommended alongside, not required: the learning_spark course; the intermediate capstone also uses spark_declarative_pipelines lessons 'Bronze: Ingesting Raw Data', 'Silver: Types, Duplicates and Quarantine' and 'Gold: Aggregates for the Business'"
   lessons:
-    - 01_files_as_files
-    - 02_text_and_logs
-    - 03_json_drift
-    - 04_variant_basics
-    - 05_xml
-    - 06_documents_to_rows
-    - 07_images_and_audio
-    - 08_first_python_data_source
-    - 09_custom_file_format
-    - 10_variant_shredding
-    - 11_text_analytics
-    - 12_api_source
-    - 13_arrow_performance
-    - 14_filter_pushdown
-    - 15_writers
-    - 16_streaming_sources
-    - 17_packaging_testing
-    - 18_capstone
+    - 01_why_spark
+    - 02_setup_and_tour
+    - 03_schemas
+    - 04_cleaning_values
+    - 05_files_as_files
+    - 06_text_and_logs
+    - 07_csv_and_delimited
+    - 08_json_drift
+    - 09_complex_types
+    - 10_variant_basics
+    - 11_xml
+    - 12_avro_and_protobuf
+    - 13_documents_to_rows
+    - 14_images_and_audio
+    - 15_first_python_data_source
+    - 16_plans_partitions_caching
+    - 17_streaming_files
+    - 18_landing_in_delta
+    - 19_text_analytics
+    - 20_inference_with_pandas_udfs
+    - 21_whats_new_4x
+    - 22_custom_file_format
+    - 23_api_source
+    - 24_arrow_performance
+    - 25_filter_pushdown
+    - 26_database_source
+    - 27_writers
+    - 28_streaming_sources
+    - 29_packaging_testing
+    - 30_python_udtfs
+    - 31_variant_shredding
+    - 32_tuning_python
+    - 33_streaming_messy_data
+    - 34_production_ingestion
+    - 35_similarity_search
+    - 36_entity_resolution
+    - 37_inference_in_production
+    - 38_capstone_intermediate
+    - 39_catalyst_python_plans
+    - 40_python_worker_protocol
+    - 41_memory_and_blobs
+    - 42_java_dsv2_connector
+    - 43_session_extensions
+    - 44_connect_plugins
+    - 45_parquet_internals
+    - 46_variant_binary_format
+    - 47_blob_table_design
+    - 48_lsh_and_ivf
+    - 49_connected_components
+    - 50_sketches
+    - 51_streaming_internals
+    - 52_determinism_retries
+    - 53_shipping_dependencies
+    - 54_observability
+    - 55_upstream_case_study
+    - 56_final_project

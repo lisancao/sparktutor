@@ -173,6 +173,17 @@ pdf.mkdir(exist_ok=True)
 (pdf / "invoice_1001.pdf").write_bytes(tiny_pdf(["Invoice 1001 total 42.50 CAD", "Thank you for shopping"]))
 (pdf / "invoice_1002.pdf").write_bytes(tiny_pdf(["Invoice 1002 total 17.00 CAD"]))
 
+# ---------------------------------------------------------------- per-lesson generators
+# Each module in scripts/messy_gen/ defines generate(out: Path) and writes its own
+# subfolder with its own fixed seed, so adding one never changes the files above.
+import importlib.util
+
+for module_path in sorted((Path(__file__).parent / "messy_gen").glob("*.py")):
+    spec = importlib.util.spec_from_file_location(module_path.stem, module_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.generate(out)
+
 total = sum(p.stat().st_size for p in out.rglob("*") if p.is_file())
 for d in sorted(p for p in out.iterdir() if p.is_dir()):
     print(f"{d.name:8} {sum(p.stat().st_size for p in d.rglob('*') if p.is_file()):7d} bytes")

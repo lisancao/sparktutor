@@ -1,0 +1,26 @@
+{
+  "type": "record",
+  "name": "Order",
+  "namespace": "shop",
+  "fields": [
+    {
+      "name": "order_id",
+      "type": "string"
+    },
+    {
+      "name": "user_id",
+      "type": "long"
+    },
+    {
+      "name": "amount",
+      "type": "double"
+    },
+    {
+      "name": "ts",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

@@ -1,0 +1,1023 @@
+- Class: meta
+  Lesson: "Plans, Partitions and Caching"
+  EstimatedMinutes: 55
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    You can now read almost anything: bytes, text, CSV, JSON, VARIANT,
+    XML, documents, images, audio, and your own format through a Python
+    data source. "Why Spark for Messy Data, and How It Runs Your Code"
+    showed you that Spark turns your code into a plan of stages and
+    tasks, that an `Exchange` is a shuffle, and that each file becomes
+    one or more partitions. This lesson is the toolkit for the next
+    question: is Spark doing what I think it is doing, and is it doing
+    too much?
+
+    It follows chapter 7 of *Learning Spark* (optimizing and tuning),
+    applied to the messy sample files. By the end you will be able to:
+
+    - Read `explain()` in all five modes and say what each line of a
+      `FileScan` means (`PushedFilters`, `PartitionFilters`,
+      `DataFilters`, `ReadSchema`)
+    - Explain why `count()` on the cleaned events fails with
+      `QUERY_ONLY_CORRUPT_RECORD_COLUMN`, using column pruning
+    - Recognize `HashAggregate`, `BroadcastHashJoin` and
+      `SortMergeJoin`, and make Spark broadcast a small table
+    - Read an adaptive plan before and after it runs, and know which
+      actions update the plan you print
+    - Predict how many partitions a file read makes, from
+      `spark.sql.files.maxPartitionBytes` and `openCostInBytes`, and
+      know which files can never be split
+    - Choose between `repartition` and `coalesce`
+    - Write a folder-per-day layout with `partitionBy` and prove that a
+      query reads only one day
+    - Cache the right things, see the cache in the plan, and avoid the
+      stale-listing trap
+
+    Everything here is checked through plans and partition counts,
+    never through timings: timings on a laptop change from run to run,
+    plans do not.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Think of `explain()` as asking a moving company for the plan before
+    they start: which rooms they will empty (the scan), what they will
+    leave behind (pruned columns and filtered rows), when everything has
+    to go through one hallway (a shuffle), and which small boxes they
+    will simply carry to every truck (a broadcast). Reading the plan
+    costs nothing, and it catches most expensive mistakes before any
+    work is done.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Sample Query
+
+    The examples use the cleaned events from "JSON Drift and
+    Quarantine": the drift-absorbing schema, the corrupt record column,
+    and `coalesce` over the old and new field names. A `day` column
+    comes from the timestamp.
+
+    ```python
+    from pyspark.sql import SparkSession, functions as F
+
+    spark = (SparkSession.builder.master("local[4]")
+             .config("spark.sql.session.timeZone", "UTC").getOrCreate())
+
+    EVENT_SCHEMA = """
+        event STRING, event_type STRING, user_id BIGINT,
+        user STRUCT<id: BIGINT, plan: STRING, geo: STRUCT<country: STRING>>,
+        amount STRING,
+        items ARRAY<STRUCT<sku: STRING, qty: INT>>,
+        ts TIMESTAMP,
+        _corrupt STRING
+    """
+    raw = (spark.read.schema(EVENT_SCHEMA)
+           .option("columnNameOfCorruptRecord", "_corrupt")
+           .json("data/messy/events"))
+
+    amount = F.coalesce(F.col("amount").try_cast("double"),
+                        F.get_json_object("amount", "$.value").try_cast("double"))
+    silver = (raw.filter(F.col("_corrupt").isNull())
+              .select(F.coalesce("event_type", "event").alias("event_type"),
+                      F.coalesce(F.col("user.id"), F.col("user_id")).alias("user_id"),
+                      F.col("user.plan").alias("plan"),
+                      amount.alias("amount"),
+                      "ts",
+                      F.to_date("ts").alias("day")))
+    ```
+
+    Setting the session time zone to UTC keeps `to_date("ts")` and the
+    printed timestamps the same on every machine. Without it Spark uses
+    your computer's time zone.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Five Ways to Explain
+
+    `df.explain(mode)` prints the plan without running anything. The
+    modes, from the 4.2.0 error message you get for a wrong one:
+
+    ```
+    IllegalArgumentException: Unknown explain mode: bogus. Accepted explain
+    modes are 'simple', 'extended', 'codegen', 'cost', 'formatted'.
+    ```
+
+    | Mode | Shows |
+    |------|-------|
+    | `simple` (the default) | the physical plan |
+    | `extended` | the parsed, analyzed and optimized logical plans, then the physical plan |
+    | `formatted` | a short tree with numbered nodes, then each node's details |
+    | `cost` | the optimized logical plan with size estimates (`Statistics(sizeInBytes=...)`) |
+    | `codegen` | the Java code Spark generates for each fused stage |
+
+    `extended` is where you see the optimizer at work. A filter and a
+    projection on the raw events:
+
+    ```python
+    user_1 = raw.filter(F.col("user_id") == 1).select("event", "amount")
+    user_1.explain("extended")
+    ```
+
+    ```
+    == Parsed Logical Plan ==
+    'Project ['event, 'amount]
+    +- Filter (user_id#2L = cast(1 as bigint))
+       +- Relation [event#0,event_type#1,user_id#2L,user#3,amount#4,items#5,ts#6,_corrupt#7] json
+
+    == Analyzed Logical Plan ==
+    event: string, amount: string
+    Project [event#0, amount#4]
+    +- Filter (user_id#2L = cast(1 as bigint))
+       +- Relation [event#0,event_type#1,user_id#2L,user#3,amount#4,items#5,ts#6,_corrupt#7] json
+
+    == Optimized Logical Plan ==
+    Project [event#0, amount#4]
+    +- Filter (isnotnull(user_id#2L) AND (user_id#2L = 1))
+       +- Relation [event#0,event_type#1,user_id#2L,user#3,amount#4,items#5,ts#6,_corrupt#7] json
+
+    == Physical Plan ==
+    *(1) Project [event#0, amount#4]
+    +- *(1) Filter (isnotnull(user_id#2L) AND (user_id#2L = 1))
+       +- FileScan json [event#0,user_id#2L,amount#4] Batched: false, DataFilters: [isnotnull(user_id#2L), (user_id#2L = 1)], Format: JSON, Location: InMemoryFileIndex(1 paths)[file:/.../data/messy/events], PartitionFilters: [], PushedFilters: [IsNotNull(user_id), EqualTo(user_id,1)], ReadSchema: struct<event:string,user_id:bigint,amount:string>
+    ```
+
+    (Paths are shortened here and below.) Reading top to bottom:
+
+    - **Parsed**: what you wrote. The quote in `'Project ['event` means
+      "not resolved yet": Spark has not checked that the columns exist.
+    - **Analyzed**: columns resolved to ids (`event#0`), types known,
+      and the literal `1` cast to `bigint` to match `user_id`.
+    - **Optimized**: the optimizer simplified the cast away and added
+      `isnotnull(user_id)`, which lets sources skip NULLs cheaply.
+    - **Physical**: what will run. The relation became a `FileScan`
+      that reads only three columns.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Reading a FileScan Line
+
+    The `FileScan` line packs most of what you need into one row. The
+    `formatted` mode prints the same facts one per line:
+
+    ```python
+    user_1.explain("formatted")
+    ```
+
+    ```
+    == Physical Plan ==
+    * Project (3)
+    +- * Filter (2)
+       +- Scan json  (1)
+
+
+    (1) Scan json
+    Output [3]: [event#0, user_id#2L, amount#4]
+    Batched: false
+    Location: InMemoryFileIndex [file:/.../data/messy/events]
+    PushedFilters: [IsNotNull(user_id), EqualTo(user_id,1)]
+    ReadSchema: struct<event:string,user_id:bigint,amount:string>
+
+    (2) Filter [codegen id : 1]
+    Input [3]: [event#0, user_id#2L, amount#4]
+    Condition : (isnotnull(user_id#2L) AND (user_id#2L = 1))
+
+    (3) Project [codegen id : 1]
+    Output [2]: [event#0, amount#4]
+    Input [3]: [event#0, user_id#2L, amount#4]
+    ```
+
+    | Field | Meaning |
+    |-------|---------|
+    | `[event#0, user_id#2L, amount#4]` / `ReadSchema` | the columns the scan produces. Everything else was **pruned**: Spark will not build it. |
+    | `Location: InMemoryFileIndex` | the list of files, made when you called `load()` |
+    | `PartitionFilters` | filters on folder names such as `day=2026-10-02`. They remove whole files before reading. |
+    | `PushedFilters` | filters handed to the file reader so it can skip data early. For Parquet that means skipping row groups using their statistics. |
+    | `DataFilters` | the filters on data columns, as Spark sees them |
+    | `Batched` | whether the reader hands over columnar batches (`true` for Parquet and ORC) |
+
+    Notice that the `Filter` node stays in the plan even
+    though the filter was pushed: a pushed filter is a hint the reader
+    may use to skip data, and Spark still checks every row it gets back.
+    And for JSON, pushing happens while parsing
+    (`spark.sql.json.filterPushdown.enabled`, default `true` since 3.1):
+    the reader still reads every line of every file, it just stops
+    building rows that cannot match. Only formats with statistics, such
+    as Parquet, can skip data without reading it.
+
+- Class: mult_question
+  Depth: all
+  Output: "A Parquet FileScan shows `PushedFilters: [IsNotNull(amount), GreaterThan(amount,20.0)]` and there is still a Filter node above it. Why?"
+  AnswerChoices: "Pushed filters only let the reader skip data it can rule out early, and Spark still checks every row it returns;The filter runs twice by mistake;The Filter node is for a different column;Pushed filters are ignored for Parquet"
+  CorrectAnswer: "Pushed filters only let the reader skip data it can rule out early, and Spark still checks every row it returns"
+  Hint: "Statistics can rule out a whole row group, but they cannot decide each row on their own."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Column Pruning, and Why count() Fails on the Cleaned Events
+
+    "JSON Drift and Quarantine" warned that a query touching only the
+    corrupt record column fails. Here is the same error from a query
+    that does not mention the corrupt column at all:
+
+    ```python
+    silver.count()
+    ```
+
+    ```
+    AnalysisException: [UNSUPPORTED_FEATURE.QUERY_ONLY_CORRUPT_RECORD_COLUMN] The feature
+    is not supported: Queries from raw JSON/CSV/XML files are disallowed when the
+    referenced columns only include the internal corrupt record column ...
+    ```
+
+    The plan explains it. `count()` is a `groupBy().count()`, so look at
+    that plan:
+
+    ```python
+    silver.groupBy().count().explain()
+    ```
+
+    ```
+    == Physical Plan ==
+    AdaptiveSparkPlan isFinalPlan=false
+    +- HashAggregate(keys=[], functions=[count(1)])
+       +- Exchange SinglePartition, ENSURE_REQUIREMENTS, [plan_id=66]
+          +- HashAggregate(keys=[], functions=[partial_count(1)])
+             +- Project
+                +- Filter isnull(_corrupt#7)
+                   +- FileScan json [_corrupt#7] ... ReadSchema: struct<_corrupt:string>
+    ```
+
+    Counting needs none of the selected columns, so the optimizer pruned
+    them all. The only column left is the one in the filter,
+    `_corrupt`, and that is exactly the query Spark refuses (the corrupt
+    column is filled only while the other columns are parsed). Pruning
+    is usually a pure win; here it changed which query reached the
+    reader.
+
+    Anything that keeps a real column in the scan avoids it, for
+    example `silver.filter(F.col("ts").isNotNull()).count()` (60 rows),
+    and so does caching (`raw.cache()` before the filter), because a
+    cached DataFrame is parsed once with every column.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Nested Columns: What JSON Can and Cannot Skip
+
+    Filter on a field inside a struct and compare the two formats.
+    JSON:
+
+    ```python
+    raw.filter(F.col("user.plan") == "pro").select("user.plan").explain()
+    ```
+
+    ```
+    *(1) Project [user#3.plan AS plan#49]
+    +- *(1) Filter (isnotnull(user#3.plan) AND (user#3.plan = pro))
+       +- FileScan json [user#3] ... PushedFilters: [],
+          ReadSchema: struct<user:struct<id:bigint,plan:string,geo:struct<country:string>>>
+    ```
+
+    The same data written to Parquet and read back:
+
+    ```
+    FileScan parquet [user#42] ... PushedFilters: [IsNotNull(user.plan), EqualTo(user.plan,pro)],
+    ReadSchema: struct<user:struct<plan:string>>
+    ```
+
+    JSON builds the whole `user` struct and pushes nothing. Parquet
+    reads only the `plan` leaf (nested schema pruning) and pushes the
+    filter on it, because it stores every leaf as its own column. For
+    messy JSON you query often, this is a strong reason to land it as
+    Parquet or Delta ("Landing Messy Data in Delta Lake") once, and query
+    that.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Aggregations and Joins in a Plan
+
+    "Why Spark for Messy Data, and How It Runs Your Code" walked through
+    `HashAggregate (partial)`, `Exchange`, `HashAggregate (final)`.
+    Joins add two more shapes. Enrich each event with the price of its
+    plan, from a two-row table:
+
+    ```python
+    prices = spark.createDataFrame([("free", 0.0), ("pro", 9.99)], "plan string, monthly double")
+    silver.join(prices, "plan", "left").explain()
+    ```
+
+    ```
+    AdaptiveSparkPlan isFinalPlan=false
+    +- Project [...]
+       +- SortMergeJoin [plan#11], [plan#50], LeftOuter
+          :- Sort [plan#11 ASC NULLS FIRST], false, 0
+          :  +- Exchange hashpartitioning(plan#11, 200), ENSURE_REQUIREMENTS, [plan_id=149]
+          :     +- Project [...]
+          :        +- Filter isnull(_corrupt#7)
+          :           +- FileScan json [...]
+          +- Sort [plan#50 ASC NULLS FIRST], false, 0
+             +- Exchange hashpartitioning(plan#50, 200), ENSURE_REQUIREMENTS, [plan_id=150]
+                +- Filter isnotnull(plan#50)
+                   +- Scan ExistingRDD[plan#50,monthly#51]
+    ```
+
+    A **sort-merge join** shuffles both sides by the key, sorts them,
+    and walks them together: two shuffles and two sorts for a lookup in
+    a two-row table. Spark chose it because it could not tell how big
+    `prices` is. A DataFrame made from a Python list shows up as
+    `Scan ExistingRDD`, which has no size statistics, so Spark assumes
+    it is huge. Tell it:
+
+    ```python
+    silver.join(F.broadcast(prices), "plan", "left").explain()
+    ```
+
+    ```
+    AdaptiveSparkPlan isFinalPlan=false
+    +- Project [...]
+       +- BroadcastHashJoin [plan#11], [plan#50], LeftOuter, BuildRight, false, false
+          :- Project [...]
+          :  +- Filter isnull(_corrupt#7)
+          :     +- FileScan json [...]
+          +- BroadcastExchange HashedRelationBroadcastMode(List(input[0, string, false]),false), [plan_id=179]
+             +- Filter isnotnull(plan#50)
+                +- Scan ExistingRDD[plan#50,monthly#51]
+    ```
+
+    A **broadcast hash join** sends the small side (`BuildRight`: the
+    right side is the one built into a hash table) to every task, and
+    the big side never moves. No `Exchange hashpartitioning`, no
+    `Sort`.
+
+    Spark broadcasts on its own when it knows a side is below
+    `spark.sql.autoBroadcastJoinThreshold` (default `10MB`; `-1` turns
+    automatic broadcasting off). For a left join only the right side can
+    be broadcast, since every left row must be kept. Broadcast only what
+    really is small: the whole table is copied to every executor.
+
+- Class: mult_question
+  Depth: all
+  Output: "You join 50 million log lines to a 200-row lookup table built with spark.createDataFrame, and the plan shows SortMergeJoin with two Exchange nodes. What is the simplest fix?"
+  AnswerChoices: "Wrap the lookup table in F.broadcast();Increase spark.sql.shuffle.partitions;Cache the log lines;Call repartition(1) on the lookup table"
+  CorrectAnswer: "Wrap the lookup table in F.broadcast()"
+  Hint: "Spark cannot estimate the size of a DataFrame made from a Python list, so it does not know the table is tiny."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## The Optimizer Copies Filters Across a Join
+
+    One more thing joins do in plans: when you filter one side on the
+    join key, Spark infers the same filter for the other side. Joining
+    the events to a large Parquet table of users, filtered to
+    `user_id < 5`, gives a scan of the *events* with
+
+    ```
+    DataFilters: [isnull(_corrupt#7), (coalesce(user#3.id, user_id#2L) < 5), ...]
+    ```
+
+    even though you only filtered the users. Rows that cannot match are
+    dropped before the join. This is constraint propagation, and it is
+    one more reason to read the plan instead of guessing.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Adaptive Query Execution, Before and After
+
+    Every plan above starts with `AdaptiveSparkPlan isFinalPlan=false`.
+    Adaptive query execution (AQE, on by default since Spark 3.2,
+    SPARK-33679; `spark.sql.adaptive.enabled`) runs the plan one shuffle
+    stage at a time, looks at the real sizes each stage produced, and
+    re-plans the rest. Plans with no shuffle (the Parquet query later in
+    this lesson) have no `AdaptiveSparkPlan` at the top at all, because
+    there is nothing to adapt.
+
+    Run a query, then print its plan again:
+
+    ```python
+    per_type = silver.groupBy("event_type").agg(F.sum("amount").alias("revenue"))
+    per_type.collect()
+    per_type.explain()
+    ```
+
+    ```
+    AdaptiveSparkPlan isFinalPlan=true
+    +- == Final Plan ==
+       ResultQueryStage 1
+       +- *(2) HashAggregate(keys=[event_type#9], functions=[sum(amount#12)])
+          +- AQEShuffleRead coalesced
+             +- ShuffleQueryStage 0
+                +- Exchange hashpartitioning(event_type#9, 200), ENSURE_REQUIREMENTS, [plan_id=244]
+                   +- *(1) HashAggregate(keys=[event_type#9], functions=[partial_sum(amount#12)])
+                      +- ...
+    +- == Initial Plan ==
+       HashAggregate(keys=[event_type#9], functions=[sum(amount#12)])
+       +- Exchange hashpartitioning(event_type#9, 200), ENSURE_REQUIREMENTS, [plan_id=228]
+          +- ...
+    ```
+
+    - `ShuffleQueryStage 0` is the part before the shuffle, run as its
+      own job.
+    - `AQEShuffleRead coalesced`: the exchange wrote 200 partitions
+      (`spark.sql.shuffle.partitions`), almost all empty, and AQE read
+      them back as far fewer.
+    - The initial plan is kept underneath for comparison.
+
+    AQE also converts a sort-merge join into a broadcast join when a
+    shuffle turns out small. Run the un-hinted `silver.join(prices, ...)`
+    and its final plan shows `BroadcastHashJoin` over `AQEShuffleRead
+    local` reads. The two shuffles still ran first, though, so the
+    hint is cheaper than the rescue.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Gotcha: Which Actions Update the Plan You Print
+
+    `explain()` after an action shows the final plan only if the action
+    ran *this* DataFrame's plan. Many actions run a slightly different
+    query built on top of it. Checked on 4.2.0, a fresh `per_type` per
+    line, then `"isFinalPlan=true" in` the explain output:
+
+    ```
+    count     False
+    show      False
+    take(1)   False
+    collect   True
+    toPandas  True
+    ```
+
+    `count()` adds an aggregate, `show()` and `take()` add a limit, and
+    each of those is a new plan with its own adaptive execution. The
+    Spark UI's SQL tab shows every one of them, so use it (or
+    `collect()` on a small result) when you want to see what AQE did.
+
+- Class: mult_question
+  Depth: all
+  Output: "You call df.count() and then df.explain(). The plan still says isFinalPlan=false. Why?"
+  AnswerChoices: "count() ran a new plan with an aggregate on top, so df's own plan never ran;AQE is turned off;The query failed;explain() always shows the initial plan"
+  CorrectAnswer: "count() ran a new plan with an aggregate on top, so df's own plan never ran"
+  Hint: "count() is groupBy().count() on top of df."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## AQE Settings Worth Knowing
+
+    All of these are SQL settings you can change with `spark.conf.set`
+    (defaults from the 4.2.0 source):
+
+    | Setting | Default | Effect |
+    |---------|---------|--------|
+    | `spark.sql.adaptive.enabled` | `true` | AQE on or off |
+    | `spark.sql.adaptive.coalescePartitions.enabled` | `true` | merge small shuffle partitions |
+    | `spark.sql.adaptive.advisoryPartitionSizeInBytes` | `64MB` | target size when merging or splitting |
+    | `spark.sql.adaptive.coalescePartitions.parallelismFirst` | `true` | ignore the target size and keep enough partitions to use every core |
+    | `spark.sql.adaptive.skewJoin.enabled` | `true` | split skewed partitions in sort-merge joins |
+    | `spark.sql.adaptive.skewJoin.skewedPartitionFactor` | `5.0` | skewed means this many times the median size... |
+    | `spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes` | `256MB` | ...and bigger than this |
+    | `spark.sql.adaptive.autoBroadcastJoinThreshold` | (falls back to `spark.sql.autoBroadcastJoinThreshold`) | broadcast limit used at runtime |
+
+    Skew is common in messy data: one bot, one tenant or one "unknown"
+    key holds most rows. To watch the skew join work on a laptop, shrink
+    the thresholds and join 400,000 rows, three quarters of them on key
+    `0`, to a 100-row table:
+
+    ```python
+    spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
+    spark.conf.set("spark.sql.adaptive.advisoryPartitionSizeInBytes", "64KB")
+    spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes", "256KB")
+
+    skewed = spark.range(0, 400_000).select(
+        F.when(F.col("id") < 300_000, 0).otherwise(F.col("id") % 100).alias("k"),
+        F.col("id").alias("v"))
+    dim = spark.range(0, 100).select(F.col("id").alias("k"), F.col("id").cast("string").alias("name"))
+    s = skewed.join(dim, "k")
+    s.toArrow()      # an action that runs s's own plan
+    s.explain()
+    ```
+
+    ```
+    AdaptiveSparkPlan isFinalPlan=true
+    +- == Final Plan ==
+       ResultQueryStage 2
+       +- *(5) Project [k#25L, v#26L, name#29]
+          +- *(5) SortMergeJoin(skew=true) [k#25L], [k#28L], Inner
+             :- *(3) Sort [k#25L ASC NULLS FIRST], false, 0
+             :  +- AQEShuffleRead coalesced and skewed
+             ...
+             +- *(4) Sort [k#28L ASC NULLS FIRST], false, 0
+                +- AQEShuffleRead coalesced
+    ```
+
+    `SortMergeJoin(skew=true)` and `AQEShuffleRead coalesced and skewed`
+    say the big partition for key `0` was split into several tasks, each
+    joined against a copy of the matching rows from the other side.
+    Unset the three settings afterwards (`spark.conf.unset(...)`).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## How Many Partitions Does a File Read Make?
+
+    Each partition of a file read is one task. Spark decides the count
+    when it plans the scan, in `FilePartition.maxSplitBytes` and
+    `getFilePartitions` (Spark source,
+    `sql/core/.../datasources/FilePartition.scala`). The rule:
+
+    1. Every file costs its size **plus `openCostInBytes`** (default
+       `4MB`, an internal setting that stands for the time it takes to
+       open a file). Add those up: `total`.
+    2. `bytes_per_core = total / minPartitionNum`, where
+       `spark.sql.files.minPartitionNum` defaults to the default
+       parallelism (the number of cores in local mode).
+    3. `max_split = min(maxPartitionBytes, max(openCostInBytes,
+       bytes_per_core))`, with `spark.sql.files.maxPartitionBytes`
+       defaulting to `128MB`.
+    4. Files that can be split are cut into pieces of at most
+       `max_split` bytes.
+    5. Pieces are sorted largest first and packed in order: a new
+       partition starts when the current one plus the next piece would
+       exceed `max_split`. Each piece adds its size plus
+       `openCostInBytes` to the partition.
+
+    Measured with `df.rdd.getNumPartitions()` on `local[4]`:
+
+    | Input | Partitions |
+    |-------|------------|
+    | `data/messy/logs` (2 small files) | 2 |
+    | `data/messy/events` (3 small files) | 3 |
+    | every file under `data/messy` (`recursiveFileLookup`; the folder grows as the course adds data) | about one per 32 files, since each small file counts as 4 MB |
+    | 200 one-line JSON files | 7 |
+    | the same, with `openCostInBytes` set to `1` | 5 |
+    | one 30.8 MB JSON Lines file | 4 |
+    | the same, `maxPartitionBytes` `4MB` | 8 |
+    | the same, `maxPartitionBytes` `1MB` | 30 |
+    | the same file gzipped (104 KB), `1MB` | 1 |
+    | the same file with `multiLine` true, `1MB` | 1 |
+    | the same file with `wholetext=True`, `1MB` | 1 |
+    | the same file with `binaryFile`, `1MB` | 1 |
+
+    Work two of them through the rule. The 200 tiny files: each counts
+    as about 4 MB, so `total` is about 800 MB, `bytes_per_core` about
+    200 MB, `max_split = min(128MB, 200MB) = 128MB`, and 32 files fit
+    in each partition: 7 partitions. The 30.8 MB file with the default
+    settings: `total` is 34.8 MB, `bytes_per_core` 8.7 MB, so
+    `max_split` is 8.7 MB and the file is cut into 4 pieces. Spark made
+    the file read smaller than 128 MB on purpose, to keep all 4 cores
+    busy.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Files That Never Split
+
+    The last four rows of that table are one partition whatever the
+    settings, because those formats cannot start reading in the middle
+    of a file:
+
+    - **gzip** (and other non-splittable compression): the only way to
+      reach byte 1,000,000 of the text is to decompress everything
+      before it. A single 10 GB `.json.gz` is one task, on one core,
+      however big the cluster. Spark splits a compressed file only if
+      its Hadoop codec implements `SplittableCompressionCodec` (the
+      check is in `FileFormat.scala`). bzip2 does: the same JSON Lines
+      as a 9 KB `.json.bz2` read with a 2 KB split size gave 5
+      partitions and all 400,000 rows. gzip does not.
+    - **`multiLine` JSON** (and CSV): one record may span lines, so a
+      reader starting mid-file cannot find the next record boundary.
+    - **`wholetext`** and **`binaryFile`**: one row per file by
+      definition ("Files as Files: binaryFile, Globs and Metadata").
+
+    For messy inputs that means: many small files are packed together
+    (cheap), big splittable files are cut up (good), and big
+    non-splittable files are a bottleneck you can only fix upstream (ask
+    for smaller files, or for a splittable format) or by rewriting them
+    once into Parquet.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Make every file read in this session produce partitions of at most
+    64 MB (the setting is a SQL setting, so it can change at runtime).
+  CorrectAnswer: |
+    spark.conf.set("spark.sql.files.maxPartitionBytes", "64MB")
+  Hint: "It is spark.sql.files.maxPartitionBytes; byte sizes accept units like 64MB."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Many Small Files
+
+    Small files are the most common performance problem with messy
+    data: one JSON file per API call, one image per upload. The packing
+    rule keeps the task count reasonable, but each file still has to be
+    listed, opened and closed, and that per-file cost is what
+    `openCostInBytes` models. A few knobs:
+
+    - `spark.sql.files.maxPartitionNum` (3.5, unset by default): if the
+      packing makes more partitions than this, Spark repacks them into
+      about that many (and logs a warning saying it ignored
+      `maxPartitionBytes`).
+    - `spark.sql.files.minPartitionNum` (3.1): raise it to cut big
+      inputs into more pieces than you have cores.
+    - The real fix is upstream: compact small files into bigger ones
+      once (read, `repartition`, write), or land them in a table format
+      that can compact itself (`OPTIMIZE` in Delta, covered in the
+      advanced "Designing Tables for Blobs").
+
+- Class: text
+  Depth: all
+  Output: |
+    ## repartition Versus coalesce
+
+    Both change the number of partitions; only one shuffles. On
+    `silver` (3 partitions, one per file):
+
+    ```
+    repartition(8)               8 Exchange RoundRobinPartitioning(8), REPARTITION_BY_NUM
+    repartition(8, 'user_id')    8 Exchange hashpartitioning(user_id#10L, 8), REPARTITION_BY_NUM
+    repartition('user_id')       1 Exchange hashpartitioning(user_id#10L, 200), REPARTITION_BY_COL
+    repartitionByRange(4, 'ts')  4 Exchange rangepartitioning(ts#6 ASC NULLS FIRST, 4), REPARTITION_BY_NUM
+    coalesce(1)                  1 Coalesce 1
+    ```
+
+    (label, `rdd.getNumPartitions()`, and the top line of the plan)
+
+    - `repartition(n)` deals rows round-robin into exactly `n`
+      partitions: even sizes, full shuffle.
+    - `repartition(n, col)` hashes the column, so every row with the
+      same value lands in the same partition.
+    - `repartition(col)` with no number uses
+      `spark.sql.shuffle.partitions` (200) and marks the exchange
+      `REPARTITION_BY_COL`, which AQE may coalesce: here to 1, because
+      the data is tiny. A number you give (`REPARTITION_BY_NUM`) is
+      kept.
+    - `repartitionByRange` samples the data to pick ranges, for sorted
+      output.
+    - `coalesce(n)` merges neighbouring partitions without a shuffle. It
+      can only reduce: `coalesce(10)` on 3 partitions stays 3. And
+      because there is no stage boundary, everything upstream runs in
+      those `n` tasks too: `coalesce(1)` after an expensive parse runs
+      the whole parse on one core. When that hurts, `repartition(1)`
+      costs a shuffle but keeps the upstream parallel.
+
+    One detail: `df.rdd.getNumPartitions()` on a DataFrame with a
+    shuffle runs the stages before the shuffle to answer, which is how
+    it could report AQE's 1 for `repartition('user_id')`. On Spark
+    Connect `df.rdd` does not exist at all (`[NOT_IMPLEMENTED] rdd is
+    not implemented.`); count distinct `F.spark_partition_id()` values
+    instead.
+
+- Class: mult_question
+  Depth: all
+  Output: "Which call gives exactly 8 partitions in which all rows of one user_id are together?"
+  AnswerChoices: "df.repartition(8, 'user_id');df.coalesce(8);df.repartition('user_id');df.repartition(8)"
+  CorrectAnswer: "df.repartition(8, 'user_id')"
+  Hint: "You need both a number (kept by AQE) and a column (hash partitioning)."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## A Folder per Day: partitionBy
+
+    `write.partitionBy("day")` writes one folder per value, named
+    `day=<value>`, and leaves the column out of the files (the folder
+    name holds it):
+
+    ```python
+    silver.write.partitionBy("day").parquet("/tmp/events_by_day")
+    ```
+
+    ```
+    events_by_day/_SUCCESS
+    events_by_day/day=2026-10-01/part-00002-...c000.snappy.parquet
+    events_by_day/day=2026-10-02/part-00001-...c000.snappy.parquet
+    events_by_day/day=2026-10-03/part-00000-...c000.snappy.parquet
+    ```
+
+    How many files land in each folder? One per **task that holds rows
+    for that value**. Counting `.parquet` files per folder for four
+    ways of writing the same 60 rows:
+
+    ```
+    plain                       {'day=2026-10-01': 1, 'day=2026-10-02': 1, 'day=2026-10-03': 1}
+    repartition(4) first        {'day=2026-10-01': 4, 'day=2026-10-02': 4, 'day=2026-10-03': 4}
+    repartition("day") first    {'day=2026-10-01': 1, 'day=2026-10-02': 1, 'day=2026-10-03': 1}
+    maxRecordsPerFile 8         {'day=2026-10-01': 3, 'day=2026-10-02': 3, 'day=2026-10-03': 3}
+    ```
+
+    The plain write happens to give one file per day only because each
+    input file holds one day. After `repartition(4)` every task holds
+    rows of every day, so files = tasks x days. With 200 tasks and a
+    year of days that is 73,000 tiny files. `repartition("day")` before
+    the write sends each day to one task. The `maxRecordsPerFile`
+    option caps rows per file (20 rows per day here, so 3 files).
+
+    Choose partition columns with few values and that queries filter
+    on: a date, a country. Never a user id or a timestamp.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Partition Pruning: Reading One Day
+
+    Read the layout back and filter on the partition column:
+
+    ```python
+    back = spark.read.parquet("/tmp/events_by_day")
+    q = back.filter((F.col("day") == "2026-10-02") & (F.col("amount") > 20)).select("user_id", "amount")
+    q.explain()
+    ```
+
+    ```
+    == Physical Plan ==
+    *(1) Project [user_id#26L, amount#29]
+    +- *(1) Filter (isnotnull(amount#29) AND (amount#29 > 20.0))
+       +- *(1) ColumnarToRow
+          +- FileScan parquet [user_id#26L,amount#29,day#31] Batched: true, DataFilters: [isnotnull(amount#29), (amount#29 > 20.0)], Format: Parquet, Location: InMemoryFileIndex(1 paths)[file:/tmp/events_by_day], PartitionFilters: [isnotnull(day#31), (day#31 = 2026-10-02)], PushedFilters: [IsNotNull(amount), GreaterThan(amount,20.0)], ReadSchema: struct<user_id:bigint,amount:double>
+    ```
+
+    Both kinds of skipping are in one line: `PartitionFilters` drop the other
+    days' folders before any file is opened, and `PushedFilters` let
+    the Parquet reader skip row groups whose statistics rule out
+    `amount > 20`. After running it, the Spark UI's SQL tab shows
+    **number of files read: 1** on the scan node (the metric is called
+    `numFiles` in the source). The exercise reads the same metric.
+
+    Pruning only works on the partition column itself. A filter that
+    means the same thing but goes through another column does not prune:
+
+    | Filter | PartitionFilters |
+    |--------|------------------|
+    | `F.col("day") == "2026-10-02"` | `[isnotnull(day), (day = 2026-10-02)]` |
+    | `F.col("day") >= "2026-10-02"` | `[isnotnull(day), (day >= 2026-10-02)]` |
+    | `F.to_date("ts") == "2026-10-02"` | `[]` (pushed as a `ts` range instead; all files opened) |
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Partition Folder Gotchas
+
+    Folder names are text, and Spark guesses their types when it reads
+    them back (`spark.sql.sources.partitionColumnTypeInference.enabled`,
+    default `true`). That is how `day` came back as a `date`. It is also
+    how messy codes get damaged:
+
+    ```python
+    spark.createDataFrame([("001", 1), ("010", 2)], "code string, n int") \
+        .write.partitionBy("code").parquet("/tmp/by_code")
+    spark.read.parquet("/tmp/by_code").orderBy("n").show()
+    ```
+
+    ```
+    +---+----+
+    |  n|code|
+    +---+----+
+    |  1|   1|
+    |  2|  10|
+    +---+----+
+    ```
+
+    The leading zeros are gone: every folder name looked like a number,
+    so `code` became an `int`. Add a folder named `code=abc` and the
+    column stays a string, so the type depends on which values exist
+    today. Keep the strings by passing a schema
+    (`spark.read.schema("code string, n int")`) or setting the inference
+    setting to `false`.
+
+    And:
+
+    - The partition column comes back as the **last** column, not where
+      it was.
+    - Reading one folder directly (`.parquet(".../day=2026-10-02")`)
+      loses the `day` column. Add `.option("basePath", ".../events_by_day")`
+      to keep it.
+
+- Class: mult_question
+  Depth: all
+  Output: "A table is written with partitionBy('zip') and the zip codes are 01234, 02139 and 10001. What type does zip have when you read the folder back with default settings?"
+  AnswerChoices: "int, and the leading zeros are lost;string;date;It fails to read"
+  CorrectAnswer: "int, and the leading zeros are lost"
+  Hint: "Spark infers partition column types from the folder names."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Caching
+
+    `cache()` keeps a DataFrame's rows after the first action that
+    computes them, so later actions skip the work. It is lazy, and it
+    returns the same DataFrame:
+
+    ```python
+    events = spark.read.schema(EVENT_SCHEMA).json("data/messy/events")
+    print(events.storageLevel, events.is_cached)
+    events.cache()
+    print(events.storageLevel, events.is_cached)
+    events.filter("user_id = 1").explain()
+    ```
+
+    ```
+    Serialized 1x Replicated False
+    Disk Memory Deserialized 1x Replicated True
+    == Physical Plan ==
+    *(1) Filter (isnotnull(user_id#2L) AND (user_id#2L = 1))
+    +- InMemoryTableScan [event#0, event_type#1, user_id#2L, ...], [isnotnull(user_id#2L), (user_id#2L = 1)]
+          +- InMemoryRelation [event#0, event_type#1, user_id#2L, ...], StorageLevel(disk, memory, deserialized, 1 replicas)
+                +- FileScan json [...] ... PushedFilters: [], ...
+    ```
+
+    The plan now reads from `InMemoryTableScan`. The file scan below it
+    has no pushed filters any more, because the cache must hold every
+    row; the filter is handed to the cache scan instead (the second list
+    after `InMemoryTableScan`), which can skip cached batches using
+    their min and max values. Until an action runs,
+    the cache is empty and the first query fills it while it runs.
+    Spark matches caches by plan, not by variable: a new DataFrame
+    built the same way (`spark.read.schema(EVENT_SCHEMA).json(...)`
+    again, plus more steps) also reads from the cache.
+
+    `cache()` is `persist()` with the default level,
+    `MEMORY_AND_DISK_DESER` (the "Optimization & Tuning" lesson of the
+    learning_spark course has the full table of levels). Pick another with
+    `persist(StorageLevel.DISK_ONLY)` and friends. Surprises:
+
+    - Asking again with a different level does nothing. A second
+      `persist(StorageLevel.DISK_ONLY)` on a cached DataFrame logs
+      `WARN CacheManager: Asked to cache already cached data.` and the
+      level stays `Disk Memory Deserialized`. `unpersist()` first.
+    - `CACHE TABLE events` in SQL is **eager**: it fills the cache
+      immediately. `CACHE LAZY TABLE events` waits for the first query,
+      like `cache()`.
+
+    Release with `df.unpersist()` (or `UNCACHE TABLE`, or
+    `spark.catalog.clearCache()` for everything).
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Cache the DataFrame `silver`, fill the cache with one action, and
+    then release it.
+  CorrectAnswer: |
+    silver.cache()
+    silver.count()
+    silver.unpersist()
+  Hint: "cache() is lazy: run an action to fill it. On a cached silver, count() works, because the cache holds every column."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## When Caching Helps, and When It Hurts
+
+    Cache when the same expensive result feeds several actions: a parsed
+    and cleaned DataFrame that you split into a good table and a
+    quarantine table, explore interactively, or loop over. "JSON Drift
+    and Quarantine" also uses caching to make the corrupt record column
+    queryable.
+
+    Do not cache:
+
+    - something used once (filling the cache costs more than it saves)
+    - a raw read you filter heavily afterwards (cache the filtered
+      result instead)
+    - more than fits: partitions that do not fit in memory go to disk
+      (with the default level) or are recomputed, and cached data
+      competes with joins and aggregations for the same memory
+
+    And one trap that matters more for messy data than any memory
+    setting: **a DataFrame keeps the file list it made at `load()`**,
+    cached or not.
+
+    ```python
+    df = spark.read.schema(EVENT_SCHEMA).json(inbox)   # inbox holds day 1
+    shutil.copy("data/messy/events/events_2026-10-02.json", inbox)
+    print(df.count())                                       # still day 1 only
+    print(spark.read.schema(EVENT_SCHEMA).json(inbox).count())
+    ```
+
+    ```
+    20
+    40
+    ```
+
+    The new file is invisible to `df` even though no action had run
+    before it arrived: listing happens when the DataFrame is created.
+    Delete a listed file instead and the next action fails with
+    `[FAILED_READ_FILE.FILE_NOT_EXIST] Encountered error while reading
+    file ... File does not exist. It is possible the underlying files
+    have been updated.` For folders that change, read again (or use a
+    stream, next lesson); `spark.catalog.refreshByPath(path)` refreshes
+    cached data and tables over that path, but did not change what this
+    `df` saw.
+
+- Class: mult_question
+  Depth: all
+  Output: "df = spark.read.json(folder) runs, then a new file lands in folder, then df.count() runs for the first time. Does the count include the new file?"
+  AnswerChoices: "No, the file list was made when df was created;Yes, nothing runs until the action;Only if df was cached;Only on Spark Connect"
+  CorrectAnswer: "No, the file list was made when df was created"
+  Hint: "Look for InMemoryFileIndex in the plan: the listing is part of the DataFrame."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## The Storage and SQL Tabs
+
+    "Why Spark for Messy Data, and How It Runs Your Code" showed how to
+    keep a session open to look at the UI. The tabs that matter here:
+
+    - **Storage** lists every cached dataset with its storage level, the
+      fraction of partitions cached and the size in memory and on disk.
+      A DataFrame cached with `cache()` is listed under its plan text;
+      `CACHE TABLE events` shows up as `In-memory table events`. Less
+      than 100% cached means partitions did not fit.
+    - **SQL / DataFrame** has one entry per query with the plan AQE
+      finally ran and per-node metrics: on a file scan, **number of
+      files read**, **size of files read** and **number of output
+      rows**; on an exchange, the shuffle sizes. This is where you prove
+      pruning worked and see which of `count()`, `show()` and
+      `collect()` ran which plan.
+
+    From code, `spark.sparkContext._jsc.sc().getRDDStorageInfo()`
+    (classic only) lists the same cached blocks; the exercise uses it to
+    check that the cache really filled.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Plans and Partitions You Can Prove
+
+    Implement the functions in the starter. The harness checks plans and
+    partition counts only.
+
+    1. `predict_file_partitions(file_sizes, splittable,
+       max_partition_bytes, open_cost, min_partitions)`: implement the
+       five-step rule from "How Many Partitions Does a File Read Make?"
+       in plain Python. The harness builds folders of tiny files and one
+       large file, sets the matching Spark settings, and compares your
+       prediction with `rdd.getNumPartitions()` for each case.
+    2. `write_by_day(silver, path)`: Parquet, one folder per day.
+    3. `big_purchases_on(spark, path, day)`: `user_id, amount` for one
+       day with `amount > 20`. Checked: `PartitionFilters` on `day`,
+       `GreaterThan(amount,20.0)` pushed, the right row count, and
+       exactly 1 file read.
+    4. `by_user(df, n)` and `one_partition(df)`: `n` hash partitions by
+       `user_id`, and one partition without an `Exchange`.
+    5. `with_plan_prices(silver, prices)`: a left join that broadcasts
+       `prices` (`BroadcastHashJoin ... BuildRight`, no
+       `SortMergeJoin`).
+    6. `cache_silver(silver)` and `release(cached)`: cache, fill with
+       one action, and unpersist. `count()` is fine here: once `silver`
+       is cached, the cache is built with every column, so pruning can
+       no longer leave only `_corrupt` in the scan.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "max_split = min(max_bytes, max(open_cost, sum(s + open_cost) // min_partitions)); cut splittable files into max_split pieces; sort descending; start a new partition when current + piece > max_split; add piece + open_cost. Then partitionBy('day').parquet, filter on F.col('day'), repartition(n, 'user_id'), coalesce(1), F.broadcast(prices), cache() + count()."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    In this lesson you learned:
+
+    - **`explain()` modes**: `simple`, `extended` (parsed, analyzed,
+      optimized, physical), `formatted`, `cost`, `codegen`
+    - **The FileScan line**: pruned columns and `ReadSchema`,
+      `PartitionFilters` (skip files), `PushedFilters` (let the reader
+      skip data; Spark still filters every row), `DataFilters`
+    - **Column pruning** explains `count()` failing with
+      `QUERY_ONLY_CORRUPT_RECORD_COLUMN`; JSON does not prune or push
+      into nested fields, Parquet does
+    - **Joins**: sort-merge (two shuffles) versus broadcast hash
+      (none); local DataFrames have no size estimate, so hint
+      `F.broadcast` for small lookups
+    - **AQE** (on since 3.2): coalesced shuffle reads, runtime broadcast,
+      skew splitting; `collect()` and `toPandas()` update the plan you
+      print, `count()`, `show()` and `take()` do not
+    - **File partitions**: `max_split = min(maxPartitionBytes,
+      max(openCostInBytes, total / minPartitionNum))`, small files
+      packed, big splittable files cut, gzip, `multiLine`, `wholetext`
+      and `binaryFile` never split
+    - **`repartition` shuffles, `coalesce` does not** (and drags
+      upstream work into its tasks)
+    - **`partitionBy`**: files per folder = tasks holding the value;
+      pruning only on the partition column; inferred folder types can
+      eat leading zeros
+    - **Caching** is lazy, matched by plan, ignored when asked twice;
+      `CACHE TABLE` is eager; and a DataFrame never sees files that
+      arrive after `load()`
+
+    Next: **Streaming Files: Your First Structured Streaming Job**,
+    where a query keeps watching that folder and reads each new file
+    exactly once.

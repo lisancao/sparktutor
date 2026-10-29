@@ -1,0 +1,11 @@
+From: customer@example.com
+To: support@example.com
+Subject: Refund for order 1001
+Date: Mon, 02 Mar 2026 09:00:00 +0000
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+MIME-Version: 1.0
+
+Hello,
+I was charged twice for order 1001.
+Thanks

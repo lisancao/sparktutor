@@ -1,0 +1,8 @@
+# exported by helpdesk 7.2
+2026-03-02T09:00:00Z | status | new -> open | chloe
+2026-03-02T09:07:00Z | status | open -> triage | chloe
+2026-03-02T09:14:00Z | priority | P2 -> P3 | dev
+2026-03-02T09:21:00Z | status | waiting -> open | emma
+2026-03-02T09:28:00Z | status | open -> resolved | dev
+2026-03-02T09:35:00Z | priority | P2 -> P1 | dev
+

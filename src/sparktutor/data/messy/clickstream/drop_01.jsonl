@@ -1,0 +1,10 @@
+{"event_id": "e001", "user_id": "u1", "type": "page_view", "page": "/p/chair", "ts": "2026-10-05T09:00:51"}
+{"event_id": "e002", "user_id": "u1", "type": "add_to_cart", "page": "/search", "ts": "2026-10-05T09:01:15"}
+{"event_id": "e004", "user_id": "u2", "type": "add_to_cart", "page": "/p/chair", "ts": "2026-10-05T09:02:03"}
+{"event_id": "e003", "user_id": "u1", "type": "add_to_cart", "page": "/cart", "ts": "2026-10-05T09:03:35"}
+{"event_id": "e005", "user_id": "u2", "type": "add_to_cart", "page": "/cart", "ts": "2026-10-05T09:04:23"}
+{"event_id": "e006", "user_id": "u2", "type": "page_view", "page": "/p/chair", "ts": "2026-10-05T09:05:03"}
+{"event_id": "e007", "user_id": "u2", "type": "page_view", "page": "/p/lamp", "ts": "2026-10-05T09:06:09"}
+{"event_id": "e008", "user_id": "u3", "type": "page_view", "page": "/p/chair", "ts": "2026-10-05T09:08:51"}
+{"event_id": "e009", "user_id": "u3", "type": "page_view", "page": "/", "ts": "2026-10-05T09:09:15"}
+{"event_id": "e010", "user_id": "u3", "type": "page_view", "page": "/search", "ts": "2026-10-05T09:12:44"}

@@ -225,9 +225,12 @@
     storage instead of from client memory.
 
     **Streaming**: `readStream`/`writeStream` work. Functions you pass to
-    `foreachBatch` and `StreamingQueryListener` implementations run in a
-    Python process on the server, not in your client, so they cannot touch
-    client-side state.
+    `foreachBatch` run in a Python process on the server, not in your
+    client, so they cannot touch client-side state. A
+    `StreamingQueryListener` added with `spark.streams.addListener` runs
+    in your client in 4.x (the client receives the events from the
+    server), so it can update client-side state; in 3.5 it ran on the
+    server.
 
     **MLlib**: `pyspark.ml` runs on Connect since 4.0. `fit()` trains on the
     server and returns a handle to a model kept in a per-session cache

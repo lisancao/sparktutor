@@ -1,0 +1,867 @@
+- Class: meta
+  Lesson: "Shipping Python Dependencies to a Cluster"
+  EstimatedMinutes: 75
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    "Packaging, Registration, Testing and Debugging" (intermediate
+    level) turned a data source into a pip package and left you with one
+    rule: a class imported from an installed module is pickled by
+    reference, so that module must be importable on every worker. "The
+    Python Worker Protocol" showed how those workers start, fork from a
+    daemon and get reused. "Spark Connect" in the Learning Spark course
+    mentioned `spark.addArtifacts` in passing. This lesson is about the
+    word *importable*: how a Python worker on an executor builds its
+    `sys.path`, which interpreter it runs, and every supported way to
+    put code and libraries in front of it.
+
+    By the end you will be able to:
+
+    - Read the worker's path setup in the 4.2.0 source
+      (`worker_util.setup_spark_files`,
+      `PythonWorkerUtils.writeSparkFiles`, `PythonWorkerFactory`) and
+      predict where an import will be resolved
+    - Pick the interpreter executors run, and recognize
+      `PYTHON_VERSION_MISMATCH` and the missing-`pyarrow` failure that
+      4.2's Arrow-optimized UDFs cause in a thin environment
+    - Ship code with `--py-files`, `spark.submit.pyFiles` and
+      `addPyFile`, and avoid three traps: the include list a UDF
+      captured when it was first used, versions that never reload in
+      reused workers, and native extensions inside a zip
+    - Ship environments with `--archives`/`spark.archives` (3.1),
+      `venv-pack` and a `pip install --target` folder, and explain why
+      `PYSPARK_PYTHON=./environment/bin/python` fails in local mode
+    - Use Spark Connect artifacts, which are private to one session,
+      down to the per-session folder, daemon and error conditions
+    - Build a Kubernetes image for PySpark and choose between client
+      and cluster mode with the driver's Python in mind
+
+    Everything runs on a laptop in local mode. Where a claim is about a
+    cluster, it is backed by the code path in `~/repos/spark-v4.2.0`
+    that a cluster takes, and said so.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Three Places Python Runs
+
+    A PySpark application has Python in more places than one:
+
+    ```text
+    your machine / driver host          executors (one per host or pod)
+    +------------------------+          +-------------------------------+
+    | driver Python          |  Py4J /  | JVM executor                  |
+    |  (your script, Classic)| ------>  |   PythonWorkerFactory         |
+    | or the Connect client  |  gRPC    |     python -m pyspark.daemon  |
+    +------------------------+          |       forked pyspark.worker   |
+                                        |       (your UDFs, read(), ...) |
+    Connect server (driver JVM) also    +-------------------------------+
+    starts Python for planning: Python
+    data sources, UDTF analysis.
+    ```
+
+    The driver's `sys.path` is whatever your venv and `PYTHONPATH` say.
+    A worker's is built by Spark, in three layers:
+
+    1. **The process environment.** `PythonWorkerFactory`
+       (`core/src/main/scala/org/apache/spark/api/python/PythonWorkerFactory.scala`)
+       starts `<pythonExec> -m pyspark.daemon pyspark.worker` with
+       `PYTHONPATH` set to `PythonUtils.sparkPythonPath` (Spark's own
+       `pyspark.zip` and the py4j zip, plus the jar Spark itself was
+       loaded from), then any
+       `PYTHONPATH` in the function's environment, then the executor's
+       own `PYTHONPATH`.
+    2. **The current directory.** Python puts the working directory
+       first on `sys.path` for `-m`. Remember this one; it causes the
+       "works on my laptop" trap below.
+    3. **Per task, from the protocol.** Before running your function,
+       the JVM writes the files root and a list of *includes*
+       (`PythonWorkerUtils.writeSparkFiles`), and
+       `pyspark/worker_util.py` does this with them:
+
+    ```python
+    def setup_spark_files(infile: IO) -> None:
+        spark_files_dir = utf8_deserializer.loads(infile)
+        ...
+        path_changed = add_path(spark_files_dir)  # *.py files that were added will be copied here
+        num_python_includes = read_int(infile)
+        for _ in range(num_python_includes):
+            filename = utf8_deserializer.loads(infile)
+            path_changed = add_path(os.path.join(spark_files_dir, filename)) or path_changed
+    ```
+
+    `add_path` inserts at position 1 and never twice, and a worker that
+    is reused keeps what earlier tasks added. Everything in this lesson
+    is a way to get a file into `spark_files_dir`, onto that include
+    list, or into the interpreter itself.
+
+    Here is what a worker sees on a stock local run (paths shortened:
+    `<venv>` is the virtual environment, `<project>` the folder the
+    script was started from):
+
+    ```python
+    from pyspark.sql import SparkSession, functions as F
+
+    spark = SparkSession.builder.master("local[2]").getOrCreate()
+    spark.sparkContext.setLogLevel("ERROR")
+
+    @F.udf("string")
+    def where_am_i(_):
+        import os, sys
+        from pyspark import SparkFiles
+        return "\n".join([
+            f"executable  {sys.executable}",
+            f"cwd         {os.getcwd()}",
+            f"files root  {SparkFiles.getRootDirectory()}",
+            *[f"sys.path    {p}" for p in sys.path[:4]],
+        ])
+
+    print(spark.range(1).select(where_am_i("id")).first()[0])
+    ```
+
+    ```text
+    executable  <venv>/bin/python
+    cwd         <project>
+    files root  /tmp/spark-7dbc15ca-.../userFiles-3d7628cb-...
+    sys.path    <project>
+    sys.path    /tmp/spark-7dbc15ca-.../userFiles-3d7628cb-...
+    sys.path    <venv>/lib/python3.12/site-packages/pyspark/python/lib/pyspark.zip
+    sys.path    <venv>/lib/python3.12/site-packages/pyspark/python/lib/py4j-0.10.9.9-src.zip
+    ```
+
+    Two things to notice. In local mode the executor *is* the driver
+    JVM, so the worker inherits the driver's working directory, and
+    `sys.path[0]` is your project folder: a `messytools/` package sitting
+    next to your script is importable in every task, by accident. On a
+    cluster the executor's working directory is somewhere else and the
+    same job fails with `ModuleNotFoundError`. That is why the exercise
+    writes its package to a temporary folder. Second, the files root is
+    a temporary `userFiles-*` folder on the driver; on executors of a
+    real cluster `SparkFiles.getRootDirectory()` is `"."`, the
+    executor's working directory (`SparkFiles.scala`:
+    `SparkEnv.get.driverTmpDir.getOrElse(".")`, and only the driver sets
+    `driverTmpDir`). Keep that difference in mind for archives.
+
+- Class: mult_question
+  Depth: all
+  Output: "A job imports a helper package that sits in the project folder next to the script. It works in local mode and fails on the cluster with ModuleNotFoundError. Why did it work locally?"
+  AnswerChoices: "python -m pyspark.daemon put the driver's working directory first on the workers' sys.path;Spark zips the script's folder and ships it automatically;The driver pickled the whole package by value;Local mode never starts Python workers"
+  CorrectAnswer: "python -m pyspark.daemon put the driver's working directory first on the workers' sys.path"
+  Hint: "In local mode the worker's current directory is the driver's, and -m adds the current directory to sys.path."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Which Python the Executors Run
+
+    In Classic mode the interpreter is fixed when the `SparkContext`
+    starts. `pyspark/core/context.py` reads it from the environment:
+
+    ```python
+    self.pythonExec = os.environ.get("PYSPARK_PYTHON", "python3")
+    self.pythonVer = "%d.%d" % sys.version_info[:2]
+    ```
+
+    Both travel inside every Python function sent to the JVM
+    (`SimplePythonFunction(..., sc.pythonExec, sc.pythonVer, ...)`), and
+    the worker compares the version with its own. Three consequences:
+
+    - **Unset means `python3` from the executor's `PATH`.** That is the
+      system Python, not your venv, whenever the venv is not activated
+      in the environment the executor inherits.
+    - **`spark.pyspark.python` works only through the launcher.** The
+      config exists (2.1), but it is turned into `PYSPARK_PYTHON` by
+      `spark-submit`'s Python runner
+      (`core/src/main/scala/org/apache/spark/deploy/PythonRunner.scala`).
+      Set from the builder in a plain `python app.py` run it is ignored:
+
+    ```python
+    spark = (SparkSession.builder.master("local[1]")
+             .config("spark.pyspark.python", "/home/lnc/.local/bin/python3.11")
+             .getOrCreate())
+    print("pythonExec:", spark.sparkContext.pythonExec)
+    print(spark.range(1).select(F.udf(lambda x: __import__("sys").executable, "string")("id")).first()[0])
+    ```
+
+    ```text
+    pythonExec: python3
+    /usr/bin/python3
+    ```
+
+    With `spark-submit --conf spark.pyspark.python=<venv>/bin/python`
+    the same script printed `<venv>/bin/python` twice.
+
+    - **The minor version must match.** Pointing workers at Python 3.11
+      from a 3.12 driver fails at the first task. The worker raises
+      `PYTHON_VERSION_MISMATCH`, and you receive it wrapped in
+      `PYTHON_EXCEPTION`:
+
+    ```text
+    $ PYSPARK_PYTHON=python3.11 spark-submit app.py
+    pyspark.errors.exceptions.base.PySparkRuntimeError: [PYTHON_VERSION_MISMATCH] Python in worker
+    has different version: 3.11 than that in driver: 3.12, PySpark cannot run with different minor
+    versions.
+    Please check environment variables PYSPARK_PYTHON and PYSPARK_DRIVER_PYTHON are correctly set.
+    ```
+
+    The check is `check_python_version` in `pyspark/worker_util.py`;
+    only `major.minor` is compared, so 3.12.3 and 3.12.9 are fine.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## A Thin Environment Meets Arrow UDFs
+
+    Since 3.4 `spark.sql.execution.pythonUDF.arrow.enabled` exists, and
+    in 4.2.0 its default is `true`: a plain `@udf` is evaluated through
+    `ArrowEvalPython`, so the **worker** imports `pyarrow` even though
+    your function never does. A worker environment with only your own
+    libraries fails like this (a venv with `tabulate` and nothing else):
+
+    ```text
+    org.apache.spark.api.python.PythonException: [PYTHON_EXCEPTION] An exception was thrown from
+    the Python worker: Traceback (most recent call last):
+        func, profiler, deserializer, serializer = read_udfs(
+        import pyarrow as pa
+    ModuleNotFoundError: No module named 'pyarrow'
+    ```
+
+    The same UDF passed with the setting turned off, and also passed
+    with Arrow on in a venv holding `pyarrow` 26.0.0 but no `pandas`:
+    the Arrow path for plain UDFs needs `pyarrow` only (`pandas_udf`,
+    `mapInPandas` and `applyInPandas` need `pandas` too). The minimums
+    PySpark 4.2.0 checks are `pyarrow>=18.0.0`, `pandas>=2.2.0` and
+    `numpy>=1.21` (`pyspark/sql/pandas/utils.py`). When the *driver*
+    lacks them the fallback is silent apart from a warning ("Arrow
+    optimization failed to enable because PyArrow or Pandas is not
+    installed. Falling back to a non-Arrow-optimized UDF."); when only
+    the workers lack them, the query fails. So a packed environment for
+    executors needs `pyarrow` in it, whatever your code imports.
+
+- Class: mult_question
+  Depth: all
+  Output: "On Spark 4.2.0, which package must a worker environment contain for a plain @udf (no pandas in the function) to run with the default settings?"
+  AnswerChoices: "pyarrow;pandas;Nothing beyond the standard library;py4j"
+  CorrectAnswer: "pyarrow"
+  Hint: "Check the default of spark.sql.execution.pythonUDF.arrow.enabled and what read_udfs imports."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Way 1: Python Files and Zips
+
+    Three entry points end in the same place:
+
+    | Entry point | When | Notes |
+    |---|---|---|
+    | `spark-submit --py-files a.zip,b.py` | at launch | also on the driver's path in client mode |
+    | `spark.submit.pyFiles` (1.0.1) | at launch, or in the builder before the context starts | read in `SparkContext.__init__` |
+    | `sc.addPyFile(path)` (0.7) | any time | Classic only; local, HDFS, HTTP(S) or FTP path |
+
+    `addPyFile` is short enough to read in full
+    (`pyspark/core/context.py`):
+
+    ```python
+    def addPyFile(self, path: str) -> None:
+        self.addFile(path)
+        dirname, filename = os.path.split(path)
+        if filename[-4:].lower() in self.PACKAGE_EXTENSIONS:   # (".zip", ".egg", ".jar")
+            self._python_includes.append(filename)
+            # for tests in local mode
+            sys.path.insert(1, os.path.join(SparkFiles.getRootDirectory(), filename))
+        importlib.invalidate_caches()
+    ```
+
+    So a `.py` file is copied into the files root (always on the
+    worker's path), a `.zip`, `.egg` or `.jar` also joins the include
+    list, and anything else (a `.whl`, a `.tar.gz`) is copied but never
+    put on a path. It also edits the **driver's** `sys.path`, which is
+    why `import messytools` starts working in your script right after
+    the call, even though nothing was installed.
+
+    Both launch-time forms worked on 4.2.0 with the same zip:
+    `spark-submit --master "local[2]" --py-files messytools.zip app.py`
+    and `.config("spark.submit.pyFiles", "/abs/path/messytools.zip")` in
+    the builder of a plain `python app.py`; in each case the driver and
+    the tasks imported `.../userFiles-*/messytools.zip/messytools/__init__.py`.
+
+    The zip itself has one rule: the package folder must be at the top
+    of the archive, so `messytools/__init__.py` is an entry, not
+    `src/messytools/__init__.py` or `__init__.py`. Leave bytecode out;
+    `zipimport` compiles from source anyway:
+
+    ```bash
+    cd src && zip -qr ../messytools.zip messytools -x '*__pycache__*'
+    unzip -l ../messytools.zip
+    ```
+
+    ```text
+      Length      Date    Time    Name
+    ---------  ---------- -----   ----
+            0  2026-10-28 14:17   messytools/
+           14  2026-10-28 14:17   messytools/__init__.py
+    ```
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    In a Classic session `spark`, ship the zip at `/tmp/deps/messytools.zip`
+    to the executors so that UDFs you create afterwards can
+    `import messytools`.
+  CorrectAnswer: |
+    spark.sparkContext.addPyFile("/tmp/deps/messytools.zip")
+  Hint: "The SparkContext method for Python files and zips."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Trap: The Include List Is Captured Once
+
+    The include list is not looked up when a task runs. It is copied
+    into the JVM `SimplePythonFunction` when the UDF is first turned into
+    a JVM object (`_wrap_function` in `pyspark/sql/udf.py`), and
+    `UserDefinedFunction._judf` caches that object. A UDF you used before
+    `addPyFile` keeps the old, empty list. You can read it through Py4J:
+
+    ```python
+    @F.udf("string")
+    def f(x): return "x"
+    spark.range(1).select(f("id")).collect()
+    print("before:", list(f._unwrapped._judf.func().pythonIncludes()),
+          f._unwrapped._judf.func().pythonExec(), f._unwrapped._judf.func().pythonVer())
+    spark.sparkContext.addPyFile(os.path.abspath("messytools.zip"))
+    print("old udf after:", list(f._unwrapped._judf.func().pythonIncludes()))
+    g = F.udf(f.func, "string")
+    print("new udf:", list(g._unwrapped._judf.func().pythonIncludes()))
+    ```
+
+    ```text
+    before: [] <venv>/bin/python 3.12
+    old udf after: []
+    new udf: ['messytools.zip']
+    ```
+
+    What that does to a job is worse than a clean failure. With an old
+    UDF `where`, then a new copy `where2`, in one application (two
+    reused workers, PIDs shown):
+
+    ```text
+    BEFORE
+      3175550 ModuleNotFoundError: No module named 'messytools'
+      3175551 ModuleNotFoundError: No module named 'messytools'
+    AFTER (same udf object)
+      3175551 ModuleNotFoundError: No module named 'messytools'
+      3175550 ModuleNotFoundError: No module named 'messytools'
+    AFTER (new udf object)
+      3175551 /tmp/spark-.../userFiles-.../messytools.zip/messytools/__init__.py
+      3175550 /tmp/spark-.../userFiles-.../messytools.zip/messytools/__init__.py
+    AFTER (old udf again)
+      3175551 /tmp/spark-.../userFiles-.../messytools.zip/messytools/__init__.py
+      3175550 /tmp/spark-.../userFiles-.../messytools.zip/messytools/__init__.py
+    ```
+
+    The old UDF starts working only because the new one ran in the same
+    reused workers first and `add_path` left the zip on their path. On a
+    cluster, with fresh executors from dynamic allocation or a worker
+    that crashed, it fails again. The fix is order: ship first, then
+    define the UDFs (or rebuild them). `mapInPandas` and `mapInArrow`
+    wrap the function again on every call (a new `pandas_udf` each
+    time, in `pyspark/sql/pandas/map_ops.py`), so they pick up the
+    current list. Spark Connect has no such trap: the server builds the
+    function from the plan for every query, with the session's includes
+    (`sessionHolder.artifactManager.getPythonIncludes` in
+    `SparkConnectPlanner.scala`).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Trap: New Versions Do Not Reload
+
+    Shipping a fixed `messytools.zip` under the same path does nothing:
+    `addPyFile` of a path that is already registered is ignored (the
+    docstring says so), and the tasks kept returning `VERSION 1.0`. A
+    new file name looks like the way out, but it is not, because a
+    reused worker already holds `messytools` in `sys.modules`:
+
+    ```python
+    spark = (SparkSession.builder.master("local[2]")
+             .config("spark.python.worker.reuse", sys.argv[1]).getOrCreate())
+    def ver():
+        f = F.udf(lambda _: f"{__import__('os').getpid()}:{__import__('messytools').VERSION}", "string")
+        return sorted(r[0] for r in spark.range(4).repartition(2).select(f("id")).distinct().collect())
+    spark.sparkContext.addPyFile(mk("messytools-1.zip", "1.0")); print("after v1:", ver())
+    spark.sparkContext.addPyFile(mk("messytools-2.zip", "2.0")); print("after v2:", ver())
+    ```
+
+    ```text
+    reuse=true
+    after v1: ['3493206:1.0', '3493207:1.0']
+    after v2: ['3493206:1.0', '3493207:1.0']
+    reuse=false
+    after v1: ['3494624:1.0', '3494626:1.0']
+    after v2: ['3494821:2.0', '3494823:2.0']
+    ```
+
+    `spark.python.worker.reuse` defaults to `true`, and turning it off
+    costs a process start per task. Treat the code you ship as fixed for
+    the life of an application: a new version means a new application,
+    or, on Connect, a new session (which gets its own workers, as you
+    will see).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Trap: Native Code Cannot Live in a Zip
+
+    Python's `zipimport` loads `.py` files from a zip but not extension
+    modules (`.so`, `.pyd`). Anything with compiled code (`numpy`,
+    `pyarrow`, `ujson`, most parsers and drivers) cannot travel through
+    `--py-files`. To see it, install a pure package and a native one for
+    the cluster's platform into a folder. The flags make pip fetch Linux
+    wheels even from a Mac:
+
+    ```bash
+    pip install --target deps/site-packages \
+        --platform manylinux2014_x86_64 --python-version 3.12 \
+        --implementation cp --only-binary=:all: ujson tabulate
+    grep Tag deps/site-packages/*.dist-info/WHEEL
+    ```
+
+    ```text
+    deps/site-packages/tabulate-0.10.0.dist-info/WHEEL:Tag: py3-none-any
+    deps/site-packages/ujson-6.0.0.dist-info/WHEEL:Tag: cp312-cp312-manylinux_2_17_x86_64
+    deps/site-packages/ujson-6.0.0.dist-info/WHEEL:Tag: cp312-cp312-manylinux2014_x86_64
+    ```
+
+    Then ship the folder both ways, as `deps.zip` with `addPyFile` and as
+    `deps.tar.gz#deps` with `addArchive`, and import both modules in a
+    task:
+
+    ```text
+    zip    : tabulate: deps.zip/tabulate/__init__.py | ujson: ModuleNotFoundError: No module named 'ujson'
+    archive: tabulate: deps/site-packages/tabulate/__init__.py | ujson: deps/site-packages/ujson.cpython-312-x86_64-linux-gnu.so
+    ```
+
+    The `.so` is in the zip; Python just cannot load it from there. The
+    archive is unpacked to a real folder, so it can. Two details from
+    the same experiments: a `.whl` passed to `addPyFile` is copied but
+    never imported (`.whl` is not in `PACKAGE_EXTENSIONS`; the import
+    failed with `ModuleNotFoundError`), while the same pure-Python wheel
+    renamed to `.zip` imported fine, because a wheel is a zip with the
+    package at its top level. That trick only works for `py3-none-any`
+    wheels.
+
+    The `manylinux` tag is the contract that matters: it promises the
+    wheel only needs a glibc at least as new as the tag
+    (`manylinux_2_17` means glibc 2.17). Build or download on the
+    platform tag of the executors, with the executors' Python minor
+    version (`cp312`), not your laptop's.
+
+- Class: mult_question
+  Depth: all
+  Output: "You ship a folder containing tabulate (pure Python) and ujson (a compiled .so) as deps.zip with addPyFile. What happens in a task?"
+  AnswerChoices: "tabulate imports and ujson fails with ModuleNotFoundError;Both import;Both fail, a zip cannot hold packages;addPyFile refuses the zip because it contains a .so"
+  CorrectAnswer: "tabulate imports and ujson fails with ModuleNotFoundError"
+  Hint: "zipimport loads source and bytecode, not extension modules."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Way 2: Archives and Packed Environments
+
+    `--archives`, `spark.archives` (3.1, marked experimental in its
+    doc) and `sc.addArchive` ship `.zip`, `.jar`, `.tar.gz`, `.tgz` or
+    `.tar` files that Spark **unpacks** on every executor. A fragment
+    names the folder: `deps.tar.gz#deps` is unpacked into a folder
+    called `deps`. The code is `Executor.updateDependencies`
+    (`core/src/main/scala/org/apache/spark/executor/Executor.scala`):
+
+    ```scala
+    val dest = new File(
+      root,
+      if (sourceURI.getFragment != null) sourceURI.getFragment else source.getName)
+    ...
+    Utils.deleteRecursively(dest)
+    Utils.unpack(source, dest)
+    ```
+
+    `root` is `SparkFiles.getRootDirectory()`, or, for a Spark Connect
+    session, a folder named after the session inside it. That one line
+    explains the most common confusion about packed environments.
+
+    **The cluster recipe.** Pack a whole venv (or conda env) and point
+    the executors' interpreter at the unpacked copy:
+
+    ```bash
+    python -m venv pyspark_venv
+    pyspark_venv/bin/pip install venv-pack pyarrow pandas
+    pyspark_venv/bin/venv-pack -p pyspark_venv -o pyspark_venv.tar.gz
+    export PYSPARK_DRIVER_PYTHON=python          # not in cluster mode
+    export PYSPARK_PYTHON=./environment/bin/python
+    spark-submit --archives pyspark_venv.tar.gz#environment app.py
+    ```
+
+    On executors of a real cluster the root is `"."`, the executor's
+    working directory, so `./environment/bin/python` resolves (that is
+    the recipe in the PySpark "Python Package Management" guide, which
+    also covers conda-pack and PEX). Two warnings come with `venv-pack`
+    0.2.0. It packs the interpreter as a symlink, and an absolute one:
+
+    ```text
+    $ tar tvzf pyspark_venv.tar.gz | grep bin/python
+    lrwxrwxrwx lnc/lnc  0 2026-10-28 13:26 bin/python3.12 -> /usr/bin/python3.12
+    lrwxrwxrwx lnc/lnc  0 2026-10-28 13:26 bin/python -> python3.12
+    lrwxrwxrwx lnc/lnc  0 2026-10-28 13:26 bin/python3 -> python3.12
+    ```
+
+    so every executor needs that exact interpreter at that path
+    (conda-pack ships the interpreter itself, which is its main
+    advantage). And it packs everything in the venv, `pip` included: a
+    venv holding only `pyarrow` and `tabulate` packed to 61 MB.
+
+    **The same recipe in local mode fails**, because in local mode the
+    executor is the driver and the root is the driver's temporary
+    `userFiles-*` folder, not the working directory:
+
+    ```text
+    root: /tmp/spark-1bb52b14-.../userFiles-0be68f22-... ['environment']
+    java.io.IOException: Cannot run program "./environment/bin/python": error=2, No such file or directory
+    ```
+
+    The archive was unpacked (`environment` is right there); the
+    interpreter path simply does not point at it. Test packed
+    environments on a real cluster manager, or in a container, not in
+    `local[*]`.
+
+    **A portable alternative for pure libraries** is a site folder, the
+    layout `pip install --target` produces, shipped as an archive and
+    added to `sys.path` inside the task. It keeps the cluster's
+    interpreter and works in local mode, on clusters and on Connect,
+    because `SparkFiles.get(name)` resolves the root for whichever mode
+    the task runs in:
+
+    ```python
+    sc.addArchive(os.path.abspath("deps.tar.gz") + "#deps")
+
+    @F.udf("string")
+    def uses_deps(x):
+        import os, sys
+        from pyspark import SparkFiles
+        site = os.path.join(SparkFiles.get("deps"), "site-packages")
+        if site not in sys.path:
+            sys.path.insert(0, site)
+        import tabulate
+        return tabulate.__file__
+    ```
+
+    You build exactly this in the exercise.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## What About `uv run`?
+
+    The 4.2.0 packaging guide adds a `uv run` recipe: a wrapper script
+    `uv_run` containing `exec uv run "$@"`, `PYSPARK_PYTHON=./uv_run`,
+    and dependencies declared inline in the script (PEP 723). We tried
+    it with uv 0.11.10, in local mode, with a script declaring
+    `tabulate==0.9.0` and a UDF that imports it:
+
+    ```text
+    Installed 1 package in 4ms
+    driver: /home/lnc/.cache/uv/environments-v2/app-45b6f186f18c50cc/bin/python 0.9.0
+    worker: /home/lnc/.local/share/uv/python/cpython-3.14-linux-x86_64-gnu/bin/python3.14 ModuleNotFoundError("No module named 'tabulate'")
+    ```
+
+    The driver ran in an environment built from the inline metadata.
+    The workers did not: Spark starts them as `./uv_run -m
+    pyspark.daemon pyspark.worker`, so `uv run` sees a module, not your
+    script, and has no metadata to read; here it picked uv's newest
+    managed Python (3.14) with nothing installed. The two minor versions
+    happened to match, so no `PYTHON_VERSION_MISMATCH` warned us. The
+    driver also printed the Arrow fallback warning, because its
+    environment had no `pyarrow`. Treat the recipe as a way to run the
+    driver, and give executors an environment of their own (a project
+    environment `uv run` can find from their working directory, an
+    archive, or an image).
+
+    (You also have to set `SPARK_HOME` when `PYSPARK_PYTHON` is a
+    wrapper: the pip launcher scripts locate Spark by running
+    `PYSPARK_PYTHON`, and with the wrapper they printed "Could not find
+    valid SPARK_HOME".)
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Way 3: Spark Connect Artifacts
+
+    With Spark Connect your program is a client; it has no
+    `SparkContext` and cannot call `addPyFile`. It uploads files to the
+    server instead:
+
+    ```python
+    spark.addArtifacts("messytools.zip", pyfile=True)        # .py, .zip, .egg, .jar
+    spark.addArtifacts("deps.tar.gz#deps", archive=True)     # .zip, .jar, .tar.gz, .tgz, .tar
+    ```
+
+    `addArtifacts` appeared in 3.5 for Connect and works in Classic
+    since 4.0 (`versionadded`/`versionchanged` in
+    `pyspark/sql/session.py`). The client
+    (`pyspark/sql/connect/client/artifact.py`) only accepts local files,
+    and checks the extension before sending anything:
+
+    ```text
+    s3: PySparkRuntimeError [UNSUPPORTED_OPERATION] s3 scheme is not supported.
+    whl: PySparkRuntimeError [UNSUPPORTED_OPERATION] /tmp/tmpi4rd9lbb/x-1.0-py3-none-any.whl file format is not supported.
+    ```
+
+    On the server, `ArtifactManager.addArtifact`
+    (`sql/core/src/main/scala/org/apache/spark/sql/artifact/ArtifactManager.scala`)
+    stores each file under a folder for the session and registers it
+    with the `SparkContext`, keyed by that session. Then three things
+    differ from Classic, all of which you can observe:
+
+    - **A folder per session.** Tasks of a Connect session find
+      `SparkFiles.getRootDirectory()` and their working directory at
+      `<root>/<uuid>`. The uuid is the server-side
+      `SparkSession.sessionUUID`, not the client's `session_id`; in one
+      run the client id was `8156908f-...` and the folder
+      `78469628-...`.
+    - **Workers per session.** `PythonWorkerFactory` starts the daemon
+      in that folder, and `SparkEnv` keeps one factory per
+      `(pythonExec, module, envVars)`, where `envVars` includes
+      `SPARK_JOB_ARTIFACT_UUID`. Two sessions never share a Python
+      worker, so they can import two versions of one package at the
+      same time.
+    - **No overwrites.** Adding a file whose name exists with different
+      bytes fails; identical bytes are accepted silently (the add is
+      idempotent):
+
+    ```text
+    org.apache.spark.SparkRuntimeException: [ARTIFACT_ALREADY_EXISTS] The artifact
+    pyfiles/messytools.zip already exists. Please choose a different name for the new artifact
+    because it cannot be overwritten. SQLSTATE: 42713
+    ```
+
+    Two client sessions on one local server, A with the zip and a
+    `deps` archive, B with nothing (task output, folder names shortened
+    to their uuid):
+
+    ```text
+    A: cwd=feef3239-... root=feef3239-... zip=1.0 tar=feef3239-.../deps/site-packages/messyarch/__init__.py
+    B: cwd=fc15ce2c-... root=fc15ce2c-... zip=missing tar=missing
+    ```
+
+    In Classic, `spark.addArtifacts` is only a front for
+    `sc.addPyFile`, `sc.addArchive` and `sc.addFile`, with no isolation.
+    It refuses a changed file under a name it already copied with
+    `DUPLICATED_ARTIFACT` ("Duplicate Artifact: ... Artifacts cannot be
+    overwritten."), where `addPyFile` ignores it.
+
+    What artifacts cannot do: change the interpreter. The server's
+    workers run the server's `PYSPARK_PYTHON` for every session, so an
+    artifact can add pure Python code and data to a session, while
+    native libraries and the Python version belong to the server's
+    image. (`cloneSession()` on the Connect client copies the session's
+    Python includes to the clone; see `ArtifactManager.clone`.)
+
+- Class: mult_question
+  Depth: all
+  Output: "Two Spark Connect sessions on one server each add a file named messytools.zip with different contents. What happens?"
+  AnswerChoices: "Each session imports its own version, in its own Python workers;The second add fails with ARTIFACT_ALREADY_EXISTS;The second add replaces the first for both sessions;Both sessions import whichever zip the server saw first"
+  CorrectAnswer: "Each session imports its own version, in its own Python workers"
+  Hint: "Artifacts live under a folder per session, and the worker factory is keyed by the session's artifact uuid. ARTIFACT_ALREADY_EXISTS is about one session re-adding a name."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Connect Lifecycle Gotchas From the Exercise
+
+    Running a local Connect server from a script, and two client
+    sessions against it, surfaced three behaviours worth knowing:
+
+    - Under `spark-submit` a master is already set, so
+      `SparkSession.builder.remote("local[2]")` is refused with
+      `CANNOT_CONFIGURE_SPARK_CONNECT_MASTER` ("Spark Connect server and
+      Spark master cannot be configured together"). Use
+      `.master("local[2]").config("spark.api.mode", "connect")`, as
+      "Spark Connect" in the Learning Spark course recommends. It still
+      warns `Failed to set spark.api.mode ... CANNOT_MODIFY_CONFIG`,
+      which is harmless.
+    - The same check refuses `SparkSession.builder.remote("sc://...")`
+      for the second session. The Connect builder itself,
+      `pyspark.sql.connect.session.SparkSession.builder.remote(url).create()`,
+      skips it.
+    - `stop()` on any Connect session in a process that started the
+      local server stops the server too (it checks `SPARK_LOCAL_REMOTE`
+      in `pyspark/sql/connect/session.py`). A second client that is
+      still open then retries its RPCs, first in `stop()`
+      (`release_session`) and otherwise at interpreter exit (an
+      `atexit` hook cleans up its ML cache), and the process hangs for
+      minutes. Release and close the extra clients
+      (`client.release_session()`, `client.close()`) before stopping
+      the session that owns the server.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Kubernetes: Put the Environment in the Image
+
+    On Kubernetes the executors are pods started from an image, so the
+    sturdiest way to ship dependencies is to bake them in. The official
+    `apache/spark:4.2.0-python3` image (we read its config from the
+    registry) is built on Ubuntu 22.04 with Java 21 and the distribution's
+    `python3` package, runs as the user `spark`, works in
+    `/opt/spark/work-dir` and starts through `/opt/entrypoint.sh`, which
+    exports `PYSPARK_PYTHON` and `PYSPARK_DRIVER_PYTHON` when you set
+    them. A derived image:
+
+    ```dockerfile
+    FROM apache/spark:4.2.0-python3
+    USER root
+    RUN pip install --no-cache-dir "pyarrow>=18.0.0" "pandas>=2.2.0"
+    COPY dist/messytools-1.0-py3-none-any.whl /tmp/
+    RUN pip install --no-cache-dir /tmp/messytools-1.0-py3-none-any.whl
+    COPY app.py /opt/app/app.py
+    USER spark
+    ```
+
+    ```bash
+    spark-submit \
+      --master k8s://https://<api-server>:443 \
+      --deploy-mode cluster \
+      --conf spark.kubernetes.container.image=registry.example.com/messy/spark-py:1.0 \
+      --conf spark.kubernetes.namespace=etl \
+      --conf spark.kubernetes.authenticate.driver.serviceAccountName=spark \
+      local:///opt/app/app.py
+    ```
+
+    `local://` means "already in the image". Files on your machine
+    passed with `--py-files` or `--archives` in cluster mode are first
+    uploaded to `spark.kubernetes.file.upload.path` (an S3 or HDFS
+    location you provide). Driver and executors can use different
+    images (`spark.kubernetes.driver.container.image`,
+    `spark.kubernetes.executor.container.image`). 4.2 also adds a
+    default `NetworkPolicy` so executor pods only accept traffic from
+    the driver and their peers (`docs/core-migration-guide.md`).
+
+    **Client vs cluster mode** decides where the driver's Python lives.
+    In cluster mode the driver is a pod from the same image, so its
+    Python matches the executors' by construction. In client mode the
+    driver is your notebook or laptop, and its minor version must match
+    the image's: check with `docker run --rm <image> python3 --version`
+    before you choose a laptop Python, or you meet
+    `PYTHON_VERSION_MISMATCH` at the first UDF. Ubuntu 22.04's `python3`
+    is 3.10, so a 3.12 laptop and the stock image do not match.
+
+    This lesson does not build the image or run a cluster; the
+    configuration names come
+    from `resource-managers/kubernetes/core/src/main/scala/org/apache/spark/deploy/k8s/Config.scala`
+    and the image facts from its published config.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## A Contrast: Notebook-Scoped Libraries
+
+    Some managed platforms let a notebook run `%pip install` and get a
+    library for that notebook alone, on the driver and the executors,
+    without restarting the cluster. In open source Spark the pieces are
+    narrower: the interpreter and native libraries are per application
+    (Classic) or per server (Connect), and only pure-Python code and
+    data can be scoped to a Connect session with artifacts. When you
+    read about per-notebook environments, ask which interpreter the
+    executors run and where the native code comes from.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Choosing a Way
+
+    | You need to ship | Classic | Connect | Notes |
+    |---|---|---|---|
+    | Your own pure-Python modules | `--py-files`, `addPyFile` | `addArtifacts(pyfile=True)` | ship before defining UDFs (Classic) |
+    | Pure third-party libraries | zip of `pip install --target` | same, as `pyfile` | versions fixed for the app |
+    | Libraries with native code | archive + `sys.path`, or packed env | archive with `archive=True` | match platform tag and Python |
+    | A different interpreter | packed env + `PYSPARK_PYTHON` (cluster only), or an image | server image only | not testable in `local[*]` |
+    | Several versions at once | separate applications | separate sessions | Connect isolates per session |
+
+    And a checklist for the day it breaks: which interpreter ran
+    (`sys.executable` in a task), which minor version, what its
+    `sys.path` was, whether the UDF was defined before the files were
+    added, and whether a reused worker already had an old module in
+    `sys.modules`. The exercise turns most of these into checks.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Ship a Package Three Ways and Prove It
+
+    The harness writes a small pure-Python package, `messytools` (with
+    `VERSION` and `clean_name()`), to a temporary folder that is not on
+    any path. You write:
+
+    1. `build_zip(src_dir, zip_path)`: an importable zip, entries
+       relative to `src_dir`, no `__pycache__` or `.pyc`.
+    2. `build_site_archive(src_dir, tar_path)`: a `.tar.gz` laid out
+       like `pip install --target`, with a single `site-packages/`
+       folder at the top.
+    3. `where_imported(spark, archive_name=None)`: a UDF that imports
+       `messytools` inside a task and returns what it found (cleaned
+       name, `VERSION`, `__file__`, PID), working in Classic and
+       Connect; for an archive it first adds
+       `<SparkFiles.get(archive_name)>/site-packages` to `sys.path`.
+    4. `captured_includes(udf)`: the include list the JVM function of a
+       Classic UDF captured, read through `_unwrapped._judf.func()`.
+
+    The harness then checks, from inside the tasks: nothing is
+    importable before shipping; after `addPyFile` every task imports the
+    zip from the files root, a UDF used before `addPyFile` captured
+    `[]` and one created after captured `['messytools.zip']`; a new
+    session with `spark.archives=deps.tar.gz#deps` imports version 1.1
+    from `deps/site-packages` in new worker processes; and two Spark
+    Connect sessions import versions 2.0 and 3.0 of the same
+    `messytools.zip` at once, from different folders and different
+    workers, with `ARTIFACT_ALREADY_EXISTS` when one re-adds a changed
+    file.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "build_zip: z.write(full, os.path.relpath(full, src_dir)) inside os.walk, pruning dirs named __pycache__. build_site_archive: tarfile add(..., arcname=f'site-packages/{entry}', filter=...) returning None for __pycache__ members. where_imported: return a struct from the UDF and select 'p.*'; import messytools inside the function and catch ImportError."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - A worker's `sys.path` is Spark's own zips, the working directory
+      (from `python -m`), the files root, and the include list sent
+      with each function. In local mode the working directory is the
+      driver's, which hides missing dependencies.
+    - Executors run `PYSPARK_PYTHON` (default `python3` from `PATH`),
+      fixed when the context starts; `spark.pyspark.python` works
+      through `spark-submit`. Minor versions must match
+      (`PYTHON_VERSION_MISMATCH`), and in 4.2.0 even a plain `@udf`
+      needs `pyarrow` on the workers.
+    - `--py-files`, `spark.submit.pyFiles` and `addPyFile` put `.py`,
+      `.zip`, `.egg` and `.jar` files on the path. Ship before you
+      define Classic UDFs (their include list is captured once), never
+      expect a new version to reload in reused workers, and keep native
+      code out of zips.
+    - `--archives`/`spark.archives` (3.1) unpack into the files root,
+      which is the working directory on cluster executors but a temp
+      folder in local mode, so `./environment/bin/python` works only on
+      a cluster. A `pip install --target` folder plus `SparkFiles.get`
+      works everywhere. `venv-pack` symlinks the interpreter.
+    - Connect artifacts (`addArtifacts`, 3.5; Classic since 4.0) are
+      per session: their own folder, their own workers, no overwrites
+      (`ARTIFACT_ALREADY_EXISTS`), local files only, no wheels, and no
+      way to change the interpreter.
+    - On Kubernetes, bake dependencies into the image; in client mode
+      the laptop's Python must match the image's.
+
+    Next: **Observability: Listeners, Metrics and Profiling Executors**,
+    where you watch these executors work: listeners, the event log, the
+    metrics system and profilers for the Python running inside them.

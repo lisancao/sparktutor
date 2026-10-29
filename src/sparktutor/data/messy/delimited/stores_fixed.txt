@@ -1,0 +1,7 @@
+HDR20261005STORES
+0001Corner Store        Toronto     201903010001250050
+0002Le Petit Marché     Montréal    202006150000000999
+0003Pho Kitchen         Hà Nội      202111010007342210
+0004Harbour Books       Halifax     202301200000000000
+0005Broken Line
+TRL000004

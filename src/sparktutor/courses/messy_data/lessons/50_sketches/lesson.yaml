@@ -1,0 +1,738 @@
+- Class: meta
+  Lesson: "Sketches: HLL, Theta and KLL from the Inside"
+  EstimatedMinutes: 85
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    "Production Ingestion: Quality Rules, Quarantine and Pipelines" in
+    the intermediate level profiled data with `approx_count_distinct`
+    and saw it report 37 customers where there were 40, then stored an
+    `hll_sketch_agg` per file to count customers across files later.
+    This lesson takes the sketches apart: how each one is built, what
+    its bytes contain, what error it promises, how to measure that
+    error against exact answers, and how to design tables of sketches
+    that answer weekly questions without ever reading the raw data
+    again.
+
+    "Building LSH and an IVF Vector Index" and "Distributed Connected
+    Components" were distributed algorithms you built from primitives.
+    Sketches are the other kind: small summaries that a task builds over
+    its partition, that merge associatively, and whose error is known in
+    advance. That last property is why Spark can make them aggregate
+    functions.
+
+    By the end of this lesson you will be able to:
+
+    - Explain Spark's own HyperLogLog++ behind `approx_count_distinct`
+      (`rsd`, precision, registers, linear counting, bias correction)
+      and why its state cannot be stored
+    - Build, store, merge and inspect DataSketches HLL sketches
+      (`hll_sketch_agg`, 3.5), read their bytes and their error bounds
+      through the JVM
+    - Avoid the traps of hashing messy values: types, empty strings,
+      case and spaces, collations, mismatched `lgConfigK`
+    - Use theta sketches (4.1) for unions, intersections and
+      differences, and predict when an intersection estimate is useless
+    - Use tuple sketches (4.2) for distinct keys with a summary, and
+      scale their summaries correctly
+    - Use KLL quantile sketches (4.1) and reason in rank error, not value
+      error
+    - Roll daily sketches up to weekly answers from a sketch table, and
+      prove that the rollup never touched the raw data
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Why Sketches
+
+    Distinct counts do not add. If 12,000 people used the app on Monday
+    and 13,000 on Tuesday, the number who used it on either day is
+    anything from 13,000 to 25,000. In the exercise's week of events
+    the seven daily distinct counts sum to **89,320**; the true number
+    of distinct users is **33,285**. Quantiles do not add either: the
+    median of medians is not the median.
+
+    The exact answers need the raw values (every user id, every latency)
+    for the whole period. A **sketch** is a fixed-size summary with two
+    properties:
+
+    - **mergeable**: `merge(sketch(A), sketch(B))` equals (in
+      distribution) `sketch(A ∪ B)`, so a sketch per day can become a
+      sketch per week, and a sketch per task a sketch per query
+    - **bounded error**: the estimate is within a known relative error
+      (distinct counts) or rank error (quantiles), with a known
+      probability, whatever the size of the input
+
+    Mergeability is what Spark exploits. The sketch aggregates are
+    `TypedImperativeAggregate`s, planned as `ObjectHashAggregate` with a
+    partial step before the shuffle and a final step after it:
+
+    ```text
+    ObjectHashAggregate(keys=[_groupingexpression#20L], functions=[hll_sketch_agg(id#15L, 12, 0, 0)])
+    +- Exchange hashpartitioning(_groupingexpression#20L, 200), ENSURE_REQUIREMENTS
+       +- ObjectHashAggregate(keys=[_groupingexpression#20L], functions=[partial_hll_sketch_agg(id#15L, 12, 0, 0)])
+          +- Project [id#15L, (id#15L % 3) AS _groupingexpression#20L]
+             +- Range (0, 1000, step=1, splits=2)
+    ```
+
+    Each task builds a sketch of its rows, the sketches are shuffled
+    (a few kilobytes each instead of the rows), and the final step
+    merges them. Storing the sketch in a table is the same merge,
+    delayed by a week.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Spark's Own HyperLogLog++
+
+    `approx_count_distinct(col, rsd=0.05)` is not a DataSketches
+    function. It is `HyperLogLogPlusPlus`
+    (`sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/aggregate/HyperLogLogPlusPlus.scala`),
+    with the algorithm in `HyperLogLogPlusPlusHelper`
+    (`sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/util/HyperLogLogPlusPlusHelper.scala`),
+    following Heule, Nunkesser and Hall, "HyperLogLog in Practice"
+    (2013). From the 4.2.0 source:
+
+    - **Precision** from the requested `rsd`:
+      `p = ceil(2 * log2(1.106 / rsd))`, and `m = 2^p` registers.
+    - **Hashing**: `XxHash64Function.hash(value, dataType, 42L,
+      isCollationAware = true, ...)`. The first `p` bits of the hash
+      pick a register; the register keeps the largest number of leading
+      zeros (plus one) seen in the remaining bits.
+    - **Storage**: 6-bit registers (`REGISTER_SIZE = 6`), ten per 64-bit
+      word, `m / 10 + 1` longs in the aggregation buffer.
+    - **Estimate**: the harmonic mean of `2^register`, with **linear
+      counting** `m * ln(m / V)` (`V` empty registers) for small
+      cardinalities, below a per-precision threshold table, and an
+      empirical **bias correction** (k-nearest-neighbour interpolation,
+      `K = 6`, in tables copied from the paper's appendix) in between.
+    - `trueRsd = 1.04 / sqrt(m)`, always at or below what you asked for.
+
+    | `rsd` | `p` | registers | buffer | `trueRsd` |
+    |---|---|---|---|---|
+    | 0.05 (default) | 9 | 512 | 52 longs, 416 bytes | 0.0460 |
+    | 0.01 | 14 | 16,384 | 1,639 longs, 13,112 bytes | 0.0081 |
+
+    Measured over 200 groups of exactly 20,000 distinct values each:
+
+    ```text
+    acd05: mean rel err -0.0061  measured RSE 0.0481  max |err| 0.1210
+    acd01: mean rel err -0.0010  measured RSE 0.0077  max |err| 0.0207
+    ```
+
+    The measured relative standard error matches `trueRsd`, and the
+    worst of 200 groups is off by 12% at the default. "Production
+    Ingestion" saw 37 for 40 customers: with 512 registers and 40
+    values, linear counting is nearly exact on average, but a few
+    unlucky register collisions move a small count by several units.
+
+    The limitation that matters for this lesson: the buffer of 52 longs
+    is internal. There is no function that returns it, so an
+    `approx_count_distinct` result cannot be stored and merged later.
+    For that, Spark has the DataSketches functions.
+
+- Class: mult_question
+  Depth: all
+  Output: "Why can't you store the result of approx_count_distinct per day and combine the days into a weekly distinct count?"
+  AnswerChoices: "It returns only the estimate, and the HLL++ registers that could be merged stay inside the aggregation buffer;Because HLL++ is not mergeable in theory;Because the estimate is rounded to a long;Because approx_count_distinct uses a random seed per query"
+  CorrectAnswer: "It returns only the estimate, and the HLL++ registers that could be merged stay inside the aggregation buffer"
+  Hint: "Spark merges HLL++ buffers between tasks every day; it just never hands them to you."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## DataSketches HLL: hll_sketch_agg
+
+    Spark 3.5 added `hll_sketch_agg`, `hll_union_agg`, `hll_union` and
+    `hll_sketch_estimate` (SPARK-16484), built on Apache DataSketches
+    (`datasketches-java-6.2.0.jar` ships in PySpark's `jars/` folder).
+    From `HllSketchAgg` in
+    `sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/aggregate/datasketchesAggregates.scala`:
+
+    - the target type is `TgtHllType.HLL_8` (one byte per register)
+    - `lgConfigK` defaults to `HllSketch.DEFAULT_LG_K` (12, so 4,096
+      registers) and must be a constant between 4 and 21
+    - the result is `sketch.toUpdatableByteArray`, a BINARY value
+    - inputs: INT, BIGINT, STRING, BINARY; NULLs, empty byte arrays
+      and strings equal to `""` under their collation are **ignored**
+
+    A sketch is just bytes, so you can open it with the same library on
+    the JVM (classic session, `spark._jvm`):
+
+    ```python
+    H = spark._jvm.org.apache.datasketches.hll.HllSketch
+    b = spark.range(20000).agg(F.hll_sketch_agg("id")).first()[0]
+    s = H.heapify(bytearray(b))
+    print(s.toString(True, False, False, False))
+    ```
+
+    ```text
+    ### HLL SKETCH SUMMARY:
+      Log Config K   : 12
+      Hll Target     : HLL_8
+      Current Mode   : HLL
+      Memory         : false
+      LB             : 20351.24727153787
+      Estimate       : 20680.03548970646
+      UB             : 21020.283717383856
+      OutOfOrder Flag: true
+      CurMin         : 0
+      NumAtCurMin    : 23
+      HipAccum       : 0.0
+      KxQ0           : 584.8881149291992
+      KxQ1           : 0.0
+      Rebuild KxQ Flg: false
+    ```
+
+    `OutOfOrder Flag: true` is worth understanding. A sketch built from
+    one stream of values can use the HIP estimator, which is more
+    accurate. A sketch that is the **union** of others cannot, and
+    Spark's partial and final aggregation merges sketches (`merge` in
+    `HllSketchAgg` builds a `Union`), so the sketches Spark returns are
+    marked out of order, as above. DataSketches publishes the bound for
+    both cases (`HllSketch.getRelErr(upperBound, outOfOrder, lgK,
+    numStdDev)`):
+
+    ```text
+    hll lgK 10 relErr 1sd upper (ooo=False, True): 0.025991325 0.032433119
+    hll lgK 12 relErr 1sd upper (ooo=False, True): 0.012920332 0.016186662
+    ```
+
+    Measured on the same 200 groups of 20,000:
+
+    ```text
+    hll12: mean rel err -0.0016  measured RSE 0.0129  max |err| 0.0386
+    hll10: mean rel err -0.0001  measured RSE 0.0302  max |err| 0.0764
+    ```
+
+    Within the out-of-order bound. The exercise checks its estimates
+    against `getRelErr(True, True, lgK, 3)`, the 3-sigma bound.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## The Bytes of an HLL Sketch
+
+    The first eight bytes are a preamble. For 3, 300 and 20,000 distinct
+    values at `lgConfigK = 12`:
+
+    ```text
+    3 bytes 40 mode LIST est 3.0 head 02 01 07 0c 03 00 03 08
+    300 bytes 2060 mode SET est 300.0 head 03 01 07 0c 09 00 00 09
+    20000 bytes 4136 mode HLL est 20253.2 head 0a 01 07 0c 00 10 00 0a
+    ```
+
+    - byte 0: preamble size in 4-byte ints (2, 3, 10)
+    - byte 1: serial version 1
+    - byte 2: family id 7, which is
+      `org.apache.datasketches.common.Family.HLL.getID()`
+    - byte 3: `lgConfigK` (`0x0c` = 12)
+    - byte 6: in LIST mode, the number of entries (3)
+    - byte 7: the current mode in the low bits (0 LIST, 1 SET, 2 HLL)
+      and the target type above them (`0x08` = HLL_8 in LIST mode)
+
+    An HLL sketch starts **sparse**: a list of coupons (register index
+    and value pairs), then a hash set of them, and moves to the full
+    array of 4,096 one-byte registers as it grows. So a sketch of three
+    users is 40 bytes, not 4 KB, and a table of sketches per day and
+    country costs little for small groups.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Hashing Messy Values
+
+    A sketch counts distinct **hashes**, so anything that changes a
+    value's bytes changes the count. The same 1,000 ids sketched as
+    BIGINT and as STRING, then unioned:
+
+    ```text
+    bigint+string union: 2009
+    bigint+int union: 988
+    theta bigint+int union: 1000
+    ```
+
+    `"1"` and `1` are different values to a hash: the union counts every
+    user twice. INT and BIGINT agree because DataSketches' HLL sketch has
+    no `update(int)` (`javap` on `BaseHllSketch` lists `update(long)`,
+    `update(double)`, `update(String)`, byte, char, int-array and
+    long-array forms), so Spark's `Int` goes to `update(long)`. Store the type you
+    sketched next to the sketch, and never union sketches of different
+    types.
+
+    Messy ids are worse. Five spellings of two people, an empty string
+    and a NULL:
+
+    ```python
+    messy = spark.createDataFrame(
+        [("Alice",), ("alice",), ("ALICE ",), (" alice",), ("",), (None,), ("Bob",)], "u string")
+    ```
+
+    ```text
+    raw=5, lcase=4, normalized=2, acd=6, acd_lcase=5, exact=6, theta=5
+    ```
+
+    - `raw`, `hll_sketch_agg(u)`: 5. The empty string is skipped.
+    - `lcase`, `hll_sketch_agg(u :: STRING COLLATE UTF8_LCASE)`: 4. The
+      HLL functions hash the collation key (collation support came in
+      4.0 with SPARK-48003; 4.1 changed it to hash the raw collation key
+      bytes, SPARK-53559), so `Alice` and `alice` fold, but the spaces
+      still count.
+    - `normalized`, `hll_sketch_agg(lower(trim(u)))`: 2, the right
+      answer.
+    - `acd`, `approx_count_distinct(u)`: 6, and `exact`,
+      `count_distinct(u)`: 6. Both count `""` as a value.
+    - `theta`: 5, like HLL.
+
+    So on data with empty strings, a sketch and an exact count disagree
+    even when the sketch is exact. Normalize first (trim, case, empty to
+    NULL), and do it in one function that every sketch and every exact
+    check shares. The exercise starts there.
+
+- Class: mult_question
+  Depth: all
+  Output: "Daily HLL sketches were built from user_id as BIGINT until March and as STRING after. What does a union across the change estimate?"
+  AnswerChoices: "Roughly twice the true count for users seen on both sides, because 42 and '42' hash differently;The true count, because the sketch normalizes types;An error, because hll_union_agg checks the input type;Half the true count"
+  CorrectAnswer: "Roughly twice the true count for users seen on both sides, because 42 and '42' hash differently"
+  Hint: "A sketch only sees hashes of bytes. The union of 1,000 ids as bigint and as string estimated 2,009."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Union Rules and the Errors You Get
+
+    Merging needs compatible sketches, and Spark checks:
+
+    ```text
+    [HLL_UNION_DIFFERENT_LG_K] Sketches have different `lgConfigK` values: 10 and 12. Set the
+    `allowDifferentLgConfigK` parameter to true to call `hll_union_agg` with different `lgConfigK`
+    values. SQLSTATE: 22000
+    ```
+
+    With `hll_union_agg("s", True)` the union works and the result has
+    the **smaller** `lgConfigK`, so the precision of the whole union
+    drops to the least precise input. Pick one `lgConfigK` per table
+    and keep it forever.
+
+    The other errors, all from real runs:
+
+    ```text
+    [HLL_INVALID_LG_K] Invalid call to `hll_sketch_agg`; the `lgConfigK` value must be between 4
+    and 21, inclusive: 30. SQLSTATE: 22546
+
+    [HLL_K_MUST_BE_CONSTANT] Invalid call to `hll_sketch_agg`; the `K` value must be a constant
+    value, but got a non-constant expression. SQLSTATE: 42K0E
+
+    [HLL_INVALID_INPUT_SKETCH_BUFFER] Invalid call to `hll_sketch_estimate`; only valid HLL sketch
+    buffers are supported as inputs (such as those produced by the `hll_sketch_agg` function).
+    SQLSTATE: 22546
+
+    [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve "hll_sketch_agg(CAST(id AS DOUBLE), 12)"
+    due to data type mismatch: The first parameter requires the ("INT" or "BIGINT" or "STRING" or
+    "BINARY") type, however "CAST(id AS DOUBLE)" has the type "DOUBLE". SQLSTATE: 42K09
+    ```
+
+    The constant-K rule (SPARK-54138, in 4.1) means you cannot choose
+    precision per group with a column. Doubles are rejected on purpose
+    (the source comment: "due to imprecision"); theta sketches accept
+    them, but think twice before counting distinct floating point
+    values.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Theta Sketches and Set Operations
+
+    HLL answers "how many distinct". Questions like "how many users
+    came back the next day" need **intersections**, and HLL cannot do
+    them well. Spark 4.1 added theta sketches (SPARK-52407):
+    `theta_sketch_agg`, `theta_union`, `theta_union_agg`,
+    `theta_intersection`, `theta_intersection_agg`, `theta_difference`
+    and `theta_sketch_estimate`.
+
+    A theta sketch keeps the `k` **smallest hash values** it has seen
+    (as fractions of the hash range) and a threshold `theta`: the
+    largest hash still kept. If `k` hashes fall below `theta`, the
+    number of distinct values is about `k / theta`. Because it keeps
+    actual hashes, two sketches can be intersected: keep the hashes
+    below both thresholds that appear in both. From the JVM:
+
+    ```text
+    org.apache.datasketches.theta.HeapCompactSketch 4096 0.04177634717109197 98045.91060164096 ...
+
+    ### HeapCompactSketch SUMMARY:
+       Estimate                : 98045.91060164096
+       Upper Bound, 95% conf   : 101104.03886023912
+       Lower Bound, 95% conf   : 95079.89637942011
+       Theta (double)          : 0.04177634717109197
+       EstMode?                : true
+       Retained Entries        : 4096
+       Seed Hash               : 93cc | 37836
+    ```
+
+    100,000 values, 4,096 hashes kept below `theta ≈ 0.0418`, estimate
+    `4096 / 0.0418 ≈ 98,046`. `lgNomEntries` defaults to 12 and ranges
+    from 4 to 26 (`ThetaSketchUtils` in
+    `sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/util/`).
+    Spark stores theta sketches with `toByteArrayCompressed`, the
+    compressed compact format (serial version 4, the second byte of the
+    sketch), 25,618 bytes here.
+
+    The **seed hash** `93cc` identifies the hash seed: DataSketches'
+    default update seed is 9001
+    (`org.apache.datasketches.thetacommon.ThetaUtil.DEFAULT_UPDATE_SEED`),
+    and sketches built with different seeds refuse to merge. Spark does
+    not let you change it, which is what you want.
+
+    Over 200 groups of 20,000 the default theta sketch measured an RSE
+    of 1.21%, comparable to `1 / sqrt(4096) = 1.56%`.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## When an Intersection Is Useless
+
+    The error of a theta set operation is relative to the **union**,
+    not to the result. Two sets of 100,000 values each, with an overlap
+    from 50,000 down to 100 (default `lgNomEntries`):
+
+    ```text
+    overlap exact est relerr
+    50000 48118 -0.038 diff 49983 union 149587
+    10000 10058 +0.006 diff 88099 union 192828
+    1000 1237 +0.237 diff 96826 union 200806
+    100 49 -0.510 diff 98117 union 201723
+    ```
+
+    The intersection estimate is the union estimate times the fraction
+    of retained hashes that are in both. With 4,096 hashes retained from
+    a union of 200,000, an overlap of 1,000 leaves about 20 shared hashes
+    to count, and 100 leaves about 2. Over 30 trials with an overlap of
+    1,000 the relative error had a standard deviation of 15.9%, from
+    -46% to +24%. A rough rule: the relative error of an intersection is
+    about `sqrt(|A ∪ B| / |A ∩ B|) / sqrt(k)` (22% here). If you need
+    small overlaps of large sets, raise `lgNomEntries`, or compute those
+    exactly.
+
+    For that reason, test intersections against the sketch's own
+    bounds, not a fixed tolerance. The result of `theta_intersection` is
+    a sketch, and its `getLowerBound(3)` and `getUpperBound(3)` say how
+    wide the answer is. The exercise checks that the exact number of
+    returning users falls inside that interval.
+
+- Class: mult_question
+  Depth: all
+  Output: "Two theta sketches of about 1,000,000 users each overlap in about 500 users. With lgNomEntries 12, how good is theta_intersection's estimate likely to be?"
+  AnswerChoices: "Very poor, because only a handful of the 4,096 retained hashes fall in the overlap;Within about 1.6%, the sketch's usual error;Exact, because intersections are computed from the hashes;It fails with an error for small overlaps"
+  CorrectAnswer: "Very poor, because only a handful of the 4,096 retained hashes fall in the overlap"
+  Hint: "The error is relative to the union: about sqrt(2,000,000 / 500) / 64."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Tuple Sketches: Distinct Keys With a Summary (4.2)
+
+    Spark 4.2 adds tuple sketches (SPARK-54179): a theta sketch whose
+    retained hashes carry a **summary**. `tuple_sketch_agg_double(key,
+    summary, lgNomEntries=12, mode="sum")` (and the `_integer` variants)
+    with modes `sum`, `min`, `max` and `alwaysone`, plus
+    `tuple_union*`, `tuple_intersection*`, `tuple_difference*`,
+    `tuple_sketch_estimate_*`, `tuple_sketch_summary_*` and
+    `tuple_sketch_theta_*`. A typical question: distinct buyers and what
+    they spent, mergeable by day.
+
+    The trap is in what the summary means once the sketch is in
+    estimation mode. 100,000 users, three purchases of 10.0 each:
+
+    ```text
+    tuple 100k users x3 x10.0: Row(users=98045.91060164096, summary_sum=122880.0, theta=0.04177634717109197)
+    tuple 10 users x3 x10.0: Row(tuple_sketch_estimate_double(t)=10.0, tuple_sketch_summary_double(t, sum)=300.0, tuple_sketch_summary_double(t, max)=30.0)
+    ```
+
+    With 10 users the sketch is exact and the sum is 300. With 100,000
+    the sum is **122,880**, not 3,000,000: it is the sum over the 4,096
+    **retained** keys (4,096 times 30). To estimate the total, divide by
+    `theta`: `122,880 / 0.0418 ≈ 2.94 million`. And
+    `tuple_sketch_theta_double` returns that `theta` as a DOUBLE, not a
+    sketch:
+
+    ```text
+    [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve "theta_sketch_estimate(tuple_sketch_theta_double(t))"
+    due to data type mismatch: The first parameter requires the "BINARY" type, however
+    "tuple_sketch_theta_double(t)" has the type "DOUBLE". SQLSTATE: 42K09
+    ```
+
+    The two `mode`s are separate. `mode` in the aggregate decides how
+    values for the same key combine inside the sketch (the 10-user
+    sketch above summed each user's three purchases to 30); `mode` in
+    `tuple_sketch_summary_double` decides how the per-key summaries
+    combine into one number (`max` gave 30, the largest per-user total).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## KLL: Quantiles You Can Merge
+
+    Spark 4.1 added KLL quantile sketches (SPARK-53991):
+    `kll_sketch_agg_bigint`, `_float`, `_double`, with
+    `kll_sketch_get_quantile_*`, `kll_sketch_get_rank_*`,
+    `kll_sketch_get_n_*`, `kll_sketch_merge_*` and
+    `kll_sketch_to_string_*`. The aggregate that merges a column of
+    stored sketches, `kll_merge_agg_*`, came later (SPARK-54785) and is
+    documented as new in 4.1.2 (SPARK-57116 corrected its `versionadded`
+    from 4.1.0). `k` defaults to 200 and ranges from 8 to 65,535.
+
+    KLL keeps a hierarchy of sorted buffers. When a level fills, it
+    sorts and keeps every other item (choosing odd or even positions at
+    random) and promotes them, with double weight, to the next level.
+    The guarantee is on **rank**: the estimated quantile `q` for rank
+    `r` has a true rank within `ε` of `r`. DataSketches gives `ε` for a
+    `k`; from a merged sketch:
+
+    ```text
+    normalized rank error k=200: 0.013294757464848584 k=50: 0.05117564776262976
+    ```
+
+    and `kll_sketch_to_string_double`:
+
+    ```text
+    ### KllKllDoublesSketch Summary:
+       K                      : 200
+       N                      : 200000
+       Epsilon                : 1.329%
+       Epsilon PMF            : 1.652%
+       Estimation Mode        : true
+       Levels                 : 10
+       Retained Items         : 496
+       Compact Storage Bytes  : 4044
+    ```
+
+    200,000 latencies in 496 retained items and 4 KB. Measured against
+    the exact quantiles of a log-normal latency sample:
+
+    ```text
+    q0.5 54.48 exact 54.81 rank error -0.00292
+    q0.9 151.31 exact 152.36 rank error -0.00157
+    q0.95 199.27 exact 203.18 rank error -0.00265
+    q0.99 362.38 exact 353.0 rank error 0.00087
+    q0.999 669.32 exact 661.31 rank error 6e-05
+    q50_0.95 235.83 exact 203.18 rank error 0.01615
+    q50_0.999 420.91 exact 661.31 rank error -0.00428
+    ```
+
+    (`q50_` rows used `k = 50`, 988 bytes.) Read them in ranks, not
+    milliseconds. With `k = 50` the p99.9 estimate is 420 ms against a
+    true 661 ms, which looks terrible, yet its rank error is only 0.43%,
+    well within `ε = 5.1%`: in the far tail a small rank error is a
+    large distance in value. For tail latencies, use a larger `k`, or
+    check how many items sit above your threshold with
+    `kll_sketch_get_rank_double` (the rank of 200 ms was 0.95136 against
+    an exact 0.94781).
+
+    Two more things to know. KLL is **randomized**: the same data gives
+    slightly different quantiles from run to run (the exercise's p99
+    was 351.58, 348.28 and 385.16 in three runs), so tests must check
+    rank error against `ε`, never exact values. Over 60 repeated runs
+    on 250,000 values the largest rank error was 0.58%, well inside
+    1.33%. And `percentile_approx` (3.1) is a different, deterministic
+    algorithm whose state, like `approx_count_distinct`'s, cannot be
+    stored.
+
+- Class: mult_question
+  Depth: all
+  Output: "A KLL sketch with k = 200 reports p99 = 362 ms. What does its guarantee say?"
+  AnswerChoices: "The true rank of 362 ms is within about 1.3% of 0.99;362 ms is within 1.3% of the true p99 in milliseconds;362 ms is exactly the 99th percentile of a random sample;Nothing, KLL has no guarantee for tails"
+  CorrectAnswer: "The true rank of 362 ms is within about 1.3% of 0.99"
+  Hint: "KLL bounds rank error, not value error."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    `sketches` has a BINARY column `latency_kll` of KLL double sketches,
+    one row per day. Set `p95` to a DataFrame with one column holding the
+    estimated 95th percentile over all rows.
+  CorrectAnswer: |
+    p95 = sketches.agg(F.kll_sketch_get_quantile_double(F.kll_merge_agg_double("latency_kll"), F.lit(0.95)))
+  Hint: "Merge with kll_merge_agg_double, then ask the merged sketch for rank 0.95."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Count-Min: Frequencies
+
+    For "how often does this value appear", Spark has had a count-min
+    sketch since 2.0 (`countMinSketch` in the Scala
+    `DataFrameStatFunctions`; PySpark's `df.stat` does not have it), and
+    since 3.5 the
+    aggregate `count_min_sketch(col, eps, confidence, seed)`, which
+    returns the serialized sketch as BINARY. The implementation is
+    Spark's own, in `common/sketch/` (`org.apache.spark.util.sketch.CountMinSketch`).
+    It overestimates, never underestimates, by at most `eps` times the
+    total count with probability `confidence`:
+
+    ```python
+    c = spark._jvm.org.apache.spark.util.sketch.CountMinSketch.readFrom(bytearray(cms))
+    ```
+
+    ```text
+    cms bytes 112076 est(7) 5100 exact 5100 est(8) 100 exact 100 total 105000 depth 7 width 2000
+    ```
+
+    `eps = 0.001` gave a width of 2,000 counters and `confidence = 0.99`
+    a depth of 7 hash rows. It is Spark-specific: there is no SQL
+    function to read it back, so you read it through the JVM or with
+    your own decoder. For "top values" inside SQL, `approx_top_k` (4.1)
+    is the tool "Production Ingestion" used.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## A Table of Sketches
+
+    The design the exercise builds, for a week of app events (user id,
+    country, latency):
+
+    ```python
+    user = F.lower(F.trim("user"))
+    user = F.when(user == "", None).otherwise(user)
+    daily = (events.groupBy("day", "country")
+             .agg(F.hll_sketch_agg(user, 14).alias("users_hll"),
+                  F.theta_sketch_agg(user, 12).alias("users_theta"),
+                  F.kll_sketch_agg_double("latency_ms", 200).alias("latency_kll"),
+                  F.count("*").alias("events")))
+    daily.write.partitionBy("day").parquet(sketch_dir)
+    ```
+
+    One row per day and country, three BINARY columns and an exact
+    count. From the exercise's run:
+
+    ```text
+    raw events: 15.4 MB; daily sketches: 0.90 MB (35 rows)
+    ```
+
+    Rollups are aggregations over the sketch table:
+
+    ```python
+    week = sketches.groupBy("country").agg(
+        F.hll_sketch_estimate(F.hll_union_agg("users_hll")).alias("users"))
+    ```
+
+    Rules that keep such a table useful for years:
+
+    - **Fix the parameters per column** (`lgConfigK`, `lgNomEntries`,
+      `k`) and record them, in the column name, a comment or table
+      properties. A change means a new column, not a silent mix.
+    - **Fix the input**: the same normalization function and type, or
+      the sketches do not merge meaningfully.
+    - **Choose the grain** you will need: you can roll day and country up
+      to week and region, never down to hour or city.
+    - **Keep exact counts next to sketches** when they are additive
+      (events, bytes): they cost nothing and catch mistakes.
+    - **Expect sizes to vary**: small groups have small sketches (an HLL
+      of three users is 40 bytes).
+
+    The exercise proves the most important property directly: it
+    deletes the raw events after writing the sketches, runs every
+    rollup, and checks that each rollup's `inputFiles()` lists only
+    sketch files. A rollup that needs raw data cannot pass.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Compatibility With Other DataSketches Libraries
+
+    The sketches Spark writes are ordinary DataSketches serializations,
+    which is why `HllSketch.heapify`, `Sketch.heapify` and
+    `KllDoublesSketch.heapify` from the bundled `datasketches-java` 6.2.0
+    read them back above. The DataSketches project defines one binary
+    format per sketch family for its Java, C++ and Python libraries, so
+    in principle a Python job can read Spark's sketches with the
+    `datasketches` package. This lesson did not verify that (the package
+    is not part of PySpark's dependencies). What you would check, with
+    a sketch from each family (the Python names below are from the
+    `datasketches` package's API and were not run here):
+
+    - HLL: `datasketches.hll_sketch.deserialize(b).get_estimate()`
+      equals `hll_sketch_estimate`; Spark writes the **updatable** form
+      of an HLL_8 sketch.
+    - Theta: `datasketches.compact_theta_sketch.deserialize(b)` reads
+      the **compressed** compact format (serial version 4, written by
+      `toByteArrayCompressed`), so the reader's version must support
+      serial version 4. The seed must be the default 9001.
+    - KLL: `datasketches.kll_doubles_sketch.deserialize(b)` and the same
+      quantiles for the same ranks (within `ε`, since KLL merges are
+      randomized).
+
+    And in the other direction, a sketch produced elsewhere must use the
+    same hashing of the same bytes: a Python sketch of `str(user_id)` and
+    a Spark sketch of a BIGINT user id are different sets.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: A Week of Users and Latencies from Daily Sketches
+
+    The harness writes a week of messy events (JSON Lines, one folder
+    per day: user ids in upper case or with spaces, empty and NULL ids,
+    latencies), and keeps the exact answers in Python. Complete:
+
+    1. `normalize_user(col)`: trim, lower case, `""` to NULL.
+    2. `daily_sketches(events)`: one row per day and country with
+       `users_hll` (lgConfigK 14), `users_theta` (lgNomEntries 12),
+       `latency_kll` (k 200) and `events`.
+    3. `weekly_distinct(sketches)`: estimated distinct users per country
+       and for all countries (country NULL).
+    4. `returning_users(sketches, day_a, day_b)`: the theta sketch and
+       estimate of users seen on both days.
+    5. `latency_quantiles(sketches, ranks)`: estimated quantiles over the
+       whole week.
+
+    The harness writes your sketches to Parquet, **deletes the raw
+    events**, and checks: BINARY sketch columns and one row per day and
+    country; rollups that read only sketch files (`inputFiles()`);
+    weekly distinct users per country within the 3-sigma bound
+    `HllSketch.getRelErr(True, True, 14, 3)` of the exact count; the
+    exact number of returning users inside the intersection sketch's
+    3-sigma interval; and each quantile's true rank within KLL's
+    normalized rank error.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "weekly_distinct: groupBy('country').agg(F.hll_sketch_estimate(F.hll_union_agg('users_hll'))) unionByName the same over all rows with F.lit(None).cast('string') as country. returning_users: theta_union_agg per day, crossJoin, F.theta_intersection('a', 'b'). latency_quantiles: F.kll_merge_agg_double, then F.kll_sketch_get_quantile_double(k, F.lit(r))."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - Distinct counts and quantiles do not add; sketches are fixed-size,
+      mergeable summaries with known error. Spark plans them as
+      `ObjectHashAggregate` with partial and final steps.
+    - `approx_count_distinct` is Spark's HyperLogLog++
+      (`p = ceil(2 log2(1.106 / rsd))`, 6-bit registers, linear counting,
+      bias correction). Its error matches `1.04 / sqrt(m)`, and its state
+      cannot be stored.
+    - `hll_sketch_agg` (3.5): DataSketches HLL_8, `lgConfigK` 4 to 21
+      (default 12), updatable bytes that start sparse. Merged sketches
+      are out of order; check against `getRelErr(True, True, lgK, n)`.
+    - Hashes see bytes: never mix types, normalize ids (trim, case, empty
+      to NULL), know that sketches skip `""` while exact counts do not,
+      and keep one `lgConfigK` per column (`HLL_UNION_DIFFERENT_LG_K`).
+    - Theta sketches (4.1) keep the `k` smallest hashes and support
+      union, intersection and difference; intersection error is relative
+      to the union, so small overlaps of big sets are unreliable. Check
+      against the result sketch's bounds.
+    - Tuple sketches (4.2) attach summaries to keys; in estimation mode
+      the summary covers retained keys only, so scale by `theta`.
+    - KLL (4.1, `kll_merge_agg_*` in 4.1.2) bounds **rank** error
+      (1.33% at `k = 200`); tail values can be far off in milliseconds;
+      results vary from run to run.
+    - A table of daily sketches with fixed parameters and normalized
+      inputs answers weekly questions in a fraction of the space, and
+      you can prove it never needs the raw data.
+
+    Next: **Streaming Internals: Checkpoints, State and Real-Time Mode**,
+    where state that must survive restarts is not a summary but every
+    key a query has seen.

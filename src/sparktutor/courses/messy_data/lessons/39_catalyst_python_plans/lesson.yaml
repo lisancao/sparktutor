@@ -1,0 +1,1116 @@
+- Class: meta
+  Lesson: How Catalyst Plans Python
+  EstimatedMinutes: 75
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Advanced Level
+
+    The basics level taught Spark's built-in ways to read messy data
+    and the core of the engine as a user sees it. The intermediate level
+    built production tools on Spark's public APIs: Python data sources
+    that push filters, write atomically and stream, UDTFs, tuning,
+    quality-checked ingestion, similarity search, entity resolution and
+    inference. The advanced level goes **inside the engine** and
+    **extends it**.
+
+    You will read Spark's source (always the 4.2.0 tag, with file paths
+    you can open), look at plans as objects rather than pictures, watch
+    the bytes that cross between the JVM and Python, write Java against
+    Spark's own interfaces (a DSv2 connector, Catalyst rules and native
+    expressions, Spark Connect plugins), take Parquet and VARIANT apart
+    byte by byte, build distributed algorithms (LSH, IVF, connected
+    components, sketches) from primitives, and prove reliability with
+    fault injection. The level ends with an upstream case study, from a
+    wrong result to a fix in Spark itself, and a final project: your own
+    connector.
+
+    It assumes the basics and intermediate levels, especially "Your
+    First Python Data Source" and "Plans, Partitions and Caching" from
+    the basics, and "Types, Arrow and Performance", "Filter Pushdown",
+    "Tuning Python on Spark" and "Packaging, Registration, Testing and
+    Debugging" from the intermediate level. Lessons here prefer
+    evidence you produce yourself (a plan node, a log line, a hexdump, a
+    JVM object reached through `spark._jvm`) over statements in prose.
+    Exercises check harder properties than "the answer is right": how
+    many times a function ran, which bytes were read, what the plan
+    looks like after a rewrite.
+
+    A note on the tools: several experiments reach into the JVM through
+    Py4J (`df._jdf`, `spark._jvm`). That only works in a **classic**
+    session, which is what SparkTutor's `spark-submit` exercises use.
+    Experiments that need Py4J say so; on Spark Connect, read plans as
+    text, or build a plugin as in "Spark Connect Plugins".
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    "Plans, Partitions and Caching" taught you to read `explain()`, and
+    "Filter Pushdown" showed what a Python data source receives from the
+    optimizer. This lesson follows a query that contains Python through
+    every phase of Catalyst and the physical planner, and explains the
+    shapes you see in its plans.
+
+    By the end of this lesson you will be able to:
+
+    - Get each phase of a query (parsed, analyzed, optimized, physical,
+      executed) as text and as JVM objects, and watch individual rules
+      rewrite a plan with `spark.sql.planChangeLog.*`
+    - Explain how `ExtractPythonUDFs` turns UDF calls into
+      `ArrowEvalPython` and `BatchEvalPython` nodes, when it fuses
+      several UDFs into one node and when it cannot
+    - Predict which filters reach a file scan when a query mixes native
+      expressions and Python, and why a nondeterministic UDF changes that
+    - Show, with call counts, when Spark 4.2.0 runs a Python UDF more
+      than once per row, and rewrite the query so it runs once
+    - Name the classes that plan a Python data source (`PythonDataSourceV2`,
+      `PythonScanBuilder`, `PythonScan`, `PythonBatch`) and the Python
+      planning workers they call
+    - Explain why Python nodes split whole-stage code generation
+    - Recognise a 4.2.0 hang caused by a new columnar path into Arrow UDFs
+      (SPARK-58241) and switch it off
+    - Show the protobuf plan a Spark Connect client sends, and explain
+      what lazy analysis on Connect means for errors
+    - Inspect plans programmatically, in tests, from the JVM tree or from
+      the formatted text
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Running Example
+
+    The examples use the web server log `data/messy/logs/access.log`
+    (200 lines), parsed with a regular expression and written to Parquet
+    in a temporary folder, so that the plans show a real file scan with
+    pushed filters:
+
+    ```python
+    LOG = r'^(\S+) \S+ \S+ \[([^\]]+)\] "(\S+) (\S+) [^"]*" (\d{3}) (\d+)'
+    raw = spark.read.text("data/messy/logs/access.log")
+    logs = raw.select(F.regexp_extract("value", LOG, 1).alias("ip"),
+                      F.regexp_extract("value", LOG, 4).alias("path"),
+                      F.regexp_extract("value", LOG, 5).cast("int").alias("status"))
+    logs.write.parquet(tmp + "/access")
+    df = spark.read.parquet(tmp + "/access")
+
+    @F.udf("string")
+    def area(path):
+        # "/api/orders/42?session=s9" -> "api"; "/?session=s1" -> "home"
+        return path.split("?")[0].split("/")[1] or "home"
+    ```
+
+    Of the 200 requests, 98 have status 200, and 31 of those are API
+    calls. Keep those numbers in mind; call counts later in the lesson
+    are measured against them.
+
+    Every session in this lesson sets one configuration that you will
+    understand by the end:
+    `spark.sql.execution.arrow.pythonUDF.columnarInput.enabled=false`.
+    Without it, some of these queries hang forever on 4.2.0.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Life of a Query
+
+    A DataFrame is a plan, not data. Every action hands that plan to a
+    `QueryExecution` object
+    (`sql/core/src/main/scala/org/apache/spark/sql/execution/QueryExecution.scala`),
+    which moves it through these phases, each a lazy value computed from
+    the one before:
+
+    | Phase | `QueryExecution` member | What happens |
+    |---|---|---|
+    | Parsed | `logical` | The tree the API built: names not yet resolved (`'path`) |
+    | Analyzed | `analyzed` | The `Analyzer` resolves names, types and functions against the catalog |
+    | Optimized | `optimizedPlan` | The `Optimizer` (and `SparkOptimizer`) rewrites the tree with rules |
+    | Physical | `sparkPlan` | The `SparkPlanner` strategies pick an operator for each logical node |
+    | Executed | `executedPlan` | Preparation rules add exchanges, code generation stages, AQE |
+    | RDD | `toRdd` | The physical plan becomes an RDD of `InternalRow` that tasks run |
+
+    `explain("extended")` prints the first four. For a filter with a
+    native part and a UDF part:
+
+    ```python
+    df.filter((F.col("status") == 200) & (area("path") == "api")).explain("extended")
+    ```
+
+    ```text
+    == Parsed Logical Plan ==
+    'Filter 'and('`=`('status, 200), '`=`(area('path)#11, api))
+    +- Relation [ip#7,path#8,status#9,bytes#10L] parquet
+
+    == Analyzed Logical Plan ==
+    ip: string, path: string, status: int, bytes: bigint
+    Filter ((status#9 = 200) AND (area(path#8)#11 = api))
+    +- Relation [ip#7,path#8,status#9,bytes#10L] parquet
+
+    == Optimized Logical Plan ==
+    Project [ip#7, path#8, status#9, bytes#10L]
+    +- Filter (pythonUDF0#13 = api)
+       +- ArrowEvalPython [area(path#8)#11], [pythonUDF0#13], 101
+          +- Filter (isnotnull(status#9) AND (status#9 = 200))
+             +- Relation [ip#7,path#8,status#9,bytes#10L] parquet
+
+    == Physical Plan ==
+    *(2) Project [ip#7, path#8, status#9, bytes#10L]
+    +- *(2) Filter (pythonUDF0#13 = api)
+       +- ArrowEvalPython [area(path#8)#11], [pythonUDF0#13], 101
+          +- *(1) Filter (isnotnull(status#9) AND (status#9 = 200))
+             +- *(1) ColumnarToRow
+                +- FileScan parquet [...] PushedFilters: [IsNotNull(status), EqualTo(status,200)], ...
+    ```
+
+    (This run used an extra `bytes` column; the plans were taken from a
+    real 4.2.0 run and shortened only where marked `...`.) A leading `'`
+    marks something unresolved. `#11` is an **expression ID**: Catalyst
+    names every attribute by ID, not by name, which is how it knows that
+    `path#8` in one node is the same column as `path#8` in another even
+    after renames.
+
+    Notice that the analyzed plan still has one `Filter` with the UDF in
+    it. The optimized plan has a new node, `ArrowEvalPython`, that did
+    not exist in anything you wrote. Most of this lesson is about where
+    that node comes from.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Phases as Objects
+
+    In a classic session, `df._jdf` is the JVM `Dataset` behind a
+    DataFrame, and its `queryExecution()` gives you every phase as a
+    JVM object through Py4J:
+
+    ```python
+    q = df.filter(F.col("status") == 200).withColumn("area", area("path"))
+    qe = q._jdf.queryExecution()
+    print(qe.logical().toString())
+    print(qe.analyzed().getClass().getName())
+    print(qe.executedPlan().getClass().getName())
+    ```
+
+    ```text
+    'Project [unresolvedstarwithcolumns(area, <lambda>('path)#17, None)]
+    +- Filter (status#8 = 200)
+       +- Relation [ip#6,path#7,status#8] parquet
+
+    org.apache.spark.sql.catalyst.plans.logical.Project
+    org.apache.spark.sql.execution.WholeStageCodegenExec
+    ```
+
+    (The UDF in this run was a lambda, hence `<lambda>`.) The parsed
+    plan shows what `withColumn` really builds in 4.2: an
+    `unresolvedstarwithcolumns` projection that the analyzer expands.
+
+    Every plan node is a `TreeNode`: `nodeName()`, `children()` (a Scala
+    `Seq`, so use `.length()` and `.apply(i)` from Python),
+    `treeString()`, `simpleString(maxFields)`, and node-specific members
+    such as `condition()` on a `FilterExec`. This is how the exercise
+    walks plans:
+
+    ```python
+    def walk(plan, depth=0):
+        yield depth, plan
+        if plan.nodeName() == "AdaptiveSparkPlan":
+            yield from walk(plan.executedPlan(), depth + 1)
+            return
+        children = plan.children()
+        for i in range(children.length()):
+            yield from walk(children.apply(i), depth + 1)
+    ```
+
+    Walking the executed plan of a nondeterministic-UDF query printed:
+
+    ```text
+    WholeStageCodegen (2)
+      Project
+        Filter
+          InputAdapter
+            ArrowEvalPython
+              WholeStageCodegen (1)
+                Filter
+                  ColumnarToRow
+                    InputAdapter
+                      Scan parquet
+    ```
+
+    Three details: `explain()` hides `WholeStageCodegen` and
+    `InputAdapter` nodes and shows `*(n)` instead; the Parquet scan's
+    `nodeName()` is `Scan parquet` (with a trailing space), while
+    `explain()` prints `FileScan parquet`; and a plan with an exchange
+    starts with `AdaptiveSparkPlan`, a leaf as far as `children()` is
+    concerned, so you must descend into its `executedPlan()` yourself.
+
+    The tracker records when each phase ran:
+    `qe.tracker().phases()` printed
+    `Map(planning -> PhaseSummary(...), optimization -> ..., analysis -> ...)`
+    with start and end times in milliseconds.
+
+- Class: mult_question
+  Depth: all
+  Output: "In a plan, what does the `#11` in `area(path#8)#11` identify?"
+  AnswerChoices: "The expression ID that names this value everywhere in the plan;The position of the column in the output;The number of the rule that created it;The partition that computes it"
+  CorrectAnswer: "The expression ID that names this value everywhere in the plan"
+  Hint: "Catalyst matches attributes by ID, not by name, so renames and self-joins stay unambiguous."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Rules, Batches and the Plan Change Log
+
+    The analyzer and the optimizer are both `RuleExecutor`s
+    (`sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/rules/RuleExecutor.scala`).
+    A `RuleExecutor` holds **batches**; each batch is a list of rules run
+    either `Once` or to a `FixedPoint` (repeat until the plan stops
+    changing, up to `spark.sql.optimizer.maxIterations`). Each rule is a
+    function from plan to plan, usually a pattern match on tree shapes.
+
+    You can watch them work. Three internal settings, all since 3.1:
+
+    - `spark.sql.planChangeLog.level`: the log4j level the messages are
+      written at (default `TRACE`, so you never see them; set `WARN`)
+    - `spark.sql.planChangeLog.rules`: a comma-separated list of rule
+      names (full class names) to log
+    - `spark.sql.planChangeLog.batches`: a comma-separated list of batch
+      names to log
+
+    ```python
+    spark.sparkContext.setLogLevel("WARN")
+    spark.conf.set("spark.sql.planChangeLog.level", "WARN")
+    spark.conf.set("spark.sql.planChangeLog.rules",
+                   "org.apache.spark.sql.execution.python.ExtractPythonUDFs,"
+                   "org.apache.spark.sql.catalyst.optimizer.PushDownPredicates")
+    files.withColumn("b", big("size")).filter("b").explain()
+    ```
+
+    (`files` is a small Python data source and `big` a UDF returning
+    `size > 1000`.) Among the output, written to stderr by
+    `PlanChangeLogger`:
+
+    ```text
+    === Applying Rule org.apache.spark.sql.catalyst.optimizer.PushDownPredicates ===
+    !Filter b#19: boolean                                                Project [path#15, kind#16, size#17L, big(size#17L)#18 AS b#19]
+    !+- Project [path#15, kind#16, size#17L, big(size#17L)#18 AS b#19]   +- Filter big(size#17L)#18
+        +- RelationV2[path#15, kind#16, size#17L] files                     +- RelationV2[path#15, kind#16, size#17L] files
+
+    === Applying Rule org.apache.spark.sql.execution.python.ExtractPythonUDFs ===
+    !Project [path#15, kind#16, size#17L, big(size#17L)#18 AS b#19]   Project [path#15, kind#16, size#17L, pythonUDF0#21 AS b#19]
+    !+- Filter big(size#17L)#18                                       +- ArrowEvalPython [big(size#17L)#18], [pythonUDF0#21], 101
+    !   +- RelationV2[path#15, kind#16, size#17L] files                  +- Project [path#15, kind#16, size#17L]
+    !                                                                       +- Filter pythonUDF0#20: boolean
+    !                                                                          +- ArrowEvalPython [big(size#17L)#18], [pythonUDF0#20], 101
+    !                                                                             +- RelationV2[path#15, kind#16, size#17L] files
+    ```
+
+    Left is before, right is after, `!` marks changed lines. Hold on to
+    this log: it shows a UDF being **copied** into a filter and then
+    extracted **twice**. You will measure the cost of that below.
+
+    Even with `rules` set, the logger also prints a summary line for
+    each batch ("Batch Hints has no effect.") and the result of each
+    batch that changed something; use `batches` to narrow it further.
+    It also prints `=== Metrics of Executed Rules ... ===` per executor.
+
+    For timing across the whole session,
+    `spark._jvm.org.apache.spark.sql.catalyst.rules.RuleExecutor.dumpTimeSpent()`
+    returns a table of every rule's effective and total time and runs:
+
+    ```text
+    === Metrics of Analyzer/Optimizer Rules ===
+    Total number of runs: 2333
+    Total time: 0.610194592 seconds
+
+    Rule                                                       Effective Time / Total Time   Effective Runs / Total Runs
+    org.apache.spark.sql.catalyst.analysis.ResolveDataSource   287834102 / 287944388         2 / 16
+    org.apache.spark.sql.catalyst.analysis.Analyzer$ResolveReferences  16610935 / 28896925   5 / 16
+    ...
+    ```
+
+    Times are nanoseconds. When planning a query is slow (a very wide
+    schema, a huge `CASE WHEN`, hundreds of unions), this table is
+    where you start.
+
+- Class: mult_question
+  Depth: all
+  Output: "You set spark.sql.planChangeLog.rules but see no rule output at all. What is the most likely reason?"
+  AnswerChoices: "spark.sql.planChangeLog.level is still TRACE, below the logger's level;The rule names must be short names, not class names;The plan change log only works in Spark Connect;Rules only log when the query is executed, not explained"
+  CorrectAnswer: "spark.sql.planChangeLog.level is still TRACE, below the logger's level"
+  Hint: "The messages are written at the configured level, which defaults to TRACE."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## How a Python UDF Enters the Plan
+
+    `F.udf(f, "string")` builds a `PythonUDF` expression
+    (`sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/PythonUDF.scala`)
+    holding the pickled function, the return type, a `deterministic`
+    flag and an **eval type**, a number that tells the Python worker how
+    to call the function. From `PythonEvalType` in
+    `core/src/main/scala/org/apache/spark/api/python/PythonRunner.scala`:
+
+    | Eval type | Name | Made by |
+    |---|---|---|
+    | 100 | `SQL_BATCHED_UDF` | `udf(..., useArrow=False)` |
+    | 101 | `SQL_ARROW_BATCHED_UDF` | `udf(...)` with Arrow on (the 4.2 default) |
+    | 200 | `SQL_SCALAR_PANDAS_UDF` | `pandas_udf`, Series to Series |
+    | 204 | `SQL_SCALAR_PANDAS_ITER_UDF` | `pandas_udf`, iterator of Series |
+    | 205 | `SQL_MAP_PANDAS_ITER_UDF` | `mapInPandas` |
+    | 207 | `SQL_MAP_ARROW_ITER_UDF` | `mapInArrow`, and Python data source reads |
+    | 250 | `SQL_SCALAR_ARROW_UDF` | `arrow_udf` (4.1) |
+
+    In Spark 4.2, regular Python UDFs are **Arrow-optimized by default**:
+    `spark.sql.execution.pythonUDF.arrow.enabled` now defaults to `true`
+    (the PySpark 4.2 migration guide says so; set it to `false` for the
+    old behaviour). That is why the plans above say
+    `ArrowEvalPython ... 101` for a plain `@udf`.
+
+    A `PythonUDF` cannot be evaluated by the JVM. Until the optimizer is
+    almost finished it sits inside ordinary expressions like any
+    function call, which lets every logical rule move it around. Then,
+    in `SparkOptimizer`
+    (`sql/core/src/main/scala/org/apache/spark/sql/execution/SparkOptimizer.scala`),
+    a batch called `Extract Python UDFs` runs once:
+
+    ```scala
+    Batch("Extract Python UDFs", Once,
+      ExtractPythonUDFFromJoinCondition,
+      CheckCartesianProducts,
+      ExtractPythonUDFFromAggregate,
+      ExtractGroupingPythonUDFFromAggregate,
+      ExtractPythonUDFs,
+      ExtractPythonUDTFs,
+      // The eval-python node may be between Project/Filter and the scan node, which breaks
+      // column pruning and filter push-down. Here we rerun the related optimizer rules.
+      ColumnPruning,
+      LimitPushDown,
+      PushPredicateThroughNonJoin,
+      PushProjectionThroughLimitAndOffset,
+      RemoveNoopOperators),
+    ```
+
+    `ExtractPythonUDFs`
+    (`sql/core/src/main/scala/org/apache/spark/sql/execution/python/ExtractPythonUDFs.scala`)
+    visits each operator bottom-up. For an operator whose expressions
+    contain UDFs it can evaluate, it inserts a `BatchEvalPython`
+    (eval type 100) or `ArrowEvalPython` (the Arrow and pandas eval
+    types) **below** the operator. That node evaluates the UDFs and
+    appends their results as new columns (`pythonUDF0#13`), and the
+    operator is rewritten to read those columns instead of calling the
+    UDF. The planner strategy `PythonEvals` in `SparkStrategies.scala`
+    then maps `ArrowEvalPython` to `ArrowEvalPythonExec` and
+    `BatchEvalPython` to `BatchEvalPythonExec`.
+
+    The rule is listed in `nonExcludableRules`: you cannot switch it off
+    with `spark.sql.optimizer.excludedRules`, because without it the
+    plan would not run at all.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Fusing UDFs: Chains, Siblings and Mixed Types
+
+    One `ArrowEvalPython` node can evaluate several UDFs in one trip to
+    Python. The comment in `ExtractPythonUDFs` names two kinds of
+    fusing: **nested chaining** (`f(g(x))`, the output of one feeds the
+    next inside the worker) and **parallel chaining** (`f(x), g(y)`,
+    evaluated side by side). Measured on 4.2.0 (in these runs `area`
+    wraps a Python function named `_area`, which is the name plans
+    print; `upper` is a second UDF and `strip_q` a pandas UDF):
+
+    ```text
+    df.select(upper(area("path")))           # nested, same eval type
+    ArrowEvalPython [upper(_area(path#8)#15)#16], [pythonUDF0#18], 101
+
+    df.select(area("path"), upper("ip"))      # siblings, same eval type
+    ArrowEvalPython [_area(path#8)#19, upper(ip#7)#20], [pythonUDF0#23, pythonUDF1#24], 101
+    ```
+
+    Fusing requires the **same eval type**. A pandas UDF inside an
+    Arrow-optimized UDF becomes two nodes, with a projection between
+    them:
+
+    ```text
+    df.select(area(strip_q("path")))          # 101 around 200
+    *(2) Project [pythonUDF0#29 AS _area(strip_q(path))#27]
+    +- ArrowEvalPython [_area(pythonUDF0#28)#26], [pythonUDF0#29], 101
+       +- *(1) Project [pythonUDF0#28]
+          +- ArrowEvalPython [strip_q(path#8)#25], [pythonUDF0#28], 200
+    ```
+
+    Two more rules from the source: iterator UDFs
+    (`SQL_SCALAR_PANDAS_ITER_UDF`, `SQL_SCALAR_ARROW_ITER_UDF`) are never
+    fused with siblings, and a chain stops at any non-UDF expression in
+    between: `foo(1 + bar(x))` needs two nodes because `1 + ...` must
+    run in the JVM. Each extra node is another serialization of the
+    rows to Python and back, so if you control the code, put the logic
+    in one UDF, or keep the UDFs of one query in one flavour.
+
+    The deduplication is real too: the rule keeps UDFs in an
+    `ExpressionSet` by their canonical form, so the same deterministic
+    UDF call written twice in one operator is evaluated once.
+
+- Class: mult_question
+  Depth: all
+  Output: "A select calls an Arrow-optimized @udf on the result of a pandas_udf: `f(g(col))`. How many Python evaluation nodes does the physical plan have?"
+  AnswerChoices: "Two, because the eval types differ;One, because the UDFs are nested;One per row;None, Arrow UDFs run in the JVM"
+  CorrectAnswer: "Two, because the eval types differ"
+  Hint: "ExtractPythonUDFs only chains UDFs whose eval types are equal (101 and 200 are not)."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Filters Around Python
+
+    "Filter Pushdown" taught what a data source receives. The other half
+    is what reaches the source after Python is in the plan. Four cases,
+    all from 4.2.0 runs over the Parquet log:
+
+    **A UDF next to a native condition.** The plan in "The Life of a
+    Query" shows `status = 200` in the scan's `PushedFilters` and only
+    the UDF comparison left above `ArrowEvalPython`. The optimizer
+    splits a condition at its `AND`s, so the native part travels down on
+    its own.
+
+    **A filter written after a UDF column.** For
+    `df.withColumn("a", area("path")).filter("status = 200")`, the
+    filter moves below the projection and into the scan. The Project
+    that computes `a` sits on top:
+
+    ```text
+    *(2) Project [ip#7, path#8, status#9, bytes#10L, pythonUDF0#32 AS a#31]
+    +- ArrowEvalPython [_area(path#8)#30], [pythonUDF0#32], 101
+       +- *(1) Filter (isnotnull(status#9) AND (status#9 = 200))
+          +- *(1) ColumnarToRow
+             +- FileScan parquet [...] PushedFilters: [IsNotNull(status), EqualTo(status,200)], ...
+    ```
+
+    **The same with a nondeterministic UDF.** Mark the UDF
+    `asNondeterministic()` and the filter stays above the Python node,
+    and nothing is pushed:
+
+    ```text
+    *(1) Project [ip#7, path#8, status#9, bytes#10L, pythonUDF0#35 AS a#34]
+    +- *(1) Filter (isnotnull(status#9) AND (status#9 = 200))
+       +- ArrowEvalPython [_area(path#8)#33], [pythonUDF0#35], 101
+          +- FileScan parquet [...] PushedFilters: [], ...
+    ```
+
+    The reason is in `PushPredicateThroughNonJoin`
+    (`sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/Optimizer.scala`):
+    a filter only moves through a `Project` if **every** field of the
+    projection is deterministic (SPARK-13473). Moving it would change
+    which rows the nondeterministic expression sees, and so its results.
+    The UDF now runs on all 200 rows, and Parquet reads every row group.
+
+    **A UDF as the predicate itself.** `df.filter(ok("status"))` with
+    `ok = udf(lambda s: s < 400, "boolean")` pushes nothing: a Python
+    function is opaque to Catalyst, so it cannot become a Parquet
+    `LessThan`. The native `F.col("status") < 400` pushes
+    `LessThan(status,400)`. On a messy-data job that filters a large
+    table by a UDF, this is the cheapest big win there is.
+
+    One more rule from the source: after extraction, `canPushThrough`
+    lets a filter move **through** `ArrowEvalPython` and
+    `BatchEvalPython` nodes (they do not change rows), which is how the
+    native `status = 200` in the first case ended up below the Python
+    node even though the extraction put the node there afterwards.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## When a UDF Runs Twice
+
+    Filter on the column a UDF produced, and look at the plan:
+
+    ```python
+    slow = (df.withColumn("area", area("path"))
+              .filter(F.col("area") == "api")
+              .filter(F.col("status") == 200))
+    slow.explain()
+    ```
+
+    ```text
+    *(3) Project [ip#6, path#7, status#8, pythonUDF0#13 AS area#11]
+    +- ArrowEvalPython [<lambda>(path#7)#9], [pythonUDF0#13], 101
+       +- *(2) Project [ip#6, path#7, status#8]
+          +- *(2) Filter (pythonUDF0#12 = api)
+             +- ArrowEvalPython [<lambda>(path#7)#9], [pythonUDF0#12], 101
+                +- *(1) Filter (isnotnull(status#8) AND (status#8 = 200))
+                   +- *(1) ColumnarToRow
+                      +- FileScan parquet [...] PushedFilters: [IsNotNull(status), EqualTo(status,200)], ...
+    ```
+
+    Two `ArrowEvalPython` nodes for one UDF. The optimizer rule
+    `PushDownPredicates` (through its part `PushPredicateThroughNonJoin`)
+    pushed `area = 'api'` below the projection by **substituting the
+    alias**: the filter became `area_udf(path) = 'api'`, and the
+    projection still computes `area_udf(path) AS area`. Those are now
+    two operators that each contain the UDF, and `ExtractPythonUDFs`
+    deduplicates only within one operator. The plan change log in "Rules,
+    Batches and the Plan Change Log" showed exactly this rewrite.
+
+    To measure it, the exercise counts calls with an accumulator added
+    to inside the UDF:
+
+    | Query (200 rows, 98 with status 200, 31 API hits among them) | UDF calls |
+    |---|---|
+    | `withColumn(area).collect()` | 200 |
+    | `withColumn(area).count()` | **0** |
+    | `slow` (filter on `area` and `status`) | **129** = 98 + 31 |
+    | filter on `area` only, then `collect()` | 270 = 200 + 70 |
+    | `u.union(u).collect()` | 400 |
+    | filter on `area` only, UDF nondeterministic | 200 |
+    | `count()` with the UDF nondeterministic | 0 |
+
+    The `count()` lines are the other side of the same coin: a UDF
+    column that nothing downstream reads is removed by column pruning,
+    deterministic or not, so the UDF never runs. If your UDF has side
+    effects you rely on, such as writing files or calling a service, an
+    action that does not use its result may skip it entirely. Side
+    effects belong in `foreach`, `foreachPartition` or a writer, not in
+    a UDF.
+
+    Spark 4.2.0 added a guard for exactly this problem, but not for
+    Python. SPARK-47672 (fixed in 4.2.0) introduced
+    `spark.sql.optimizer.avoidDoubleFilterEval` (default `true`): a
+    filter that references an **expensive** projected expression is not
+    pushed through the projection. "Expensive" is the `expensive` flag on
+    `Expression`, and in 4.2.0 `ScalaUDF` sets it but `PythonUDF` does
+    not. SPARK-59693 extends the guard to Python UDFs; it is fixed in
+    4.4.0. Until you run 4.4, these rewrites avoid the second evaluation:
+
+    - **Filter first, then make the UDF nondeterministic.**
+      `df.filter(status == 200).withColumn("area", area.asNondeterministic()("path")).filter(area == "api")`
+      gives one Python node, keeps `status = 200` pushed (it was below
+      the UDF already), and runs the UDF 98 times. This is the
+      exercise's rewrite. The cost: any filter you write **after** the
+      nondeterministic column stays above it.
+    - **Replace the UDF by native functions** where you can
+      (`F.split(F.split("path", r"\?")[0], "/")[1]` here). No Python
+      node at all.
+    - **Materialize.** Cache or write the UDF column, then filter.
+      After `c = u.cache()` and `c.count()` (200 calls, which builds the
+      cache), `c.filter("area = 'api'").collect()` made 0 calls. One
+      trap, measured in a classic session: if you had already run
+      `u.collect()` **before** calling `cache()`, a later `c.collect()`
+      on that same object ran the UDF 200 more times, because the
+      DataFrame reuses the physical plan it planned before the cache
+      existed. DataFrames derived from it (the filter) did use the
+      cache. Cache before the first action, or act on a derived
+      DataFrame.
+
+    The same mechanics explain why one UDF call costs more than you
+    think in bigger plans: every operator that ends up with a copy of
+    the expression evaluates it again, and only an exchange, a cache or
+    a write stops that.
+
+- Class: mult_question
+  Depth: all
+  Output: "On Spark 4.2.0, `df.withColumn('a', my_udf('x')).filter(col('a') == 'k').collect()` runs over 200 rows and 70 match. Roughly how many times does the deterministic Python UDF run?"
+  AnswerChoices: "270, once in the pushed filter and again in the projection for matching rows;200, once per row;70, only for matching rows;400, twice for every row"
+  CorrectAnswer: "270, once in the pushed filter and again in the projection for matching rows"
+  Hint: "The filter is pushed below the projection by substituting the alias, so the UDF lands in two operators."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    `area` is a Python UDF. Build `once`: a version of it that Spark
+    must not copy into a pushed filter, so that a filter on its result
+    evaluates it only once.
+  CorrectAnswer: |
+    once = area.asNondeterministic()
+  Hint: "A filter is only pushed through a projection whose fields are all deterministic."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Grouped and Map Operators
+
+    `mapInPandas`, `mapInArrow`, `applyInPandas` and friends are not
+    expressions; they are logical operators of their own, defined in
+    `sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/plans/logical/pythonLogicalOperators.scala`
+    and planned by `SparkStrategies.BasicOperators`. From 4.2.0 runs over
+    the `files` source:
+
+    ```text
+    df.mapInPandas(lambda it: it, df.schema).filter("kind = 'png'")
+
+    *(2) Filter (isnotnull(kind#34) AND (kind#34 = png))
+    +- MapInPandas <lambda>(path#29, kind#30, size#31L)#32, [path#33, kind#34, size#35L], false
+       +- *(1) Project [path#29, kind#30, size#31L]
+          +- BatchScan files[path#29, kind#30, size#31L] (Python) RuntimeFilters: []
+    ```
+
+    ```text
+    df.groupBy("kind").applyInPandas(lambda p: p.head(1), df.schema)
+
+    AdaptiveSparkPlan isFinalPlan=false
+    +- FlatMapGroupsInPandas [kind#30], <lambda>(path#29, kind#30, size#31L)#36, [path#37, kind#38, size#39L]
+       +- Sort [kind#30 ASC NULLS FIRST], false, 0
+          +- Exchange hashpartitioning(kind#30, 200), ENSURE_REQUIREMENTS, [plan_id=132]
+             +- Project [kind#30, path#29, kind#30, size#31L]
+                +- BatchScan files[...] (Python) RuntimeFilters: []
+    ```
+
+    What to read from them:
+
+    - The output columns of a map operator have **new expression IDs**
+      (`kind#34`, not `kind#30`). Catalyst cannot know that your
+      function passes `kind` through unchanged, so the filter on
+      `kind#34` cannot move below `MapInPandas`. Filter **before**
+      `mapInPandas` when the filter does not depend on its output.
+    - The trailing `false` is the `isBarrier` flag
+      (`mapInPandas(..., barrier=True)` runs all tasks of the stage
+      together, for distributed training).
+    - `FlatMapGroupsInBatchExec` declares a required distribution
+      (`ClusteredDistribution` on the keys) and ordering, so the planner
+      adds an `Exchange` and a `Sort`. Each group is then fed to Python
+      as one pandas DataFrame, which is why one huge group can run a
+      worker out of memory (more in "Memory, Spill and Very Large
+      Files").
+    - These operators are opaque for column pruning as well: the
+      `Project` feeds every input column to Python, used or not. Select
+      only the columns the function needs before calling it.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## How a Python Data Source Is Planned
+
+    A Python data source looks like any DSv2 source to Catalyst. The
+    classes are in
+    `sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/v2/python/`:
+
+    | Class | Role | Python worker it starts |
+    |---|---|---|
+    | `PythonDataSourceV2` | The `TableProvider`; creates the Python `DataSource` once per instance (`getOrCreateDataSourceInPython`) and holds the planned read (`readInfo`) | `pyspark.sql.worker.create_data_source` |
+    | `PythonTable` | `Table` with `SupportsRead` (and write) | |
+    | `PythonScanBuilder` | `ScanBuilder` with `SupportsPushDownFilters` only | `pyspark.sql.worker.data_source_pushdown_filters` (when the flag is on and filters exist) |
+    | `PythonScan` | `Scan`; `description` is `(Python)`, metadata `PushedFilters` and `ReadSchema` | |
+    | `PythonBatch` | `Batch`: `planInputPartitions()` and `createReaderFactory()` | `pyspark.sql.worker.plan_data_source_read` |
+    | `PythonPartitionReaderFactory` | On executors: runs `read()` | the normal UDF worker, eval type 207 |
+
+    All of these "planning workers" run on the **driver**, through
+    `PythonPlannerRunner`
+    (`sql/core/src/main/scala/org/apache/spark/sql/execution/python/PythonPlannerRunner.scala`),
+    which starts a Python process with the same factory as executor
+    workers, writes one request, reads one answer and releases the
+    worker. Pushdown and partition planning share a call: when filters
+    are pushed, `data_source_pushdown_filters` also returns the
+    partitions and the pickled read function, and `PythonScanBuilder`
+    stores that result with `ds.setReadInfo(...)`, saving a second
+    worker call.
+
+    On executors there is no special reader in the JVM:
+    `PythonPartitionReaderFactory.createReader` builds a
+    `MapInBatchEvaluatorFactory` with eval type `SQL_MAP_ARROW_ITER_UDF`
+    and feeds it **one row**, the pickled partition. Your `read()` runs
+    as if it were the function of a `mapInArrow`; tuples you yield are
+    turned into Arrow batches in Python, which is why "Types, Arrow and
+    Performance" found the conversion cost in Python.
+
+    Three consequences you can now explain from the classes:
+
+    - **No column pruning.** `PythonScanBuilder` does not implement
+      `SupportsPushDownRequiredColumns`, so `ReadSchema` is always the
+      full schema ("Filter Pushdown" observed this). No limit or
+      aggregate pushdown either. "A DSv2 Connector in Java" implements
+      all three.
+    - **`PushedFilters` only in `explain("formatted")`.** It is metadata
+      of `PythonScan` (`getMetaData`), which the formatted mode prints
+      per node; the one-line `BatchScan files[...] (Python)` does not.
+    - **The 4.2.0 plan-reuse bug.** `readInfo` lives on the
+      `PythonDataSourceV2` instance, and that instance belongs to the
+      relation the DataFrame (or a view) holds, not to one scan. So
+      **every scan of the same relation shares one planned read**. A
+      scan whose filters cannot be pushed never calls `pushFilters`, so
+      its `PythonBatch` calls `getOrCreateReadInfo` and finds whatever
+      planned read another scan of that relation left there, possibly a
+      **filtered** one. Across queries, that is the wrong-results trap
+      from "Filter Pushdown" (a later `df.count()` returns the filtered
+      count). It also happens **inside one query** that reads the
+      relation twice: a `d.union(d.filter(...))` plans two scans of one
+      relation. This lesson's `files` source is its own, not the one
+      from "Filter Pushdown": its `kind` is the bare file extension
+      (`png`, `json`), not a category such as `image`, and it lists all
+      of `data/messy`, which has grown many folders since the early
+      lessons, so its counts are larger and will keep changing. Over
+      that folder `d.union(d.filter("kind = 'png'")).count()` should be
+      the number of files plus the number of PNGs; at the time of
+      writing (190 files, 53 PNGs) it returned 106, twice the PNG count,
+      on the first run and the next: the unfiltered side read the
+      PNG-only plan too. "From Wrong Results to a Fix: An Upstream Case Study"
+      takes it apart and reads the fix on Spark's master branch, which
+      keeps the planned read on each scan.
+
+    On Spark Connect it is worth knowing that the server caches
+    translated plans per session (`spark.connect.session.planCache.enabled`,
+    internal, default `true`, since 4.0), and since 4.1 always caches
+    the translation of data source reads
+    (`spark.connect.session.planCache.alwaysCacheDataSourceReadsEnabled`,
+    internal, default `true`). That is one reason the reuse trap appears
+    on Connect as well: two DataFrames built from the same read can share
+    one relation.
+
+- Class: mult_question
+  Depth: all
+  Output: "Why does explain() of a Python data source always show the full ReadSchema, even for select('path')?"
+  AnswerChoices: "PythonScanBuilder implements only SupportsPushDownFilters, not SupportsPushDownRequiredColumns;The Python worker sends all columns for safety;Column pruning is disabled for every DSv2 source;ReadSchema is always the full schema in explain()"
+  CorrectAnswer: "PythonScanBuilder implements only SupportsPushDownFilters, not SupportsPushDownRequiredColumns"
+  Hint: "Column pruning reaches a DSv2 source through a mix-in interface on its ScanBuilder."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Whole-Stage Codegen and Why Python Splits It
+
+    The `*(1)`, `*(2)` prefixes in a physical plan are **codegen stage
+    IDs**. `CollapseCodegenStages`
+    (`sql/core/src/main/scala/org/apache/spark/sql/execution/WholeStageCodegenExec.scala`)
+    fuses chains of operators that implement `CodegenSupport` into one
+    generated Java class whose `processNext()` loops over rows with no
+    virtual calls between operators. `explain("codegen")` prints the
+    generated source. For the UDF query with a pushed filter:
+
+    ```text
+    Found 2 WholeStageCodegen subtrees.
+    == Subtree 1 / 2 (maxMethodCodeSize:462; maxConstantPoolSize:166(0.25% used); numInnerClasses:0) ==
+    *(1) Filter (isnotnull(status#9) AND (status#9 = 200))
+    +- *(1) ColumnarToRow
+       +- FileScan parquet [...]
+    Generated code:
+    ...
+    /* 039 */           boolean columnartorow_isNull_2 = columnartorow_mutableStateArray_2[2].isNullAt(columnartorow_rowIdx_0);
+    /* 040 */           int columnartorow_value_2 = columnartorow_isNull_2 ? -1 : (columnartorow_mutableStateArray_2[2].getInt(columnartorow_rowIdx_0));
+    /* 041 */
+    /* 042 */           boolean filter_value_2 = !columnartorow_isNull_2;
+    /* 043 */           if (!filter_value_2) continue;
+    /* 044 */
+    /* 045 */           boolean filter_value_3 = false;
+    /* 046 */           filter_value_3 = columnartorow_value_2 == 200;
+    /* 047 */           if (!filter_value_3) continue;
+    ...
+    == Subtree 2 / 2 (maxMethodCodeSize:314; maxConstantPoolSize:124(0.19% used); numInnerClasses:0) ==
+    *(2) Project [ip#7, path#8, status#9, bytes#10L, pythonUDF0#227 AS a#21]
+    +- ArrowEvalPython [_area(path#8)#19], [pythonUDF0#227], 101
+       +- ...
+    ```
+
+    You can read the filter `status = 200` straight out of lines 39 to
+    47: a null check and an `int` comparison inlined into the scan
+    loop over `OnHeapColumnVector`s. `ArrowEvalPythonExec` (like every
+    Python exec node) does not implement `CodegenSupport`, so the stage
+    ends below it and a new one starts above it, joined by an
+    `InputAdapter`. Between them rows are materialized as `UnsafeRow`s,
+    copied into Arrow batches, sent to Python, and the results joined
+    back to the rows Spark kept (the next lesson shows those bytes).
+
+    That boundary is the real price of a UDF, more than the Python
+    function itself: the JVM side loses fusion, and every column the
+    node passes through is buffered. "Tuning Python on Spark" measured
+    it; here you can see where it comes from.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## A 4.2.0 Trap: Columnar Input to Arrow UDFs
+
+    Look again at a UDF directly over a Parquet scan, with default
+    settings:
+
+    ```python
+    spark.range(3).selectExpr("cast(id as string) s").write.parquet(p)
+    q = spark.read.parquet(p).select(F.udf(lambda s: s + "!", "string")("s"))
+    q.explain()
+    q.collect()
+    ```
+
+    ```text
+    *(1) Project [pythonUDF0#6 AS <lambda>(s)#4]
+    +- ArrowEvalPython [<lambda>(s#2)#3], [pythonUDF0#6], 101
+       +- FileScan parquet [s#2] Batched: true, ...
+    ```
+
+    There is no `ColumnarToRow`. Spark 4.2.0 added a columnar path into
+    Arrow UDFs (SPARK-56350): `ArrowEvalPythonExec.supportsColumnar` is
+    `child.supportsColumnar && spark.sql.execution.arrow.pythonUDF.columnarInput.enabled`
+    (new in 4.2.0, default `true`), and then
+    `ColumnarArrowEvalPythonEvaluatorFactory` consumes the scan's
+    `ColumnarBatch`es directly. A vectorized Parquet scan is columnar,
+    so the planner takes that path.
+
+    And `collect()` **never returns**. No error, no log line, a task
+    that waits forever. The cause is SPARK-58241 (affects 4.2.0, fixed
+    in 4.2.1 and 4.3.0): the columnar runner writes the input schema to
+    the Python worker in the place the 4.1 protocol had it, while the
+    4.2.0 worker expects it in the eval configuration, so the two sides
+    disagree about the bytes and both wait. "The Python Worker Protocol"
+    reproduces it at the byte level and shows how to turn the hang into
+    an error.
+
+    Which shapes hang, from runs on 4.2.0:
+
+    | Query over a vectorized Parquet scan | Result |
+    |---|---|
+    | `@udf` (Arrow-optimized, 101) on a column, nothing in between | **hangs** |
+    | the same with `useArrow=False` (100) | works |
+    | `pandas_udf` (200) on a column | works |
+    | `@udf` on `concat(s, 'x')` | works |
+    | `@udf` on `status + 0` | **hangs** (so don't count on wrapping the column) |
+    | a `Filter` between scan and UDF | works (the child is row-based) |
+    | `spark.sql.parquet.enableVectorizedReader=false` | works |
+
+    The fix on 4.2.0 is one setting, which every session in this lesson
+    sets:
+
+    ```python
+    spark.conf.set("spark.sql.execution.arrow.pythonUDF.columnarInput.enabled", "false")
+    ```
+
+    SPARK-60294 turns the setting off by default in 4.4.0 because of
+    further problems with producers that reuse their vectors. Keep it off
+    on 4.2.x unless you have measured a gain and tested your query
+    shapes.
+
+- Class: mult_question
+  Depth: all
+  Output: "On Spark 4.2.0 a job with a plain @udf over spark.read.parquet(...) hangs without any error. What is the quickest safe fix?"
+  AnswerChoices: "Set spark.sql.execution.arrow.pythonUDF.columnarInput.enabled to false;Increase spark.driver.memory;Set spark.python.worker.reuse to false;Repartition the DataFrame before the UDF"
+  CorrectAnswer: "Set spark.sql.execution.arrow.pythonUDF.columnarInput.enabled to false"
+  Hint: "The hang is in the new columnar input path into Arrow UDFs (SPARK-58241)."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Spark Connect: The Plan as Protobuf
+
+    On Spark Connect the client has no Catalyst. A DataFrame is a tree of
+    `LogicalPlan` objects in `pyspark.sql.connect.plan` that serializes
+    to the `Relation` protobuf message
+    (`sql/connect/common/src/main/protobuf/spark/connect/relations.proto`).
+    You can print it. With a local Connect server (run under the shared
+    port lock, with `SPARK_TESTING=1`):
+
+    ```python
+    spark = SparkSession.builder.remote("local[2]").getOrCreate()
+    df = (spark.read.text(os.path.abspath("data/messy/logs/access.log"))
+          .select(F.split("value", " ")[6].alias("path"))
+          .filter(area("path") == "api"))
+    p = df._plan.to_proto(spark.client)
+    print(p)
+    ```
+
+    ```text
+    root {
+      common { plan_id: 2 }
+      filter {
+        input {
+          common { plan_id: 1 }
+          project {
+            input {
+              common { plan_id: 0 }
+              read { data_source { format: "text" schema: ""
+                options { key: "wholetext" value: "false" }
+                paths: ".../data/messy/logs/access.log" } }
+            }
+            expressions { alias { expr { unresolved_extract_value { ... } } name: "path" } }
+          }
+        }
+        condition {
+          unresolved_function {
+            function_name: "=="
+            arguments {
+              common_inline_user_defined_function {
+                function_name: "area"
+                deterministic: true
+                arguments { unresolved_attribute { unparsed_identifier: "path" } }
+                python_udf {
+                  output_type { string { collation: "UTF8_BINARY" } }
+                  eval_type: 101
+                  command: "\200\005\225\007\003\000\000..."
+                  python_ver: "3.12"
+                }
+              }
+            }
+            arguments { literal { string: "api" } }
+          }
+        }
+      }
+    }
+    ```
+
+    (Reformatted to fewer lines; the real output also carries
+    `python_origin` entries with the file and line of each call, used
+    for error messages.) The whole message was 2069 bytes. Everything
+    is **unresolved**: names are strings, functions are names, and the
+    UDF is its cloudpickled bytes plus the eval type and the client's
+    Python version.
+
+    On the server, `SparkConnectPlanner`
+    (`sql/connect/server/src/main/scala/org/apache/spark/sql/connect/planner/SparkConnectPlanner.scala`)
+    turns the message into an unresolved Catalyst plan:
+    `transformRelation` dispatches on the relation type
+    (`case proto.Relation.RelTypeCase.FILTER => transformFilter(...)`),
+    and `transformPythonUDF` builds a `PythonUDF` from the command bytes,
+    with the server's Python executable and the session's artifacts
+    added to its includes. From there it is the same `QueryExecution` as
+    in a classic session, and the plans you print with `explain()` are
+    the same.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Lazy Analysis on Connect
+
+    The difference you notice first is **when errors appear**. In a
+    classic session the `Dataset` constructor analyzes eagerly, so a bad
+    column fails at `select`:
+
+    ```text
+    classic: spark.range(3).select("nope")
+    AnalysisException [UNRESOLVED_COLUMN.WITH_SUGGESTION] A column, variable, or function
+    parameter with name `nope` cannot be resolved. Did you mean one of the following? [`id`].
+    SQLSTATE: 42703
+    ```
+
+    On Connect, `select("nope")` returns a DataFrame without contacting
+    the server. The error comes with the first call that needs analysis:
+    `df.columns`, `df.schema`, `printSchema()`, `explain()` or an
+    action. Each sends an `AnalyzePlan` RPC, handled by
+    `SparkConnectAnalyzeHandler`; the server log said
+    `Spark Connect RPC error during: analyze` and the client raised the
+    same `AnalysisException` at `bad.columns`.
+
+    Two practical consequences:
+
+    - **Tests on Connect must touch the schema** (or run an action) to
+      prove a transformation is valid. A function that only builds
+      DataFrames passes even when every column name is wrong.
+    - **Schema calls cost a round trip.** The client caches the schema
+      on each DataFrame (`_cached_schema` in
+      `pyspark/sql/connect/dataframe.py`), but every new DataFrame you
+      derive starts uncached. A loop that calls `df.columns` after each
+      `withColumn` makes one RPC per iteration; build the projection
+      once with `select` or `withColumns`.
+
+    The Python-specific tools of this lesson are classic only: `df._jdf`
+    and `spark._jvm` do not exist on Connect. Text inspection works on
+    both, because `explain()` prints the server's plan.
+    `contextlib.redirect_stdout` around `df.explain("formatted")` is the
+    portable way to test plans, and the exercise's `pushed_filters` uses
+    it.
+
+- Class: mult_question
+  Depth: all
+  Output: "On Spark Connect, which call is the first to fail for `bad = spark.range(3).select('nope')`?"
+  AnswerChoices: "bad.columns, because it sends an AnalyzePlan request;spark.range(3).select('nope') itself;Only an action such as collect();None, Connect ignores unknown columns"
+  CorrectAnswer: "bad.columns, because it sends an AnalyzePlan request"
+  Hint: "The Connect client builds unresolved plans locally and only asks the server to analyze when it needs the schema."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Reading Plans in Tests: JVM Tree or Text?
+
+    Both have a place:
+
+    | | JVM tree (`_jdf.queryExecution()`) | Text (`explain()` captured) |
+    |---|---|---|
+    | Works on Connect | no | yes |
+    | Stable across versions | node classes and names, fairly | formats change more often |
+    | Node details | typed: `condition()`, `output()`, `metrics()` | what the printer chose to print |
+    | AQE | descend into `AdaptiveSparkPlan.executedPlan()` | prints `isFinalPlan=false` until executed |
+    | Expression IDs | available (`exprId()`) | printed as `#n`, differ per run |
+
+    Rules of thumb for plan assertions that survive upgrades: assert on
+    node names and on the presence of a pushed filter, not on the full
+    string; never hard-code expression IDs (match `name#\d+`); and run
+    `explain()` after the action when you care about the final adaptive
+    plan, as "Plans, Partitions and Caching" showed.
+
+    Plan inspection is also how the advanced lessons check your work:
+    "Catalyst Extensions: Rules and Native Functions" asserts that a
+    Python node disappears after your rule runs, and "A DSv2 Connector
+    in Java" asserts on the pushed predicates and required columns of
+    your scan.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Plan Inspectors and Two Rewrites
+
+    The harness writes the access log to Parquet, builds queries and a
+    small `files` Python data source, and counts UDF calls with an
+    accumulator. `walk(plan)` and `plan_text(df)` are given. Complete:
+
+    1. `python_nodes(df)`: the `nodeName()` of every node of
+       `df._jdf.queryExecution().executedPlan()` that is in
+       `PYTHON_NODES`, top-down.
+    2. `filter_above_python(df, column)`: `True` if a `Filter` whose
+       `condition()` mentions the column is an ancestor of a Python node.
+    3. `pushed_filters(df)`: every filter in the `PushedFilters: [...]`
+       lines of `explain("formatted")`, as separate strings.
+    4. `api_hits_one_eval(df, area)`: the same rows as `api_hits_slow`,
+       with exactly one Python node, the UDF run once per row with
+       status 200, and `status = 200` still pushed into Parquet.
+    5. `errors_pushed(df)`: the same rows as `errors_slow` (a UDF
+       predicate), with no Python and `status >= 400` pushed.
+
+    The checks: the slow query has two `ArrowEvalPython` nodes, an
+    `applyInPandas` query has a `FlatMapGroupsInPandas` behind
+    `AdaptiveSparkPlan`, a filter after a nondeterministic UDF sits above
+    it, pushed filters are read from Parquet and from the Python source,
+    and your rewrites match the slow queries row for row with fewer UDF
+    calls (129 down to 98).
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "python_nodes: [n.nodeName() for _, n in walk(plan) if n.nodeName() in PYTHON_NODES]. pushed_filters: re.match(r'\\s*PushedFilters: \\[(.*)\\]', line), then re.split(r', (?=[A-Za-z]+\\()', inside). api_hits_one_eval: filter on status first, then withColumn with area.asNondeterministic(), then filter on area."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - A query moves through `QueryExecution`: `logical`, `analyzed`,
+      `optimizedPlan`, `sparkPlan`, `executedPlan`, `toRdd`. In a classic
+      session each is a JVM object you can walk with `nodeName()` and
+      `children()`; descend into `AdaptiveSparkPlan.executedPlan()`.
+    - Rules run in batches; `spark.sql.planChangeLog.level=WARN` with
+      `.rules` or `.batches` shows each rewrite, and
+      `RuleExecutor.dumpTimeSpent()` shows where planning time goes.
+    - In 4.2, `@udf` is Arrow-optimized by default (eval type 101).
+      `ExtractPythonUDFs`, in the `Extract Python UDFs` batch near the
+      end of optimization, inserts `ArrowEvalPython` / `BatchEvalPython`
+      below the operator that uses the UDF and fuses UDFs of the same
+      eval type; different eval types need separate nodes.
+    - Native conditions next to a UDF are still pushed; a filter written
+      after a **nondeterministic** UDF is not; a UDF used as a predicate
+      never reaches the source. Map and grouped operators give their
+      output new IDs, so nothing moves below them.
+    - On 4.2.0 a filter on a Python UDF's output column evaluates the UDF
+      twice (alias substitution puts it in two operators). The guard of
+      SPARK-47672 covers Scala UDFs only; SPARK-59693 adds Python in
+      4.4.0. Filter first and use `asNondeterministic()`, go native, or
+      materialize.
+    - Python data sources: `PythonDataSourceV2`, `PythonScanBuilder`
+      (filters only, so no column pruning), `PythonScan`, `PythonBatch`,
+      planning workers on the driver, reads as eval type 207 on
+      executors. The planned read lives on the provider instance, which
+      is the root of the 4.2.0 plan-reuse bug.
+    - Python nodes are not `CodegenSupport`, so they end codegen stages.
+    - On 4.2.0, an Arrow UDF straight over a vectorized Parquet scan can
+      hang (SPARK-58241, fixed in 4.2.1): set
+      `spark.sql.execution.arrow.pythonUDF.columnarInput.enabled=false`.
+    - Spark Connect sends an unresolved protobuf plan
+      (`df._plan.to_proto(client)`); `SparkConnectPlanner` builds the
+      Catalyst plan on the server; analysis errors appear at the first
+      schema call or action.
+
+    Next: **The Python Worker Protocol**, which follows a UDF out of the
+    plan and into the Python process that runs it, down to the bytes on
+    the socket.

@@ -1,0 +1,586 @@
+- Class: meta
+  Lesson: "Tuning Python on Spark"
+  EstimatedMinutes: 50
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    "Plans, Partitions and Caching" taught you to read a plan, count
+    partitions, choose between `repartition` and `coalesce`, control
+    files per folder with `partitionBy`, and cache. "Types, Arrow and
+    Performance" showed why yielding Arrow batches from a data source
+    beats yielding tuples. This lesson applies both to the part of a job
+    that usually costs the most with messy data: **your Python code**.
+
+    By the end of this lesson you will be able to:
+
+    - Explain where the time goes when Spark runs Python, and find every
+      Python step in a plan (`BatchEvalPython`, `ArrowEvalPython`,
+      `MapInPandas`, `MapInArrow`, `FlatMapGroupsInPandas`)
+    - Measure built-ins against the kinds of Python UDF, with ratios you
+      can trust more than absolute times
+    - Spot Python that runs **more often than you think**: a filter that
+      blocks pushdown, a filter on a UDF column that evaluates the UDF
+      twice, several actions that recompute it, and a `count()` that
+      runs none of it
+    - Profile a UDF with the built-in profiler (4.0)
+    - Spread Python work over cores when the input arrives in one piece,
+      and split a hot key with salting
+    - Know the worker and Arrow settings worth touching, and a 4.2.0 hang
+      to avoid
+
+    The exercise takes a deliberately slow error report over the web
+    server log and tunes it. It is graded on plan shape, call counts and
+    output files, never on timings, because timings depend on your
+    machine.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Where the Time Goes
+
+    Spark's own operators run in the JVM on binary rows. A Python UDF
+    cannot: for every batch of rows, Spark
+
+    1. converts the input columns to a wire format (pickled rows for the
+       old path, Arrow record batches for the others),
+    2. sends them over a local socket to a Python worker process (started
+       or reused per task),
+    3. the worker deserializes them, calls your function, serializes the
+       results, and sends them back,
+    4. Spark converts the results to its own rows and continues.
+
+    So a Python step costs serialization both ways, a process boundary,
+    and the Python interpreter itself, on top of whatever your function
+    does. Every tuning rule in this lesson comes down to one of:
+
+    - **don't cross at all** (use a built-in),
+    - **cross fewer times** (fewer rows, fewer Python nodes, fewer
+      actions),
+    - **cross in bigger, cheaper units** (Arrow batches, vectorized
+      pandas or pyarrow code), or
+    - **cross in parallel** (enough partitions to keep every core busy).
+
+    The advanced level opens the box: "How Catalyst Plans Python" for the
+    planner rules and "The Python Worker Protocol" for the socket
+    protocol and the worker's life.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Think of an interpreter at a meeting between two people who don't
+    share a language. Every sentence is said, translated, answered and
+    translated back. It works, but it is slow. You speed it up by saying
+    things the other side already understands (built-ins), by sending
+    whole paragraphs instead of single sentences (Arrow batches), by not
+    asking the same question twice (caching), and by hiring more
+    interpreters when there is a lot to say (more partitions).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Finding Python in a Plan
+
+    Parsing the status code of each line of `data/messy/logs/access.log`
+    four ways:
+
+    ```python
+    STATUS = r'" (\d{3}) '
+
+    @sf.udf("int")
+    def status_udf(line):
+        m = re.search(STATUS, line)
+        return int(m.group(1)) if m else None
+
+    status_row = sf.udf(lambda l: int(re.search(STATUS, l).group(1)), "int", useArrow=False)
+
+    @sf.pandas_udf("int")
+    def status_pd(s: pd.Series) -> pd.Series:
+        return s.str.extract(r'" (\d{3}) ', expand=False).astype("Int32")
+
+    built_in = sf.regexp_extract("value", STATUS, 1).cast("int")
+    ```
+
+    The node each one adds above the `FileScan text` (from
+    `lines.select(...).explain()`):
+
+    | Code | Plan node |
+    |---|---|
+    | `@sf.udf` (4.2 default) | `ArrowEvalPython [status_udf(value#0)#1], [pythonUDF0#6], 101` |
+    | `sf.udf(..., useArrow=False)` | `BatchEvalPython [<lambda>(value#0)#2], [pythonUDF0#8]` |
+    | `@sf.pandas_udf` | `ArrowEvalPython [status_pd(value#0)#3], [pythonUDF0#10], 200` |
+    | `regexp_extract` | none: `Project [cast(regexp_extract(value#0, ...) as int) AS status#11]` |
+
+    The number after `ArrowEvalPython` is the evaluation type
+    (`PythonEvalType` in `pyspark/util.py`): 101 is an Arrow-optimized
+    plain UDF (`SQL_ARROW_BATCHED_UDF`; plain UDFs are Arrow-optimized
+    by default since 4.2, SPARK-54555), 200 a pandas UDF. The other
+    Python operators have their own nodes:
+
+    | Code | Plan node |
+    |---|---|
+    | `df.mapInPandas(f, schema)` | `MapInPandas` |
+    | `df.mapInArrow(f, schema)` | `MapInArrow` |
+    | `df.groupBy(k).applyInPandas(f, schema)` | `FlatMapGroupsInPandas`, after an `Exchange` and a `Sort` |
+    | a UDTF ("Python UDTFs in Depth") | `ArrowEvalPythonUDTF` or `BatchEvalPythonUDTF` |
+
+    How UDFs combine matters. Nested calls of the same kind are fused
+    into one node (`plus1(status_udf(value))` gave a single
+    `ArrowEvalPython [plus1(status_udf(value#0)#21)#22]`). Calls of
+    **different** kinds in one `select` become a chain, one round trip
+    each:
+
+    ```text
+    +- ArrowEvalPython [status_pd(value#0)#14], [pythonUDF0#20], 200
+       +- BatchEvalPython [<lambda>(value#0)#13], [pythonUDF0#19]
+          +- ArrowEvalPython [status_udf(value#0)#12], [pythonUDF0#18], 101
+             +- FileScan text [value#0] ...
+    ```
+
+    A first tuning pass is just this: list the Python nodes, and for each
+    ask whether a built-in could replace it and whether it could merge
+    with its neighbours.
+
+- Class: mult_question
+  Depth: all
+  Output: "A select calls a pandas_udf, a plain @udf and a udf with useArrow=False, each on the same column. How many Python nodes does the plan have?"
+  AnswerChoices: "Three, one per kind, chained;One, because they read the same column;Two, Arrow and non-Arrow;None until an action runs"
+  CorrectAnswer: "Three, one per kind, chained"
+  Hint: "Only UDFs of the same evaluation type share a node."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## How Much Slower? Measure It
+
+    The same four status parsers over 2 million synthetic log lines (a
+    cached DataFrame in 8 partitions, `local[4]` on a 16-core machine,
+    `select(sf.sum(...)).first()`, best of three):
+
+    | Parser | Time | Ratio |
+    |---|---|---|
+    | built-in `regexp_extract` | 0.27 s | 1.0 |
+    | `pandas_udf` with `Series.str.extract` | 0.39 s | 1.5 |
+    | `@sf.udf`, Arrow-optimized (4.2 default) | 0.73 s | 2.7 |
+    | `@sf.udf`, `useArrow=False` | 0.98 s | 3.6 |
+
+    Your numbers will differ; the order rarely does. Three lessons from
+    the ratios: a built-in wins whenever one exists; a vectorized pandas
+    function is close behind, because the per-row work happens in
+    compiled code; and the default Arrow path is usually cheaper than
+    the old pickled path for light functions like these. When the
+    function itself dominates (a model, as in "Running a Model over Your
+    Data with pandas UDFs"), the two come out close.
+
+    When you measure yourself:
+
+    - Make the action consume the column (`sum`, a `noop` write
+      `df.write.format("noop").mode("overwrite").save()`), not
+      `count()`: see the next section.
+    - Cache the input first and run each variant more than once, so file
+      reading and worker start-up are not part of the comparison.
+    - Compare ratios on one machine. Absolute times on a laptop say
+      little about a cluster.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Python That Runs More Often Than You Think
+
+    A UDF that counts its calls in an accumulator (`acc.add(1)` inside
+    the function) shows what the plan implies. Over `spark.range(1000)`:
+
+    | Query | Rows | UDF calls |
+    |---|---|---|
+    | `df.withColumn("y", f("id")).filter(sf.col("y") > 500)`, collected | 500 | **1500** |
+    | the same with `f.asNondeterministic()` | 500 | 1000 |
+    | `withColumn("y", f(...))` then two aggregations on `y` | | **2000** |
+    | the same after `.cache()` | | 1000 |
+    | `df.withColumn("y", f("id")).count()` | | **0** |
+
+    **A filter on a UDF column evaluates the UDF twice.** The optimizer
+    pushes the filter below the projection by copying the expression, so
+    the plan has two Python nodes for the same function:
+
+    ```text
+    *(3) Project [id#0L, pythonUDF0#11L AS y#2L]
+    +- ArrowEvalPython [plus1(id#0L)#1L], [pythonUDF0#11L], 101
+       +- *(2) Project [id#0L]
+          +- *(2) Filter (pythonUDF0#10L > 500)
+             +- ArrowEvalPython [plus1(id#0L)#1L], [pythonUDF0#10L], 101
+    ```
+
+    Spark 4.2 has a guard against this double evaluation for Scala UDFs
+    (SPARK-47672, `spark.sql.optimizer.avoidDoubleFilterEval`), but not
+    for Python UDFs; that arrives in 4.4.0 (SPARK-59693). On 4.2, marking
+    the UDF `asNondeterministic()` stops the copy (one node, 1000 calls),
+    at the price of telling the optimizer something untrue that also
+    blocks other rewrites. Often simpler: filter on the input columns
+    instead, or cache after the UDF.
+
+    **Every action recomputes everything** that is not cached, Python
+    included. Two aggregations over a UDF column ran the UDF 2000 times;
+    after `cache()` and a first action, 1000.
+
+    **`count()` can run none of it.** Spark prunes columns the action
+    does not need, so `df.withColumn("y", f("id")).count()` never called
+    `f`. A "benchmark" that times `count()` measures nothing about your
+    UDF. (The exercise counts calls through actions that use the
+    column.)
+
+- Class: mult_question
+  Depth: all
+  Output: "On Spark 4.2, df.withColumn(\"y\", my_udf(\"x\")).filter(\"y > 0\") is collected. How often does my_udf run for a row that passes the filter?"
+  AnswerChoices: "Twice, once for the filter and once for the projection;Once, Spark reuses the value;Once, because the filter runs on x;It depends on spark.sql.execution.pythonUDF.arrow.enabled"
+  CorrectAnswer: "Twice, once for the filter and once for the projection"
+  Hint: "Look for two ArrowEvalPython nodes with the same function in the plan. The guard against this covers Scala UDFs in 4.2, Python UDFs only from 4.4.0."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## A Python Filter Hides the Condition
+
+    Spark cannot look inside a Python function, so it cannot push a
+    Python filter into the scan. On a Parquet file with a `status`
+    column:
+
+    ```python
+    pq.filter(sf.col("status") >= 400).explain()
+    is_err = sf.udf(lambda s: s is not None and s >= 400, "boolean")
+    pq.filter(is_err("status")).explain()
+    ```
+
+    ```text
+    +- FileScan parquet [status#27,value#28] ... PushedFilters: [IsNotNull(status), GreaterThanOrEqual(status,400)], ...
+
+    +- *(1) Filter pythonUDF0#31: boolean
+       +- ArrowEvalPython [<lambda>(status#27)#30], [pythonUDF0#31], 101
+          +- FileScan parquet [status#27,value#28] ... PushedFilters: [], ...
+    ```
+
+    With the built-in, the Parquet reader skips row groups whose
+    statistics rule the condition out, and every row it does return
+    skips Python. With the UDF, every row is read and sent to Python just
+    to decide that most of them are not wanted. The order rule follows:
+    **filter with built-ins first, then run Python on what is left.** The
+    exercise checks for it by finding the `Filter` below the
+    `ArrowEvalPython` node.
+
+    This example is for reading plans. If you run it on stock 4.2.0,
+    the UDF over the Parquet column can hang (the section on the 4.2.0
+    hang below explains why); set
+    `spark.conf.set("spark.sql.execution.arrow.pythonUDF.columnarInput.enabled", "false")`
+    first.
+
+    One more Python call hides in there. In the exercise's slow job the
+    status is parsed by a UDF and filtered by another, and the plan
+    parses the status twice, once for the filter and once for the output
+    (`BatchEvalPython [<lambda>(get(value#0)#115)#121]` below the filter,
+    `get(value#0)#115` again above it): the double evaluation from the
+    previous section, on a real job.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## A 4.2.0 Hang: Plain UDFs Over Parquet Columns
+
+    New in 4.2 (SPARK-56350): Arrow-based Python UDFs can take columnar
+    input directly from a scan that produces Arrow-backed batches,
+    skipping a conversion (`spark.sql.execution.arrow.pythonUDF.columnarInput.enabled`,
+    default `true`). On stock 4.2.0 this path has a bug: a **plain
+    `@sf.udf`** (Arrow-optimized, evaluation type 101) applied
+    **to a column read by the vectorized Parquet reader**, directly or
+    through some expressions such as `col + 0`, makes the Python worker
+    wait forever. No error,
+    no progress. It is SPARK-58241, fixed in 4.2.1 and 4.3.0.
+
+    Reproduced for this lesson, with a timeout so the script ends:
+
+    ```python
+    spark.range(100).selectExpr("cast(id as int) as status").write.parquet(p)
+    plus1 = sf.udf(lambda s: s + 1, "int")
+    spark.read.parquet(p).select(plus1("status").alias("x")).agg(sf.sum("x")).first()
+    ```
+
+    The job never finished within 90 seconds; with
+    `spark.conf.set("spark.sql.execution.arrow.pythonUDF.columnarInput.enabled",
+    "false")` the same query returned 5050 at once. The shape matters.
+    In our runs a `pandas_udf`, `useArrow=False`, or a `Filter` between
+    the scan and the UDF (`filter("status >= 0")`) all returned 5050,
+    while `plus1(sf.col("status") + 0)` hung just like `plus1("status")`,
+    so don't count on an expression around the column. On 4.2.0, set the
+    configuration to `false` in jobs that apply plain UDFs to Parquet
+    columns, or upgrade to 4.2.1. The advanced lessons "How
+    Catalyst Plans Python" and "The Python Worker Protocol" take this bug
+    apart.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Profiling a UDF (4.0)
+
+    When a UDF is slow and you don't know why, profile it on the
+    executors. Since 4.0, a SQL setting turns the profiler on for Python
+    and pandas UDFs, and `spark.profile` shows the results on the
+    driver:
+
+    ```python
+    NETS = [(ipaddress.ip_network("10.0.0.0/23"), "office"),
+            (ipaddress.ip_network("10.0.2.0/24"), "vpn")]
+
+    @sf.pandas_udf("string")
+    def network(ips: pd.Series) -> pd.Series:
+        def one(ip):
+            a = ipaddress.ip_address(ip)
+            for net, name in NETS:
+                if a in net:
+                    return name
+            return "other"
+        return ips.map(one)
+
+    spark.conf.set("spark.sql.pyspark.udf.profiler", "perf")
+    df.groupBy(network("ip").alias("n")).count().collect()
+    spark.profile.show(type="perf")
+    ```
+
+    ```text
+    ============================================================
+    Profile of UDF<id=2>
+    ============================================================
+             560286 function calls (560278 primitive calls) in 0.108 seconds
+
+       Ordered by: internal time, cumulative time
+
+       ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        80000    0.034    0.000    0.048    0.000 ipaddress.py:1213(_parse_octet)
+        20000    0.010    0.000    0.058    0.000 {built-in method from_bytes}
+        20000    0.009    0.000    0.071    0.000 ipaddress.py:1187(_ip_int_from_string)
+        20000    0.009    0.000    0.083    0.000 ipaddress.py:1286(__init__)
+        20000    0.008    0.000    0.104    0.000 p4_prof.py:10(one)
+        30000    0.006    0.000    0.008    0.000 ipaddress.py:739(__contains__)
+    ...
+    ```
+
+    Over 20,000 addresses, most of the time is spent parsing the address
+    string (`_parse_octet` four times per address), not in the network
+    lookup. That points at the fix (parse once per distinct address, or
+    compare integer ranges), which is the point of profiling.
+
+    Details:
+
+    - The setting accepts `perf` or `memory`; unset it to stop
+      profiling. It is a SQL setting, so `spark.conf.set` works at
+      runtime, and it works on Spark Connect too (tested).
+    - `memory` needs the `memory_profiler` package on the workers.
+      Without it, PySpark only warns (`UserWarning: Install the
+      'memory_profiler' library in the cluster to enable memory
+      profiling`) and shows nothing.
+    - `spark.profile.dump(path)` writes the profiles to files and
+      `spark.profile.clear()` forgets them. Profiling has overhead: turn
+      it on to investigate, not in production.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Turn on the performance profiler for Python UDFs in this session,
+    so that `spark.profile.show()` reports where the UDF's time goes.
+  CorrectAnswer: |
+    spark.conf.set("spark.sql.pyspark.udf.profiler", "perf")
+  Hint: "The setting is spark.sql.pyspark.udf.profiler; its values are perf and memory."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Big Inputs in One Piece: Spread the Python Work
+
+    "Plans, Partitions and Caching" showed that a gzip file is read by
+    one task, whatever its size. If expensive Python work runs right
+    after that read, it runs on one core too. A `repartition` before the
+    Python step pays for a shuffle and lets every core run Python:
+
+    ```python
+    raw = spark.read.text(path)          # one 400,000-line .log.gz: 1 partition
+    raw.select(sf.sum(slow_status("value"))).first()
+    raw.repartition(8).select(sf.sum(slow_status("value"))).first()
+    ```
+
+    ```text
+    +- ArrowEvalPython [slow_status(value#0)#48], [pythonUDF0#50], 101
+       +- Exchange RoundRobinPartitioning(8), REPARTITION_BY_NUM, [plan_id=399]
+          +- FileScan text [value#0] ... big.log.gz ...
+    ```
+
+    Measured on `local[4]`, best of three, for two versions of
+    `slow_status` (a regex plus a loop that makes it more or less
+    expensive):
+
+    | Python work per line | As read (1 task) | `repartition(8)` first |
+    |---|---|---|
+    | light | 0.70 s | 0.53 s |
+    | heavy | 3.49 s | 1.33 s |
+
+    The heavier the Python work compared with reading, the more the
+    shuffle pays off. It cannot help when one **row** is the problem: a
+    single 2 GB file read with `binaryFile` is one row, and one Python
+    call. Split such inputs while reading instead (byte ranges, as in
+    "Reading a Custom File Format, in Parallel"; the advanced "Memory,
+    Spill and Very Large Files" goes further).
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Hot Keys: Salting a Grouped Python Step
+
+    `applyInPandas` hands each group to one Python call as one pandas
+    DataFrame. If one key holds most rows (a default user id, a bot, a
+    `NULL` turned into `0`), one task does most of the work and that
+    worker holds the whole group in memory. Adaptive query execution
+    splits skewed **joins**; it does not split a group.
+
+    When the per-group result can be combined from partial results
+    (counts, sums, min and max, sketches), split the hot group with a
+    **salt**, process the pieces, and combine:
+
+    ```python
+    def stats(pdf: pd.DataFrame) -> pd.DataFrame:
+        return pd.DataFrame({"user": [pdf.user.iloc[0]], "n": [len(pdf)],
+                             "total": [int(pdf.v.sum())]})
+
+    SALT = 8
+    salted = (df.withColumn("salt", sf.col("v") % SALT)   # any well-spread column, or rand()
+                .groupBy("user", "salt").applyInPandas(stats, "user long, n long, total long")
+                .groupBy("user").agg(sf.sum("n").alias("n"), sf.sum("total").alias("total")))
+    ```
+
+    On 100,000 rows where user 0 had 90,000, the salted result equalled
+    the plain `groupBy("user").applyInPandas(stats, ...)` result, and the
+    largest pandas DataFrame any call received shrank from 90,000 rows to
+    13,847. If the per-group logic needs every row of the group at once
+    and in order (sessionization, for example), salting does not apply;
+    filter or split the hot key out and handle it separately.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Worker and Arrow Settings
+
+    Settings that affect Python execution in 4.2.0 (checked in the
+    source; the advanced "The Python Worker Protocol" shows them at
+    work):
+
+    | Setting | Default | What it does |
+    |---|---|---|
+    | `spark.sql.execution.pythonUDF.arrow.enabled` (3.4) | `true` since 4.2 | plain UDFs use Arrow batches; decided when the UDF is created |
+    | `spark.sql.execution.arrow.maxRecordsPerBatch` (2.3) | `10000` | rows per Arrow batch sent to pandas and Arrow UDFs |
+    | `spark.sql.execution.arrow.maxBytesPerBatch` (4.0, internal) | `64MB` | caps batch size in bytes too, for wide rows |
+    | `spark.sql.execution.pythonUDF.arrow.concurrency.level` (4.0) | unset | run an Arrow-optimized plain UDF concurrently inside a worker (for I/O-heavy UDFs; must be above 1) |
+    | `spark.sql.pyspark.udf.profiler` (4.0) | unset | `perf` or `memory` profiling |
+    | `spark.python.worker.reuse` (1.2) | `true` | keep workers alive between tasks |
+    | `spark.python.worker.faulthandler.enabled` (3.2) | `false` | a Python traceback when a worker crashes |
+    | `spark.python.worker.idleTimeoutSeconds` (4.0) | `0` (off) | log a worker that has been silent this long |
+    | `spark.python.worker.killOnIdleTimeout` (4.1) | `false` | also kill it |
+    | `spark.python.worker.tracebackDumpIntervalSeconds` (4.1) | `0` (off) | dump worker tracebacks to stderr periodically |
+
+    Batch size is easy to see with a pandas UDF that returns the length
+    of each batch it gets. Over 25,000 rows in one partition it saw
+    batches of 10000 and 5000 rows; with `maxRecordsPerBatch` set to
+    `3000`, 3000 and 1000. Bigger batches mean fewer round trips and
+    more memory per call; the default is sensible unless rows are very
+    wide (documents, images), where a smaller batch keeps a worker's
+    memory in check.
+
+    The `spark.python.*` settings are fixed when the application starts:
+    `spark.conf.set("spark.python.worker.reuse", "false")` fails with
+    `[CANNOT_MODIFY_CONFIG] Cannot modify the value of the Spark config:
+    "spark.python.worker.reuse"`. Set them on the builder or with
+    `spark-submit --conf`.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "You want to switch off Python worker reuse for a job. Which works?"
+  AnswerChoices: "Set spark.python.worker.reuse=false when the session is created, with the builder or spark-submit --conf;spark.conf.set(\"spark.python.worker.reuse\", \"false\") at any time;A SQL SET statement;It cannot be changed"
+  CorrectAnswer: "Set spark.python.worker.reuse=false when the session is created, with the builder or spark-submit --conf"
+  Hint: "spark.python.* settings are application settings; changing one at runtime gives CANNOT_MODIFY_CONFIG."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Writing the Output
+
+    "Plans, Partitions and Caching" showed that a `partitionBy` write
+    makes one file per task per value. Tuning a Python job often changes
+    the number of tasks (a `repartition` to spread Python work, a
+    different read split), and with it the number of files. Check the
+    layout after tuning, not before: in the exercise, the slow job's
+    `repartition(8)` before `partitionBy("status")` writes 8 files into
+    each status folder; `repartition("status")` writes one.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Tune an Error Report
+
+    `slow_report(lines, counter)` builds a report of the log's error
+    lines (status 400 and up) with the internal network of each client:
+    four row-at-a-time UDFs re-parse every line, a Python UDF filters,
+    and the network lookup runs again for every action. `slow_write`
+    scatters 8 files into each status folder. Both are written; keep
+    them as the reference. The harness splits the 21 KB log into 8 KB
+    pieces (3 partitions), as if it were big. Complete:
+
+    1. `parse(lines)`: `ip`, `path`, `status` (int) and `bytes` (bigint)
+       with `sf.regexp_extract` and casts, no Python.
+    2. `errors_only(parsed)`: a built-in filter.
+    3. `make_network_udf(counter)`: a pandas UDF that maps `network_of`
+       over a batch and adds the batch length to `counter`.
+    4. `fast_report(lines, counter)`: parse, filter, add `network`, and
+       cache.
+    5. `write_by_status(enriched, out)`: one file per status folder.
+
+    The harness checks: no Python node in the parse and the filter; one
+    `ArrowEvalPython` node in the report, above the status filter, and no
+    `BatchEvalPython`; the report is cached; the network UDF processed
+    each error row exactly once across a write, a summary and a collect;
+    the same rows and summary as the slow job; and exactly one file in
+    each status folder. It prints the slow and fast call counts and file
+    layouts.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "parse: lines.select(sf.regexp_extract('value', LINE, 1).alias('ip'), ...); errors_only: parsed.filter(sf.col('status') >= 400); fast_report: errors_only(parse(lines)).withColumn('network', make_network_udf(counter)('ip')).cache(); write_by_status: enriched.repartition('status').write.mode('overwrite').partitionBy('status').parquet(out)."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - Python costs serialization, a process boundary and the interpreter.
+      Don't cross (built-ins), cross less (fewer rows, nodes and
+      actions), cross in batches (Arrow, pandas), and cross in parallel.
+    - Find Python in plans: `BatchEvalPython`, `ArrowEvalPython` (101
+      plain Arrow UDF, 200 pandas UDF), `MapInPandas`, `MapInArrow`,
+      `FlatMapGroupsInPandas`. Different UDF kinds in one select chain
+      into separate nodes.
+    - Measured ratios on one machine: built-in 1, pandas UDF 1.5, Arrow
+      UDF 2.7, pickled UDF 3.6. Measure with actions that use the
+      column; `count()` may skip the UDF entirely.
+    - In 4.2 a filter on a UDF column evaluates the UDF twice (the guard
+      covers Scala UDFs; Python follows in 4.4.0, SPARK-59693). Every
+      action recomputes uncached Python. A Python filter blocks
+      pushdown: filter with built-ins first.
+    - On 4.2.0, a plain UDF over a Parquet column, directly or through
+      some expressions such as `col + 0`, can hang (SPARK-58241, fixed
+      in 4.2.1); set
+      `spark.sql.execution.arrow.pythonUDF.columnarInput.enabled` to
+      `false` or change the shape.
+    - Profile with `spark.sql.pyspark.udf.profiler=perf` and
+      `spark.profile.show()` (4.0).
+    - Spread Python work after a one-partition read with `repartition`;
+      salt hot keys when partial results combine.
+    - `spark.python.*` settings are fixed at startup; check the output
+      layout after tuning.
+
+    Next: **Streaming Messy Data: Drift, Dead Letters and State**, where
+    the same data arrives as a stream with late events and changing
+    schemas.

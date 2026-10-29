@@ -1,0 +1,28 @@
+{
+  "schema": 2,
+  "case_id": "CASE-0003",
+  "opened": "2026-03-05T08:30:00Z",
+  "status": "triage",
+  "priority": "P1",
+  "tags": [
+    "escalation"
+  ],
+  "meta": {
+    "customer": {
+      "id": "C003"
+    },
+    "escalated": true
+  },
+  "attachments": [
+    {
+      "name": "notes.txt",
+      "sha256": "ca4c34d3bc9ec38060090234656b8f84b3bf3ce57a7be1c9434e2198b9dc7eef",
+      "bytes": 39
+    },
+    {
+      "name": "export.json",
+      "sha256": "ab51d6dfe5dbb6f946f9d5b8fead2c1df956d39d9f646488bf729dc7e65b1965",
+      "bytes": 52
+    }
+  ]
+}

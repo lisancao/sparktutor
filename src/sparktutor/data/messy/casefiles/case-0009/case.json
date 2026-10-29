@@ -1,0 +1,26 @@
+﻿{
+  "schema": 2,
+  "case_id": "CASE-0009",
+  "opened": "2026-03-21T10:30:00+02:00",
+  "status": "open",
+  "priority": "P2",
+  "tags": [
+    "damaged",
+    "fr"
+  ],
+  "meta": {
+    "customer": {
+      "id": "C090",
+      "name": "Hélène Côté"
+    },
+    "channel": "email",
+    "lang": "fr"
+  },
+  "attachments": [
+    {
+      "name": "lettre.eml",
+      "sha256": "20c4b8919194b3da343a334d9f03fd0398c9961f0acec58786672eed2daa15d3",
+      "bytes": 284
+    }
+  ]
+}

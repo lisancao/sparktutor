@@ -1,0 +1,1044 @@
+- Class: meta
+  Lesson: "Feature Vectors and Similarity Search"
+  EstimatedMinutes: 60
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    "Images and Audio" decoded pixels and WAV samples into numbers,
+    "Text Analytics Without an LLM" turned documents into TF-IDF vectors
+    and found near-duplicate messages with `MinHashLSH`, and "Running a
+    Model over Your Data with pandas UDFs" ran Python over every row in
+    batches. This lesson joins those threads into one job that every
+    media library, product catalogue and search system needs: **given a
+    file, find the files most like it.**
+
+    The recipe has three steps, and each has its own traps:
+
+    1. **Features.** Turn each file into a fixed-length list of numbers
+       (a *feature vector*) so that similar files get similar numbers.
+    2. **Similarity.** Decide what "close" means: cosine similarity,
+       Euclidean distance, and why scaling decides the answer.
+    3. **Search.** Compare every pair exactly (simple, correct, and
+       quadratic), or let locality-sensitive hashing propose a few
+       candidates (fast, and sometimes wrong), and *measure* how wrong.
+
+    By the end of this lesson you will be able to:
+
+    - Build colour histograms for images and frequency-band energies for
+      audio with pandas UDFs, and make them robust to the mess in a real
+      library (gray and RGBA images, different sizes, different sample
+      rates)
+    - Move between `array<float>` columns and MLlib vectors
+      (`array_to_vector`, `vector_to_array`), and use `VectorAssembler`,
+      `Normalizer` and `StandardScaler`
+    - Use the **vector functions new in Spark 4.2**
+      (`vector_cosine_similarity`, `vector_l2_distance`,
+      `vector_normalize`, `vector_avg` and friends), and know their type
+      rules, NULL rules and a float overflow bug in 4.2.0
+    - Run an exact k-nearest-neighbour search with a self join and a
+      window, read its plan, and explain why it does not scale
+    - Run approximate search with `BucketedRandomProjectionLSH`
+      (`approxNearestNeighbors`, `approxSimilarityJoin`), choose
+      `bucketLength` and `numHashTables`, and measure recall against the
+      exact answer
+    - Say which of these pieces work on Spark Connect in 4.2.0, and
+      where real embedding models fit
+
+    Building LSH and an IVF index from scratch is the subject of the
+    advanced lesson "Building LSH and an IVF Vector Index"; here you use
+    what MLlib ships.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Imagine describing every photo in a shoebox with a short list of
+    numbers: how much of it is red, how much is blue, how much is white.
+    Two photos of the same red mug get almost the same list, even if one
+    is a little brighter. Finding "photos like this one" then becomes
+    finding lists of numbers that are close to each other. Comparing
+    your photo with every other photo works for a shoebox. For a
+    warehouse of photos you need a shortcut, and the shortcut sometimes
+    misses. This lesson builds both and measures the miss.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Data: a Small Media Library
+
+    `data/messy/media_library/` holds product photos and short sound
+    clips that come in **families**: the same thing captured or exported
+    in different ways.
+
+    - `images/`: eight families (a red mug, a blue shirt, a green
+      plant, a yellow banana, a gray laptop, a sunset, a checkerboard, a
+      sky), each as an original, a brighter copy, a noisy copy, a larger
+      copy (40 x 40 instead of 24 x 24) and a copy with the object moved.
+    - `audio/`: eight families of mono 16-bit WAV clips (tones at 220,
+      440 and 1000 Hz, a two-note chord, white noise, a rising chirp, a
+      pulsed beep and a hum), each as an original, a quiet copy, a noisy
+      copy, a copy detuned by 2 percent and a copy saved at 8000 samples
+      per second instead of 4000.
+    - `labels.csv`: `file, kind, family` for every valid file. It is the
+      answer key: a good feature puts each file next to a member of its
+      own family.
+
+    The mess a real library has is planted too: the sky family was
+    exported with an alpha channel, the checkerboard also exists as a
+    one-channel gray image, `IMG_0042.png` is a byte-for-byte re-upload
+    of the mug, and `thumbnail_cache.png` is not a PNG at all.
+
+    ```python
+    from pyspark.sql import functions as F
+
+    labels = spark.read.option("header", True).csv("data/messy/media_library/labels.csv")
+    labels.groupBy("kind").agg(F.count("*").alias("files"),
+                               F.count_distinct("family").alias("families")).show()
+    ```
+
+    ```text
+    +-----+-----+--------+
+    | kind|files|families|
+    +-----+-----+--------+
+    |audio|   40|       8|
+    |image|   42|       8|
+    +-----+-----+--------+
+    ```
+
+    The folder is small on purpose, so that an exact search over every
+    pair finishes in a second and you can check every approximate answer
+    against it. The code is the same for a million files; only the
+    search step has to change, and the end of the lesson says how.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## A Vector Is a Row of Numbers
+
+    A feature vector is just a fixed-length list of numbers. Spark can
+    hold one in two ways, and you will use both:
+
+    - **`array<float>` (or `array<double>`)**: an ordinary SQL array.
+      Every SQL function, Parquet, `from_json` and the new 4.2 vector
+      functions understand it. This is the format to store.
+    - **An MLlib vector** (`pyspark.ml.linalg.DenseVector` or
+      `SparseVector`, column type `VectorUDT`, shown as `vector` in a
+      schema). MLlib estimators such as `StandardScaler` and
+      `BucketedRandomProjectionLSH` require it. A sparse vector stores
+      only the non-zero positions, which is how TF-IDF vectors with
+      262144 slots fit in memory.
+
+    ```python
+    from pyspark.ml.linalg import Vectors
+    from pyspark.ml.functions import array_to_vector, vector_to_array
+
+    d = Vectors.dense([0.5, 0.0, 0.5])
+    s = Vectors.sparse(3, [0, 2], [0.5, 0.5])
+    print(d, s, d == s, d.dot(s), d.norm(2))
+
+    df = spark.createDataFrame([("a", [0.5, 0.0, 0.5])], "id string, arr array<double>")
+    v = df.withColumn("vec", array_to_vector("arr"))
+    v.printSchema()
+    v.select(vector_to_array("vec", "float32").alias("back")).printSchema()
+    ```
+
+    ```text
+    [0.5,0.0,0.5] (3,[0,2],[0.5,0.5]) True 0.5 0.7071067811865476
+    root
+     |-- id: string (nullable = true)
+     |-- arr: array (nullable = true)
+     |    |-- element: double (containsNull = true)
+     |-- vec: vector (nullable = true)
+
+    root
+     |-- back: array (nullable = false)
+     |    |-- element: float (containsNull = false)
+    ```
+
+    - `array_to_vector` (3.1) turns a numeric array into a dense
+      vector; `vector_to_array` (3.0) goes back, as `double` by default
+      or `float` with `dtype="float32"`.
+    - A dense and a sparse vector with the same values are equal.
+    - **`array_to_vector` does not accept a NULL array.** The task fails
+      with `[FAILED_EXECUTE_UDF]` caused by a
+      `java.lang.NullPointerException`. Filter NULL features out before
+      converting; a file whose features could not be computed has no
+      place in a vector index anyway.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Image Features: Colour Histograms
+
+    A **colour histogram** counts how many pixels fall into each colour
+    cell. Cut each of red, green and blue into 4 levels (0 to 63, 64 to
+    127, and so on) and you get 4 x 4 x 4 = 64 cells; the vector is the
+    *fraction* of pixels in each cell. The exercise file gives you the
+    NumPy function:
+
+    ```python
+    def color_histogram(data, channels, bins=4):
+        px = np.frombuffer(data, dtype=np.uint8).reshape(-1, channels)
+        if channels == 1:
+            b = g = r = px[:, 0]
+        else:
+            b, g, r = px[:, 0], px[:, 1], px[:, 2]      # alpha (if any) is ignored
+        step = 256 // bins
+        cell = (r // step).astype(int) * bins * bins + (g // step).astype(int) * bins + (b // step).astype(int)
+        return (np.bincount(cell, minlength=bins ** 3) / len(cell)).astype(np.float32)
+    ```
+
+    Three decisions in those lines handle the mess:
+
+    - **B, G, R order.** As "Images and Audio" showed, the image source
+      stores pixels blue first. Getting it wrong would not fail; it would
+      quietly file red mugs next to blue shirts.
+    - **Channels.** A gray image has one channel, which counts as equal
+      red, green and blue; an RGBA image has a fourth byte, which is
+      skipped. The gray checkerboard ends up with exactly the same
+      vector as the colour one.
+    - **Fractions, not counts.** Dividing by the number of pixels makes
+      the 40 x 40 copy comparable with the 24 x 24 original.
+
+    Wire it into Spark with a pandas UDF, keeping only images the
+    source could decode:
+
+    ```python
+    @F.pandas_udf("array<float>")
+    def histogram(data: pd.Series, channels: pd.Series) -> pd.Series:
+        return pd.Series([color_histogram(d, c) for d, c in zip(data, channels)])
+
+    images = (spark.read.format("image").load("data/messy/media_library/images")
+              .filter("image.nChannels > 0")
+              .select(F.col("_metadata.file_name").alias("file"),
+                      histogram("image.data", "image.nChannels").alias("features")))
+
+    images.select("file", F.size("features").alias("n"),
+                  F.round(F.aggregate("features", F.lit(0.0), lambda a, x: a + x), 4).alias("total"),
+                  F.slice("features", 45, 8).alias("cells_45_to_52")) \
+          .filter(F.col("file").startswith("mug_red")).orderBy("file").show(truncate=False)
+    ```
+
+    ```text
+    +--------------------+---+-----+----------------------------------------------+
+    |file                |n  |total|cells_45_to_52                                |
+    +--------------------+---+-----+----------------------------------------------+
+    |mug_red_bright.png  |64 |1.0  |[0.0, 0.0, 0.0, 0.0, 0.2847222, 0.0, 0.0, 0.0]|
+    |mug_red_large.png   |64 |1.0  |[0.0, 0.0, 0.0, 0.0, 0.28, 0.0, 0.0, 0.0]     |
+    |mug_red_moved.png   |64 |1.0  |[0.0, 0.0, 0.0, 0.0, 0.28125, 0.0, 0.0, 0.0]  |
+    |mug_red_noisy.png   |64 |1.0  |[0.0, 0.0, 0.0, 0.0, 0.203125, 0.0, 0.0, 0.0] |
+    |mug_red_original.png|64 |1.0  |[0.0, 0.0, 0.0, 0.0, 0.2847222, 0.0, 0.0, 0.0]|
+    +--------------------+---+-----+----------------------------------------------+
+    ```
+
+    Cell 49 (position 48 counting from 0, `F.slice` counts from 1) is
+    red level 3, green 0, blue 0: the mug. About 28 percent of each image
+    is mug; the noisy copy has scattered some mug pixels into
+    neighbouring cells. The function returns `float32` on purpose: the
+    4.2 vector functions take `array<float>`, as the next sections show.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## What a Histogram Cannot See
+
+    A histogram describes *how much* of each colour, not *where*. That is
+    why the moved mug matches the original, and it has two consequences
+    worth knowing before you trust it:
+
+    - **It is not a fingerprint.** `mug_red_bright.png` has the same
+      histogram as the original (brightening by 20 did not push any
+      pixel into another cell), so the re-uploaded `IMG_0042.png` is
+      "identical" to two different files. For exact duplicates use a
+      content hash of the bytes (`sha2(content, 256)` on a `binaryFile`
+      read, as in "Files as Files: binaryFile, Globs and Metadata") and
+      keep similarity search for *near* duplicates.
+    - **Hard cell edges are brittle.** A small shift that crosses a cell
+      boundary moves a pixel's whole weight. The one image in this
+      library whose nearest neighbour is from another family,
+      `plant_green_bright.png`, is exactly that: brightening pushed the
+      leaves and the pot across cell edges. Real systems blur the edges
+      (soft binning), use colour spaces that separate brightness from
+      hue, or use a learned embedding, which is the end of this lesson.
+
+- Class: mult_question
+  Depth: all
+  Output: "Two images have the same 64-value colour histogram. What can you conclude?"
+  AnswerChoices: "They have the same mix of colours, but they may differ in layout, brightness within a cell or content;They are byte-for-byte identical files;They have the same width and height;One is a resized copy of the other"
+  CorrectAnswer: "They have the same mix of colours, but they may differ in layout, brightness within a cell or content"
+  Hint: "A histogram counts pixels per colour cell. It forgets where each pixel was and how large the image is."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Audio Features: Energy per Frequency Band
+
+    For sound, the useful description is *which pitches* are present.
+    A Fourier transform (`numpy.fft.rfft`) turns the samples into the
+    strength of each frequency; adding up the power in bands of 125 Hz
+    between 0 and 2000 Hz gives 16 numbers, and dividing by the total
+    gives the *share* of energy in each band, so a quiet copy and a loud
+    copy look the same:
+
+    ```python
+    def band_energies(content, bands=16, top_hz=2000.0):
+        with wave.open(io.BytesIO(content)) as w:
+            rate = w.getframerate()
+            x = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").astype(np.float64) / 32768
+        power = np.abs(np.fft.rfft(x)) ** 2
+        freqs = np.fft.rfftfreq(len(x), d=1.0 / rate)        # the frequency of each FFT bin, in Hz
+        band = (freqs / (top_hz / bands)).astype(int)
+        keep = band < bands
+        energy = np.bincount(band[keep], weights=power[keep], minlength=bands)
+        total = energy.sum()
+        return (energy / total).astype(np.float32) if total > 0 else None
+    ```
+
+    The 440 Hz tone puts all its energy in band 3 (375 to 500 Hz), in
+    every variant:
+
+    ```text
+    +---------------------+---------------------------------------------------------------------------------+
+    |file                 |bands                                                                            |
+    +---------------------+---------------------------------------------------------------------------------+
+    |tone_440_detuned.wav |[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] |
+    |tone_440_hires.wav   |[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] |
+    |tone_440_noisy.wav   |[0.0, 0.0, 0.0, 0.99, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]|
+    |tone_440_original.wav|[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] |
+    |tone_440_quiet.wav   |[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] |
+    +---------------------+---------------------------------------------------------------------------------+
+    ```
+
+    The pandas UDF is the same shape as for images, over a `binaryFile`
+    read with `pathGlobFilter` set to `*.wav`. A silent clip has no
+    energy to share out, so the function returns `None` and the job
+    filters those rows.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Gotcha: Bands Must Be in Hertz, Not FFT Positions
+
+    The tempting shortcut is to cut the FFT output into 16 equal slices
+    by position (`np.array_split(power, 16)`). That works until two
+    files have different sample rates or lengths. The `hires` copies were
+    saved at 8000 samples per second: the same number of FFT positions
+    then covers twice the frequency range, so position 3 means a
+    different pitch in each file. With the shortcut, the nearest
+    neighbour was in the right family for **30 of the 40** clips, and
+    every `hires` file matched something else (the 1000 Hz `hires` tone
+    looked identical to the 440 Hz original). With bands computed from
+    `rfftfreq` and the file's own rate, all **40 of 40** match.
+
+    This is the general lesson of messy feature extraction: a feature
+    has *units*. Pixel fractions instead of pixel counts, hertz instead
+    of array positions, seconds instead of samples. Whenever files in
+    one library were produced differently, compute features in units
+    that do not depend on how the file was produced.
+
+- Class: mult_question
+  Depth: all
+  Output: "Your audio feature cuts the FFT output into 16 equal slices by position. A clip saved at 8000 samples per second is compared with the same sound saved at 4000. What happens?"
+  AnswerChoices: "The same pitch lands in different slices, so the copies look unrelated;Nothing, the FFT is independent of the sample rate;The 8000 Hz clip fails to decode;The vectors have different lengths and Spark raises an error"
+  CorrectAnswer: "The same pitch lands in different slices, so the copies look unrelated"
+  Hint: "The FFT's positions span 0 up to half the sample rate. What frequency does position 3 mean in each file?"
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Length, Scale and What "Close" Means
+
+    Two measures of closeness cover most uses:
+
+    - **Cosine similarity** is the cosine of the angle between two
+      vectors: 1 when they point the same way, 0 when they share nothing
+      (for vectors without negative values, such as histograms). It
+      ignores length, so a vector and twice that vector are identical.
+    - **Euclidean distance** is the straight-line distance: the square
+      root of the sum of squared differences. It cares about length.
+
+    For **unit vectors** (length 1) they agree exactly:
+    `distance^2 = 2 - 2 * cosine`. Ranking by smallest distance and by
+    largest cosine then gives the same neighbours, which is why the
+    usual recipe is: normalize every vector to length 1, then use
+    whichever measure the tool supports. MLlib's
+    `BucketedRandomProjectionLSH` supports only Euclidean distance, so
+    you will feed it unit vectors.
+
+    MLlib has transformers for scaling (all checked in 4.2.0):
+
+    - `Normalizer(p=2.0)` (default `p` is 2.0) scales each **row** to
+      length 1.
+    - `StandardScaler` learns each **column's** spread and divides by
+      it. Its defaults are `withStd=True` and `withMean=False`: it does
+      not subtract the mean unless you ask, because subtracting would
+      turn sparse vectors dense.
+    - `MinMaxScaler` maps each column to the range 0 to 1.
+    - `VectorAssembler` concatenates columns (numbers and vectors) into
+      one vector.
+
+    Column scaling matters as soon as you mix features with different
+    units. Append the file size in bytes to the 16 audio bands and the
+    `original` and `hires` copies of a tone differ by 1000 bytes, so
+    their Euclidean distance is at least 1000, while every band
+    difference is below 1: the size decides every neighbour. The fitted
+    `StandardScaler` reports that column's standard deviation (`std`,
+    here 405.1) and divides by it. Scaling equalizes spread, but it
+    cannot tell you whether file size *should* matter; leaving it out is
+    the real fix.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## VectorAssembler and Missing Values
+
+    `VectorAssembler` refuses NULLs by default (`handleInvalid="error"`)
+    and the job fails with `[FAILED_EXECUTE_UDF]`, caused by
+    `Encountered null while assembling a row with handleInvalid =
+    "error"`. The other settings:
+
+    - `handleInvalid="skip"` drops the rows with a NULL input. Count
+      before and after so files do not vanish silently.
+    - `handleInvalid="keep"` puts NaN in the missing positions, but it
+      has to know how many positions a vector column has. For a vector
+      column made by `array_to_vector` it cannot, and fails with
+      `Can not infer column lengths with handleInvalid = "keep". Consider
+      using VectorSizeHint to add metadata for columns: [v].` Add a
+      `VectorSizeHint(inputCol="v", size=16)` stage before the
+      assembler.
+
+    The same behaviour holds on Spark Connect; there the failure arrives
+    as a `SparkException` for the first case and as an
+    `UnknownException` wrapping the `java.lang.RuntimeException` for the
+    second.
+
+- Class: mult_question
+  Depth: all
+  Output: "You normalize every feature vector to length 1. Which statement is true?"
+  AnswerChoices: "Ranking neighbours by smallest Euclidean distance gives the same order as ranking by largest cosine similarity;Euclidean distance becomes meaningless;Cosine similarity changes for every pair;You must also run StandardScaler before any comparison"
+  CorrectAnswer: "Ranking neighbours by smallest Euclidean distance gives the same order as ranking by largest cosine similarity"
+  Hint: "For unit vectors, distance squared equals 2 minus 2 times the cosine."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Vector Functions in Spark 4.2
+
+    Spark 4.2.0 added SQL functions for float vectors stored as arrays:
+
+    | Function | Returns | JIRA |
+    |---|---|---|
+    | `vector_cosine_similarity(a, b)` | float | SPARK-54713 |
+    | `vector_inner_product(a, b)` | float | SPARK-54713 |
+    | `vector_l2_distance(a, b)` | float | SPARK-54713 |
+    | `vector_norm(v, degree)` | float | SPARK-55030 |
+    | `vector_normalize(v, degree)` | array<float> | SPARK-55030 |
+    | `vector_sum(v)`, `vector_avg(v)` (aggregates) | array<float> | SPARK-55031 |
+
+    `degree` is optional (2.0 by default); 1.0, 2.0 and `float('inf')`
+    are the accepted values. There are **no Python wrappers** in
+    `pyspark.sql.functions` in 4.2.0, so call them by name with
+    `F.call_function` (3.5) or write SQL:
+
+    ```python
+    spark.sql("""SELECT vector_cosine_similarity(array(1.0F, 2.0F, 3.0F), array(4.0F, 5.0F, 6.0F)) AS cos,
+      vector_inner_product(array(1.0F, 2.0F, 3.0F), array(4.0F, 5.0F, 6.0F)) AS dot,
+      vector_l2_distance(array(1.0F, 2.0F, 3.0F), array(4.0F, 5.0F, 6.0F)) AS l2,
+      vector_norm(array(3.0F, 4.0F)) AS n2, vector_norm(array(3.0F, 4.0F), 1.0F) AS n1,
+      vector_normalize(array(3.0F, 4.0F)) AS unit""").show()
+
+    pairs.select(F.call_function("vector_cosine_similarity", "a", "b").alias("cosine"))
+    ```
+
+    ```text
+    +---------+----+--------+---+---+----------+
+    |      cos| dot|      l2| n2| n1|      unit|
+    +---------+----+--------+---+---+----------+
+    |0.9746319|32.0|5.196152|5.0|7.0|[0.6, 0.8]|
+    +---------+----+--------+---+---+----------+
+    ```
+
+    The rules, each checked on 4.2.0:
+
+    - **`array<float>` only.** An `array<double>` (what Python floats
+      become by default) or an `array<int>` fails at analysis with
+      `[DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] ... The first parameter
+      requires the "ARRAY<FLOAT>" type, however "v" has the type
+      "ARRAY<DOUBLE>".` There is no implicit cast: cast with
+      `F.col("v").cast("array<float>")`, or produce `float32` features
+      as the UDFs in this lesson do. Even an untyped `NULL` literal fails
+      the same way (its type is `VOID`); write `CAST(NULL AS
+      ARRAY<FLOAT>)`.
+    - **Same length.** Different lengths fail at run time with
+      `[VECTOR_DIMENSION_MISMATCH] Vectors passed to
+      vector_cosine_similarity must have the same dimension, but got 2
+      and 3. SQLSTATE: 22000`. The aggregates raise the same condition.
+    - **NULLs.** A NULL array, a NULL element, an empty array or a
+      zero-length vector gives NULL from `vector_cosine_similarity`
+      (there is no angle to measure), and `vector_normalize` of a zero
+      vector is NULL. `vector_avg` and `vector_sum` skip NULL arrays
+      and also **skip any vector that contains a NULL element**, so the
+      average of `[1, NULL]` and `[3, 4]` is `[3.0, 4.0]`.
+    - A degree other than 1, 2 or infinity fails with
+      `[INVALID_VECTOR_NORM_DEGREE]`.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Gotcha: Float Overflow in 4.2.0
+
+    The 4.2.0 vector functions add up products and squares in single
+    precision, and those intermediate sums are *quadratic* in the input,
+    so they overflow long before the result would:
+
+    ```python
+    spark.sql("""SELECT vector_cosine_similarity(array(1e20F, 1e20F), array(1e20F, 1e20F)) AS cos_big,
+     vector_l2_distance(array(3e19F, 0F), array(-3e19F, 0F)) AS l2_big,
+     vector_norm(array(3e19F, 4e19F)) AS norm_big,
+     vector_cosine_similarity(array(1e-30F, 1e-30F), array(1e-30F, 1e-30F)) AS cos_tiny,
+     vector_normalize(array(3e19F, 4e19F)) AS unit_big""").show()
+    ```
+
+    ```text
+    +-------+--------+--------+--------+----------+
+    |cos_big|  l2_big|norm_big|cos_tiny|  unit_big|
+    +-------+--------+--------+--------+----------+
+    |    NaN|Infinity|Infinity|    NULL|[0.0, 0.0]|
+    +-------+--------+--------+--------+----------+
+    ```
+
+    Every value should be ordinary (1.0, 6e19, 5e19, 1.0 and
+    `[0.6, 0.8]`). SPARK-58544 fixes it in 4.3.0. Normalized features
+    such as histograms and band shares are nowhere near these ranges,
+    but raw counts, money in cents or embeddings from a badly scaled
+    model can be. Normalize or scale *before* calling the functions, in
+    Python if necessary.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Same Maths With Higher-Order Functions
+
+    Before 4.2, or when you need `double` precision, write the dot
+    product with the higher-order functions from "Complex Types and
+    Higher-Order Functions": `zip_with` multiplies element by element and
+    `aggregate` adds up:
+
+    ```python
+    dot = F.aggregate(F.zip_with("a", "b", lambda x, y: x * y), F.lit(0.0), lambda acc, x: acc + x)
+    norm = lambda c: F.sqrt(F.aggregate(F.transform(c, lambda x: x * x), F.lit(0.0), lambda acc, x: acc + x))
+
+    pairs.select((dot / (norm("a") * norm("b"))).alias("cosine_double"),
+                 F.call_function("vector_cosine_similarity",
+                                 F.col("a").cast("array<float>"),
+                                 F.col("b").cast("array<float>")).alias("cosine_float")).show()
+    ```
+
+    ```text
+    +------------------+------------+
+    |     cosine_double|cosine_float|
+    +------------------+------------+
+    |0.9746318461970762|   0.9746319|
+    +------------------+------------+
+    ```
+
+    Both run in the JVM with no Python worker. The built-in is shorter
+    and faster (it is a single tight loop); the higher-order version
+    works on any numeric array and any Spark version since 3.1, and
+    keeps double precision. For MLlib vectors there is no SQL function
+    at all: convert with `vector_to_array` or use a Python UDF such as
+    `float(a.dot(b))` from "Text Analytics Without an LLM".
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    `pairs` has two `array<float>` columns, `a` and `b`. Add a column
+    `cosine` with their cosine similarity using the Spark 4.2 built-in,
+    in a DataFrame called `scored`.
+  CorrectAnswer: |
+    scored = pairs.withColumn("cosine", F.call_function("vector_cosine_similarity", "a", "b"))
+  Hint: "There is no F.vector_cosine_similarity in 4.2.0. Call the SQL function by name with F.call_function."
+
+- Class: mult_question
+  Depth: all
+  Output: "Your features column is array<double>. What does vector_cosine_similarity(features, features) do on Spark 4.2.0?"
+  AnswerChoices: "It fails at analysis with DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE because it needs ARRAY<FLOAT>;It casts the arrays to float silently;It returns NULL for every row;It computes the result in double precision"
+  CorrectAnswer: "It fails at analysis with DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE because it needs ARRAY<FLOAT>"
+  Hint: "The 4.2 vector functions accept exactly array<float> and do not add an implicit cast."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Exact Nearest Neighbours
+
+    With unit vectors in an `array<float>` column `unit`, the exact
+    search is a self join, a score and a window:
+
+    ```python
+    from pyspark.sql import Window
+
+    a = vectors.select("file", F.col("unit").alias("a"))
+    b = vectors.select(F.col("file").alias("neighbour"), F.col("unit").alias("b"))
+    pairs = (a.crossJoin(b).filter(F.col("file") != F.col("neighbour"))
+             .select("file", "neighbour",
+                     F.call_function("vector_cosine_similarity", "a", "b").alias("cosine")))
+    best = Window.partitionBy("file").orderBy(F.desc("cosine"), "neighbour")
+    nearest = pairs.withColumn("rank", F.row_number().over(best)).filter("rank = 1").drop("rank")
+    ```
+
+    ```text
+    +------------------+------------------+---------+
+    |file              |neighbour         |cosine   |
+    +------------------+------------------+---------+
+    |IMG_0042.png      |mug_red_bright.png|1.0      |
+    |checker_gray.png  |checker_bright.png|1.0      |
+    |mug_red_bright.png|IMG_0042.png      |1.0      |
+    |sky_bright.png    |sky_large.png     |0.7395378|
+    |sunset_bright.png |sunset_noisy.png  |0.6599892|
+    +------------------+------------------+---------+
+    ```
+
+    - **Drop the pair of a file with itself**, or every file's nearest
+      neighbour is itself at cosine 1.
+    - **Break ties.** Several files have identical vectors (the
+      checkerboards, the mug copies). Ordering by the neighbour's name
+      after the score makes the answer the same on every run; without it
+      `row_number` picks any of the tied rows. For `k` neighbours, keep
+      `rank <= k`.
+    - Over the whole library, the nearest neighbour is in the right
+      family for **41 of 42** images and **40 of 40** clips. The bright
+      sky and sunset still find their family, at a much lower cosine
+      than the others: a sign that brightness is the weak spot of this
+      feature.
+
+    The plan shows what the join costs:
+
+    ```text
+    +- BroadcastNestedLoopJoin BuildRight, Cross, NOT (file#73 = neighbour#432)
+       :- Project [file#73, static_invoke(VectorFunctionImplUtils.vectorNormalize(features#74, 2.0, vector_normalize)) AS a#431]
+       ...
+       +- BroadcastExchange IdentityBroadcastMode, [plan_id=573]
+    ```
+
+    A `BroadcastNestedLoopJoin` sends one side to every task and
+    compares every row with every row: 42 x 42 = 1764 pairs, 1722 after
+    dropping self pairs. The built-in functions appear as
+    `static_invoke(VectorFunctionImplUtils...)`, plain JVM code with no
+    Python step.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Why the Exact Search Does Not Scale
+
+    The number of pairs grows with the *square* of the library:
+
+    | Files | Pairs to score |
+    |---|---|
+    | 42 | 1722 |
+    | 10 000 | about 100 million |
+    | 1 000 000 | about 1 trillion |
+
+    A trillion cosine computations is not impossible for a big cluster,
+    but it has to be repeated whenever the library changes, and a
+    broadcast nested loop join needs one whole side in every task's
+    memory. Two common ways out:
+
+    - **Restrict the pairs** by a key you already trust: compare only
+      within a product category, a language or a file type. That is
+      *blocking*, and "Deduplication and Entity Resolution" builds on
+      it.
+    - **Let a hash propose candidates**, so that most far-apart pairs
+      are never compared. That is locality-sensitive hashing, next.
+
+    The exact search keeps one essential job even at scale: on a
+    **sample**, it is the ground truth that tells you how good the
+    approximate search is.
+
+- Class: mult_question
+  Depth: all
+  Output: "You run the exact self-join search over 200 000 images. Roughly how many pairs does Spark score?"
+  AnswerChoices: "About 40 billion;About 200 000;About 400 000;About 200 million"
+  CorrectAnswer: "About 40 billion"
+  Hint: "Every image is compared with every other image: n times (n - 1)."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Gotcha: Do Not Derive a Distance From a Float Cosine
+
+    For unit vectors `distance = sqrt(2 - 2 * cosine)`, so it is tempting
+    to compute the cosine once and derive the distance. In `float`
+    precision that loses most of the digits exactly where they matter,
+    for near-duplicates:
+
+    ```python
+    spark.sql("""SELECT vector_cosine_similarity(a, b) AS cosine,
+      sqrt(2 - 2 * vector_cosine_similarity(a, b)) AS dist_from_cosine,
+      vector_l2_distance(a, b) AS dist_direct
+    FROM VALUES (vector_normalize(array(1.0F, 0.001F)), vector_normalize(array(1.0F, 0.0F))) AS t(a, b)""").show()
+    ```
+
+    ```text
+    +---------+----------------+-----------+
+    |   cosine|dist_from_cosine|dist_direct|
+    +---------+----------------+-----------+
+    |0.9999995|     9.765625E-4|9.999997E-4|
+    +---------+----------------+-----------+
+    ```
+
+    The cosine is stored with about 7 significant digits, and `2 - 2 *
+    0.9999995` keeps only one of them. While building this lesson, a
+    recall check that compared MLlib's double-precision distances with
+    distances derived this way reported misses that were not misses.
+    Compare like with like: cosines with cosines, or distances computed
+    directly.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Approximate Search: BucketedRandomProjectionLSH
+
+    **Locality-sensitive hashing** (LSH) gives similar vectors the same
+    hash value more often than dissimilar ones, then only compares
+    vectors that share a value. "Text Analytics Without an LLM" used
+    `MinHashLSH` for sets of words (Jaccard distance). For numeric
+    vectors and Euclidean distance, MLlib has
+    `BucketedRandomProjectionLSH` (2.2):
+
+    - It draws `numHashTables` random directions (unit vectors, from
+      `seed`).
+    - For each direction it projects your vector onto it (a dot product)
+      and cuts the line into buckets of width `bucketLength`: the hash
+      is `floor(projection / bucketLength)`. Nearby vectors have nearby
+      projections, so they usually land in the same bucket.
+    - Two vectors become **candidates** when they share a bucket in
+      **any** table (the MLlib source calls this OR-amplification). More
+      tables mean more chances to meet: more candidates, fewer misses.
+
+    ```python
+    from pyspark.ml.feature import BucketedRandomProjectionLSH
+
+    lsh = BucketedRandomProjectionLSH(inputCol="vec", outputCol="hashes",
+                                      bucketLength=0.1, numHashTables=3, seed=42)
+    model = lsh.fit(audio_vectors)
+    model.transform(audio_vectors).select("file", "hashes") \
+        .filter(F.col("file").startswith("tone_440")).show(truncate=False)
+    ```
+
+    ```text
+    +---------------------+-----------------------+
+    |file                 |hashes                 |
+    +---------------------+-----------------------+
+    |tone_440_detuned.wav |[[-3.0], [0.0], [-4.0]]|
+    |tone_440_hires.wav   |[[-3.0], [0.0], [-4.0]]|
+    |tone_440_noisy.wav   |[[-3.0], [0.0], [-4.0]]|
+    |tone_440_original.wav|[[-3.0], [0.0], [-4.0]]|
+    |tone_440_quiet.wav   |[[-3.0], [0.0], [-4.0]]|
+    +---------------------+-----------------------+
+    ```
+
+    `hashes` is an `array<vector>`, one one-element vector per table.
+    All five variants of the tone share all three buckets.
+
+    Things that surprised us in 4.2.0:
+
+    - **`bucketLength` has no default.** `fit()` succeeds without it,
+      and the first `transform` fails with `[FAILED_EXECUTE_UDF]`
+      caused by `java.util.NoSuchElementException: Failed to find a
+      default value for bucketLength`. `numHashTables` defaults to 1.
+    - **Set `seed` yourself.** The Python default is
+      `hash(type(self).__name__)`, Python's string hash, which is
+      randomized per process unless `PYTHONHASHSEED` is set. Two runs of
+      `python job.py` got default seeds `3768212157542391484` and
+      `5963237220475713588`, so different random directions and
+      different candidates. `spark-submit` sets `PYTHONHASHSEED=0`, which
+      happens to make it stable there. An explicit `seed=42` makes the
+      index the same everywhere.
+    - **One index per vector length.** The model takes its size from the
+      data, and a vector of another length fails with `requirement
+      failed: The columns of A don't match the number of elements of x.
+      A: 64, x: 16` (wrapped in `FAILED_EXECUTE_UDF`). Images and audio
+      need separate models; so would two embedding models.
+    - The vectors must not be NULL (see `array_to_vector` above).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Two Ways to Ask
+
+    **One query: `approxNearestNeighbors(dataset, key, k)`.** Give it the
+    query as an MLlib vector and how many neighbours you want:
+
+    ```python
+    key = audio_vectors.filter("file = 'chirp_original.wav'").first().vec
+    model.approxNearestNeighbors(audio_vectors, key, 5) \
+        .select("file", F.round("distCol", 4).alias("distance")).show()
+    ```
+
+    ```text
+    +------------------+--------+
+    |              file|distance|
+    +------------------+--------+
+    |chirp_original.wav|     0.0|
+    |   chirp_quiet.wav|     0.0|
+    |   chirp_hires.wav|  0.0052|
+    |   chirp_noisy.wav|  0.0483|
+    | chirp_detuned.wav|  0.0721|
+    +------------------+--------+
+    ```
+
+    The query file itself comes first at distance 0 because it is in the
+    dataset. With narrower buckets and one table
+    (`bucketLength=0.05, numHashTables=1`) the same call returns only
+    **three** rows:
+
+    ```text
+    +------------------+--------+
+    |              file|distance|
+    +------------------+--------+
+    |chirp_original.wav|     0.0|
+    |   chirp_quiet.wav|     0.0|
+    |   chirp_hires.wav|  0.0052|
+    +------------------+--------+
+    ```
+
+    In 4.2.0 the public method searches only rows that share a bucket
+    with the key (the Scala source calls this single probe), so **it can
+    return fewer than k rows**. Treat `k` as a maximum.
+
+    **All pairs: `approxSimilarityJoin(datasetA, datasetB, threshold)`.**
+    It explodes each row's hashes into one row per table, joins on
+    (table, bucket), removes duplicate pairs, computes the exact
+    Euclidean distance of each candidate pair and keeps those with
+    distance strictly **less than** `threshold`. The result has struct
+    columns `datasetA` and `datasetB` with the original rows and a
+    `distCol` column:
+
+    ```python
+    hashed = model.transform(audio_vectors)
+    candidates = (model.approxSimilarityJoin(hashed, hashed, 2.0)
+                  .filter(F.col("datasetA.file") != F.col("datasetB.file"))
+                  .select(F.col("datasetA.file").alias("file"),
+                          F.col("datasetB.file").alias("neighbour"),
+                          F.col("distCol").alias("distance")))
+    ```
+
+    Two unit vectors are never more than 2 apart, so a threshold of 2.0
+    keeps every candidate, which is what you want when you then pick the
+    best per file with a window. Passing already hashed data saves
+    hashing twice; the method only hashes inputs that lack the output
+    column.
+
+- Class: mult_question
+  Depth: all
+  Output: "model.approxNearestNeighbors(df, key, 10) returns 4 rows. What is the most likely reason?"
+  AnswerChoices: "Only 4 rows shared a bucket with the key, and the method searches only those;The dataset has only 4 rows;k is capped at numHashTables;The other 6 rows had NULL distances"
+  CorrectAnswer: "Only 4 rows shared a bucket with the key, and the method searches only those"
+  Hint: "The public method compares the key only with rows in the same bucket as the key in at least one table."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Measuring Recall
+
+    LSH trades misses for work, so measure both against the exact answer:
+
+    - **Work**: how many candidate pairs it compared, out of all
+      `n * (n - 1)` ordered pairs.
+    - **Recall@1**: for what fraction of files it found a neighbour as
+      similar as the true nearest one. Compare *similarities*, not
+      names: when several files tie for nearest, finding any of them is
+      correct.
+
+    With `seed=42` on this library:
+
+    | Kind | bucketLength | Tables | Pairs compared | Recall@1 |
+    |---|---|---|---|---|
+    | image | 0.05 | 1 | 408 of 1722 (24%) | 0.905 |
+    | image | 0.05 | 5 | 1026 (60%) | 0.976 |
+    | image | 0.1 | 5 | 1428 (83%) | 1.000 |
+    | image | 0.2 | 3 | 1602 (93%) | 1.000 |
+    | audio | 0.05 | 1 | 180 of 1560 (12%) | 0.800 |
+    | audio | 0.05 | 5 | 550 (35%) | 1.000 |
+    | audio | 0.1 | 5 | 906 (58%) | 1.000 |
+    | audio | 0.5 | 1 | 792 (51%) | 0.900 |
+
+    Reading it:
+
+    - **Wider buckets and more tables** raise both recall and work.
+      Past some width every vector lands in the same few buckets and LSH
+      degenerates into the exact search (the image index compares every
+      pair at width 0.5 with five tables).
+    - **More tables beat wider buckets** for the same work: audio at
+      width 0.05 with five tables finds everything with 35 percent of
+      the pairs; width 0.5 with one table compares more and misses more.
+    - **Choose `bucketLength` from the distances you care about.** Most
+      nearest neighbours here are within 0.2 of each other (many are
+      exact copies at 0); the brightened images are 0.4 to 0.8 away.
+      Buckets much narrower than the distances you need to find split
+      families; buckets much wider merge everything.
+    - The fractions are high because the library is tiny: 42 files
+      cannot spread out. On a million files the same settings compare a
+      far smaller share; what stays true is the method: sweep on a
+      sample, measure recall and work against an exact search, then
+      pick.
+
+- Class: mult_question
+  Depth: all
+  Output: "Your LSH index misses too many true neighbours. Which change raises recall while usually costing the least extra work?"
+  AnswerChoices: "Increase numHashTables;Lower bucketLength;Lower the approxSimilarityJoin threshold;Use a different seed"
+  CorrectAnswer: "Increase numHashTables"
+  Hint: "A pair becomes a candidate if it shares a bucket in any table."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## On Spark Connect
+
+    MLlib runs on Spark Connect since 4.0 (SPARK-50812): `fit` trains on
+    the server, and the client holds a reference to a server-side model
+    ("Spark Connect" in the learning_spark course explains the model
+    cache). For this lesson we ran every piece under a local
+    Connect session on 4.2.0:
+
+    - Work the same: `array_to_vector`, `vector_to_array` (including
+      `dtype="float32"`), `VectorAssembler` (with the same errors),
+      `Normalizer`, `StandardScaler` and its `mean`/`std`,
+      `MinMaxScaler`, `BucketedRandomProjectionLSH` fit and transform,
+      `approxNearestNeighbors`, `approxSimilarityJoin`, the 4.2 vector
+      functions, and the whole exercise solution, with the same recall.
+    - Differs: **the `distCol` argument is ignored**.
+      `approxSimilarityJoin(a, b, 0.5, distCol="d")` returns columns
+      `datasetA, datasetB, distCol` on Connect and `datasetA, datasetB,
+      d` in classic mode; `approxNearestNeighbors` behaves the same way.
+      "Text Analytics Without an LLM" met this with MinHash. Keep the
+      default name and rename with `alias`.
+    - Errors from the server keep their class and message, but a JVM
+      exception without an error class (such as the `VectorSizeHint`
+      one) arrives wrapped differently than in classic mode, so match
+      on the message text, not the Python exception type.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Text Vectors Fit the Same Pattern
+
+    The TF-IDF vectors from "Text Analytics Without an LLM" are MLlib
+    *sparse* vectors, already normalized to length 1 by `Normalizer`.
+    `BucketedRandomProjectionLSH` accepts sparse vectors, so the same
+    recall method applies to documents. For short texts compared as
+    sets of words, `MinHashLSH` with Jaccard distance (from that lesson)
+    is usually the better choice; for longer texts or learned
+    embeddings, cosine on unit vectors is.
+
+    To use the 4.2 vector functions on TF-IDF, convert with
+    `vector_to_array(col, "float32")`, which makes every one of the
+    `numFeatures` slots explicit: 4096 floats per document is fine,
+    262144 is a megabyte per row. Keep large sparse vectors as MLlib
+    vectors.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Where Real Embedding Models Fit (Ungraded)
+
+    A colour histogram knows nothing about mugs. In production you
+    would replace `color_histogram` and `band_energies` with a learned
+    **embedding model** (an image encoder, an audio encoder, a sentence
+    embedding model) that maps each file to a few hundred floats where
+    distance tracks meaning. Nothing else in this lesson changes:
+
+    - Run the model with an **iterator pandas UDF** that loads it once
+      per task and returns `array<float>`, exactly as in "Running a
+      Model over Your Data with pandas UDFs"; "Model Inference in
+      Production" adds caching by content hash so each file is embedded
+      once.
+    - **Store** the vectors as `array<float>` in Parquet or Delta, next
+      to the file's content hash and the model's name and version, so a
+      new model version never mixes with the old one in one index.
+    - **Normalize** once (`vector_normalize`), then search with
+      `vector_cosine_similarity` exactly, or LSH approximately, and
+      measure recall on a sample as above.
+    - Learned embeddings are dense and have hundreds of dimensions.
+      Random-projection LSH needs more tables there; the advanced lesson
+      "Building LSH and an IVF Vector Index" builds an IVF index
+      (k-means lists searched a few at a time) from DataFrame primitives
+      and compares its recall curve with LSH's. Dedicated vector
+      databases do the same with more engineering; Spark's strength is
+      building, refreshing and evaluating the vectors in bulk.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Find Each File's Closest Match
+
+    `color_histogram` and `band_energies` are written for you as plain
+    NumPy. Implement:
+
+    1. `image_vectors(spark)`: one row per valid image in
+       `data/messy/media_library/images` with `file` and `features`
+       (`array<float>`, 64 values), from a pandas UDF.
+    2. `audio_vectors(spark)`: the same for the `.wav` files (16 values).
+    3. `with_unit_vectors(vectors)`: add `unit` (`vector_normalize`) and
+       `vec` (`array_to_vector` of `unit`).
+    4. `exact_neighbours(vectors)`: `file, neighbour, cosine`, the best
+       other file for each file, ties broken by name.
+    5. `lsh_candidates(vectors, bucket_length, num_tables)`: every pair
+       `BucketedRandomProjectionLSH` proposes (threshold 2.0, seed 42),
+       as `file, neighbour, distance`, without self pairs.
+    6. `lsh_neighbours(candidates)`: the best candidate per file.
+    7. `recall_at_1(vectors, exact, approx)`: the fraction of files
+       whose LSH neighbour is as similar as the exact best (within
+       1e-6), counting files LSH found nothing for as misses.
+
+    The harness checks the vector shapes and sums, that the gray and
+    colour checkerboards match and the red mug lands in the red cell,
+    compares your exact neighbours with a NumPy search on the driver,
+    then runs LSH twice per kind (width 0.05 with one table, width 0.1
+    with five) and checks that the wider setting compares more pairs,
+    the narrow one misses something, and the wider one finds at least
+    95 percent.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Images: spark.read.format('image').load(folder).filter('image.nChannels > 0'), then a @F.pandas_udf('array<float>') over image.data and image.nChannels. Exact: crossJoin two renamed copies, filter file != neighbour, F.call_function('vector_cosine_similarity', 'a', 'b'), then row_number over Window.partitionBy('file').orderBy(F.desc('cosine'), 'neighbour'). LSH: model.approxSimilarityJoin(hashed, hashed, 2.0) and select F.col('distCol').alias('distance')."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - A **feature vector** is a fixed-length list of numbers; store it
+      as `array<float>`, convert to an MLlib vector with
+      `array_to_vector` (3.1) when an estimator needs one (never a NULL
+      array).
+    - **Features need units** that do not depend on how a file was
+      produced: pixel fractions, B, G, R order handled, gray and alpha
+      handled; frequency bands in hertz from the file's own sample rate.
+    - A histogram is **not a fingerprint**: use a content hash for exact
+      duplicates.
+    - **Normalize to length 1**, and cosine and Euclidean distance rank
+      neighbours the same way. Column scaling (`StandardScaler`,
+      defaults `withStd=True`, `withMean=False`) matters when features
+      have different units.
+    - Spark 4.2's **vector functions** (`vector_cosine_similarity`,
+      `vector_l2_distance`, `vector_normalize`, `vector_avg`, ...) take
+      `array<float>` only, have no Python wrappers (use
+      `F.call_function`), return NULL for zero vectors, and overflow in
+      4.2.0 for huge values (SPARK-58544, fixed in 4.3.0).
+    - **Exact search** is a self join (a `BroadcastNestedLoopJoin`), a
+      score and a window with a tie-breaker; it is quadratic, and it is
+      your ground truth on a sample.
+    - **`BucketedRandomProjectionLSH`** needs an explicit
+      `bucketLength`, one model per vector length, and unit vectors for
+      cosine-like search. `approxNearestNeighbors` can return fewer than
+      `k` rows; `approxSimilarityJoin` keeps pairs with distance below
+      the threshold. On Connect, `distCol` is ignored.
+    - **Measure recall and work** against the exact answer; prefer more
+      tables over wider buckets.
+
+    Next: **Deduplication and Entity Resolution**, where the things to
+    match are customer records from several systems, and finding pairs
+    is only the first step towards one record per real person.

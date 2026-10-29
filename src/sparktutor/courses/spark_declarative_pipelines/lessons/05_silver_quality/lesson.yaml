@@ -74,7 +74,16 @@
     resolves the input eagerly, at registration time, before the
     pipeline's own datasets exist in the catalog. Operations such as
     `select`, `where`, `withColumn`, `join` and window functions are
-    resolved later and work fine.
+    resolved later and register fine.
+
+    `withColumn` has a different 4.2.0 problem of its own (SPARK-59663,
+    open): once the upstream table already exists, on a **second** run
+    against a persistent catalog, a `withColumn` anywhere in a flow that
+    reads a pipeline dataset drops the dependency on it. The flow can
+    run before its input refreshes and silently read the old data. A
+    single run (what SparkTutor does) is not affected. In pipelines you
+    run repeatedly, add columns with `select("*", expr.alias("name"))`
+    instead of `withColumn`.
 
     The window pattern avoids it, and it is more explicit about *which*
     duplicate wins:

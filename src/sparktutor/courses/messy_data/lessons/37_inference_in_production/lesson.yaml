@@ -1,0 +1,724 @@
+- Class: meta
+  Lesson: "Model Inference in Production"
+  EstimatedMinutes: 65
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    "Running a Model over Your Data with pandas UDFs" got a model onto
+    the executors: the iterator form to load it once per task,
+    `mapInPandas` for whole-batch scoring, and a list of surprises (a
+    filter on a UDF's output runs the UDF twice, a global cache in your
+    script resets for every task, `mapInPandas` drops extra columns
+    silently, nullable integers arrive as `float64`). Its LLM sketch
+    ended with what it left out. This lesson is that list.
+
+    In production the model is often **not on the executor at all**: it
+    is a service behind an HTTP API (a hosted model, an LLM provider, an
+    internal classifier, a geocoder). Every call costs time or money,
+    the service fails in several different ways, and Spark, as you saw,
+    may run your code more than once. The job has to stay correct and
+    cheap anyway.
+
+    By the end of this lesson you will be able to:
+
+    - Cache results by a **content hash** and the **model version**, so
+      a rerun only pays for new inputs and a new model recomputes
+      everything
+    - Find new work with a **left anti join** against a result table and
+      a dead-letter table
+    - Call a service from `mapInPandas` with **one client per
+      partition**, **batched requests** and a **client-side rate
+      limit**, and explain with numbers why a UDF per row is worse
+    - Retry the failures that can heal (429, 5xx, timeouts, per-item
+      "busy") with **exponential backoff and jitter**, and send the ones
+      that cannot to a **dead-letter table**
+    - Use an **idempotency key** so that a retry after a timeout is not
+      paid twice, and write results **once** so Spark's re-evaluation is
+      not paid twice either
+    - Avoid a 4.2.0 hang with plain Python UDFs over Parquet columns
+      (SPARK-58241)
+    - Train or apply one model per group with `applyInPandas`, and say
+      what stage-level scheduling (GPUs, resource profiles) can and
+      cannot do in local mode
+    - Validate structured LLM answers with `try_parse_json` and
+      `try_variant_get`
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Think of the service as a translation agency you pay per page. You
+    would not send pages one envelope at a time, you would not resend a
+    page they already translated because your mailroom lost the receipt,
+    and you would keep a binder of finished translations so next month
+    you only send the new pages. When the agency says "too busy, try
+    later", you wait a bit longer each time instead of hammering their
+    door. That is this lesson, with Spark doing the mailroom.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Setup: a Service That Misbehaves
+
+    The data is the support inbox from "Running a Model over Your Data
+    with pandas UDFs": 240 tickets in
+    `data/messy/support_tickets/inbox/`. The model is a remote
+    classifier. The exercise file contains a small HTTP server,
+    `FakeClassifier`, that the harness starts on `127.0.0.1` with a
+    free port, and every executor (in local mode, a process on your
+    machine) can reach it. It answers `POST /v1/classify` with one
+    result per item, and it fails the way real services fail:
+
+    | Behaviour | What the client sees | Heals on retry? |
+    |---|---|---|
+    | more than 16 requests in a second | HTTP 429 with `Retry-After: 0.5` | yes, after waiting |
+    | more than 20 items in a request | HTTP 413 | no |
+    | an item whose text has no letters | per-item `{"error": "no text", "retryable": false}` | no |
+    | about one key in seven, first time | per-item `{"error": "model busy", "retryable": true}` | yes |
+    | about one request in five | the answer arrives after 1 second | yes, if you retry with the same idempotency key |
+
+    The last row is the nasty one: the service *did the work*, but the
+    client gave up waiting (its timeout is 0.5 seconds). A naive retry
+    pays for the same work twice.
+
+    The exercise also gives you a small `ServiceClient` (one keep-alive
+    `http.client` connection; it raises `RetryableError` for 429, 5xx,
+    timeouts and resets, and `PermanentError` for other 4xx), a
+    `RateLimiter`, `backoff_seconds` and `idempotency_key`. Everything
+    in this lesson runs with the standard library: no network, no keys.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Content Keys: Never Pay Twice for the Same Input
+
+    The first rule of expensive inference: **the cache key is the
+    content**, not the row id. Two tickets with the same text get the
+    same answer, so hash the text:
+
+    ```python
+    keyed = tickets.withColumn("key", F.sha2(F.coalesce(F.col("text"), F.lit("")), 256))
+    print(tickets.count(), keyed.select("key").distinct().count())
+    keyed.groupBy("key").agg(F.count("*").alias("tickets"), F.first("text").alias("text")) \
+         .filter("tickets > 1").select("tickets", "text").show()
+    ```
+
+    ```text
+    240 232
+    +-------+----+
+    |tickets|text|
+    +-------+----+
+    |      3|    |
+    |      3|  ?!|
+    |      2| ...|
+    |      4|NULL|
+    +-------+----+
+    ```
+
+    240 tickets, 232 distinct inputs. Here the duplicates are junk; in
+    a real inbox they are template e-mails, retries of a web form, the
+    same product photo uploaded by many sellers, and the savings are
+    large.
+
+    Design points:
+
+    - **Hash exactly what the model sees.** If you clean text before
+      sending it, hash the cleaned text; otherwise two inputs that the
+      model cannot tell apart get two keys. `coalesce(text, "")` makes
+      NULL and empty one input, on purpose (the model gets the same
+      thing either way).
+    - **Keep the model version next to the key**, not inside it. The
+      cache table has `key, model_version, label, ...`; a lookup asks
+      for "this key **with this version**". Rolling out `kw-2` then
+      recomputes everything without touching the `kw-1` rows, which you
+      keep for comparison or rollback.
+    - SHA-256 (`sha2(col, 256)`, Spark 1.5) is overkill for collisions
+      and cheap; `xxhash64` (3.0) is faster but 64 bits are too few to
+      trust as an identity across billions of rows.
+
+- Class: mult_question
+  Depth: all
+  Output: "You ship model version kw-2. Your cache table is keyed by sha2(text) alone and already has a row for every text. What happens on the next run?"
+  AnswerChoices: "Nothing is recomputed, so every row keeps its kw-1 answer;Every text is sent to kw-2;Only the texts kw-1 failed on are sent;The job fails because the keys collide"
+  CorrectAnswer: "Nothing is recomputed, so every row keeps its kw-1 answer"
+  Hint: "The lookup must ask for the key and the model version together."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## New Work Is a Left Anti Join
+
+    A **left anti join** keeps the rows on the left that have no match on
+    the right: exactly "inputs we have not answered yet".
+
+    ```python
+    def new_work(keyed, done, model_version):
+        finished = done.filter(F.col("model_version") == model_version).select("key").distinct()
+        return keyed.select("key", "text").dropDuplicates(["key"]).join(finished, "key", "left_anti")
+    ```
+
+    `done` is the result cache **and** the dead-letter table together:
+    an input that failed permanently ("no text") should not be retried
+    on every run. When you fix the cause (a new model that handles empty
+    text, a bug in the request), delete those dead letters or bump the
+    version and they come back as new work.
+
+    On the very first run neither table exists yet, and
+    `spark.read.parquet(path)` on a missing folder fails at once with
+    `[PATH_NOT_FOUND]`. Catch it and use an empty DataFrame with the
+    result schema:
+
+    ```python
+    def read_or_empty(path):
+        try:
+            return spark.read.schema(RESULT_SCHEMA).parquet(path)
+        except Exception:
+            return spark.createDataFrame([], RESULT_SCHEMA)
+    ```
+
+    A table format with a catalog ("Landing Messy Data in Delta Lake")
+    removes that dance: create the table once, empty, then `MERGE` into
+    it by `key` and `model_version`, which also makes the write itself
+    safe to repeat.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    `inputs` has columns `key` and `text`; `cache` has `key` and
+    `model_version`. Create `todo`: the rows of `inputs` whose key has
+    no row in `cache` with `model_version` equal to `"kw-1"`.
+  CorrectAnswer: |
+    todo = inputs.join(cache.filter(F.col("model_version") == "kw-1").select("key"), "key", "left_anti")
+  Hint: "Filter the cache to the version first, then join on key with how='left_anti'."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## One Client per Partition, Not a Request per Row
+
+    The obvious way to call a service is a UDF: one row in, one request
+    out. Here it is against the fake service, with a fresh connection
+    per call and no rate limit, over the 232 inputs on `local[4]`:
+
+    ```python
+    @F.udf("string")
+    def classify_one(key, text):
+        c = ServiceClient(url)
+        try:
+            r = c.classify([{"key": key, "text": text}], MODEL_VERSION, idempotency_key(MODEL_VERSION, [key]))
+            return r[0].get("label") or r[0].get("error")
+        except (RetryableError, PermanentError) as e:
+            return f"ERROR {e}"
+        finally:
+            c.close()
+    ```
+
+    Counting at the service afterwards: **232 requests, 216 of them
+    answered 429** (Too Many Requests), and 221 rows came back as errors
+    (the 216 plus the 5 texts without letters). Four tasks firing requests as fast as they can blew through the
+    service's limit almost at once, and adding retries to this UDF would
+    only make it worse (every row retrying on its own schedule). The
+    same work through `mapInPandas` with a client, a rate limiter and
+    batches of 10 per partition made **34 requests and got no 429 at
+    all**. What the partition-level function buys:
+
+    - **One connection per task**, reused (keep-alive): no TCP and TLS
+      handshake per row, and one place to hold authentication.
+    - **Batching**: 10 items per request instead of 1. Most model
+      APIs accept lists; the per-request overhead dominates small
+      inputs.
+    - **A rate limit you control**: the limiter lives in the task, so
+      it sees every request the task makes.
+    - **Retries with a view of the whole batch**: re-send only the items
+      that failed, together.
+
+    The client is created **inside** the function, at the top. As
+    "Running a Model over Your Data with pandas UDFs" showed, a global
+    in your script is reset for every task anyway, and a client object
+    created on the driver cannot be pickled with its open socket.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Rate Limits Are per Task; Budgets Are Global
+
+    A limiter inside `mapInPandas` limits **one task**. The service sees
+    the sum over every task running at the same time:
+
+    ```text
+    total rate = rate per task x tasks running at once
+    ```
+
+    The exercise repartitions the work to `NUM_TASKS = 4` and allows
+    `REQUESTS_PER_SECOND = 2.0` per task: at most 8 requests per second
+    against a service that allows 16, with headroom for retries. On a
+    cluster, "tasks running at once" is the number of partitions or the
+    number of executor cores, whichever is smaller, so fix it
+    explicitly with `repartition(n)` (or `coalesce(n)`) right before the
+    calls, and derive the per-task rate from the service's budget.
+
+    The `RateLimiter` in the exercise is the simplest token bucket: one
+    request every `1 / rate` seconds. When the service still says 429,
+    respect its `Retry-After` header instead of your own backoff: it
+    knows its load better than you do.
+
+    Even with a limit, a retry storm can happen if every task retries on
+    the same schedule. That is what **jitter** prevents, next.
+
+- Class: mult_question
+  Depth: all
+  Output: "Your mapInPandas function limits itself to 5 requests per second. The job runs 40 tasks at once on the cluster. What rate does the service see?"
+  AnswerChoices: "Up to 200 requests per second;5 requests per second;40 requests per second;It depends only on the batch size"
+  CorrectAnswer: "Up to 200 requests per second"
+  Hint: "Every task has its own limiter."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Retries: What, How Long, How Often
+
+    Sort every failure into one of two bins before writing any retry
+    code:
+
+    - **Retryable**: rate limited (429), server errors (5xx), timeouts,
+      connection resets, and items the service marks
+      `retryable: true` ("model busy"). They may heal.
+    - **Permanent**: bad requests (400, 413, 422), authentication
+      errors, and items marked `retryable: false` ("no text"). Retrying
+      wastes money and time; record them.
+
+    For the retryable ones, wait longer after each attempt
+    (**exponential backoff**) and randomize the wait (**jitter**) so that
+    tasks that failed together do not retry together:
+
+    ```python
+    def backoff_seconds(attempt, base=0.05, cap=2.0):
+        return random.uniform(0, min(cap, base * 2 ** attempt))
+    ```
+
+    After `MAX_ATTEMPTS` (4 here, counting the first) an item gives up
+    and becomes a failure with its last error. The attempt count goes
+    into the output so you can see what the retries cost. From one run
+    of the exercise solution:
+
+    ```text
+    +------+--------+-----+
+    |status|attempts|count|
+    +------+--------+-----+
+    |failed|       1|    2|
+    |failed|       2|    2|
+    |    ok|       1|  167|
+    |    ok|       2|   45|
+    |    ok|       3|   16|
+    +------+--------+-----+
+    ```
+
+    228 of 232 succeeded, 61 of them only thanks to a retry (busy items,
+    and requests whose answer came too late). The 4 failures are the
+    texts without letters, the permanent kind: two of them show 2
+    attempts because the *whole request* they were in timed out once;
+    none was re-sent after the service said "no text".
+
+    Two limits keep retries from hanging a job:
+
+    - A **timeout on every request** (`http.client.HTTPConnection(...,
+      timeout=0.5)` in the exercise). Without one, a service that never
+      answers holds the task forever.
+    - A **cap on attempts** and on the backoff (`cap=2.0` seconds), so a
+      partition has a bounded worst case.
+
+- Class: mult_question
+  Depth: all
+  Output: "The service answers one item in a batch with {\"error\": \"invalid language\", \"retryable\": false}. What should the client do with that item?"
+  AnswerChoices: "Record it as failed for the dead-letter table and not retry it;Retry it with exponential backoff until it succeeds;Retry the whole batch;Drop it silently"
+  CorrectAnswer: "Record it as failed for the dead-letter table and not retry it"
+  Hint: "Permanent errors do not heal; retrying them costs money and time."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Timeouts and Idempotency Keys
+
+    A timeout is not a failure. It means **"I don't know"**: the request
+    may never have arrived, or the service may have done the work and
+    the answer got lost. If the work has a cost (a paid model call) or a
+    side effect (an e-mail sent, a ticket created), a blind retry can do
+    it twice.
+
+    An **idempotency key** is an id the client sends with a request so
+    the service can recognize a repeat. The exercise derives it from the
+    model and the sorted item keys, so a retry of the same items carries
+    the same key:
+
+    ```python
+    def idempotency_key(model, keys):
+        return hashlib.sha256((model + "|" + ",".join(sorted(keys))).encode()).hexdigest()
+    ```
+
+    The fake service stores each answer under its key and returns the
+    stored answer for a repeat, without running the model again. The
+    harness checks the service's own count: after a run with several
+    timeouts, the model ran **exactly once** per input. Many real APIs
+    accept an `Idempotency-Key` header for exactly this reason; when a
+    service does not, make the side effect itself idempotent (an upsert
+    keyed by your content key instead of an insert).
+
+    Derive the key from the **content**, never from `uuid4()` per call
+    and never from the task attempt: a key that changes on retry is not
+    an idempotency key.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Write Once, Then Split
+
+    The results have to go to two places: successes to the cache,
+    failures to the dead-letter table. The natural code calls the
+    service **twice**, because each write is an action and each action
+    runs the plan from the start, including your `mapInPandas`:
+
+    ```python
+    results = work.mapInPandas(make_caller(url), RESULT_SCHEMA)
+    results.filter("status = 'ok'").write.parquet(cache_dir)          # calls the service
+    results.filter("status = 'failed'").write.parquet(dead_dir)       # calls it again
+    ```
+
+    Measured against the fake service, the same 232 inputs:
+
+    | Pattern | HTTP requests |
+    |---|---|
+    | two filtered writes of `results` | 63 |
+    | one write to staging, then split the staged copy | 34 |
+
+    The model ran 228 times in both cases only because the idempotency
+    key turned the second pass into stored answers. Against a service
+    without one, the split writes would have paid twice. This is the
+    re-evaluation that "Why Your Model May Run More Than Once" in
+    "Running a Model over Your Data with pandas UDFs" warned about and
+    "Tuning Python on Spark" measured (a filter on a UDF's output runs
+    it twice, every action recomputes uncached Python), one level up:
+    **anything expensive must be computed once and stored before you
+    branch on it**.
+
+    ```python
+    results.write.mode("overwrite").parquet(staging_dir)
+    staged = spark.read.parquet(staging_dir)
+    staged.filter("status = 'ok'").write.mode("append").parquet(cache_dir)
+    staged.filter("status = 'failed'").write.mode("append").parquet(dead_letter_dir)
+    ```
+
+    Why not `results.cache()`? A cache is a hint: blocks can be evicted
+    under memory pressure, or lost with an executor, and then Spark
+    recomputes them silently, calling the service again. A written file
+    is a fact. Counting `work` before the call (the exercise does, to
+    return how many items it sends) is free: `work` is the input of
+    `mapInPandas`, so its plan does not contain the call at all.
+
+- Class: mult_question
+  Depth: all
+  Output: "results = df.mapInPandas(call_service, schema). You write results.filter('ok') to one table and results.filter('failed') to another. How many times is the service called for each row?"
+  AnswerChoices: "Twice, once per write;Once, Spark shares the result between the writes;Once, because filter is lazy;It depends on spark.sql.shuffle.partitions"
+  CorrectAnswer: "Twice, once per write"
+  Hint: "Each write is an action, and each action runs the plan from the source."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Retries You Do Not Write: Task Retries
+
+    Your retry loop handles the service. Spark has its own retries one
+    level up: when a task fails (a Python exception you did not catch, a
+    lost executor), the scheduler runs the **whole partition** again,
+    from the first row, up to `spark.task.maxFailures` times (4 by
+    default on a cluster). Speculative execution may also run a slow
+    task twice at the same time. Local mode does not retry tasks at all
+    (a failed task fails the job) unless the master is written
+    `local[N,F]`.
+
+    So the requests of a partition can be sent again even when your code
+    is perfect. The design above already survives it:
+
+    - The **idempotency key** makes repeated requests free at the
+      service.
+    - The **output is only written through Spark** (the staging write
+      and the appends), which commits a task's output only when the task
+      succeeds. Never write results to the cache *from inside*
+      `mapInPandas`: a task that fails halfway leaves half its rows
+      behind, and its retry writes them again.
+    - **Catch what you expect** (`RetryableError`, `PermanentError`) and
+      turn it into a row; let only truly unexpected errors fail the
+      task.
+
+    "Determinism, Retries and Fault Injection" in the advanced level
+    forces these retries on purpose and proves the output is identical.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Gotcha: Plain Python UDFs Over Parquet Can Hang in 4.2.0
+
+    The cache is Parquet, so sooner or later you will run a Python
+    function over a column you read back from it. On stock 4.2.0 a
+    plain `@udf` (Arrow-optimized by default) over a vectorized Parquet
+    column can hang forever with no error: SPARK-58241, fixed in 4.2.1
+    and 4.3.0. "Tuning Python on Spark" shows the hang, "How Catalyst
+    Plans Python" measures which query shapes hang, and "The Python
+    Worker Protocol" shows what the worker is waiting for.
+
+    - **Measured** in those lessons on 4.2.0: setting
+      `spark.sql.execution.arrow.pythonUDF.columnarInput.enabled` to
+      `false`, a `pandas_udf`, `useArrow=False`, or a filter between the
+      scan and the UDF all return normally.
+    - **Not a fix:** wrapping the column in an expression.
+      `up(F.trim("text"))` returned in our runs, but "Tuning Python on
+      Spark" shows `col + 0` hanging just like the bare column, so don't
+      count on it.
+    - **Per the JIRA**, `mapInPandas` is not affected; this exercise
+      calls the service from `mapInPandas`, which is why it never meets
+      the hang.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## One Model per Group: applyInPandas
+
+    Sometimes the model is per group: one forecasting model per store,
+    one anomaly threshold per sensor, one classifier per language.
+    `groupBy(...).applyInPandas(func, schema)` (3.0) shuffles the rows so
+    that each group arrives at one call of your function as **one pandas
+    DataFrame**, and your function returns a DataFrame of any length.
+
+    As a tiny example, "train" a keyword model per channel: the three
+    most frequent words for each label, from the labelled inbox:
+
+    ```python
+    def train_channel(pdf: pd.DataFrame) -> pd.DataFrame:
+        rows = []
+        for label, g in pdf.groupby("label"):
+            words = Counter(w for t in g["text"] for w in re.findall(r"[a-z]+", (t or "").lower())
+                            if w not in STOP and len(w) > 2)
+            rows.append({"channel": pdf["channel"].iloc[0], "label": label, "tickets": len(g),
+                         "top_words": [w for w, _ in words.most_common(3)]})
+        return pd.DataFrame(rows)
+
+    models = train.groupBy("channel").applyInPandas(
+        train_channel, "channel string, label string, tickets long, top_words array<string>")
+    ```
+
+    ```text
+    +--------+--------+-------+------------------------------+
+    |channel |label   |tickets|top_words                     |
+    +--------+--------+-------+------------------------------+
+    |chat    |privacy |23     |[data, information, marketing]|
+    |chat    |returns |15     |[size, changed, mind]         |
+    |chat    |shipping|25     |[not, does, shipping]         |
+    ...
+    |web_form|warranty|19     |[warranty, one, year]         |
+    +--------+--------+-------+------------------------------+
+    ```
+
+    The plan shows the price:
+
+    ```text
+    +- FlatMapGroupsInPandas [channel#1], train_channel(...), [channel#25, label#26, tickets#27L, top_words#28]
+       +- Sort [channel#1 ASC NULLS FIRST], false, 0
+          +- Exchange hashpartitioning(channel#1, 4), ENSURE_REQUIREMENTS, [plan_id=198]
+    ```
+
+    - **A shuffle and a sort** bring each group together.
+    - **With the `pd.DataFrame -> pd.DataFrame` form, a whole group lives
+      in memory at once**: the PySpark docstring warns of "the potential
+      OOM risk if data is skewed and certain groups are too large to fit
+      in memory". One giant store (or the `NULL` group) can sink the
+      job; check group sizes first with `groupBy(...).count()`.
+    - **4.1 added an iterator form** (`Iterator[pd.DataFrame] ->
+      Iterator[pd.DataFrame]`, or with the key first,
+      `(key, Iterator[pd.DataFrame])`), which receives each group in Arrow
+      batches. With `maxRecordsPerBatch` set to 25, the chat group
+      (84 tickets) arrived as batches of `[25, 25, 25, 9]` instead of one
+      DataFrame of 84. Use it when your per-group work can be done
+      incrementally (running sums, streaming updates to a model); a
+      model that needs all rows at once still needs them in memory.
+    - The function sees the grouping key in its DataFrame; the result
+      columns are matched by name, as with `mapInPandas`.
+    - Store the per-group models (as here, as rows) and apply them with a
+      join; do not retrain them in every scoring job.
+
+- Class: mult_question
+  Depth: all
+  Output: "Your applyInPandas job fails with an out-of-memory error in one task while all others finish quickly. What is the most likely cause?"
+  AnswerChoices: "One group is much larger than the others, and a whole group must fit in memory;spark.sql.execution.arrow.maxRecordsPerBatch is too high;The function returns too few columns;applyInPandas does not support string keys"
+  CorrectAnswer: "One group is much larger than the others, and a whole group must fit in memory"
+  Hint: "applyInPandas hands each group to your function as a single pandas DataFrame."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## GPUs and Resource Profiles (Mention Only)
+
+    A local model on a GPU needs executors with GPUs and tasks that ask
+    for them. Spark's **stage-level scheduling** lets one stage of a job
+    request different resources from the rest: build a
+    `ResourceProfile` with `ResourceProfileBuilder`,
+    `ExecutorResourceRequests` and `TaskResourceRequests` (for example
+    `TaskResourceRequests().cpus(2).resource("gpu", 1)`), and pass it as
+    `profile=` to `mapInPandas` or `mapInArrow` (both accept it in 4.2).
+
+    It needs a cluster manager. In local mode on 4.2.0 both forms fail
+    at once:
+
+    ```text
+    SparkException: TaskResourceProfiles are only supported for Standalone, Yarn and
+    Kubernetes cluster for now when dynamic allocation is disabled.
+
+    SparkException: ResourceProfiles are only supported on YARN and Kubernetes and
+    Standalone with dynamic allocation enabled.
+    ```
+
+    (the first for a task-only profile, the second for one that also
+    asks for executor resources). On a real cluster you also need GPU
+    discovery (`spark.executor.resource.gpu.amount` and a discovery
+    script) and a model that pins itself to the GPU it was assigned
+    (`TaskContext.get().resources()["gpu"]`). For a remote service, none
+    of this applies: the service owns the hardware, and your job owns the
+    rate.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Structured Answers From an LLM (Ungraded)
+
+    An LLM extraction job is the same pipeline with a prompt in the
+    request and JSON in the answer: content key over **prompt template
+    version plus input**, model version in the cache, batched calls with
+    retries, and a dead-letter table. The new part is that the answer is
+    text that *should* be JSON and often is not. Validate it in Spark,
+    after the call, with the VARIANT functions from "VARIANT Basics:
+    Profiling and Nested Data" (all 4.0):
+
+    ```python
+    LABELS = ["shipping", "returns", "warranty", "privacy"]
+    v = answers.withColumn("v", F.try_parse_json("answer"))
+    label = F.try_variant_get("v", "$.label", "string")
+    checked = v.select("ticket_id",
+        F.lower(F.trim(label)).alias("label"),
+        F.try_variant_get("v", "$.order_id", "bigint").alias("order_id"),
+        F.when(F.col("v").isNull(), "not json")
+         .when(label.isNull(), "no label")
+         .when(~F.lower(F.trim(label)).isin(LABELS), "unknown label")
+         .alias("problem"))
+    ```
+
+    ```text
+    +---------+--------+--------+-------------+
+    |ticket_id|label   |order_id|problem      |
+    +---------+--------+--------+-------------+
+    |I0001    |warranty|NULL    |NULL         |
+    |I0002    |NULL    |NULL    |not json     |
+    |I0003    |warranty|1301    |NULL         |
+    |I0004    |billing |1301    |unknown label|
+    |I0005    |NULL    |77      |no label     |
+    |I0006    |NULL    |NULL    |not json     |
+    +---------+--------+--------+-------------+
+    ```
+
+    The six answers were: valid JSON; `Sure! Here is the JSON:
+    {"label": "shipping"}`; `{"label": "Warranty ", "order_id":
+    "1301"}`; a label outside the list; JSON without a label; and no
+    answer at all (NULL).
+
+    - `try_parse_json` returns NULL instead of failing on text that is
+      not JSON, which is how chatter around the JSON becomes a countable
+      problem.
+    - `try_variant_get` casts on the way out and returns NULL when it
+      cannot: the string `"1301"` became the number 1301, while
+      `"1301x"` gives NULL. Its strict sibling `variant_get` fails the
+      job with `[INVALID_VARIANT_CAST] The variant value "1301x" cannot
+      be cast into "BIGINT". Please use try_variant_get instead.`
+    - `schema_of_variant(v)` per row (`OBJECT<label: STRING, order_id:
+      STRING>` for `I0003`) is a quick way to profile what the model
+      actually returns across thousands of answers.
+    - Rows with a `problem` go to the dead-letter table **with the
+      answer**, and can be retried with a repair prompt ("your previous
+      answer was not valid JSON; answer only with ..."). Count them per
+      model version: the rate of invalid answers is a quality metric of
+      the model.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: A Rerunnable Inference Job
+
+    The service (`FakeClassifier`), the client, the limiter,
+    `backoff_seconds` and `idempotency_key` are written for you.
+    Implement:
+
+    1. `with_content_key(tickets)`: add `key`, the SHA-256 of the text
+       (NULL as `""`).
+    2. `new_work(keyed, done, model_version)`: distinct `key, text` not
+       yet done for this version (left anti join).
+    3. `make_caller(url, ...)`: the `mapInPandas` function: one client
+       and one limiter per partition, chunks of `BATCH_SIZE`, the
+       idempotency key on every request, retries with backoff for
+       retryable failures up to `MAX_ATTEMPTS`, and one `RESULT_SCHEMA`
+       row per item with `status`, `attempts` and `error`.
+    4. `run_inference(spark, tickets, url, cache_dir, dead_letter_dir,
+       staging_dir, model_version)`: find new work, call the service,
+       write once to staging, then append `ok` rows to the cache and
+       `failed` rows to the dead-letter table; return how many items
+       were sent.
+    5. `labelled_tickets(spark, tickets, cache_dir, model_version)`:
+       every ticket with its cached label.
+
+    The harness starts the service and checks: the content keys, that
+    new work ignores other model versions, that run 1 sends every
+    distinct text once, that only the texts without letters are dead
+    letters and none of them was re-sent, that the service never
+    answered 429 and never got more than 10 items in one request, that
+    busy items were retried, that the model ran exactly once per input
+    despite the timeouts, that run 2 sends only the 10 new tickets, and
+    that a new model version recomputes everything with the right labels.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "In call(batches): client = ServiceClient(url) and limiter = RateLimiter(rate) before the loop; for each chunk: attempts += 1, limiter.wait(), client.classify(items, model_version, idempotency_key(model_version, chunk)). On RetryableError sleep e.retry_after or backoff_seconds(attempt) and put the chunk back while attempts remain. Yield pd.DataFrame with attempts as pd.array(..., dtype='int32'). In run_inference write results once to staging_dir and split the copy you read back."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - **Cache by content**: `sha2` of exactly what the model sees, with
+      the **model version** stored next to it. A rerun pays only for new
+      inputs; a new version recomputes everything.
+    - **New work** is a left anti join against the cache and the
+      dead-letter table for the current version.
+    - **Call services from `mapInPandas`** with one client per
+      partition, batched requests and a per-task rate limit; the service
+      sees `rate x concurrent tasks`. A UDF per row made 232 requests and
+      got 216 rate-limit errors; the partition version made 34 and got
+      none.
+    - **Retry what can heal** (429 with `Retry-After`, 5xx, timeouts,
+      per-item retryable errors) with exponential backoff and jitter, a
+      timeout on every request and a cap on attempts; send the rest to a
+      **dead-letter table** with the error.
+    - A timeout means "unknown": an **idempotency key** derived from the
+      content makes the retry free.
+    - **Write once, then split**: two writes of the same `mapInPandas`
+      result call the service twice; a cache is a hint, a file is a
+      fact. Never write results from inside the function.
+    - On 4.2.0, a plain `@udf` over a Parquet column can hang
+      (SPARK-58241, fixed in 4.2.1): turn off
+      `spark.sql.execution.arrow.pythonUDF.columnarInput.enabled`, or use
+      a pandas UDF or `mapInPandas`. Wrapping the column in an
+      expression is not a reliable fix.
+    - **`applyInPandas`** runs one model per group, at the price of a
+      shuffle and a whole group in memory. Stage-level scheduling (GPUs)
+      needs a cluster manager, not local mode.
+    - **LLM answers** are validated in Spark with `try_parse_json` and
+      `try_variant_get`; invalid answers are dead letters with a reason.
+
+    Next: **Capstone: An Unstructured Ingestion Source and a Catalog
+    Pipeline**, the last lesson of the intermediate level, where the
+    pieces of this level come together in one source and one pipeline.

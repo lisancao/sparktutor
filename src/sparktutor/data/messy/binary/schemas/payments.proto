@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package shop;
+
+enum Method {
+  METHOD_UNSPECIFIED = 0;
+  CARD = 1;
+  CASH = 2;
+  GIFT_CARD = 3;
+}
+
+message Payment {
+  string payment_id = 1;
+  string order_id = 2;
+  int64 amount_cents = 3;
+  Method method = 4;
+  repeated string flags = 5;
+  optional string note = 6;
+}

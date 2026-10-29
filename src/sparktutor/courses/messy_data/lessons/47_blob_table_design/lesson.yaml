@@ -1,0 +1,635 @@
+- Class: meta
+  Lesson: Designing Tables for Blobs
+  EstimatedMinutes: 70
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    "Files as Files: binaryFile, Globs and Metadata" and "Images and
+    Audio" read unstructured files into DataFrames, "Landing Messy Data
+    in Delta Lake" put messy records into Delta tables (MERGE, time
+    travel, history), "Memory, Spill and Very Large Files" showed what
+    big binary values do to a Spark job, and "Parquet from the Inside"
+    showed how a column chunk is laid out on disk. This lesson puts those
+    together into one design question: **how do you store unstructured
+    data in tables** so that it stays cheap to query, correct when the
+    sources change, and deletable when someone asks you to forget a
+    file?
+
+    By the end you will be able to:
+
+    - Choose between inline bytes and pointers for each blob, and explain
+      what each choice does to Parquet files, row groups and queries
+    - Build a content-addressed catalog (hash as key) that de-duplicates
+      and re-ingests idempotently with `MERGE`
+    - Use the Delta Lake 4.4.1 features that matter for media tables,
+      each verified on Spark 4.2: deletion vectors, row tracking, liquid
+      clustering, `OPTIMIZE`, `VACUUM` and its retention check, column
+      mapping, `DESCRIBE DETAIL`
+    - Keep derived artifacts (dimensions, extracted text, embeddings)
+      consistent with their sources, keyed by hash and versioned
+    - Delete a source file end to end, and prove that no copy of its
+      bytes is left in any data file
+
+    Every example runs with `# spark-connectors: delta` (Delta 4.4.1 for
+    Spark 4.2). Outside SparkTutor, the same session comes from
+    `spark-submit --packages io.delta:delta-spark_4.2_2.13:4.4.1` with
+    `spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension` and
+    `spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog`.
+    Always read with `.format("delta")`: a Delta folder read as plain
+    Parquet silently returns deleted and superseded rows.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Inline Bytes or Pointers
+
+    A blob can live **in** the table (a `BINARY` column) or **next to**
+    it (a path or URI in a `STRING` column, the bytes in object storage).
+    The trade-off is mostly physics:
+
+    | | Inline `BINARY` | Pointer to object storage |
+    |---|---|---|
+    | Atomic with the row | yes, one commit | no, two systems to keep in sync |
+    | Readable by any engine | yes | only if it can reach the store |
+    | Table file sizes | grow with the blobs | stay small |
+    | Row groups | a few rows each | thousands of rows |
+    | Delete for good | rewrite the file, then vacuum | delete the object |
+    | Re-reading content | Parquet decoding | a plain GET, range reads possible |
+
+    Measure the Parquet side yourself. Forty random 1 MB blobs, one file:
+
+    ```python
+    rng = random.Random(1)
+    blobs = [(i, f"img{i}.bin", bytes(rng.getrandbits(8) for _ in range(1_000_000))) for i in range(40)]
+    spark.createDataFrame(blobs, "id int, uri string, content binary").coalesce(1) \
+        .write.format("delta").save(t)
+    f = glob.glob(t + "/*.parquet")[0]
+    md = pq.ParquetFile(f).metadata
+    print("file", os.path.getsize(f), "row groups", md.num_row_groups,
+          [md.row_group(i).num_rows for i in range(md.num_row_groups)])
+    c = md.row_group(0).column(2)
+    print(c.path_in_schema, c.total_compressed_size, c.statistics.has_min_max if c.statistics else None)
+    ```
+
+    ```text
+    file 40003417 row groups 1 [40]
+    content 40002032 False
+    ```
+
+    Forty rows make one 40 MB row group, and 99.99% of the file is one
+    column chunk. Three consequences:
+
+    - **Queries that don't need the bytes are still cheap**, as long as
+      they don't select `content`: column pruning skips the whole chunk.
+      `spark.read.format("delta").load(t).select("uri").explain()` shows
+      `ReadSchema: struct<uri:string>` on the Delta scan. Put cheap metadata
+      columns next to the blob and never `SELECT *` on a media table.
+    - **Parallelism collapses.** A row group is the unit of a Parquet
+      split ("Parquet from the Inside"), so one 128 MB row group of
+      images is one task, however many cores you have.
+    - **Random binary doesn't compress** (40 MB of content, 40 MB on
+      disk), and binary columns get no min/max statistics, so the blob
+      column can never help skipping.
+
+    The usual answer is a threshold: inline small files (icons, short
+    text, thumbnails) where atomicity is worth it, pointers above it.
+    This lesson uses 64 KiB. Blobs above it go to a **content-addressed
+    store**: a folder (or bucket) where each object's name is its
+    SHA-256, `cas/<first 2 hex>/<hash>`.
+
+- Class: mult_question
+  Depth: all
+  Output: "A media table stores 2 MB images inline with Parquet's default 128 MB row groups. A query counts images per media_type. What does it read?"
+  AnswerChoices: "Only the media_type column chunks, because of column pruning;Every image, because blobs can't be pruned;Only the footer, because counts come from statistics;Every row group's content chunk once, then caches it"
+  CorrectAnswer: "Only the media_type column chunks, because of column pruning"
+  Hint: "Parquet stores each column of a row group in its own chunk, and Spark asks only for the columns the query uses."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Content Addressing
+
+    Key every blob by the hash of its bytes, not by its path:
+
+    - **De-duplication is free.** The same logo uploaded under five names
+      is one blob row and one stored object.
+    - **Writes are idempotent.** Re-ingesting a folder computes the same
+      hashes; a `MERGE ... WHEN NOT MATCHED THEN INSERT` finds them all
+      and inserts nothing.
+    - **Derived data has a stable key.** A thumbnail or an embedding of
+      hash `ab12...` is valid for any path that has those bytes, and
+      becomes stale only when the bytes change, which changes the hash.
+    - **Integrity is checkable.** Recompute the hash of a stored object
+      and compare it with its name.
+
+    Paths still matter (people delete files, not hashes), so keep two
+    tables: `blobs` (one row per distinct content) and `sources` (one row
+    per path, pointing at a hash). The design:
+
+    ```text
+    sources  (uri, content_hash, size)                 one row per file path
+        |
+        v
+    blobs    (content_hash, media_type, size,          one row per distinct content
+              content  -- inline, or NULL
+              blob_uri -- cas/<h[:2]>/<h>, or NULL)
+        |
+        v
+    derived  (content_hash, artifact, extractor, value) one row per artifact and extractor version
+    ```
+
+    `sha2(content, 256)` computes the hash in Spark; for files too large
+    to read as one value ("Memory, Spill and Very Large Files"), hash
+    them in chunks where they are written and store the result.
+
+    One MERGE rule bites immediately. A batch that contains the same
+    content twice (two paths, same bytes) must be de-duplicated before
+    it is merged, or a `WHEN MATCHED` clause fails:
+
+    ```python
+    spark.createDataFrame([("h1", 1)], "h string, v int").write.format("delta").save(t5)
+    src = spark.createDataFrame([("h1", 2), ("h1", 3), ("h2", 4), ("h2", 5)], "h string, v int")
+    src.createOrReplaceTempView("src")
+    spark.sql(f"MERGE INTO delta.`{t5}` t USING src s ON t.h = s.h "
+              "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *")
+    ```
+
+    ```text
+    UnsupportedOperationException [DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW_IN_MERGE] Cannot perform Merge as multiple source rows matched and attempted to modify the same ...
+    ```
+
+    And an insert-only MERGE has the opposite trap: it does **not**
+    check duplicates among the rows it inserts. Merging only the two
+    `h2` rows inserted both:
+
+    ```text
+    [Row(h='h1', v=1), Row(h='h2', v=4), Row(h='h2', v=5)]
+    MERGE {'numTargetRowsInserted': '2', 'numSourceRows': '2', ...}
+    ```
+
+    So `dropDuplicates(["content_hash"])` before every blob MERGE.
+
+- Class: mult_question
+  Depth: all
+  Output: "Two paths in one ingest batch have identical bytes. The blobs MERGE has only a `WHEN NOT MATCHED THEN INSERT` clause and the source is not de-duplicated. What happens?"
+  AnswerChoices: "Both rows are inserted and the hash is no longer unique;Delta raises DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW_IN_MERGE;Delta keeps the first row;The MERGE is retried until one row remains"
+  CorrectAnswer: "Both rows are inserted and the hash is no longer unique"
+  Hint: "The multiple-match error is about source rows matching the same target row. New rows match nothing."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## A Media Table in Delta 4.4.1
+
+    Create the blobs table with the features this lesson relies on, then
+    ask Delta what it built:
+
+    ```python
+    spark.sql(f"""CREATE TABLE delta.`{t}` (content_hash STRING, media_type STRING, size BIGINT, content BINARY, uri STRING)
+      USING delta CLUSTER BY (content_hash)
+      TBLPROPERTIES ('delta.enableDeletionVectors'='true', 'delta.enableRowTracking'='true', 'delta.columnMapping.mode'='name')""")
+    d = spark.sql(f"DESCRIBE DETAIL delta.`{t}`").first().asDict()
+    for k in ["format", "numFiles", "sizeInBytes", "clusteringColumns", "minReaderVersion", "minWriterVersion", "tableFeatures"]:
+        print(k, d.get(k))
+    ```
+
+    ```text
+    format delta
+    numFiles 0
+    sizeInBytes 0
+    clusteringColumns ['content_hash']
+    minReaderVersion 3
+    minWriterVersion 7
+    tableFeatures ['appendOnly', 'clustering', 'columnMapping', 'deletionVectors', 'domainMetadata', 'invariants', 'rowTracking']
+    ```
+
+    Reader version 3 and writer version 7 mean "table features": a
+    reader must support every listed feature, so older Delta readers
+    and some other engines can't open this table. Enable what you use,
+    not everything. What each one buys a media table:
+
+    - **Liquid clustering** (`CLUSTER BY`): `OPTIMIZE` lays files out by
+      the clustering columns, so a lookup by hash reads one file. It is
+      the alternative to Hive-style partitioning (a table can't have
+      both: `PARTITIONED BY` with `CLUSTER BY` is a `ParseException`),
+      and you can change the columns later
+      (`ALTER TABLE ... CLUSTER BY (uri)` worked on 4.4.1).
+    - **Deletion vectors**: `DELETE`, `UPDATE` and `MERGE` mark rows as
+      deleted in a small side file instead of rewriting a 128 MB file of
+      images. Fast, and a trap for deletion, as you'll see.
+    - **Row tracking**: stable row ids and commit versions, readable as
+      `_metadata.row_id` and `_metadata.row_commit_version`, which give
+      lineage ("which ingest wrote this row?") without your own columns.
+    - **Column mapping** (`'name'` mode): Parquet columns get physical
+      names, so `RENAME COLUMN` and `DROP COLUMN` are metadata-only.
+
+    Load the sample files (every file under `data/messy`) with
+    `binaryFile`:
+
+    ```python
+    files = spark.read.format("binaryFile").option("recursiveFileLookup", "true").load("data/messy")
+    cat = files.select(sf.sha2("content", 256).alias("content_hash"), sf.lit("x").alias("media_type"),
+                       sf.col("length").alias("size"), "content", sf.col("path").alias("uri"))
+    cat.write.format("delta").mode("append").save(t)
+    ```
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What the Log Records About Blobs
+
+    Open the commit that added the files (`_delta_log/00000000000000000001.json`).
+    Each `add` action carries per-file statistics; this is one, from the
+    run behind this lesson:
+
+    ```text
+    {"add":{"path":"5h/part-00000-48228e87-...-c000.snappy.parquet","size":56289,
+     "stats":"{\"numRecords\":32,
+       \"minValues\":{\"col-6300247c-...\":\"03505f0117ceae57079104178b196847\",
+                      \"col-62c177c1-...\":1072,
+                      \"col-b84e968d-...\":\"file:/tmp/sparktutor_5umccve8/da\", ...},
+       \"maxValues\":{\"col-6300247c-...\":\"f5d65693d8e9ffae7dfe2c0b9d265106\", ...},
+       \"nullCount\":{..., \"col-f633c139-...\":0, ...},
+       \"tightBounds\":true}",
+     "baseRowId":0,"defaultRowCommitVersion":1}}
+    ```
+
+    Read it like a footer:
+
+    - Columns appear by **physical name** (`col-<uuid>`), the effect of
+      column mapping. Renaming `uri` changes only the table metadata.
+    - The 64-character hashes and the paths are **truncated to 32
+      characters** in min/max. Skipping by hash still works (the prefix
+      is enough to exclude most files), it just can't be exact.
+    - The `content` column (`col-f633...`) has a null count and **no
+      min/max**, like the Parquet statistics of a binary column.
+    - `baseRowId` and `defaultRowCommitVersion` are row tracking: row ids
+      for this file start at 0, and its rows were written by version 1.
+    - The data file sits in a short random folder (`5h/`). Testing
+      tables with and without each feature, that came from column
+      mapping, not from clustering:
+
+      ```text
+      cm False ['Ei', 'QG']
+      cm True ['fd', 'tm']
+      plain False ['part-00000-b64c63da-...-c000.snappy.parquet', 'part-00001-...']
+      plain True ['part-00000-f415456d-...-c000.snappy.parquet', 'part-00001-...']
+      ```
+
+      Don't write tooling that expects data files at the table root.
+
+    Column mapping is also what makes renames possible at all. Without
+    it:
+
+    ```text
+    AnalysisException [DELTA_UNSUPPORTED_RENAME_COLUMN] Column rename is not supported for your Delta table.
+    ```
+
+    With it, `ALTER TABLE ... RENAME COLUMN uri TO source_uri` succeeds
+    and the columns read back as
+    `['content_hash', 'media_type', 'size', 'content', 'source_uri']`.
+    Row tracking shows up the same way:
+
+    ```python
+    spark.read.format("delta").load(t).select("_metadata.row_id", "_metadata.row_commit_version").limit(3).collect()
+    ```
+
+    ```text
+    [Row(row_id=12, row_commit_version=1), Row(row_id=13, row_commit_version=1), Row(row_id=14, row_commit_version=1)]
+    ```
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Deletion Vectors and the Bytes They Leave Behind
+
+    Twenty 2000-byte random blobs in one file, with deletion vectors on.
+    Delete one row, then look for its bytes on disk:
+
+    ```python
+    def files_with(path, needle):
+        hits = []
+        for f in glob.glob(path + "/**/*.parquet", recursive=True):
+            if needle in open(f, "rb").read():
+                hits.append(os.path.relpath(f, path))
+        return hits
+
+    rng = random.Random(7)
+    rows = [(f"id{i}", bytes(rng.getrandbits(8) for _ in range(2000))) for i in range(20)]
+    secret = rows[3][1][:64]
+    spark.createDataFrame(rows, "id string, content binary").coalesce(1).write.format("delta") \
+        .option("delta.enableDeletionVectors", "true").save(t)
+    print("files with secret:", files_with(t, secret))
+    spark.sql(f"DELETE FROM delta.`{t}` WHERE id = 'id3'")
+    print("after DELETE:", files_with(t, secret), spark.read.format("delta").load(t).filter("id='id3'").count())
+    print(sorted(os.listdir(t)))
+    ```
+
+    ```text
+    files with secret: ['part-00000-68b4fd09-6905-437d-bcb6-da02378a28d4-c000.snappy.parquet']
+    after DELETE: ['part-00000-68b4fd09-6905-437d-bcb6-da02378a28d4-c000.snappy.parquet'] 0
+    ['.deletion_vector_f6b8945a-....bin.crc', '.part-00000-....parquet.crc', '_delta_log', 'deletion_vector_f6b8945a-8c87-4591-a601-bd0c3f336612.bin', 'part-00000-68b4fd09-6905-437d-bcb6-da02378a28d4-c000.snappy.parquet']
+    ```
+
+    The row is gone from every query, and its bytes are exactly where
+    they were. `DESCRIBE HISTORY` says why: `numDeletionVectorsAdded: 1`,
+    no files removed. Without deletion vectors, the same DELETE rewrites
+    the file (`numRemovedFiles: 1, numAddedFiles: 1, numCopiedRows: 19`),
+    but the **old file is still on disk** too, kept for time travel.
+
+    Making the bytes disappear takes two more steps:
+
+    ```python
+    spark.sql(f"REORG TABLE delta.`{t}` APPLY (PURGE)")
+    print("after REORG:", files_with(t, secret))
+    spark.conf.set("spark.databricks.delta.retentionDurationCheck.enabled", "false")
+    spark.sql(f"VACUUM delta.`{t}` RETAIN 0 HOURS")
+    print("after VACUUM:", files_with(t, secret))
+    spark.conf.unset("spark.databricks.delta.retentionDurationCheck.enabled")
+    ```
+
+    ```text
+    after REORG: ['part-00000-68b4fd09-6905-437d-bcb6-da02378a28d4-c000.snappy.parquet']
+    Deleted 2 files and directories in a total of 1 directories.
+    after VACUUM: []
+    ```
+
+    `REORG ... APPLY (PURGE)` rewrites files that have deletion vectors
+    into new files without the deleted rows, and removes the old ones
+    **from the log**: they are still on disk until `VACUUM` deletes
+    files that are no longer referenced and older than the retention
+    period. The history of that table reads
+    `WRITE, DELETE, REORG, VACUUM START, VACUUM END`.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## VACUUM and Its Safety Check
+
+    The default retention is 7 days (168 hours). Asking for less fails:
+
+    ```text
+    IllegalArgumentException [DELTA_VACUUM_RETENTION_PERIOD_TOO_SHORT] The specified VACUUM retention period is too low and may corrupt this Delta table if any writes are in progress.
+    ```
+
+    The check exists because a running job (a long query, a stream, a
+    writer that hasn't committed yet) may still read files that the
+    latest version no longer references. Turning it off with
+    `spark.databricks.delta.retentionDurationCheck.enabled=false` is
+    reasonable for a deletion you must complete now on a table you
+    control; on a shared table, run the deletion and wait out the
+    retention instead, or shorten `delta.deletedFileRetentionDuration`
+    deliberately and tell the readers. VACUUM also ends time travel to
+    versions whose files it deleted, which is the point for a deletion
+    request and a loss for everything else.
+
+    `VACUUM ... DRY RUN` lists what would go. On a freshly written table
+    with the default retention it lists nothing: every file is younger
+    than 168 hours.
+
+- Class: mult_question
+  Depth: all
+  Output: "A table has deletion vectors enabled. After `DELETE FROM media WHERE content_hash = 'ab12...'`, where are the deleted image's bytes?"
+  AnswerChoices: "Still in the original Parquet file, masked by a deletion vector file;Removed from the Parquet file in place;Moved into the deletion vector file;Only in the transaction log"
+  CorrectAnswer: "Still in the original Parquet file, masked by a deletion vector file"
+  Hint: "A deletion vector is a bitmap of deleted row positions. Nothing rewrites the data file until REORG ... APPLY (PURGE)."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    The Delta table at path `t` has deletion vectors. Run the one SQL
+    statement that rewrites its files without the rows that deletion
+    vectors mark as deleted (the step before VACUUM).
+  CorrectAnswer: |
+    spark.sql(f"REORG TABLE delta.`{t}` APPLY (PURGE)")
+  Hint: "REORG TABLE delta.`<path>` APPLY (PURGE)"
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Small Files from Continuous Ingestion
+
+    Media arrives a few files at a time: a stream with a short trigger,
+    or a job per upload. Each commit adds at least one file, and each
+    file adds a footer to read and a task to schedule:
+
+    ```python
+    for i in range(12):
+        spark.range(i * 10, i * 10 + 10).withColumn("b", sf.lit(b"x" * 100)).coalesce(1) \
+            .write.format("delta").mode("append").save(t3)
+    print("files", spark.sql(f"DESCRIBE DETAIL delta.`{t3}`").first().numFiles)
+    r = spark.sql(f"OPTIMIZE delta.`{t3}`").first()
+    print(r.metrics.numFilesAdded, r.metrics.numFilesRemoved)
+    print("files", spark.sql(f"DESCRIBE DETAIL delta.`{t3}`").first().numFiles,
+          "on disk", len(glob.glob(t3 + "/*.parquet")))
+    ```
+
+    ```text
+    files 12
+    1 12
+    files 1 on disk 13
+    ```
+
+    `OPTIMIZE` compacted twelve files into one in a new commit; the
+    twelve are still on disk until a VACUUM, and time travel to the old
+    versions still works. `delta.autoOptimize.autoCompact` exists in Delta
+    4.4.1 and does fire: a table with it set to `true` ended 60 one-row
+    appends with 11 files. On a clustered table, `OPTIMIZE` also
+    clusters:
+
+    ```python
+    spark.sql(f"CREATE TABLE delta.`{t2}` (content_hash STRING, size BIGINT) USING delta CLUSTER BY (content_hash)")
+    for i in range(8):
+        spark.range(i * 5000, (i + 1) * 5000).select(
+            sf.sha2(sf.col("id").cast("string"), 256).alias("content_hash"), sf.col("id").alias("size")) \
+            .write.format("delta").mode("append").save(t2)
+    key = spark.sql("select sha2('12345', 256)").first()[0]
+    # files_read() sums the scan's "number of files read" metric, like rows_scanned in "Parquet from the Inside"
+    print("before", spark.sql(f"DESCRIBE DETAIL delta.`{t2}`").first().numFiles,
+          files_read(spark.read.format("delta").load(t2).filter(sf.col("content_hash") == key)))
+    spark.conf.set("spark.databricks.delta.optimize.maxFileSize", 200000)
+    spark.sql(f"OPTIMIZE delta.`{t2}`")
+    print("after", spark.sql(f"DESCRIBE DETAIL delta.`{t2}`").first().numFiles,
+          files_read(spark.read.format("delta").load(t2).filter(sf.col("content_hash") == key)))
+    ```
+
+    ```text
+    before 16 16
+    after 14 1
+    ```
+
+    Before clustering every file holds random hashes, so a lookup reads
+    all 16. After `OPTIMIZE` (with a small target file size so this tiny
+    table makes several files) each file covers a range of hashes and
+    the lookup reads one. That is the right layout for a catalog looked
+    up by hash.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Partitioning Versus Clustering for Media
+
+    Hive-style `partitionBy` writes a folder per value. It is a good fit
+    for a column with few values that nearly every query filters on, and
+    a bad one for everything a media table is usually queried by:
+
+    - **By hash** or by path: one folder per file. Every ingest makes
+      tiny files, and listing the table becomes the bottleneck.
+    - **By media type**: few values, but very uneven sizes. The video
+      partition is huge, the icon partition tiny, and each partition is
+      compacted separately.
+    - **By ingest date**: useful for retention and incremental
+      processing, useless for "find this hash".
+
+    Liquid clustering keeps one flat layout and lets `OPTIMIZE` group
+    rows by up to a few columns, and you can change the columns without
+    rewriting the table first. For a catalog, cluster `blobs` and
+    `derived` by `content_hash` and `sources` by `uri`. If you also need
+    time-based retention, filter on an ingest timestamp column; with
+    clustering on it too, old data stays in its own files.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Derived Artifacts That Stay Consistent
+
+    Thumbnails, extracted text, image dimensions, embeddings: every
+    derived artifact is a function of the **bytes** and of the **code**
+    that computed it. Key it by both:
+
+    ```text
+    derived (content_hash, artifact, extractor, value)
+             ab12...       png_size  headers-v1 32x32
+    ```
+
+    - **New content** gets artifacts by an anti-join: candidates minus
+      what `derived` already has for this extractor version, then an
+      insert-only MERGE. Running it twice adds nothing.
+    - **Changed content** (a file overwritten in place) has a new hash.
+      The `sources` MERGE repoints the path
+      (`WHEN MATCHED AND t.content_hash <> s.content_hash THEN UPDATE`),
+      and the new hash has no artifacts yet, so the anti-join picks it
+      up. Old artifacts belong to the old hash and stay valid for any
+      other path that still has it.
+    - **New code** (`headers-v2`) is a new extractor value: compute it
+      alongside, switch readers, delete the old rows.
+    - **Deleted content** takes its artifacts with it: delete by hash.
+
+    Messy inputs need guards in the extractor. `images/scans/corrupt.png`
+    starts with the PNG signature and then says `not really a png`; an
+    extractor that reads width and height from bytes 17 to 24 without
+    checking for the `IHDR` chunk at bytes 13 to 16 would store garbage
+    dimensions for it.
+
+    Derived columns that are expensive and small (an embedding is a few
+    KB) belong in their own table rather than as columns of `blobs`:
+    recomputing them never rewrites the files that hold the blobs, and
+    their files stay small enough for fast scans.
+
+- Class: mult_question
+  Depth: all
+  Output: "A file at the same path is overwritten with new bytes and re-ingested. Why does the derived table not need an explicit invalidation step?"
+  AnswerChoices: "The new bytes have a new hash, which has no artifacts yet, so the anti-join computes them;Delta's change data feed deletes the old artifacts;The MERGE on sources deletes derived rows automatically;OPTIMIZE recomputes stale artifacts"
+  CorrectAnswer: "The new bytes have a new hash, which has no artifacts yet, so the anti-join computes them"
+  Hint: "Artifacts are keyed by content_hash, not by path."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Forgetting a File, End to End
+
+    A deletion request names a file. With the design above, forgetting
+    it means:
+
+    1. Delete its row from `sources`.
+    2. If another path still points at the same hash, stop: the content
+       is still in use (a second copy of the same logo).
+    3. Otherwise delete the hash from `blobs` and `derived`, and delete
+       the CAS object.
+    4. Purge deletion vectors (`REORG ... APPLY (PURGE)`) on the three
+       tables and `VACUUM ... RETAIN 0 HOURS` (with the retention check
+       off, see above).
+    5. Prove it: scan every Parquet file under the tables for a sample of
+       the bytes.
+
+    Two things this does not cover, and a real system must: copies
+    outside these tables (caches, exports, model training sets), and the
+    transaction log, which stores no blob bytes but does keep paths in
+    `add`/`remove` actions and column statistics (32-character prefixes
+    of `uri`, as you saw) until log cleanup removes old commit files. If
+    a path itself is personal data, don't use it as a column with
+    statistics; store a hash of it.
+
+    A Delta gotcha you will see while doing this: reading a table that
+    has deletion vectors logs
+    `ERROR DeltaParquetFileFormat: Failed to translate filter EqualTo(__delta_internal_is_row_deleted,0)`
+    with Delta 4.4.1 on Spark 4.2. The results are correct (every check
+    in this lesson passes with it in the log); it is noise, not a failed
+    query.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: A Content-Addressed Media Catalog
+
+    The harness copies the sample media (`images`, `audio`, `pdf`,
+    `docs`, `mail`) into an `incoming` folder and adds two random files
+    above the 64 KiB inline limit and a copy of
+    `images/products/red_16x8.png` under another name. Implement:
+
+    1. `create_tables(spark, tables)`: the three Delta tables by path,
+       clustered (`blobs` and `derived` by `content_hash`, `sources` by
+       `uri`), with deletion vectors enabled.
+    2. `scan(spark, root)`: every file as `uri, content_hash, media_type,
+       size, content`, with the media type from magic bytes for PNG, WAV
+       and PDF and from the extension for `.md`, `.txt` and `.eml`.
+    3. `ingest(spark, scanned, tables, cas_root)`: large contents to the
+       CAS (atomically, skipping existing objects), then idempotent
+       MERGEs into `blobs` and `sources`.
+    4. `derive(spark, tables)`: `png_size` (from a real IHDR only) and
+       `wav_rate` for inline blobs, idempotent, with `extractor`.
+    5. `forget(spark, tables, uri, cas_root)`: the end-to-end deletion;
+       return whether the content was removed.
+    6. `compact(spark, table_path)`.
+
+    The harness ingests the media in one batch and the mail one file per
+    commit, re-ingests everything (no table may get a new version that
+    changes rows), compacts `sources` to one file, runs `derive` twice,
+    forgets the duplicate (content must stay), then forgets a PNG and a
+    large file and searches every Parquet file under the tables for
+    their bytes.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Create with CREATE TABLE IF NOT EXISTS delta.`path` (...) USING delta CLUSTER BY (col) TBLPROPERTIES ('delta.enableDeletionVectors' = 'true'). In ingest, dropDuplicates(['content_hash']) before the blobs MERGE, use sf.when(size <= limit, content) for inline bytes, and write CAS files in foreachPartition through a temp name plus os.replace. In forget, check the sources table again after deleting the uri, and finish with REORG TABLE ... APPLY (PURGE) and VACUUM ... RETAIN 0 HOURS on all three tables with spark.databricks.delta.retentionDurationCheck.enabled set to false."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - Inline small blobs, point to large ones. Inline blobs make one
+      huge column chunk per row group, get no statistics, and collapse
+      parallelism; column pruning keeps metadata queries cheap if you
+      never select `content` by accident.
+    - Key content by SHA-256: free de-duplication, idempotent MERGEs,
+      stable keys for derived data. Keep paths in their own `sources`
+      table, and `dropDuplicates` before merging blobs (an insert-only
+      MERGE won't).
+    - Delta 4.4.1 on Spark 4.2: liquid clustering (`CLUSTER BY`, laid
+      out by `OPTIMIZE`, a hash lookup read 1 of 14 files), deletion
+      vectors, row tracking (`_metadata.row_id`), column mapping
+      (physical `col-<uuid>` names, random file prefixes, renames),
+      `DESCRIBE DETAIL` for features and protocol versions.
+    - A DELETE with deletion vectors leaves the bytes in the data file;
+      `REORG ... APPLY (PURGE)` rewrites without them and `VACUUM`
+      deletes the old files, after the 168-hour retention or with
+      `DELTA_VACUUM_RETENTION_PERIOD_TOO_SHORT` disabled deliberately.
+    - Derived artifacts are keyed by hash and extractor version, so new
+      content, changed content and new code are all an anti-join.
+    - Prove deletion by searching the bytes, not by querying the table.
+
+    Next: **Building LSH and an IVF Vector Index**, where the embeddings
+    you would store in a derived table become a searchable index.

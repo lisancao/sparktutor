@@ -1,0 +1,57 @@
+[
+  {
+    "name": "order_id_present",
+    "severity": "error",
+    "check": "order_id IS NOT NULL AND trim(order_id) <> ''"
+  },
+  {
+    "name": "customer_id_present",
+    "severity": "error",
+    "check": "customer_id IS NOT NULL AND trim(customer_id) <> ''"
+  },
+  {
+    "name": "quantity_is_integer",
+    "severity": "error",
+    "check": "try_cast(quantity AS INT) IS NOT NULL"
+  },
+  {
+    "name": "quantity_positive",
+    "severity": "error",
+    "check": "try_cast(quantity AS INT) > 0"
+  },
+  {
+    "name": "unit_price_is_number",
+    "severity": "error",
+    "check": "try_cast(unit_price AS DECIMAL(10,2)) IS NOT NULL"
+  },
+  {
+    "name": "status_allowed",
+    "severity": "error",
+    "check": "lower(trim(status)) IN ('placed', 'shipped', 'cancelled', 'returned')"
+  },
+  {
+    "name": "status_lowercase",
+    "severity": "warn",
+    "check": "status = lower(trim(status))"
+  },
+  {
+    "name": "currency_allowed",
+    "severity": "error",
+    "check": "currency IN ('CAD', 'USD')"
+  },
+  {
+    "name": "order_ts_valid",
+    "severity": "error",
+    "check": "try_to_timestamp(order_ts) IS NOT NULL"
+  },
+  {
+    "name": "order_ts_not_after_file_day",
+    "severity": "error",
+    "check": "to_date(try_to_timestamp(order_ts)) <= _file_date"
+  },
+  {
+    "name": "customer_known",
+    "severity": "error",
+    "check": "_customer_known"
+  }
+]

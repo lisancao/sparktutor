@@ -1,0 +1,492 @@
+- Class: meta
+  Lesson: "VARIANT Basics: Profiling and Nested Data"
+  EstimatedMinutes: 40
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    In "JSON Drift and Quarantine" you tamed drifting JSON with one
+    carefully written schema. That works, but you had to know every shape
+    in advance, and the next drift means editing the schema again.
+    "Complex Types and Higher-Order Functions" then showed how to work
+    with structs and arrays once their shape is declared. VARIANT is the
+    next step: nested data whose shape you do not have to declare at all. **VARIANT** (Spark 4.0)
+    takes the other route: store each record as one semi-structured value,
+    keep everything, and decide how to read it at query time.
+
+    This lesson loads the same drifting events from `data/messy/events/`
+    without writing a field-level schema, and uses VARIANT to find out
+    what is really in them.
+
+    By the end of this lesson you will be able to:
+
+    - Load JSON files straight into a VARIANT column with
+      `singleVariantColumn`, keeping malformed lines (4.1)
+    - Read fields with `:` paths, `::` casts and `try_variant_get`, and
+      know exactly when each returns NULL or fails
+    - Profile which keys and types occur with `variant_explode` (4.0) and
+      `schema_of_variant`
+    - Normalize a field that is sometimes a number, sometimes a string and
+      sometimes an object
+    - Explode arrays nested inside a VARIANT, without losing rows
+
+    If VARIANT is new to you, `spark_4_whats_new` lesson 2 is a good
+    short tour; the next section recaps what you need.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## VARIANT in One Page
+
+    A `VARIANT` value holds any JSON-like data (objects, arrays, strings,
+    numbers, booleans, null) in a compact binary encoding that records the
+    type of every value and where each field lives.
+
+    ```sql
+    SELECT parse_json('{"user": {"id": 7}, "tags": ["a", "b"]}') AS v
+    ```
+
+    - `parse_json(str)` builds one, and fails the query on invalid JSON
+      (`MALFORMED_RECORD_IN_PARSING.WITHOUT_SUGGESTION`).
+      `try_parse_json(str)` returns NULL instead.
+    - `v:user.id` follows a path and returns a VARIANT; `v:tags[0]`
+      indexes an array. A path that does not exist gives NULL, never an
+      error.
+    - `::` casts: `v:user.id::bigint`. In Python,
+      `F.variant_get(col, "$.user.id", "bigint")` is the same thing.
+    - A cast that cannot work fails the query:
+      `[INVALID_VARIANT_CAST] The variant value {"currency":"CAD","value":29.93}
+      cannot be cast into "DOUBLE"`. `try_variant_get` returns NULL
+      instead.
+    - `schema_of_variant(v)` describes one value's type, and
+      `schema_of_variant_agg(v)` merges the types across all rows.
+
+    Casts are value conversions, not just labels. `try_variant_get` on the
+    JSON string `"12.5"` with type `double` gives `12.5`; on `"abc"` it
+    gives NULL; on an object it gives NULL; and the number `12.5` read as
+    `int` gives `12` (the fraction is dropped, with no error). Pick the
+    target type deliberately.
+
+    In Python, a collected VARIANT arrives as a `VariantVal`; its
+    `toPython()` method turns it into ordinary dicts and lists (decimals
+    come back as `Decimal`).
+
+- Class: mult_question
+  Depth: all
+  Output: "`v:amount::double` fails with INVALID_VARIANT_CAST on a few rows. What does `try_variant_get(v, '$.amount', 'double')` return for those rows?"
+  AnswerChoices: "NULL;0.0;The raw JSON text;It also fails"
+  CorrectAnswer: "NULL"
+  Hint: "The try_ functions turn a failed cast into a missing value."
+
+- Class: text
+  Depth: beginner
+  Output: |
+    A typed column is a form with fixed boxes: if the "amount" box only
+    takes numbers, a form that says "amount: twelve" is rejected. A
+    VARIANT is more like keeping the whole original letter in a folder,
+    with sticky tabs that say where each part is. You never throw a
+    letter away; when you need the amount, you look it up and decide how
+    to read what you find.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Loading Files as VARIANT
+
+    The JSON source (and CSV and XML) can put each whole record into one
+    VARIANT column:
+
+    ```python
+    ev = spark.read.option("singleVariantColumn", "v").json("data/messy/events")
+    ev.printSchema()
+    ```
+
+    ```
+    root
+     |-- v: variant (nullable = true)
+    ```
+
+    No inference pass and no schema to maintain: whatever fields a record
+    has, they are in `v`. Compare that with the eight-column union schema
+    that inference produced in "JSON Drift and Quarantine".
+
+    What about the truncated line at the end of day 3? It becomes a row
+    whose `v` is NULL. Since Spark 4.1 (SPARK-51296) you can also keep its
+    raw text, by giving a schema with the variant column plus a string
+    corrupt column:
+
+    ```python
+    ev = (spark.read
+        .option("singleVariantColumn", "v")
+        .option("columnNameOfCorruptRecord", "_bad")
+        .schema("v VARIANT, _bad STRING")
+        .json("data/messy/events")
+        .cache())
+
+    ev.filter("_bad IS NOT NULL").select("v", "_bad").collect()
+    # [Row(v=None, _bad='{"event_type": "purchase", "user": {"id": 9')]
+    ```
+
+    The `.cache()` is there for the same reason as in "JSON Drift and
+    Quarantine": a
+    query that reads only the corrupt column fails with
+    `UNSUPPORTED_FEATURE.QUERY_ONLY_CORRUPT_RECORD_COLUMN`.
+
+    Without the option, the corrupt column must have the default name:
+    `.schema("v VARIANT, _corrupt_record STRING")` works on its own.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Gotcha: Option Order in Classic PySpark
+
+    These two reads look the same, and in classic PySpark only the first
+    one works:
+
+    ```python
+    (spark.read.option("singleVariantColumn", "v")
+               .option("columnNameOfCorruptRecord", "_bad")
+               .schema("v VARIANT, _bad STRING"))          # works
+
+    (spark.read.schema("v VARIANT, _bad STRING")
+               .option("singleVariantColumn", "v")
+               .option("columnNameOfCorruptRecord", "_bad"))  # fails
+    ```
+
+    ```
+    [INVALID_SINGLE_VARIANT_COLUMN] User specified schema
+    "STRUCT<v: VARIANT, _bad: STRING>" is invalid when the
+    `singleVariantColumn` option is enabled. The schema must either be a
+    variant field, or a variant field plus a corrupt column field.
+    ```
+
+    In the 4.2.0 source, the classic `DataFrameReader` checks the schema
+    against the options **on every `.option()` and `.schema()` call**.
+    In the second read, at the moment `singleVariantColumn` is set, the
+    corrupt column is still called `_corrupt_record`, so `_bad` looks like
+    an unexpected extra field. Passing both options in one
+    `.options(singleVariantColumn="v", columnNameOfCorruptRecord="_bad")`
+    after the schema fails the same way. A Spark Connect session checks
+    later and accepts any order.
+
+    The rule that always works: **options first, schema last** (or use
+    the default name `_corrupt_record`).
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "In classic PySpark, `spark.read.schema('v VARIANT, _bad STRING').option('singleVariantColumn', 'v')` raises INVALID_SINGLE_VARIANT_COLUMN. What is the simplest fix?"
+  AnswerChoices: "Set the singleVariantColumn and columnNameOfCorruptRecord options before calling schema();Change _bad to an INT column;Drop the schema and use inferSchema;Switch to FAILFAST mode"
+  CorrectAnswer: "Set the singleVariantColumn and columnNameOfCorruptRecord options before calling schema()"
+  Hint: "The schema is validated against the options that are set at the moment of each call."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Profiling: Which Keys, Which Types?
+
+    `schema_of_variant_agg(v)` gives the merged shape in one string:
+
+    ```
+    OBJECT<amount: VARIANT, event: STRING, event_type: STRING,
+           items: ARRAY<OBJECT<qty: BIGINT, sku: STRING>>, ts: STRING,
+           user: OBJECT<geo: OBJECT<country: STRING>, id: BIGINT, plan: STRING>,
+           user_id: BIGINT>
+    ```
+
+    `amount: VARIANT` says "more than one type", but not which types, or
+    how many rows have each key. For that, turn every key into a row with
+    the table-valued function `variant_explode` (4.0, SPARK-47680):
+
+    ```sql
+    SELECT pos, key, value FROM variant_explode(parse_json('{"b": [1,2], "a": {"x": 1}}'))
+    ```
+
+    ```
+    +---+---+-------+
+    |pos|key|  value|
+    +---+---+-------+
+    |  0|  a|{"x":1}|
+    |  1|  b|  [1,2]|
+    +---+---+-------+
+    ```
+
+    Applied to a table with `LATERAL`, it runs once per row, and a
+    profile is a `GROUP BY` away:
+
+    ```sql
+    SELECT key,
+           count(*) AS n,
+           collect_set(schema_of_variant(value)) AS types
+    FROM ev, LATERAL variant_explode(v)
+    GROUP BY key
+    ```
+
+    Keys come back sorted (VARIANT objects store their keys in sorted
+    order), each with its `pos`, `key` and `value`. For an array,
+    `variant_explode` returns one row per element with `key` NULL; for a
+    scalar such as a string it returns no rows.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Making the Type Set Readable
+
+    Run that profile and the `amount` row is a mess:
+
+    ```
+    [OBJECT<currency: STRING, value: DECIMAL(3,2)>, STRING, DECIMAL(4,2),
+     OBJECT<currency: STRING, value: DECIMAL(3,1)>, DECIMAL(2,1), ...]
+    ```
+
+    `schema_of_variant` reports JSON numbers with a fraction as the
+    smallest `DECIMAL(precision, scale)` that holds each exact value, so
+    `6.13` is `DECIMAL(3,2)` and `32.83` is `DECIMAL(4,2)`. Every
+    distinct precision becomes a separate "type". For a profile you want
+    the kind, not the exact precision: keep the leading capital letters.
+
+    ```sql
+    sort_array(collect_set(regexp_extract(schema_of_variant(value), '^[A-Z]+', 0))) AS types
+    ```
+
+    ```
+    +----------+---+-------------------------+
+    |key       |n  |types                    |
+    +----------+---+-------------------------+
+    |amount    |60 |[DECIMAL, OBJECT, STRING]|
+    |event     |40 |[STRING]                 |
+    |event_type|20 |[STRING]                 |
+    |items     |40 |[ARRAY]                  |
+    |ts        |60 |[STRING]                 |
+    |user      |40 |[OBJECT]                 |
+    |user_id   |20 |[BIGINT]                 |
+    +----------+---+-------------------------+
+    ```
+
+    Now the drift is readable at a glance: `amount` has three shapes,
+    `event` and `event_type` together cover 60 rows (a rename), and
+    `user_id` plus `user` cover 60 (a move). The same query one level
+    down (`LATERAL variant_explode(v:user)`) shows `geo` in only 20 rows.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## The Same Profile in the DataFrame API
+
+    Table-valued functions are also available from Python as
+    `spark.tvf` (4.0), and `DataFrame.lateralJoin` (4.0) applies one per
+    row. `outer()` marks the column as coming from the left side of the
+    lateral join:
+
+    ```python
+    profile = (ev.lateralJoin(spark.tvf.variant_explode(F.col("v").outer()))
+        .groupBy("key").agg(F.count("*").alias("n"))
+        .orderBy("key"))
+    ```
+
+    It gives the same counts as the SQL. Use whichever reads better to
+    you; the lessons use SQL for lateral queries because it is shorter.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    `ev` is registered as a temp view called `ev` with a VARIANT column
+    `v`. Assign to `keys` a DataFrame (via `spark.sql`) with one row per
+    top-level key: columns `key` and `n` (the number of rows that have
+    that key).
+  CorrectAnswer: |
+    keys = spark.sql("SELECT key, count(*) AS n FROM ev, LATERAL variant_explode(v) GROUP BY key")
+  Hint: "Use FROM ev, LATERAL variant_explode(v) and group by key."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Normalizing a Field With Three Shapes
+
+    The profile told you `amount` is a number, a numeric string, or an
+    object with a `value`. Read every shape with `try_variant_get` and take
+    the first that works:
+
+    ```python
+    amount = F.coalesce(
+        F.try_variant_get("v", "$.amount", "double"),        # 6.13 and "32.83"
+        F.try_variant_get("v", "$.amount.value", "double"))  # {"value": 29.93, ...}
+    ```
+
+    The first reading handles numbers and numeric strings (the cast
+    converts `"32.83"`), and returns NULL for objects; the second handles
+    objects. Renames and moves are the same pattern:
+
+    ```python
+    F.coalesce(F.try_variant_get("v", "$.event_type", "string"),
+               F.try_variant_get("v", "$.event", "string"))
+    F.coalesce(F.try_variant_get("v", "$.user.id", "bigint"),
+               F.try_variant_get("v", "$.user_id", "bigint"))
+    ```
+
+    And `try_variant_get(v, "$.ts", "timestamp")` turns the ISO string
+    into a real timestamp, in the session time zone.
+
+    Compare with "JSON Drift and Quarantine": there, `amount` had to be declared as
+    `STRING` in advance so that objects survived as text. With VARIANT
+    nothing had to be declared; the shapes were discovered by profiling
+    and handled at read time.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## VARIANT Gotchas You Will Hit While Profiling
+
+    - **You cannot group or sort by a VARIANT.** `GROUP BY v:user` fails
+      with `GROUP_EXPRESSION_TYPE_IS_NOT_ORDERABLE`. Group by a cast
+      (`v:user.plan::string`) or by the JSON text: `to_json(v:user)` works,
+      and gives one string per distinct object because `to_json` writes
+      keys in sorted order (`to_json(parse_json('{"b":2,"a":1}'))` is
+      `{"a":1,"b":2}`).
+    - **Missing is not the same as JSON null.** For a missing key,
+      `v:key IS NULL` is true. For `{"key": null}`, `v:key` is a VARIANT
+      holding JSON null, so `IS NULL` is false and `is_variant_null(v:key)`
+      is true. Check both when "no value" matters.
+    - **Decimals are exact.** `schema_of_variant(parse_json('1.50'))` is
+      `DECIMAL(2,1)` (the trailing zero is not kept), while
+      `parse_json('1e3')` is a `DOUBLE`. That is why the profile strips
+      the precision.
+
+- Class: mult_question
+  Depth: all
+  Output: "A profile shows `event` in 40 rows and `event_type` in 20 rows, never both in the same row, with 60 records in total. What does that most likely mean?"
+  AnswerChoices: "The field was renamed, so coalesce the two names;Two thirds of the records are invalid;event_type is a nested field of event;The files must be read with a stricter schema"
+  CorrectAnswer: "The field was renamed, so coalesce the two names"
+  Hint: "Add up the counts and remember the day 3 file."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Nested Arrays in a VARIANT
+
+    `items` is an array of objects inside each record. Explode it with
+    `variant_explode_outer`, the variant of `variant_explode` that keeps a
+    row (of NULLs) when the input is NULL or not an array:
+
+    ```sql
+    SELECT item.value:sku::string AS sku,
+           sum(item.value:qty::int) AS qty
+    FROM ev, LATERAL variant_explode_outer(v:items) AS item
+    GROUP BY 1
+    ORDER BY 1
+    ```
+
+    ```
+    +----+----+
+    | sku| qty|
+    +----+----+
+    |NULL|NULL|
+    |  P1|   8|
+    |  P2|  12|
+    ...
+    ```
+
+    The `NULL` group holds the 21 records without items (day 1 and the
+    malformed line): 82 rows in all, against 61 with `variant_explode`.
+    The trade-off is exactly `explode` versus `explode_outer` from "JSON
+    Drift and Quarantine" (and the arrays of "Complex Types and
+    Higher-Order Functions"), and the same advice applies: keep the outer form and
+    filter explicitly.
+
+    There is also a pure-DataFrame route: cast the array to
+    `array<variant>` and use the ordinary `explode`:
+
+    ```python
+    (ev.select(F.explode(F.try_variant_get("v", "$.items", "array<variant>")).alias("it"))
+       .select(F.variant_get("it", "$.sku", "string").alias("sku")))
+    ```
+
+    Note that `try_variant_get(..., "array<variant>")` returns NULL for
+    a single object (it is not an array). That matters for XML, where one
+    child element and several child elements have different shapes, as
+    you will see in "XML".
+
+- Class: mult_question
+  Depth: all
+  Output: "Records without an `items` key disappear from your item counts. Which change keeps them?"
+  AnswerChoices: "Use LATERAL variant_explode_outer(v:items) instead of variant_explode;Cast v to STRING first;Use schema_of_variant_agg;Add a GROUP BY on v"
+  CorrectAnswer: "Use LATERAL variant_explode_outer(v:items) instead of variant_explode"
+  Hint: "The _outer form keeps a row of NULLs when the input has nothing to explode."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## When to Leave VARIANT
+
+    VARIANT is the right landing type for data whose shape you do not
+    control. It is not a reason to never model data. Once profiling has
+    shown you the fields everyone queries (`event_type`, `user_id`,
+    `amount`, `ts`), promote them to typed columns in a silver table, as
+    the exercise does, and keep the original `v` next to them for the
+    long tail of rarely used fields.
+
+    Typed columns are easier to filter, join, group and validate, and
+    other tools understand them. VARIANT also has a storage side: when it
+    is written to Parquet, Spark 4.1 and later store stable fields as
+    typed columns inside the file ("shredding"). "VARIANT Shredding and
+    Performance", in the intermediate level, opens a Parquet file to show what was
+    shredded and what that means for query speed.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Profile and Normalize Without a Schema
+
+    Work on the same `data/messy/events/` files as "JSON Drift and Quarantine", this
+    time without a field-level schema.
+
+    1. `load_events(spark, path)`: one VARIANT column `v` per record,
+       malformed lines kept in `_bad` (options first, then the schema
+       `v VARIANT, _bad STRING`), plus `file` from `_metadata`, cached.
+    2. `key_profile(spark, ev)`: one row per top-level key with `key`,
+       `n` and `types`, the sorted set of base type names (`DECIMAL`,
+       `OBJECT`, `STRING`, ...), using `LATERAL variant_explode(v)`.
+    3. `normalize(ev)`: for every record that parsed, `event_type`,
+       `user_id`, `plan`, `amount` (a double for every shape), `ts` (a
+       timestamp) and `file`.
+    4. `item_rows(spark, ev)`: `sku` and `qty` per item with
+       `LATERAL variant_explode_outer(v:items)`.
+
+    The harness computes the expected values with Python's `json` module
+    and checks: 61 rows with exactly one malformed record captured, the
+    whole key profile (including the three shapes of `amount`), no NULLs
+    in the normalized key fields, the sum of all amounts, and the item
+    rows and quantities per SKU.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Load: spark.read.option('singleVariantColumn', 'v').option('columnNameOfCorruptRecord', '_bad').schema('v VARIANT, _bad STRING').json(path). Profile: SELECT key, count(*) AS n, sort_array(collect_set(regexp_extract(schema_of_variant(value), '^[A-Z]+', 0))) AS types FROM ev, LATERAL variant_explode(v) GROUP BY key ORDER BY key. Amount: coalesce(get('$.amount', 'double'), get('$.amount.value', 'double'))."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    In this lesson you learned:
+
+    - **`singleVariantColumn`** loads each JSON record into one VARIANT
+      column with no inference pass. A malformed line gives a NULL `v`;
+      since 4.1 a `v VARIANT, _bad STRING` schema plus
+      `columnNameOfCorruptRecord` keeps its raw text.
+    - **Option order matters in classic PySpark**: set the options before
+      the schema, or the read fails with `INVALID_SINGLE_VARIANT_COLUMN`.
+    - **Reading fields**: `:` paths return NULL when missing; `::` and
+      `variant_get` fail with `INVALID_VARIANT_CAST` on impossible casts;
+      `try_variant_get` returns NULL and converts numeric strings.
+    - **Profiling**: `LATERAL variant_explode(v)` turns keys into rows;
+      group by key with `collect_set` over the base type name from
+      `schema_of_variant`.
+    - **Normalizing**: `coalesce` over several `try_variant_get` readings
+      handles type changes, renames and moves.
+    - **Nested arrays**: `variant_explode_outer(v:items)` keeps records
+      without items; `variant_explode` drops them.
+    - **Gotchas**: no grouping or sorting by VARIANT (group by a cast or
+      `to_json`), missing key versus JSON null (`is_variant_null`).
+
+    Next: **XML**, where attributes, text nodes and "one child or many"
+    give semi-structured data a few new tricks.

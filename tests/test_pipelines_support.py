@@ -16,6 +16,7 @@ from sparktutor.engine.executor import (
     is_pipeline_source,
     pipeline_command,
     requested_connectors,
+    runs_with_python,
     spark_env,
     write_pipeline_project,
     write_script_project,
@@ -105,6 +106,17 @@ class TestConnectors:
         jars = fetch_jars(["kafka"], tmp_path)
         assert len(jars) == len(CONNECTORS["kafka"].jars)
         assert all(j.read_text() == "cached" for j in jars)
+
+    def test_spark_modules_match_the_pinned_version(self):
+        for name in ("avro", "protobuf", "kafka"):
+            assert all("/4.2.0/" in j for j in CONNECTORS[name].jars if "org/apache/spark/" in j)
+        assert connector_args(["avro", "protobuf"], ["/j/a.jar", "/j/p.jar"], in_pipeline=False) == [
+            "--jars", "/j/a.jar,/j/p.jar"]
+
+    def test_run_with_python_directive(self):
+        assert runs_with_python("# spark-run: python\nimport pyspark\n")
+        assert not runs_with_python("import pyspark  # spark-run: python is a comment here\n")
+        assert not runs_with_python(SDP_CODE)
 
     def test_unknown_connector(self, tmp_path):
         with pytest.raises(ValueError, match="Unknown connector 'iceberg'"):

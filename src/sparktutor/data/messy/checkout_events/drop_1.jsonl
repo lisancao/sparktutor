@@ -1,0 +1,10 @@
+{"event_id": "c001", "user": "u1", "action": "add", "page": "/p/desk", "ts": "2026-10-05T09:00:14Z"}
+{"event_id": "c004", "user": "u2", "action": "view", "page": "/search", "ts": "2026-10-05T09:02:03Z"}
+{"event_id": "c002", "user": "u1", "action": "view", "page": "/", "ts": "2026-10-05T09:04:32Z"}
+{"event_id": "c003", "user": "u1", "action": "pay", "page": "/checkout", "ts": "2026-10-05T09:09:18Z", "amount": 16.39}
+{"event_id": "c005", "user": "u2", "action": "add", "page": "/cart", "ts": "2026-10-05T09:15:28Z"}
+{"event_id": "c006", "user": "u2", "action": "view", "page": "/search", "ts": "2026-10-05T09:21:15Z"}
+{"event_id": "c007", "user": "u3", "action": "view", "page": "/", "ts": "2026-10-05T09:30:04Z"}
+{"event_id": "c008", "user": "u3", "action": "view", "page": "/p/chair", "ts": "2026-10-05T09:33:47Z"}
+{"event_id": "c009", "user": "u4", "action": "view", "page": "/p/desk", "ts": "2026-10-05T09:38:21Z"}
+{"event_id": "c010", "user": "u4", "action": "view", "page": "/", "ts": "2026-10-05T09:40:48Z"}

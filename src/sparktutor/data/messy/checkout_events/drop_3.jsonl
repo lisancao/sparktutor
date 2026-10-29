@@ -1,0 +1,8 @@
+{"event_id": "c012", "user": "u5", "action": "view", "page": "/search", "ts": "2026-10-05T10:10:05Z"}
+{"event_id": "c018", "user": "u1", "action": "view", "page": "/search", "ts": "2026-10-05T10:45:56Z"}
+{"event_id": "c019", "user": "u1", "action": "pay", "page": "/checkout", "ts": "2026-10-05T10:50:12Z", "amount": 41.76}
+{"event_id": "c020", "user": "u5", "action": "view", "page": "/p/desk", "ts": "2026-10-05T10:30:08Z"}
+{"event_id": "c021", "user": "u5", "action": "pay", "page": "/checkout", "ts": "2026-10-05T10:44:31Z", "amount": 62.99}
+{"event_id": "c022", "user": "u6", "action": "view", "page": "/p/desk", "ts": "2026-10-05T10:55:05Z"}
+{"event_id": "c023", "user": "u4", "action": "view", "page": "/p/lamp", "ts": "2026-10-05T10:58:40Z"}
+{"event_id": "c999", "user": "u2", "action": "view", "page": "/", "ts": "2026-10-05T08:10:00Z"}

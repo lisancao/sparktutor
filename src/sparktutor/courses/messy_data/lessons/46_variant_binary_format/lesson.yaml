@@ -1,0 +1,674 @@
+- Class: meta
+  Lesson: The VARIANT Binary Format
+  EstimatedMinutes: 75
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    "VARIANT Basics: Profiling and Nested Data" used VARIANT as a type,
+    "VARIANT Shredding and Performance" (intermediate level) looked at
+    which columns Spark writes, and "Parquet from the Inside" decoded the
+    Parquet file around them. Every one of those lessons treated the two
+    blobs inside a VARIANT as opaque. This lesson opens them.
+
+    You will read the encoding the way Spark's own code does, from
+    `common/variant/src/main/java/org/apache/spark/types/variant/` in the
+    4.2.0 repo (`VariantUtil.java` for the layout and type ids,
+    `VariantBuilder.java` for how `parse_json` writes it, `Variant.java`
+    for how a lookup reads it), and you will check every rule against
+    real bytes from the sample events.
+
+    By the end you will be able to:
+
+    - Decode a VARIANT metadata dictionary and value by hand, header bit
+      by header bit
+    - Predict exactly which bytes `parse_json` produces for a document,
+      including integer widths, decimal versus double, field order and
+      offset sizes
+    - Build VARIANT bytes yourself and hand them to Spark, and know what
+      Spark checks (and doesn't) when it reads them
+    - Read a shredded VARIANT column at the byte level with pyarrow and
+      rebuild the original value from `typed_value` and `value`
+    - Explain the performance model: offset lookups, binary search over
+      sorted keys, and what shredding saves
+
+    `common/variant/README.md` is short and worth quoting: Spark
+    implements the Parquet project's VariantEncoding and VariantShredding
+    specs at a pinned parquet-format commit, "but does not yet support
+    Variant values containing UUID, Time, or nanosecond-precision
+    Timestamp", and has no public API to choose a shredding schema.
+    VARIANT arrived in 4.0 (SPARK-45827).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Two Blobs per Value
+
+    In Python a VARIANT comes back as `pyspark.sql.types.VariantVal`
+    (4.0) with two attributes, `value` and `metadata`, both `bytes`:
+
+    ```python
+    events = spark.read.option("singleVariantColumn", "v").json("data/messy/events")
+    first = events.filter(sf.col("_metadata.file_name").contains("10-01")).first().v
+    print(type(first).__name__, first.toJson())
+    print(len(first.metadata), first.metadata.hex(" "))
+    print(len(first.value), first.value.hex(" "))
+    ```
+
+    ```text
+    VariantVal {"amount":6.13,"event":"view","ts":"2026-10-01T10:00:00","user_id":0}
+    27 01 04 00 05 0c 12 14 65 76 65 6e 74 75 73 65 72 5f 69 64 61 6d 6f 75 6e 74 74 73
+    44 02 04 02 00 03 01 07 00 0d 05 21 11 76 69 65 77 0c 00 20 02 65 02 00 00 4d 32 30 32 36 2d 31 30 2d 30 31 54 31 30 3a 30 30 3a 30 30
+    ```
+
+    The **metadata** is a dictionary of every object key used anywhere
+    in the value. The **value** refers to keys by their position in that
+    dictionary. Each row carries its own metadata: there is no table-wide
+    dictionary. (In Parquet, the `v.metadata` column of the sample events
+    is dictionary-encoded, so three distinct blobs over 61 rows cost 224
+    bytes in total; Parquet de-duplicates what VARIANT repeats.)
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Metadata Dictionary
+
+    ```text
+    01                header: version 1, sorted_strings 0, offset_size 1
+    04                dictionary size: 4 keys
+    00 05 0c 12 14    5 offsets (size + 1) into the string bytes
+    65 76 65 6e 74    "event"     bytes  0..5
+    75 73 65 72 5f 69 64          "user_id"   5..12
+    61 6d 6f 75 6e 74             "amount"   12..18
+    74 73             "ts"       18..20
+    ```
+
+    The header byte packs three things: the low 4 bits are the version
+    (always 1), bit 4 is `sorted_strings`, and bits 6 and 7 hold
+    `offset_size - 1`. `VariantBuilder.result()` computes it as
+    `VERSION | ((offsetSize - 1) << 6)`:
+
+    - `offset_size` is the smallest width (1 to 4 bytes) that holds both
+      the total string length and the number of keys. The dictionary
+      size itself is written with that same width.
+    - Spark never sets `sorted_strings`. Keys appear in the order the
+      parser first met them (`event`, `user_id`, `amount`, `ts`: the JSON
+      order of the first object), so a reader can't binary-search the
+      dictionary itself.
+
+    A source-reading note: the class comment of `VariantUtil.java` still
+    describes the dictionary size as a "4-byte little-endian unsigned
+    integer". The builder writes `offsetSize` bytes, and the bytes above
+    agree with the builder. When a comment and the code disagree, the
+    bytes decide.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Value Header
+
+    Every value starts with one header byte. The low 2 bits are the
+    **basic type**, the high 6 bits the **type info**:
+
+    | Basic type | Meaning | Type info |
+    |---|---|---|
+    | 0 PRIMITIVE | a scalar | the primitive type id |
+    | 1 SHORT_STR | a string of 0 to 63 bytes | its length; the UTF-8 bytes follow |
+    | 2 OBJECT | an object | sizes of its integer fields |
+    | 3 ARRAY | an array | sizes of its integer fields |
+
+    The primitive type ids, from `VariantUtil.java`, with the content
+    that follows the header:
+
+    | Id | Type | Content |
+    |---|---|---|
+    | 0, 1, 2 | null, true, false | nothing |
+    | 3, 4, 5, 6 | INT1, INT2, INT4, INT8 | little-endian signed, 1/2/4/8 bytes |
+    | 7 | DOUBLE | 8 bytes IEEE |
+    | 8, 9, 10 | DECIMAL4, DECIMAL8, DECIMAL16 | 1 scale byte + 4/8/16-byte signed unscaled |
+    | 11 | DATE | 4-byte days since 1970-01-01 |
+    | 12, 13 | TIMESTAMP, TIMESTAMP_NTZ | 8-byte microseconds since the epoch |
+    | 14 | FLOAT | 4 bytes IEEE |
+    | 15 | BINARY | 4-byte length + bytes |
+    | 16 | LONG_STR | 4-byte length + UTF-8 bytes |
+    | 20 | UUID | 16 bytes, big-endian |
+
+    So the header byte of a primitive is `type_id << 2`: `0c` is INT1
+    (3 << 2), `20` is DECIMAL4 (8 << 2), `40` is LONG_STR. A short string
+    is `(length << 2) | 1`: `11` is a 4-byte string, `4d` a 19-byte one.
+    That is why short strings stop at 63 bytes: 6 bits of type info.
+
+- Class: mult_question
+  Depth: all
+  Output: "A VARIANT value is the two bytes `0c ff`. What is it?"
+  AnswerChoices: "The integer -1 stored as INT1;A 3-byte short string;The integer 255 stored as INT1;An object with 255 fields"
+  CorrectAnswer: "The integer -1 stored as INT1"
+  Hint: "0x0c has basic type 0 (primitive) and type info 3. INT1 is signed."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## An Object, Byte by Byte
+
+    The object header's type info is `0 b4 b3b2 b1b0`: `b4` says whether
+    the field count takes 1 byte or 4 (`is_large`, set above 255
+    fields), `b3b2` is `field_id_size - 1` and `b1b0` is
+    `field_offset_size - 1`. Then come the field count, the field ids,
+    `count + 1` offsets (the last one is the total data size), and the
+    field data. Here is the first day-one event:
+
+    ```text
+    02                      OBJECT, 1-byte count, 1-byte ids, 1-byte offsets
+    04                      4 fields
+    02 00 03 01             field ids:  amount(2) event(0) ts(3) user_id(1)
+    07 00 0d 05 21          offsets:    7        0        13     5    end=33
+    11 76 69 65 77          data +0:  "view"           (short string, 4 bytes)
+    0c 00                   data +5:  0                (INT1)
+    20 02 65 02 00 00       data +7:  6.13             (DECIMAL4, scale 2, unscaled 613)
+    4d 32 30 ... 30         data +13: "2026-10-01T10:00:00" (short string, 19 bytes)
+    ```
+
+    Two orders are at work, and confusing them is the classic decoder
+    bug:
+
+    - The **id and offset lists are sorted by key name** (`amount`,
+      `event`, `ts`, `user_id`). `VariantBuilder.finishWritingObject`
+      sorts its `FieldEntry` list (compared with Java's
+      `String.compareTo`) before it writes them.
+    - The **data stays in the original JSON order** (`event` at offset 0,
+      then `user_id`, `amount`, `ts`). Offsets let the sorted lists point
+      anywhere.
+
+    `field_id_size` is chosen from the largest id in this object and
+    `field_offset_size` from this object's data size, so a small nested
+    object inside a huge one still uses 1-byte fields. Objects nest by
+    simply containing another value header in their data.
+
+    Arrays are objects without ids. Type info `000 b2 b1b0` holds
+    `is_large` and `offset_size - 1`:
+
+    ```text
+    [1,"a",null]   03 03 00 02 04 05 0c 01 05 61 00
+                   ARRAY, 3 elements, offsets 0 2 4 end 5,
+                   then 0c 01 (1), 05 61 ("a"), 00 (null)
+    ```
+
+- Class: mult_question
+  Depth: all
+  Output: "In the object above, a reader wants `ts`. Which bytes does it NOT need to read?"
+  AnswerChoices: "The data of the other three fields;The field id list;The offset list;The metadata dictionary"
+  CorrectAnswer: "The data of the other three fields"
+  Hint: "The id list finds the slot, the dictionary resolves the name, and the offset jumps straight to the data."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## How parse_json Picks Each Encoding
+
+    ```python
+    for text in ["1", "-129", "300", "70000", "5000000000", "9223372036854775808", "12.34", "1.50",
+                 "0.000001", "1234567890.12", "1.5e3", "1E2", '"hi"', "true", "null", "[1,\"a\",null]"]:
+        v = spark.sql(f"SELECT parse_json('{text}') AS v").first().v
+        print(f"{text:22} {v.value.hex(' ')}")
+    ```
+
+    ```text
+    1                      0c 01
+    -129                   10 7f ff
+    300                    10 2c 01
+    70000                  14 70 11 01 00
+    5000000000             18 00 f2 05 2a 01 00 00 00
+    9223372036854775808    28 00 00 00 00 00 00 00 00 80 00 00 00 00 00 00 00 00
+    12.34                  20 02 d2 04 00 00
+    1.50                   20 02 96 00 00 00
+    0.000001               20 06 01 00 00 00
+    1234567890.12          24 02 14 1a 99 be 1c 00 00 00
+    1.5e3                  1c 00 00 00 00 00 70 97 40
+    1E2                    1c 00 00 00 00 00 00 59 40
+    "hi"                   09 68 69
+    true                   04
+    null                   00
+    [1,"a",null]           03 03 00 02 04 05 0c 01 05 61 00
+    ```
+
+    The rules, from `VariantBuilder.buildJson`, `appendLong`,
+    `tryParseDecimal` and `appendDecimal`:
+
+    - **Integers** use the narrowest of INT1, INT2, INT4, INT8 that holds
+      them. `-129` needs INT2 (`10 7f ff`).
+    - **An integer too big for a long** (`9223372036854775808`) is parsed
+      as a decimal with scale 0, and with 19 digits it lands in DECIMAL16.
+    - **A number with a fraction and no exponent** becomes a decimal if
+      its precision and scale are at most 38, in the narrowest of
+      DECIMAL4 (precision and scale up to 9), DECIMAL8 (18) and
+      DECIMAL16. The scale is kept as written: `1.50` is scale 2,
+      unscaled 150 (`96 00 00 00`), not 1.5.
+    - **A number with an exponent** (`1.5e3`, `1E2`), or one with more
+      than 38 digits, becomes a DOUBLE.
+
+    That last rule is why "VARIANT Shredding and Performance" found that
+    a field mixing `1` and `1.5e3` is never shredded: an integer and a
+    double don't merge, while an integer and a decimal do.
+
+    `schema_of_variant` hides the widths: it reports every integer as
+    `BIGINT`. The bytes are the only place to see them.
+
+- Class: mult_question
+  Depth: all
+  Output: "What does `parse_json('[2.50]')` store for the element?"
+  AnswerChoices: "DECIMAL4 with scale 2 and unscaled value 250;DOUBLE 2.5;DECIMAL4 with scale 1 and unscaled value 25;INT1 2 plus a fraction byte"
+  CorrectAnswer: "DECIMAL4 with scale 2 and unscaled value 250"
+  Hint: "No exponent, so it is a decimal, and Java's BigDecimal keeps the scale as written."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Types JSON Can't Express
+
+    JSON has no dates, timestamps or bytes, but VARIANT does. Casting a
+    typed value to VARIANT keeps its type:
+
+    ```python
+    r = spark.sql("""SELECT cast(date'2026-10-01' AS variant) AS d,
+                            cast(timestamp'2026-10-01 10:00:00' AS variant) AS t,
+                            cast(timestamp_ntz'2026-10-01 10:00:00' AS variant) AS n,
+                            cast(X'CAFE' AS variant) AS b,
+                            cast(1.5f AS variant) AS f""").first()
+    for k in r.asDict():
+        print(k, r[k].value.hex(" "), repr(r[k].toPython()), r[k].toJson())
+    ```
+
+    ```text
+    d 2c f7 50 00 00 datetime.date(2026, 10, 1) "2026-10-01"
+    t 30 00 08 92 7a c4 5c 06 00 datetime.datetime(2026, 10, 1, 10, 0, tzinfo=zoneinfo.ZoneInfo(key='UTC')) "2026-10-01 10:00:00+00:00"
+    n 34 00 08 92 7a c4 5c 06 00 datetime.datetime(2026, 10, 1, 10, 0) "2026-10-01 10:00:00"
+    b 3c 02 00 00 00 ca fe b'\xca\xfe' "yv4="
+    f 38 00 00 c0 3f 1.5 1.5
+    ```
+
+    `0x50f7` is 20727 days after 1970-01-01. TIMESTAMP and TIMESTAMP_NTZ
+    store identical microseconds and differ only in the type id (12
+    versus 13); the difference is how they are rendered. In JSON output a
+    date and a timestamp become strings and binary becomes base64, so
+    `to_json` is lossy: `parse_json(to_json(v))` gives you strings back,
+    not dates. For ingestion that means a VARIANT built from JSON never
+    contains a DATE, whatever the text looked like.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Hand-Made Bytes, Read by Spark
+
+    `VariantVal(value, metadata)` accepts any bytes, and a DataFrame
+    with a `variant` column accepts any `VariantVal`. Encode
+    `{"a": 1, "b": "hi"}` by hand:
+
+    ```python
+    from pyspark.sql.types import VariantVal
+
+    metadata = bytes([0x01, 0x02, 0x00, 0x01, 0x02]) + b"ab"
+    value = bytes([0x02, 0x02, 0x00, 0x01, 0x00, 0x02, 0x05, 0x0c, 0x01, 0x09]) + b"hi"
+    df = spark.createDataFrame([(VariantVal(value, metadata),)], "v variant")
+    df.select(sf.to_json("v"), sf.variant_get("v", "$.b", "string"), sf.schema_of_variant("v")).show(truncate=False)
+    ```
+
+    ```text
+    +----------------+-------------------+----------------------------+
+    |to_json(v)      |variant_get(v, $.b)|schema_of_variant(v)        |
+    +----------------+-------------------+----------------------------+
+    |{"a":1,"b":"hi"}|hi                 |OBJECT<a: BIGINT, b: STRING>|
+    +----------------+-------------------+----------------------------+
+    ```
+
+    Nothing validates the bytes on the way in. A truncated object is
+    accepted by `createDataFrame` and fails only when an expression
+    reads it:
+
+    ```python
+    bad = spark.createDataFrame([(VariantVal(bytes([0x02, 0x05]), metadata),)], "v variant")
+    print("created fine")
+    bad.select(sf.to_json("v")).collect()
+    ```
+
+    ```text
+    created fine
+    SparkRuntimeException [MALFORMED_VARIANT] Variant binary is malformed. Please check the data source is valid. SQLSTATE: 22023
+    ```
+
+    `VariantUtil.checkIndex` raises `MALFORMED_VARIANT` whenever a read
+    would run past the end of the buffer. It is a bounds check, not a
+    validation of the format, which matters for the next experiment.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Why the Field Ids Must Be Sorted
+
+    `Variant.getFieldByKey` (`Variant.java`) is what `variant_get` uses
+    to find a key. For objects with fewer than 32 fields
+    (`BINARY_SEARCH_THRESHOLD`) it scans the id list; from 32 fields on,
+    it **binary-searches** it, comparing dictionary strings. Build an
+    object whose id list is in dictionary order instead of key order,
+    once small and once with 40 fields:
+
+    ```python
+    def obj(keys, values_int, sort_ids):
+        n = len(keys)
+        strs = b"".join(k.encode() for k in keys)
+        offs = [0]
+        for k in keys:
+            offs.append(offs[-1] + len(k))
+        meta = bytes([0x01, n]) + bytes(offs) + strs
+        fields = list(range(n))
+        if sort_ids:
+            fields.sort(key=lambda i: keys[i])
+        data, dataoffs = b"", {}
+        for i in range(n):
+            dataoffs[i] = len(data)
+            data += bytes([0x0c, values_int[i]])
+        val = bytes([0x02, n]) + bytes(fields) + bytes(dataoffs[i] for i in fields) + bytes([len(data)]) + data
+        return VariantVal(val, meta)
+
+    for n in [5, 40]:
+        keys = [f"k{i:02d}" for i in reversed(range(n))]   # dictionary in reverse order
+        vals = [int(k[1:]) for k in keys]
+        for sort in [True, False]:
+            r = spark.createDataFrame([(obj(keys, vals, sort),)], "v variant").select(
+                sf.variant_get("v", "$.k01", "int").alias("k01"), sf.variant_get("v", "$.k03", "int").alias("k03"),
+                sf.substring(sf.to_json("v"), 1, 30).alias("json")).first()
+            print(n, "sorted" if sort else "UNSORTED", r)
+    ```
+
+    ```text
+    5 sorted Row(k01=1, k03=3, json='{"k00":0,"k01":1,"k02":2,"k03"')
+    5 UNSORTED Row(k01=1, k03=3, json='{"k04":4,"k03":3,"k02":2,"k01"')
+    40 sorted Row(k01=1, k03=3, json='{"k00":0,"k01":1,"k02":2,"k03"')
+    40 UNSORTED Row(k01=None, k03=None, json='{"k39":39,"k38":38,"k37":37,"k')
+    ```
+
+    The unsorted 40-field object is accepted, prints fine, and
+    `variant_get` returns **NULL** for keys that are right there. No
+    error, no warning: a wrong result. With 5 fields the linear scan
+    hides the bug, so a writer can pass every small test and still
+    corrupt real data. If you ever produce VARIANT bytes outside Spark (a
+    custom data source, another engine, the exercise below), sort the id
+    and offset lists by key, and test with objects of at least 32 fields.
+
+    (Spark's builder sorts with Java `String.compareTo`, which compares
+    UTF-16 code units. A writer that sorts by code point or by UTF-8
+    bytes agrees with it except for keys that mix characters above
+    U+FFFF with characters from U+E000 to U+FFFF; test such keys if
+    your data has them.)
+
+- Class: mult_question
+  Depth: all
+  Output: "Your custom writer produces VARIANT objects with unsorted field ids. Your tests use objects with 3 to 10 keys and all pass. What happens in production with 50-key objects?"
+  AnswerChoices: "variant_get silently returns NULL for some keys that exist;Spark raises MALFORMED_VARIANT on read;Spark sorts the ids when it loads the bytes;Nothing, sorting is only a performance hint"
+  CorrectAnswer: "variant_get silently returns NULL for some keys that exist"
+  Hint: "From BINARY_SEARCH_THRESHOLD (32) fields on, the lookup binary-searches the id list."
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    `value` and `metadata` hold the bytes of a VARIANT you encoded. Build
+    a one-row DataFrame `check` with a column `v` of type `variant` from
+    them, so you can test it with Spark functions.
+  CorrectAnswer: |
+    check = spark.createDataFrame([(VariantVal(value, metadata),)], "v variant")
+  Hint: "Wrap the two byte strings in pyspark.sql.types.VariantVal and give createDataFrame the DDL schema 'v variant'."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Limits and Parse Errors
+
+    - **Duplicate keys.** `parse_json('{"a":1,"a":2}')` fails. In a
+      classic PySpark script it arrives as a raw
+      `Py4JJavaError`, with the real conditions in its text:
+      `[MALFORMED_RECORD_IN_PARSING.WITHOUT_SUGGESTION] Malformed records
+      are detected in record parsing` caused by `[VARIANT_DUPLICATE_KEY]
+      Failed to build variant because of a duplicate object key `a``.
+      `try_parse_json` returns NULL instead. The internal
+      `spark.sql.variant.allowDuplicateKeys` (default false, 4.0) keeps
+      the last value: `{"a":2}`. Messy feeds do contain duplicate keys,
+      so decide which behaviour you want before the first bad file.
+    - **Size.** `VariantUtil.SIZE_LIMIT` is 128 MiB for a value and for
+      a metadata blob (16 MiB only when Spark runs its own tests). The
+      message of `VARIANT_CONSTRUCTOR_SIZE_LIMIT` in
+      `error-conditions.json` still says 16 MiB; the code says 128. A
+      20 MB string parses fine:
+
+      ```python
+      spark.sql("SELECT length(to_json(parse_json(concat('\"', repeat('x', 20000000), '\"')))) AS n").first().n
+      ```
+
+      ```text
+      20000002
+      ```
+
+      Building a value over the limit fails with `VARIANT_SIZE_LIMIT`
+      ("Cannot build variant bigger than <sizeLimit> in
+      <functionName>"), so a VARIANT column is not a place for blobs; "Designing
+      Tables for Blobs" covers what is.
+    - **Offsets.** Offsets and ids are at most 4 bytes, and data
+      offsets are relative to the object or array that contains them, so
+      deep nesting costs a few header bytes per level, not a rewrite.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## PySpark Already Has a Decoder
+
+    `pyspark/sql/variant_utils.py` contains `VariantUtils` (the
+    decoder behind `VariantVal.toPython()` and `toJson()`) and a Python
+    `VariantBuilder` (behind `VariantVal.parseJson`). They are worth
+    reading after the exercise. Don't import them for the exercise: the point is
+    to write the decoder yourself, and the harness checks you against
+    both the Python decoder and the JVM's `to_json`.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Shredding at the Byte Level
+
+    "VARIANT Shredding and Performance" showed the shredded columns in
+    the footer. Here is what a row in them contains. Write the three days
+    of events to one file and read the `v` struct back with pyarrow (no
+    Spark involved in the reading):
+
+    ```python
+    import glob, json
+    import pyarrow.parquet as pq
+
+    events.coalesce(1).write.mode("overwrite").parquet("/tmp/var_shred")
+    f = glob.glob("/tmp/var_shred/*.parquet")[0]
+    rows = pq.read_table(f).column("v").to_pylist()
+
+    def show(x):
+        if isinstance(x, bytes):
+            return x.hex(" ")
+        if isinstance(x, dict):
+            return {k: show(v) for k, v in x.items() if v is not None}
+        if isinstance(x, list):
+            return [show(v) for v in x]
+        return x
+
+    print(json.dumps(show(rows[25])))
+    ```
+
+    Row 25 is a day-two purchase (shortened, indented by hand):
+
+    ```text
+    {"metadata": "01 09 00 05 09 0b 0f 15 1a 1d 20 22 65 76 65 6e 74 ...",
+     "typed_value": {
+       "amount": {"value": "11 32 35 2e 38"},
+       "event": {"typed_value": "purchase"},
+       "event_type": {},
+       "items": {"typed_value": [{"typed_value": {"qty": {"typed_value": 1}, "sku": {"typed_value": "P9"}}}, ...]},
+       "ts": {"typed_value": "2026-10-02T11:04:00"},
+       "user": {"typed_value": {"geo": {}, "id": {"typed_value": 4}, "plan": {"typed_value": "pro"}}},
+       "user_id": {}}}
+    ```
+
+    - `metadata` is the row's **original** dictionary, unchanged.
+    - The top-level `value` is null: every field of this object fits the
+      file's shredding schema.
+    - `amount` has no `typed_value` column in this file (its types
+      disagree across the days), so its `value` holds ordinary VARIANT
+      bytes: `11 32 35 2e 38` is the short string `"25.8"`.
+    - `event_type`, `user_id` and `user.geo` are `{}`: both columns
+      null, which in an object means **the field is absent** in this row.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Reconstruction Rules
+
+    The sample events don't show every case, so write a file that does
+    (40 regular rows, then five odd ones):
+
+    ```python
+    docs = [{"a": i, "b": {"x": i, "y": "s"}} for i in range(40)]
+    docs += [{"a": None, "b": {"x": 1, "y": "s"}}, {"a": 2, "b": {"x": 1, "y": "s", "z": True}},
+             {"a": 4}, {"a": 5, "b": {"x": None, "y": "s"}}, {"a": 6, "b": {"y": "s"}, "c": [1]}]
+    df = spark.createDataFrame([(json.dumps(d),) for d in docs], "j string").select(sf.parse_json("j").alias("v"))
+    df.coalesce(1).write.mode("overwrite").parquet("/tmp/var_cases")
+    ```
+
+    `a`, `b.x` and `b.y` get typed columns (the rare `z` and `c` don't).
+    The odd rows, without metadata:
+
+    ```text
+    {'a': None, 'b': {'x': 1, 'y': 's'}}           -> {'typed_value': {'a': {'value': '00'}, 'b': {'typed_value': {'x': {'typed_value': 1}, 'y': {'typed_value': 's'}}}}}
+    {'a': 2, 'b': {'x': 1, 'y': 's', 'z': True}}   -> {'typed_value': {'a': {'typed_value': 2}, 'b': {'value': '02 01 04 00 01 04', 'typed_value': {'x': {'typed_value': 1}, 'y': {'typed_value': 's'}}}}}
+    {'a': 4}                                       -> {'typed_value': {'a': {'typed_value': 4}, 'b': {}}}
+    {'a': 5, 'b': {'x': None, 'y': 's'}}           -> {'typed_value': {'a': {'typed_value': 5}, 'b': {'typed_value': {'x': {'value': '00'}, 'y': {'typed_value': 's'}}}}}
+    {'a': 6, 'b': {'y': 's'}, 'c': [1]}            -> {'value': '02 01 03 00 06 03 01 00 02 0c 01', 'typed_value': {'a': {'typed_value': 6}, 'b': {'typed_value': {'x': {}, 'y': {'typed_value': 's'}}}}}
+    ```
+
+    Read every node the same way:
+
+    | `typed_value` | `value` | Meaning |
+    |---|---|---|
+    | set | null | the value, from the typed column |
+    | null | set | VARIANT bytes: a type that didn't fit, or a JSON `null` (`00`) |
+    | null | null | missing (only valid for an object field) |
+    | object, set | object, set | a **partially shredded** object: merge the typed fields with the residual object in `value` |
+
+    `02 01 04 00 01 04` is an object with one field, id 4 (`z` in that
+    row's dictionary), data `04` (true). `02 01 03 00 06 03 01 00 02 0c
+    01` is the top-level residual `{"c": [1]}`. A JSON null is **not**
+    the same as a missing field: `{"x": None}` stores `value = 00`,
+    `{}` stores nothing.
+
+    `VariantShreddingWriter.java` produces these columns and
+    `ShreddingUtils.java` rebuilds a VARIANT from them on read when a
+    query needs the whole value. A query that asks for one typed field
+    (`try_variant_get(v, '$.a', 'int')` with `pushVariantIntoScan`)
+    reads that field's own columns instead of rebuilding the whole
+    value.
+
+- Class: mult_question
+  Depth: all
+  Output: "In a shredded object, a field node has `value = 00` and `typed_value = null`. What was in the original row?"
+  AnswerChoices: "The field with a JSON null;No such field;The field with a value of the shredded type;An empty string"
+  CorrectAnswer: "The field with a JSON null"
+  Hint: "00 is a VARIANT primitive with type id 0. A missing field has both columns null."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What the Format Costs and Saves
+
+    The design choices add up to a clear performance model:
+
+    - **Lookups are offset jumps.** To get `$.user.plan`, Spark reads the
+      object header, finds `user` in the id list (scan or binary search,
+      comparing dictionary strings), jumps by its offset, and repeats one
+      level down. It never parses the other fields' bytes. JSON text must
+      be tokenized up to the field you want.
+    - **Keys are resolved by string comparison** against the row's
+      dictionary, because each row has its own dictionary. There are no
+      global field ids to cache.
+    - **Shredding skips the format entirely** for typed fields: a
+      shredded `user.id` is an INT64 Parquet column, decoded by the
+      vectorized reader like any other.
+    - **Building is the expensive direction.** `to_json` or rebuilding a
+      full VARIANT from shredded columns touches every byte.
+
+    An indicative measurement on a laptop (`local[4]`, 100,000 objects
+    of 100 integer keys each, stored as JSON strings in Parquet or as
+    unshredded VARIANT; best of three runs; your numbers will differ):
+
+    | Query | JSON string, `get_json_object` | VARIANT, `variant_get` | Ratio |
+    |---|---|---|---|
+    | sum of `$.k000` | 0.21 s | 0.09 s | 2.4 |
+    | sum of `$.k099` | 0.20 s | 0.08 s | 2.4 |
+    | sum of `length(to_json(v))` | | 2.02 s | |
+
+    Two honest observations: extracting the first and the last of 100
+    keys costs the same for both formats here (the lookup is not where
+    the time goes at this size), and turning the whole VARIANT back into
+    text is more than twenty times slower than extracting a field. Don't
+    `to_json` a VARIANT column to filter on it.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Decoder, Encoder, Shredded Reader
+
+    Implement, in plain Python (no `variant_utils`, no Spark calls):
+
+    1. `metadata_keys(metadata)`: the dictionary as a list of `str`.
+    2. `decode(value, metadata, pos=0, keys=None)`: the value at `pos` as
+       a Python object, with exactly the types `VariantVal.toPython()`
+       returns (`int`, `float`, `decimal.Decimal`, `str`, `bytes`,
+       `datetime.date`, aware UTC `datetime` for TIMESTAMP, naive for
+       TIMESTAMP_NTZ, `list`, `dict`, `None`, `bool`).
+    3. `encode(obj)`: `(value, metadata)` bytes **identical** to
+       `parse_json` for a JSON document parsed the way Spark parses
+       numbers (`int`, `decimal.Decimal` for plain fractions, `float`
+       for exponents). `_decimal(d)` is provided.
+    4. `from_shredded(row)`: rebuild the Python value of one row of a
+       shredded VARIANT column read with pyarrow.
+
+    The harness decodes every sample event and compares with both the
+    JVM's `to_json` and `toPython()`, then edge cases built by Spark (all
+    integer widths, every decimal size, a double, a 300-key object with
+    2-byte ids, a 300-element array with a 4-byte count, dates,
+    timestamps, binary, a float, long and non-ASCII strings). It encodes
+    a set of documents plus every sample event and compares bytes with
+    `parse_json`, has Spark look up every key of a 40-key object you
+    encoded, and rebuilds every row of two shredded files.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Decode: header & 3 is the basic type, header >> 2 the type info; for an object, is_large = (info >> 4) & 1, id size = ((info >> 2) & 3) + 1, offset size = (info & 3) + 1, and data starts after count + 1 offsets. Encode: add each key to the dictionary when you first meet it (before encoding its value), append field data in input order, then sort the (key, id, offset) list by key; choose id size from the largest id in the object and offset size from the object's data size. from_shredded: a dict typed_value is an object (merge decode(value) into it if value is set), a list is an array, anything else is the value; skip fields whose two columns are both null."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - A VARIANT is a **metadata** dictionary (header with version and
+      offset size, key count, offsets, UTF-8 keys in first-seen order)
+      and a **value** whose first byte packs a basic type and type info.
+    - Scalars carry their own type ids: INT1 to INT8 by width, DECIMAL4/8/16
+      by precision with the written scale, DOUBLE for exponents, short
+      strings up to 63 bytes in the header, DATE, TIMESTAMP and
+      TIMESTAMP_NTZ, BINARY, FLOAT, LONG_STR.
+    - Objects store sorted id and offset lists and unsorted data. Ids
+      **must** be sorted by key: from 32 fields on, `getFieldByKey`
+      binary-searches, and unsorted ids give silent NULLs.
+    - `VariantVal(value, metadata)` lets you hand Spark your own bytes;
+      only bounds are checked (`MALFORMED_VARIANT`), not the format.
+    - Duplicate keys fail parsing (`VARIANT_DUPLICATE_KEY` under
+      `MALFORMED_RECORD_IN_PARSING`); the size limit is 128 MiB despite
+      the 16 MiB in one error message.
+    - Shredded columns keep the row's metadata; `typed_value` holds what
+      fits, `value` holds VARIANT bytes for the rest, both null means
+      missing, and a partially shredded object merges the two.
+
+    Next: **Designing Tables for Blobs**, where the payload stops being a
+    few hundred bytes of JSON and becomes images, PDFs and audio.

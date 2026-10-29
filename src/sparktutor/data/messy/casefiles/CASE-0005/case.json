@@ -1,0 +1,19 @@
+{
+  "schema": 2,
+  "case_id": "CASE-0005",
+  "opened": "2026-03-11T16:45:00Z",
+  "status": "open",
+  "priority": "P4",
+  "tags": [],
+  "meta": {
+    "channel": "web",
+    "browser": "Firefox 141"
+  },
+  "attachments": [
+    {
+      "name": "label.png",
+      "sha256": "988f40e44fb35988224d789dc63f5b5806d724822462447fa94e3e1539db298e",
+      "bytes": 74
+    }
+  ]
+}

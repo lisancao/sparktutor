@@ -1,0 +1,820 @@
+- Class: meta
+  Lesson: "Python UDTFs in Depth"
+  EstimatedMinutes: 55
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    "Documents to Rows" used a Python user-defined table function (UDTF)
+    to turn one PDF into one row per page, joined it back to the files
+    with `lateralJoin`, and warned about a left join that drops files.
+    That was a UDTF in its simplest form: a function of one row that
+    yields rows.
+
+    UDTFs can do much more, and messy data needs most of it:
+
+    - read a **whole table** (or each group of it, in order) and keep
+      state between rows: sessions, deduplication, gap filling
+    - decide their **output columns at analysis time** from their
+      arguments, so one function can extract whatever fields a query asks
+      for
+    - report problems as data instead of failing the job
+
+    By the end of this lesson you will be able to:
+
+    - Explain the lifecycle (`__init__`, `eval`, `terminate`, `cleanup`)
+      and how many instances Spark creates, with evidence
+    - Create UDTFs at the right moment so they run Arrow-optimized, and
+      predict what each kind of yielded value turns into
+    - Call UDTFs with scalar arguments in lateral joins, and with `TABLE`
+      arguments with `PARTITION BY`, `ORDER BY` and `WITH SINGLE
+      PARTITION`, from SQL and from the DataFrame API
+    - Write `analyze()` for dynamic schemas, pass state from it to the
+      executors, and let a function require its own partitioning
+    - Avoid the 4.2.0 traps: the left lateral join that drops rows
+      (SPARK-60564), `terminate()` in a lateral join, and a parser
+      ambiguity in `TABLE` arguments
+    - Know when `arrow_udtf` (4.1) is the better tool
+
+    The exercise parses a service's `key=value` logs
+    (`data/messy/service_logs/kv.log`) into typed columns with a
+    function whose columns come from its arguments, and then turns the
+    events into user sessions with a function over a partitioned, ordered
+    table.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Where a UDTF Fits
+
+    | Tool | Rows in | Rows out | Typical use |
+    |---|---|---|---|
+    | built-in function | 1 | 1 | anything Spark already does |
+    | `explode`, `inline`, `posexplode` | 1 | 0 to n | arrays and maps you already have |
+    | Python UDF (`udf`, `pandas_udf`) | 1 | 1 | a value Spark cannot compute |
+    | **Python UDTF**, scalar arguments | 1 | 0 to n | parse one value into many rows |
+    | **Python UDTF**, `TABLE` argument | a partition of a table | 0 to n | stateful work per group, in order |
+    | `applyInPandas` | a group, as a pandas DataFrame | 0 to n | per-group work that fits in memory |
+    | `mapInPandas`, `mapInArrow` | a partition, in batches | 0 to n | batch work, model scoring |
+
+    A UDTF is called like a table (`SELECT * FROM f(...)`), works in SQL
+    as well as Python, streams rows one at a time instead of holding a
+    whole group in memory like `applyInPandas`, and can choose its output
+    schema from its arguments. Python UDTFs arrived in Spark 3.5
+    (SPARK-43798); `analyze()` and `PARTITION BY` / `ORDER BY` on table
+    arguments in 4.0 (SPARK-44380, SPARK-44503); in 4.2 they are
+    Arrow-optimized by default (SPARK-54555).
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Picture a clerk at a counter. A UDF is a clerk who takes one form and
+    hands back one stamped form. A UDTF clerk may hand back several forms
+    or none, and can keep notes between customers. With a `TABLE`
+    argument and `PARTITION BY user`, every user gets their own clerk
+    with a fresh notepad, and `ORDER BY ts` lines that user's forms up in
+    time order. When the queue for one clerk is empty, the clerk can hand
+    over a summary (`terminate`) before going home (`cleanup`).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Lifecycle, Observed
+
+    A UDTF is a class. Spark creates instances of it on the executors
+    and calls, in order:
+
+    1. `__init__(self)` (or `__init__(self, analyze_result)`, below)
+    2. `eval(self, *args)` once per input row; it may `yield` any number
+       of rows
+    3. `terminate(self)` once, after the last row; it may `yield` too
+    4. `cleanup(self)` once at the very end, also after a failure
+
+    To see it, this UDTF writes every call to a file, together with the
+    task's partition id:
+
+    ```python
+    @udtf(returnType="tag string, total int")
+    class Trace:
+        def __init__(self):
+            self.id = uuid.uuid4().hex[:4]
+            self.t = 0
+            self.log("init", TaskContext.get().partitionId())
+        def eval(self, tag, v):
+            self.log("eval", tag, v)
+            self.t += v
+            yield tag, v
+        def terminate(self):
+            self.log("terminate", self.t)
+            yield "end", self.t
+        def cleanup(self):
+            self.log("cleanup")
+    ```
+
+    Over three rows in one partition, in a lateral join
+    (`SELECT d.tag AS input, t.* FROM d, LATERAL trace(tag, v) t`):
+
+    ```text
+    a130 init 0
+    a130 eval x 1
+    a130 eval y 2
+    a130 eval z 3
+    a130 terminate 6
+    a130 cleanup
+    ```
+
+    ```text
+    [Row(input='x', tag='x', total=1), Row(input='y', tag='y', total=2),
+     Row(input='z', tag='z', total=3), Row(input='z', tag='end', total=6)]
+    ```
+
+    One instance served the whole partition, so `self.t` carried over
+    from row to row. With scalar arguments that is a side effect of how
+    tasks are cut, not something to rely on: another partitioning gives
+    other totals. The row from `terminate()` is attached to the **last**
+    input row (`input='z'`), which is rarely what you want. State across
+    rows is meant for `TABLE` arguments.
+
+    When `eval` raises, `cleanup()` still runs and `terminate()` does
+    not. In a test where the second of two runs failed, the log files
+    held `terminate: 't'` (from the good run only) and `cleanup: 'cc'`
+    (both runs). Put closing of files and connections in `cleanup`.
+
+- Class: mult_question
+  Depth: all
+  Output: "A UDTF's eval raises an exception half way through a partition. Which methods still run on that instance?"
+  AnswerChoices: "cleanup only;terminate and cleanup;terminate only;neither"
+  CorrectAnswer: "cleanup only"
+  Hint: "terminate produces final rows, which makes no sense after a failure; cleanup is for releasing resources."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Create UDTFs After the Session Exists
+
+    `udtf(cls, returnType=...)` (or `@udtf(...)` on the class) decides
+    **when it is called** whether the function runs Arrow-optimized. It
+    reads `spark.sql.execution.pythonUDTF.arrow.enabled` (default `true`
+    in 4.2) from the active session, and if there is no session yet it
+    falls back to the old, non-Arrow path. The same class, decorated
+    before and after `getOrCreate()`:
+
+    ```python
+    @udtf(returnType="a int")
+    class Early:
+        def eval(self, x): yield (2.7,)
+
+    spark = SparkSession.builder.master("local[2]").getOrCreate()
+
+    @udtf(returnType="a int")
+    class Late:
+        def eval(self, x): yield (2.7,)
+
+    Early(sf.lit(1)).explain(); Late(sf.lit(1)).explain()
+    print(Early(sf.lit(1)).collect(), Late(sf.lit(1)).collect())
+    ```
+
+    ```text
+    == Physical Plan ==
+    BatchEvalPythonUDTF Early(1)#0, [a#1]
+    +- *(1) Scan OneRowRelation[]
+
+    == Physical Plan ==
+    ArrowEvalPythonUDTF Late(1)#2, [a#3], 301
+    +- *(1) Scan OneRowRelation[]
+
+    [Row(a=None)] [Row(a=2)]
+    ```
+
+    Two different execution paths, and two different answers for the
+    same code (more on that in the next section). On Spark Connect it is
+    worse: a UDTF created before a Connect session exists is a classic
+    one, and calling it fails:
+
+    ```text
+    [JVM_ATTRIBUTE_NOT_SUPPORTED] Attribute `sparkContext` is not supported in
+    Spark Connect as it depends on the JVM. ...
+    ```
+
+    The rule from "Documents to Rows" for
+    UDFs holds for UDTFs: define the class anywhere, but call `udtf(...)`
+    after the session exists. The exercise does it in a `make_udtfs()`
+    function. To force a path, pass `useArrow=True` or `useArrow=False`.
+
+    The number at the end of `ArrowEvalPythonUDTF ... 301` is the Python
+    evaluation type (`PythonEvalType` in `pyspark/util.py`): 300 is a
+    plain UDTF, 301 an Arrow-optimized one, 302 an `arrow_udtf`.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What eval May Yield
+
+    The schema is fixed by `returnType` (or `analyze`). What you yield is
+    converted to it, and the two execution paths convert differently.
+    Measured on 4.2.0:
+
+    | `eval` yields, for the schema shown | Arrow (4.2 default) | Non-Arrow (`useArrow=False`) |
+    |---|---|---|
+    | `(1, "x")`, `[1, "x"]`, `Row(a=1, b="x")` for `a int, b string` | the row | the row |
+    | `{"b": "x", "a": 1}` (a dict, any key order) | the row, matched by name | the row, matched by name |
+    | `1` for `a int` (not a tuple) | the row | `UDTF_INVALID_OUTPUT_ROW_TYPE` |
+    | `(2.7,)` for `a int` | **2, truncated** | **NULL** |
+    | `("5", 7)` for `a int, s string` | `UDTF_ARROW_DATA_CONVERSION_ERROR` | **`a` NULL, `s` `'7'`** |
+    | `(1,)` for `a int, b string` | `UDTF_RETURN_SCHEMA_MISMATCH` | `UDTF_RETURN_SCHEMA_MISMATCH` |
+    | `None` | one row of NULLs | one row of NULLs |
+    | nothing (`return`, or `return None`) | no rows | no rows |
+    | `return [(1,), (2,)]` (a list instead of `yield`) | two rows | two rows |
+    | `eval` raises `ValueError("bad line: 1")` | `UDTF_EXEC_ERROR` ... `in the 'eval' method: bad line: 1` | same |
+
+    All the runtime errors arrive as `PYTHON_EXCEPTION` from the task
+    with the UDTF condition inside, for example:
+
+    ```text
+    PySparkRuntimeError: [UDTF_RETURN_SCHEMA_MISMATCH] The number of columns in
+    the result does not match the specified schema. Expected column count: 2,
+    Actual column count: 1. ...
+    ```
+
+    The lesson for messy data: **convert values yourself** and yield
+    exactly the declared types. Both paths have a row in the table that
+    silently turns a value into something else, and they disagree with
+    each other. Two errors happen when you create the UDTF, before any
+    query: a class without `eval` (`INVALID_UDTF_NO_EVAL`) and a class
+    with neither `returnType` nor `analyze` (`INVALID_UDTF_RETURN_TYPE`).
+
+- Class: mult_question
+  Depth: all
+  Output: "An Arrow-optimized UDTF (the 4.2 default) declares `ms int` and yields `(2.7,)`. What does Spark return?"
+  AnswerChoices: "2, truncated without an error;NULL;3, rounded;A UDTF_ARROW_DATA_CONVERSION_ERROR"
+  CorrectAnswer: "2, truncated without an error"
+  Hint: "The Arrow path casts a float into an int column by dropping the fraction; the non-Arrow path gives NULL instead."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Scalar Arguments and Lateral Joins
+
+    With scalar arguments, a UDTF is usually joined to the rows it was
+    computed from. In the DataFrame API (4.0), mark the columns that come
+    from the outer DataFrame with `.outer()`; in SQL, use `LATERAL`
+    after a comma or a `JOIN`:
+
+    ```python
+    @udtf(returnType="word string, n int")
+    class Words:
+        def eval(self, text):
+            if text is None:
+                return
+            for i, w in enumerate(text.split()):
+                yield w, i
+
+    df = spark.createDataFrame([(1, "a b"), (2, ""), (3, None), (4, "c")],
+                               "id int, text string")
+    df.lateralJoin(Words(sf.col("text").outer())).collect()
+
+    spark.udtf.register("words", Words)
+    df.createOrReplaceTempView("t")
+    spark.sql("SELECT id, w.* FROM t, LATERAL words(text) w").collect()
+    ```
+
+    ```text
+    [Row(id=1, text='a b', word='a', n=0), Row(id=1, text='a b', word='b', n=1),
+     Row(id=4, text='c', word='c', n=0)]
+    [Row(id=1, word='a', n=0), Row(id=1, word='b', n=1), Row(id=4, word='c', n=0)]
+    ```
+
+    The plan is a single node over the input, no join at all:
+
+    ```text
+    ArrowEvalPythonUDTF words(text#1)#39, [id#0], [word#40, n#41], 301
+    +- *(1) Scan ExistingRDD[id#0,text#1]
+    ```
+
+    Rows 2 and 3 produced nothing, so an inner lateral join drops them.
+    Arguments can also be passed by name, in SQL and Python, and Python
+    defaults work:
+
+    ```python
+    @udtf(returnType="a string, b string")
+    class Named:
+        def eval(self, a, b="dflt"):
+            yield a, b
+    spark.udtf.register("named", Named)
+    spark.sql("SELECT * FROM named(b => 'x', a => 'y')").collect()   # [Row(a='y', b='x')]
+    spark.sql("SELECT * FROM named('only')").collect()               # [Row(a='only', b='dflt')]
+    Named(b=sf.lit("x"), a=sf.lit("y")).collect()                    # [Row(a='y', b='x')]
+    ```
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    `lines` is a DataFrame with a `line` column and `kv` is a UDTF that
+    takes a line and a spec string. Create `parsed`: `lines` joined
+    laterally with `kv` called on each line and the literal spec
+    `"user,ms:int"`.
+  CorrectAnswer: |
+    parsed = lines.lateralJoin(kv(sf.col("line").outer(), sf.lit("user,ms:int")))
+  Hint: "lateralJoin takes the UDTF call. The line column comes from the outer DataFrame, so it needs .outer(); the spec is a literal."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Left Lateral Join Trap (SPARK-60564)
+
+    To keep rows that produce nothing, you ask for a left join. In 4.2.0
+    the obvious forms return the inner join's result:
+
+    ```python
+    df.lateralJoin(Words(sf.col("text").outer()), how="left").collect()
+    spark.sql("SELECT id, w.* FROM t LEFT JOIN LATERAL words(text) w").collect()
+    ```
+
+    ```text
+    [Row(id=1, text='a b', word='a', n=0), Row(id=1, text='a b', word='b', n=1),
+     Row(id=4, text='c', word='c', n=0)]
+    [Row(id=1, word='a', n=0), Row(id=1, word='b', n=1), Row(id=4, word='c', n=0)]
+    ```
+
+    Rows 2 and 3 are gone, without an error. Re-verified on 4.2.0 for
+    this lesson; it is SPARK-60564 (open, affects 3.5 to 4.2), and it is
+    not specific to Python: `LEFT JOIN LATERAL (SELECT explode(...))`
+    behaves the same. The analyzed plan is right (`LateralJoin ...,
+    LeftOuter`); the optimizer rule `OptimizeOneRowRelationSubquery`
+    (`sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/subquery.scala`)
+    then matches `LateralJoin(left, LateralSubquery(OneRowSubquery(plan)),
+    _, None)`, ignores the join type, and turns the generator into an
+    inner one. The `None` in that pattern is the join condition, which is
+    why adding one avoids the rule.
+
+    **Workaround 1: an explicit condition.** `ON true` in SQL, or
+    `on=sf.lit(True)` in `lateralJoin`:
+
+    ```python
+    df.lateralJoin(Words(sf.col("text").outer()), on=sf.lit(True), how="left").collect()
+    ```
+
+    ```text
+    [Row(id=1, text='a b', word='b', n=1), Row(id=1, text='a b', word='a', n=0),
+     Row(id=2, text='', word=None, n=None), Row(id=3, text=None, word=None, n=None),
+     Row(id=4, text='c', word='c', n=0)]
+    ```
+
+    Correct, but look at what it costs:
+
+    ```text
+    SortMergeJoin [coalesce(text#1, ), isnull(text#1)], [coalesce(text#13, ), isnull(text#13)], LeftOuter
+    :- Sort ... +- Exchange hashpartitioning(coalesce(text#1, ), isnull(text#1), 200)
+    :     +- Scan ExistingRDD[id#0,text#1]
+    +- Sort ... +- Exchange hashpartitioning(...)
+          +- ArrowEvalPythonUDTF Words(text#13)#9, [text#13], [word#11, n#12], 301
+             +- HashAggregate(keys=[text#1], functions=[])
+                +- Exchange hashpartitioning(text#1, 200)
+    ```
+
+    Spark decorrelates the subquery: it computes the UDTF once per
+    **distinct** input value and joins the results back, with three
+    shuffles. A marker file per `eval` call counted 4 calls for 5 input
+    rows, because two rows had the same text. For a UDTF with side
+    effects or randomness that changes behaviour, not only speed.
+
+    **Workaround 2 (better): a UDTF that never yields nothing.** If every
+    input must appear in the output, make the function say so:
+
+    ```python
+    @udtf(returnType="word string, n int")
+    class WordsOrNull:
+        def eval(self, text):
+            words = (text or "").split()
+            if not words:
+                yield None, None
+                return
+            for i, w in enumerate(words):
+                yield w, i
+    ```
+
+    An inner lateral join then keeps every row, and the plan is one
+    `ArrowEvalPythonUDTF` node again. The exercise's `kv_extract` works
+    this way: a blank line gives one row with `_error = 'blank'`.
+
+- Class: mult_question
+  Depth: all
+  Output: "In Spark 4.2.0, df.lateralJoin(my_udtf(sf.col(\"x\").outer()), how=\"left\") silently drops rows for which my_udtf yields nothing. Which fix keeps every row with a single UDTF node in the plan?"
+  AnswerChoices: "Make the UDTF yield a row of NULLs when it has nothing to return, and use an inner lateral join;Add on=sf.lit(True);Use how=\"left_outer\";Set spark.sql.execution.pythonUDTF.arrow.enabled to false"
+  CorrectAnswer: "Make the UDTF yield a row of NULLs when it has nothing to return, and use an inner lateral join"
+  Hint: "on=sf.lit(True) is also correct, but it turns the plan into a join over distinct inputs with several shuffles."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## terminate() in a Lateral Join: Two More Surprises
+
+    You saw that rows from `terminate()` attach to the last input row of
+    the partition. When a partition has **no** input rows, there is no
+    row to attach them to, and the task fails in the JVM:
+
+    ```python
+    @udtf(returnType="total int")
+    class Total:
+        def __init__(self): self.t = 0
+        def eval(self, v): self.t += v
+        def terminate(self): yield (self.t,)
+
+    df = spark.range(0, 3, 1, 4)          # 4 partitions, one of them empty
+    df.lateralJoin(Total(sf.col("id").cast("int").outer())).collect()
+    ```
+
+    ```text
+    java.lang.NullPointerException: Cannot invoke
+    "org.apache.spark.sql.catalyst.InternalRow.numFields()" because "this.row1" is null
+    ```
+
+    It happens with and without Arrow, in classic and Spark Connect
+    sessions (4.2.0). The cause is in `EvalPythonUDTFExec`
+    (`sql/core/src/main/scala/org/apache/spark/sql/execution/python/EvalPythonUDTFExec.scala`):
+    output rows after the last input row are joined with "the last
+    element of its child output", which an empty partition never set. A
+    JIRA search found no report of it. The rule that avoids both
+    surprises: with scalar arguments, yield only from `eval`; use
+    `terminate()` with `TABLE` arguments, where each partition's rows
+    belong to the function and no join is involved.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## TABLE Arguments: a Function Over a Table
+
+    A UDTF can take a whole table (or query) as an argument. Each `eval`
+    call then receives one `Row` of that table, and the clauses after
+    `TABLE(...)` decide how the rows are grouped and ordered:
+
+    ```python
+    @udtf(returnType="k string, n_rows int, first_v int, instance string, pid int")
+    class Lifecycle:
+        def __init__(self):
+            self.id = uuid.uuid4().hex[:6]
+            self.k, self.n, self.first = None, 0, None
+        def eval(self, row):
+            if self.k is None:
+                self.k, self.first = row["k"], row["v"]
+            self.n += 1
+        def terminate(self):
+            yield self.k, self.n, self.first, self.id, os.getpid()
+
+    spark.udtf.register("lifecycle", Lifecycle)
+    data = spark.createDataFrame([("a", 3), ("b", 1), ("a", 1), ("c", 5), ("b", 2), ("a", 2)],
+                                 "k string, v int")
+    data.createOrReplaceTempView("data")
+    spark.sql("SELECT * FROM lifecycle(TABLE(data) PARTITION BY k ORDER BY v)").show()
+    ```
+
+    ```text
+    +---+------+-------+--------+-------+
+    |  k|n_rows|first_v|instance|    pid|
+    +---+------+-------+--------+-------+
+    |  a|     3|      1|  37ff25|3475345|
+    |  b|     2|      1|  c7c0ea|3475345|
+    |  c|     1|      5|  266679|3475345|
+    +---+------+-------+--------+-------+
+    ```
+
+    Every key got its **own instance** (three ids, one Python process),
+    and each saw its rows in `v` order (`first_v` is the smallest). That
+    is what makes per-group state safe. The other forms:
+
+    - `TABLE(data)` with no clause: one instance per input partition,
+      with whatever rows it happens to hold. Here it gave two rows,
+      `(a, 3, 3)` and `(c, 3, 5)`: the partitions of `createDataFrame`.
+    - `TABLE(data) WITH SINGLE PARTITION`: one instance sees everything
+      (`(a, 6, 3)`). Fine for small inputs, a bottleneck for large ones.
+    - `TABLE(SELECT ... FROM ... WHERE ...)`: any query can be the
+      argument.
+
+    In the DataFrame API (4.0), `DataFrame.asTable()` returns a table
+    argument with `partitionBy`, `orderBy` and `withSinglePartition`:
+
+    ```python
+    Lifecycle(data.asTable().partitionBy("k").orderBy("v")).show()
+    ```
+
+    The plan shows the price of `PARTITION BY`: a shuffle by the key and
+    a sort, before the UDTF runs.
+
+    ```text
+    +- ArrowEvalPythonUDTF lifecycle(c#112)#105, [k#106, n_rows#107, ...], 301
+       +- Project [named_struct(k, k#0, v, v#1, partition_by_0, partition_by_0#111) AS c#112]
+          +- Sort [partition_by_0#111 ASC NULLS FIRST, v#1 ASC NULLS FIRST], false, 0
+             +- Exchange hashpartitioning(partition_by_0#111, 3), REPARTITION_BY_COL, [plan_id=236]
+    ```
+
+    A `Row` lets you read fields by name (`row["k"]`). The helper column
+    `partition_by_0` in the plan is not visible to `eval`: the row's
+    fields were just `k` and `v`.
+
+- Class: mult_question
+  Depth: all
+  Output: "You call SELECT * FROM f(TABLE(events) PARTITION BY user ORDER BY ts). How many instances of the UDTF class does Spark create?"
+  AnswerChoices: "One per distinct user;One per task, whatever the users;Exactly one;One per input row"
+  CorrectAnswer: "One per distinct user"
+  Hint: "Each PARTITION BY value gets a fresh instance, so state in __init__ is per user."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## A Parser Trap With Extra Arguments
+
+    Scalar arguments can follow a `TABLE` argument. Written the natural
+    way, the parser reads the comma as part of `ORDER BY`:
+
+    ```sql
+    SELECT * FROM sessionize(TABLE(events) PARTITION BY user ORDER BY ts, 30)
+    ```
+
+    ```text
+    [_LEGACY_ERROR_TEMP_0064] The table function call includes a table argument
+    with an invalid partitioning/ordering specification: the ORDER BY clause
+    included multiple expressions without parentheses surrounding them; please
+    add parentheses around these expressions and then retry the query again.
+    ```
+
+    The same happens after `PARTITION BY user, 30`, and with `ORDER BY ts
+    DESC, 30`. Any of these work:
+
+    ```sql
+    SELECT * FROM sessionize(TABLE(events) PARTITION BY user ORDER BY (ts), 30)
+    SELECT * FROM sessionize(TABLE(events) PARTITION BY user ORDER BY ts, gap_minutes => 30)
+    SELECT * FROM sessionize(TABLE(events) PARTITION BY user ORDER BY (ts, k), 30)
+    ```
+
+    Named arguments (`gap_minutes => 30`, the name of the `eval`
+    parameter) read best. `PARTITION BY` on a scalar argument is a plain
+    `PARSE_SYNTAX_ERROR`.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Stopping Early
+
+    To stop reading a partition (you found what you needed), raise
+    `SkipRestOfInputTableException` from `eval`. Spark stops sending rows
+    to that instance and calls `terminate()`:
+
+    ```python
+    from pyspark.sql.udtf import SkipRestOfInputTableException
+
+    @udtf(returnType="k string, v int")
+    class FirstTwo:
+        def __init__(self): self.n = 0
+        def eval(self, row):
+            self.n += 1
+            if self.n > 2:
+                raise SkipRestOfInputTableException("done")
+            yield row["k"], row["v"]
+    ```
+
+    Over five `a` rows and three `b` rows with `PARTITION BY k ORDER BY
+    v` it returned `a 0, a 1, b 0, b 1`. Note that Spark still shuffles
+    and sorts the whole input; only the Python work stops.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## analyze(): Choosing the Schema From the Arguments
+
+    Instead of a fixed `returnType`, a UDTF can have a static method
+    `analyze` (4.0). Spark calls it **during analysis, on the driver**, in
+    a Python worker, with one `AnalyzeArgument` per argument, and uses
+    the returned `AnalyzeResult` as the output schema. For a call like
+    `pick(line, 'action,user')` in a lateral join, the arguments were:
+
+    ```text
+    AnalyzeArgument(dataType=StringType(), value=None, isTable=False, isConstantExpression=False)
+    AnalyzeArgument(dataType=StringType(), value='action,user', isTable=False, isConstantExpression=True)
+    ```
+
+    A column has no value at analysis time; a literal does. So a constant
+    argument can steer the schema:
+
+    ```python
+    @dataclass
+    class KeysResult(AnalyzeResult):
+        keys: tuple = ()
+
+    @udtf
+    class Pick:
+        @staticmethod
+        def analyze(line: AnalyzeArgument, keys: AnalyzeArgument):
+            if not keys.isConstantExpression or not isinstance(keys.value, str):
+                raise ValueError("keys must be a constant string such as 'user,action'")
+            names = tuple(k.strip() for k in keys.value.split(","))
+            schema = StructType()
+            for n in names:
+                schema = schema.add(n, StringType())
+            return KeysResult(schema=schema, keys=names)
+
+        def __init__(self, analyze_result=None):
+            self.keys = analyze_result.keys
+
+        def eval(self, line, keys):
+            pairs = dict(p.split("=", 1) for p in (line or "").split() if "=" in p)
+            yield tuple(pairs.get(k) for k in self.keys)
+    ```
+
+    ```text
+    SELECT p.* FROM lines, LATERAL pick(line, 'action,user') p
+    +------+----+
+    |action|user|
+    +------+----+
+    | login|  u1|
+    |  NULL|  u2|
+    +------+----+
+    ```
+
+    Three things to take from it:
+
+    - **Subclass `AnalyzeResult`** (a dataclass, deliberately not frozen)
+      to carry what `analyze` worked out (here, the parsed keys) to the
+      executors. Spark pickles the result and passes it to
+      `__init__(self, analyze_result)`, so `eval` need not parse the
+      spec again for every row.
+    - **Errors in `analyze` fail the query at analysis**, before any job
+      runs, as `[TABLE_VALUED_FUNCTION_FAILED_TO_ANALYZE_IN_PYTHON]
+      Failed to analyze the Python user defined table function:
+      Traceback ... ValueError: keys must be a constant string ...`.
+      Validate arguments there.
+    - **Build the schema from type objects** (`StringType()`,
+      `IntegerType()`). `StructType().add("ms", "int")` fails, in
+      `analyze` or anywhere else in PySpark, with `[CANNOT_PARSE_DATATYPE]
+      Unable to parse datatype. int.`, because `add` with a string expects
+      the JSON type name (`"integer"`, `"long"`, `"string"`), not the
+      DDL name.
+
+- Class: mult_question
+  Depth: all
+  Output: "Your UDTF's analyze() reads keys.value to build the schema. A query passes a column instead of a literal for keys. What does analyze() see?"
+  AnswerChoices: "value=None and isConstantExpression=False;the first row's value;a list of all values;the column name as a string"
+  CorrectAnswer: "value=None and isConstantExpression=False"
+  Hint: "analyze runs during analysis, before any data is read."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Letting the Function Choose Its Partitioning
+
+    `AnalyzeResult` can also require how a `TABLE` argument is grouped
+    and ordered, so callers cannot forget:
+
+    ```python
+    @udtf
+    class PerKey:
+        @staticmethod
+        def analyze(t):
+            return AnalyzeResult(
+                schema=StructType().add("k", StringType()).add("total", LongType()),
+                partitionBy=[PartitioningColumn("k")],
+                orderBy=[OrderingColumn("v")])
+        ...
+    spark.sql("SELECT * FROM per_key(TABLE(data))").show()   # a 6, b 3, c 5
+    ```
+
+    The caller then must not add a clause of their own:
+
+    ```text
+    [TABLE_VALUED_FUNCTION_REQUIRED_METADATA_INCOMPATIBLE_WITH_CALL] Failed to
+    evaluate the table function per_key because its table metadata specified its
+    own required partitioning of the input table, but the function call specified
+    the WITH SINGLE PARTITION or PARTITION BY clause; ...
+    ```
+
+    The other fields: `withSinglePartition=True` (exclusive with
+    `partitionBy`), and `select=[SelectedColumn("k"),
+    SelectedColumn("v * 2", alias="dv")]`, which makes `eval` receive
+    only those expressions (an alias is required for anything that is not
+    a plain column). With that `select`, `eval` read `row["k"]` and
+    `row["dv"]`, and the query returned `[Row(k='a', doubled=6), Row(k='b',
+    doubled=2)]`.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## arrow_udtf (4.1): Batches Instead of Rows
+
+    `arrow_udtf` (4.1) is a different kind of table function. `eval`
+    receives a `pyarrow.RecordBatch` (for a `TABLE` argument) or
+    `pyarrow.Array`s (for scalar arguments) and yields Arrow tables or
+    batches, so the work can be vectorized:
+
+    ```python
+    import pyarrow as pa, pyarrow.compute as pc
+    from pyspark.sql.functions import arrow_udtf
+
+    @arrow_udtf(returnType="k string, v2 int")
+    class ArrowDouble:
+        def eval(self, batch: pa.RecordBatch):
+            yield pa.table({"k": batch.column("k"), "v2": pc.multiply(batch.column("v"), 2)})
+
+    ArrowDouble(data.asTable()).collect()   # [Row(k='a', v2=6), Row(k='b', v2=2)]
+    ```
+
+    It appears in the plan with evaluation type 302. It cannot sit on the
+    right side of a lateral join:
+
+    ```text
+    [LATERAL_JOIN_WITH_ARROW_UDTF_UNSUPPORTED] LATERAL JOIN with Arrow-optimized
+    user-defined table functions (UDTFs) is not supported. Arrow UDTFs cannot be
+    used on the right-hand side of a lateral join.
+    ```
+
+    Reach for it when the per-row Python work is the bottleneck and the
+    logic can be written with `pyarrow.compute`; keep the row-based UDTF
+    for parsing and stateful logic, which is most of messy data.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Determinism, the Optimizer and Performance
+
+    - **UDTFs are non-deterministic by default** (the `udtf` docstring
+      says so). Mark a pure function with `.asDeterministic()` so the
+      optimizer may treat it like any other expression.
+    - **UDTFs are opaque to the optimizer.** A `WHERE` after the UDTF is
+      evaluated on its output, and the input of a `TABLE` argument is read
+      in full unless you filter it inside `TABLE(SELECT ... WHERE ...)`.
+      Filter before the UDTF, not after.
+    - **Where the time goes.** Each row crosses from the JVM to Python
+      and back; with the Arrow path it travels in batches. `PARTITION BY`
+      adds a shuffle and a sort. One very large key means one very busy
+      instance: count rows per key before you trust a `PARTITION BY`.
+    - **Where analysis runs.** `analyze` runs in a Python worker on the
+      driver (or on the Spark Connect server), once per query analysis.
+      Keep it fast and free of network calls.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Parse key=value Logs, Then Sessionize
+
+    `data/messy/service_logs/kv.log` holds a morning of logs from two
+    hosts, lines like:
+
+    ```text
+    ts=2026-10-07T09:06:58Z level=WARN msg="card \"declined\" twice" user=u2 action=add_to_cart ms=195 region=vn-north
+    ```
+
+    with blank lines, a comment, a repeated key, an upper-case key, a
+    flag, `ms=fast` and a line cut off inside a quoted value. The helpers
+    `parse_spec`, `parse_logfmt` and `convert` are written. Complete:
+
+    1. `KVExtract.analyze`: reject a spec that is not a constant string
+       (with "constant" in the message); otherwise one column per spec
+       field plus `_extra map<string,string>` and `_error string`, as a
+       `SpecResult` that also carries the parsed fields.
+    2. `KVExtract.__init__` and `eval`: exactly one row per line.
+    3. `extract(lines, kv_extract)`: the lateral join.
+    4. `Sessionize.eval` and 5. `terminate`: a new session when the gap
+       since the previous event is more than `gap_minutes`.
+    6. `sessionize(events, gap_minutes, sessionize_udtf)`: a table
+       argument partitioned by user and ordered by `ts`.
+
+    The harness tests `analyze` as plain Python, then checks the schema,
+    one row per line, an Arrow UDTF node and no join in the plan, the
+    `_error` values, the analysis error for a non-constant spec, the
+    sessions against a plain Python reference, the shuffle and sort in
+    the plan, and the same sessions from SQL with a `TABLE` argument.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "In eval, build values with try/except ValueError around convert(...). In Sessionize.eval: if self.end is not None and ts - self.end > timedelta(minutes=gap_minutes): yield from self._finish() and reset start and actions. sessionize: sessionize_udtf(events.asTable().partitionBy('user').orderBy('ts'), sf.lit(gap_minutes))."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - A UDTF instance runs `__init__`, `eval` per row, `terminate`, then
+      `cleanup` (which also runs after a failure; `terminate` does not).
+    - Call `udtf(...)` after the session exists: the Arrow decision (4.2
+      default, SPARK-54555) is made at creation time, and a UDTF created
+      before a Connect session cannot run on it.
+    - Yield exactly the declared types: Arrow and non-Arrow paths coerce
+      wrong values differently and silently.
+    - Scalar arguments: one instance per task, rows from `terminate`
+      attach to the last input row and crash on an empty partition. Use
+      `TABLE` arguments for state.
+    - In 4.2.0 `LEFT JOIN LATERAL` without a condition and
+      `lateralJoin(..., how="left")` drop rows (SPARK-60564). Prefer a
+      UDTF that always yields a row; `ON true` works but decorrelates
+      into a join over distinct inputs.
+    - `TABLE(t) PARTITION BY k ORDER BY c` gives one instance per key, in
+      order, after a shuffle and sort; `asTable().partitionBy().orderBy()`
+      is the DataFrame form. Use named arguments after `ORDER BY`.
+    - `analyze` (4.0) runs on the driver, sees constants but not column
+      values, can return a subclassed `AnalyzeResult` that reaches
+      `__init__`, and can require partitioning, ordering and selected
+      columns.
+    - `arrow_udtf` (4.1) works on Arrow batches and cannot be used in a
+      lateral join.
+
+    Next: **VARIANT Shredding and Performance**, where VARIANT values
+    are split into typed Parquet columns when they are written.

@@ -1,0 +1,1276 @@
+- Class: meta
+  Lesson: "CSV and Delimited Files"
+  EstimatedMinutes: 65
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    "Columns and Expressions: Cleaning Values" read a CSV file with every
+    column as a string and cleaned the values afterwards. "Files as
+    Files: binaryFile, Globs and Metadata" showed `_metadata` and how Spark lists files, and "Text and
+    Logs" read text line by line and met encodings. This lesson is about
+    the CSV reader itself, which can do a lot of that work for you, and
+    can also get it silently wrong.
+
+    CSV is the most common messy format there is: every spreadsheet,
+    database and legacy system can export it, and no two of them agree
+    on the details. There is an informational standard (RFC 4180), but
+    real files differ in separators, quoting, escaping, line breaks,
+    encodings, null markers, number and date conventions, and whether
+    the header matches the data.
+
+    By the end of this lesson you will be able to:
+
+    - Read headers correctly, including duplicate and blank names, and
+      know why `enforceSchema` defaults to ignoring them
+    - Decide when `inferSchema` is worth its cost, and what it breaks
+      (leading zeros, mixed columns, dates)
+    - Set `sep`, `quote`, `escape`, `unescapedQuoteHandling` and
+      `multiLine` for the file you actually have
+    - Control `nullValue`, `emptyValue`, `nanValue`, whitespace,
+      `dateFormat`, `timestampFormat` and `locale` (decimal commas)
+    - Read other encodings, byte order marks and comment lines, and know
+      the Spark 4.0 charset restriction
+    - Keep malformed rows with `mode` and `columnNameOfCorruptRecord`,
+      and avoid the `DROPMALFORMED` counting trap
+    - Read a folder whose files have reordered or extra columns
+    - Parse CSV inside a column with `from_csv` and `schema_of_csv`, and
+      fixed-width files with `substring`
+    - Write CSV that other tools read back exactly
+
+- Class: text
+  Depth: beginner
+  Output: |
+    A CSV file is a spreadsheet printed as plain text: one line per row,
+    commas between the cells. It carries no types, so `00042` could be a
+    number or a code, and no rules for awkward cells, so every program
+    invents its own way to write a comma, a quote or a line break inside
+    one. Reading CSV well means finding out which rules this particular
+    file follows, and telling Spark.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Sample Files
+
+    `data/messy/delimited/` holds one file per kind of trouble:
+
+    | File | What is wrong with it |
+    |------|-----------------------|
+    | `products.csv` | quotes doubled inside quoted fields, line breaks inside descriptions, SKUs with leading zeros, `NA` for missing |
+    | `orders_eu.csv` | a byte order mark, `#` comment lines, `;` separator, decimal commas (`1.234,50`), `dd.MM.yyyy` dates, two bad rows |
+    | `legacy_latin1.tsv` | tab separated, ISO-8859-1 encoded, Windows line endings, a duplicated and a blank header name |
+    | `stores_fixed.txt` | fixed-width columns, a header and a trailer record, one truncated line |
+    | `sales/` | one feed over three days: columns reordered on day 2, a new column on day 3, a short row and a bad amount |
+
+    To try small cases, it is easiest to write tiny files yourself. The
+    examples in this lesson use this helper:
+
+    ```python
+    import os, tempfile
+    from pyspark.sql import functions as F
+
+    tmp = tempfile.mkdtemp()
+
+    def csv_file(name, text, encoding="utf-8"):
+        """Write `text` to a new file and return its path."""
+        path = os.path.join(tmp, name)
+        with open(path, "w", encoding=encoding, newline="") as f:
+            f.write(text)
+        return path
+    ```
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The CSV Reader and Its Defaults
+
+    Three spellings, one reader:
+
+    ```python
+    spark.read.option("header", True).option("sep", ";").csv(path)
+    spark.read.csv(path, header=True, sep=";")
+    spark.read.format("csv").option("header", True).option("sep", ";").load(path)
+    ```
+
+    Unlike the `wholetext` keyword of `text()` ("Text and Logs"), every
+    keyword of `csv()` defaults to `None`, which means "not set", so
+    mixing `.option(...)` and keywords is safe here. Option names are
+    case-insensitive.
+
+    The defaults, from `CSVOptions` in the 4.2.0 source, are worth
+    knowing by heart, because most CSV bugs are a default that doesn't
+    fit the file:
+
+    | Option | Default | Meaning |
+    |--------|---------|---------|
+    | `sep` (alias `delimiter`) | `,` | field separator |
+    | `header` | `false` | first line is data, columns are `_c0`, `_c1`, ... |
+    | `inferSchema` | `false` | every column is `STRING` |
+    | `enforceSchema` | `true` | a given schema wins over the header, by position |
+    | `quote` | `"` | quote character |
+    | `escape` | `\` | escape character inside quotes (not RFC 4180's `""`) |
+    | `multiLine` | `false` | one record per line |
+    | `nullValue` | empty string | text that means NULL |
+    | `emptyValue` | empty string | what a quoted `""` becomes |
+    | `nanValue`, `positiveInf`, `negativeInf` | `NaN`, `Inf`, `-Inf` | special floating-point values |
+    | `ignoreLeadingWhiteSpace`, `ignoreTrailingWhiteSpace` | `false` when reading, `true` when writing | trim values |
+    | `encoding` (alias `charset`) | `UTF-8` | text encoding |
+    | `comment` | disabled | lines starting with this character are skipped |
+    | `mode` | `PERMISSIVE` | what to do with malformed rows |
+    | `locale` | `en-US` | for month names and decimal parsing |
+    | `unescapedQuoteHandling` | `STOP_AT_DELIMITER` | stray quotes inside values |
+    | `maxColumns`, `maxCharsPerColumn` | 20480, unlimited | parser limits |
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Headers
+
+    Without `header`, the first line is a data row and columns are
+    named by position. With it, names come from the first line, and
+    Spark makes them unique:
+
+    ```python
+    p = csv_file("headers.csv", "id,name,id,,  city  \n1,Ada,7,x,Toronto\n")
+    spark.read.csv(p).columns
+    # ['_c0', '_c1', '_c2', '_c3', '_c4']
+    spark.read.option("header", True).csv(p).columns
+    # ['id0', 'name', 'id2', '_c3', '  city  ']
+    spark.read.option("header", True).csv(csv_file("case.csv", "ID,id\n1,2\n")).columns
+    # ['ID0', 'id1']
+    ```
+
+    - A **duplicated name** gets its position appended (`id0`, `id2`),
+      and so does a case-insensitive duplicate (`ID`/`id`, because
+      `spark.sql.caseSensitive` is false by default).
+    - A **blank name** becomes `_c` plus its position (`_c3`).
+    - **Spaces are kept** (`'  city  '`).
+
+    Names with dots, spaces or brackets need backticks, because a dot
+    otherwise means "field of a struct":
+
+    ```python
+    odd = spark.read.option("header", True).csv(
+        csv_file("odd.csv", "first name,amount (CAD),e.mail\nAda,1,a@x.ca\n"))
+    odd.select("e.mail")
+    # [UNRESOLVED_COLUMN.WITH_SUGGESTION] ... name `e`.`mail` cannot be resolved.
+    # Did you mean one of the following? [`e.mail`, `first name`, `amount (CAD)`].
+    odd.select("`e.mail`", F.col("`amount (CAD)`"))          # works
+    odd.toDF("first_name", "amount_cad", "email").columns    # rename them all
+    ```
+
+    `toDF(*names)` renames every column by position, the quickest way to
+    replace a bad header (as in the exercise's `legacy_latin1.tsv`).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## enforceSchema: Your Schema Wins, Silently
+
+    When you pass a schema **and** `header=True`, the header line is
+    skipped and **ignored**: columns are taken by position. If the file's
+    columns are in another order, nothing complains:
+
+    ```python
+    swapped = csv_file("swapped.csv", "name,id\nAda,1\nBao,2\n")
+    spark.read.option("header", True).schema("id INT, name STRING").csv(swapped).show()
+    ```
+
+    ```
+    +----+----+
+    |  id|name|
+    +----+----+
+    |NULL|   1|
+    |NULL|   2|
+    +----+----+
+    ```
+
+    The names went into `id` (not integers, so NULL) and the IDs into
+    `name`. Set `enforceSchema` to `false` (2.4, SPARK-23786) and Spark
+    checks the header against the schema instead:
+
+    ```python
+    (spark.read.option("header", True).option("enforceSchema", False)
+        .schema("id INT, name STRING").csv(swapped).collect())
+    ```
+
+    ```
+    [FAILED_READ_FILE.NO_HINT] Encountered error while reading file .../swapped.csv.
+    Caused by: SparkIllegalArgumentException: CSV header does not conform to the schema.
+     Header: name, id
+     Schema: id, name
+    Expected: id but found: name
+    ```
+
+    It does not reorder the columns for you; it refuses to read them
+    wrongly, which is what you want in a production job. The check
+    happens per file when it is read, so it also catches a single file
+    in a folder whose layout changed. A corrupt record column (later in
+    this lesson) in the schema does not break the check.
+
+- Class: mult_question
+  Depth: all
+  Output: "You read a CSV with `header=True` and an explicit schema `id INT, name STRING`, but the file's header is `name,id`. With default options, what happens?"
+  AnswerChoices: "The header is ignored and columns are filled by position, so id is NULL and name holds the IDs;Spark matches the columns by name;The read fails with a header mismatch error;Spark infers a new schema from the header"
+  CorrectAnswer: "The header is ignored and columns are filled by position, so id is NULL and name holds the IDs"
+  Hint: "enforceSchema is true by default. What does it enforce?"
+
+- Class: text
+  Depth: all
+  Output: |
+    ## inferSchema: Convenient, Slow and Lossy
+
+    `inferSchema` reads the data to guess a type for each column:
+
+    ```python
+    inv = csv_file("infer.csv",
+        "sku,zip,qty,price,day,ts,flag,mixed\n"
+        "00123,02139,1,1.50,2026-01-05,2026-01-05 10:00:00,true,7\n"
+        "00456,10001,2,2.25,2026-01-06,2026-01-06 11:30:00,false,x\n")
+    df = spark.read.option("header", True).option("inferSchema", True).csv(inv)
+    df.printSchema()
+    df.show()
+    ```
+
+    ```
+    root
+     |-- sku: integer (nullable = true)
+     |-- zip: integer (nullable = true)
+     |-- qty: integer (nullable = true)
+     |-- price: double (nullable = true)
+     |-- day: date (nullable = true)
+     |-- ts: timestamp (nullable = true)
+     |-- flag: boolean (nullable = true)
+     |-- mixed: string (nullable = true)
+
+    +---+-----+---+-----+----------+-------------------+-----+-----+
+    |sku|  zip|qty|price|       day|                 ts| flag|mixed|
+    +---+-----+---+-----+----------+-------------------+-----+-----+
+    |123| 2139|  1|  1.5|2026-01-05|2026-01-05 10:00:00| true|    7|
+    |456|10001|  2| 2.25|2026-01-06|2026-01-06 11:30:00|false|    x|
+    +---+-----+---+-----+----------+-------------------+-----+-----+
+    ```
+
+    What went wrong:
+
+    - **Leading zeros are gone.** `00123` became `123` and the ZIP code
+      `02139` became `2139`. Identifiers that look like numbers must stay
+      strings.
+    - **One odd value makes a column `string`** (`mixed`), and on a
+      bigger file that one value may be in row 9 million.
+    - **Dates are only found in ISO format** (`preferDate`, an option
+      since 3.4 and on by default, makes `2026-01-05` a `DATE`).
+      `05/01/2026` stays a string unless you pass `dateFormat`, and then
+      it is inferred as a date in that format.
+    - **Padded numbers become doubles**: ` 7 ` is inferred as `double`,
+      because the integer check is stricter than the double check.
+
+    It also costs time. Counting the Spark jobs that just *defining*
+    the DataFrame starts (with `spark.sparkContext.statusTracker()` and a
+    job group) on `products.csv`:
+
+    ```
+    schema given:          0 jobs
+    header only:           1 job   (read the first line for the names)
+    header + inferSchema:  2 jobs  (first line, then a full pass)
+    ```
+
+    The full pass reads the **entire** input before your query starts.
+    `samplingRatio` makes it cheaper and riskier: a column of 1,000
+    numbers followed by one `hello` is `string` with full inference and
+    `int` with `samplingRatio=0.1`, and then `hello` silently becomes
+    NULL.
+
+    Use inference to explore a new file, then copy the schema it found
+    (`df.schema.simpleString()`, as in "Schemas for Data You Don't
+    Control"), fix the types that are wrong, and pass that schema in the
+    real job.
+
+- Class: mult_question
+  Depth: all
+  Output: "A product file has SKUs like 00042 and 10007. You read it with `inferSchema=True`. What happens to the SKUs?"
+  AnswerChoices: "They become integers and lose their leading zeros;They stay strings because they have leading zeros;Spark fails because the values are ambiguous;They become decimals"
+  CorrectAnswer: "They become integers and lose their leading zeros"
+  Hint: "Inference only asks: does every value parse as an integer?"
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Separators
+
+    `sep` (or its alias `delimiter`) is the field separator. Get it wrong
+    and you don't get an error, you get one wide column:
+
+    ```python
+    semi = csv_file("semi.csv", "a;b\n1,5;2\n")
+    spark.read.option("header", True).csv(semi).collect()
+    # [Row(a;b='1')]          the comma in 1,5 split the line instead
+    spark.read.option("header", True).option("sep", ";").csv(semi).collect()
+    # [Row(a='1,5', b='2')]
+    ```
+
+    - Tabs: `sep="\t"` in Python (a tab character). Spark also accepts
+      the two characters backslash and `t`, `sep="\\t"`, which is handy
+      in config files.
+    - **Multi-character separators** work since 3.0 (SPARK-24540):
+      `option("sep", "||")` reads `1|x||2` as `1|x` and `2`.
+    - Any single character, including non-ASCII ones such as `¦` or the
+      control character U+0001 that Hive uses.
+    - An empty separator fails with `IllegalArgumentException: Delimiter
+      cannot be empty`.
+
+    A semicolon-separated file is often a European export, where the
+    comma is already taken as the decimal point. Keep that in mind for
+    the numbers section below.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Quotes and Escapes: Spark Is Not RFC 4180 by Default
+
+    A field that contains the separator, a quote or a line break is
+    wrapped in quotes. Inside quotes, there are two conventions for a
+    literal quote character: RFC 4180 (Excel, Python's `csv` module,
+    most databases) doubles it, `""`; Spark's default escapes it with a
+    backslash, `\"`.
+
+    ```python
+    q = csv_file("quotes.csv",
+        'id,note\n1,"hello, world"\n2,"she said ""hi"""\n3,"back\\"slash"\n')
+    spark.read.option("header", True).csv(q).show(truncate=False)
+    spark.read.option("header", True).option("escape", '"').csv(q).show(truncate=False)
+    ```
+
+    ```
+    +---+-----------------+
+    |id |note             |
+    +---+-----------------+
+    |1  |hello, world     |
+    |2  |"she said ""hi"""|
+    |3  |back"slash       |
+    +---+-----------------+
+
+    +---+-------------+
+    |id |note         |
+    +---+-------------+
+    |1  |hello, world |
+    |2  |she said "hi"|
+    |3  |"back\"slash"|
+    +---+-------------+
+    ```
+
+    With the default escape, the RFC-style row 2 comes back with all its
+    quotes; with `escape='"'` it is right and the backslash-style row 3
+    is wrong. Neither setting reads both. Find out which convention the
+    producer uses (it is almost always `""` for files from other tools)
+    and set `escape` to match. `quote` changes the quote character
+    (`quote="'"` for single quotes), and an empty `quote` turns quoting
+    off entirely.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Stray Quotes: unescapedQuoteHandling
+
+    Hand-made files contain quotes that are not escaped at all. Since
+    3.1 (SPARK-33566), `unescapedQuoteHandling` chooses what the parser
+    does with them. On the line `2,"x"y,z",8` (header `id,note,n`):
+
+    | Setting | Result for row 2 |
+    |---------|------------------|
+    | `STOP_AT_DELIMITER` (default) | `'"x"y'`, `'z"'` (the 8 is lost) |
+    | `STOP_AT_CLOSING_QUOTE` | `'x"y,z'`, `'8'` |
+    | `BACK_TO_DELIMITER` | `'xy,z'`, `'8'` |
+    | `SKIP_VALUE` | NULL, `'z"'` |
+    | `RAISE_ERROR` | the read fails: `TextParsingException: Unescaped quote character '"' inside quoted value of CSV field` |
+
+    A quote in the middle of an unquoted value (`a "b" c`) is just a
+    character in every mode. None of these modes recovers every case
+    correctly, which is the point: use `RAISE_ERROR` in a check job to
+    find out whether a feed has the problem at all, and fix the producer
+    if you can.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Line Breaks Inside Fields: multiLine
+
+    By default, Spark reads CSV **line by line**, which lets it split a
+    large file into byte ranges and read them in parallel. A quoted field
+    with a line break in it is then cut in two:
+
+    ```python
+    spark.read.option("header", True).csv("data/messy/delimited/products.csv").count()   # 17
+    ```
+
+    ```
+    +---------------+-------------+---------------------+
+    |sku            |name         |description          |
+    +---------------+-------------+---------------------+
+    |00042          |Kettle, steel|Boils 1.7 L.         |
+    |Auto shut-off."|39.99        |yes                  |
+    |00107          |Tea mug      |"The ""classic"" mug"|
+    +---------------+-------------+---------------------+
+    ```
+
+    The file has 15 products. With `multiLine` (and the RFC escape):
+
+    ```python
+    good = (spark.read.option("header", True).option("multiLine", True)
+            .option("escape", '"').csv("data/messy/delimited/products.csv"))
+    good.count()   # 15
+    ```
+
+    ```
+    +-----+-------------+----------------------------+
+    |sku  |name         |description                 |
+    +-----+-------------+----------------------------+
+    |00042|Kettle, steel|Boils 1.7 L.\nAuto shut-off.|
+    |00107|Tea mug      |The "classic" mug           |
+    |00230|Spoon set    |NULL                        |
+    +-----+-------------+----------------------------+
+    ```
+
+    The cost: in `multiLine` mode a file can no longer be split, so each
+    file is read by one task from start to end. Fine for many
+    small-to-medium files, a bottleneck for one huge file.
+
+    A second cost is fragility. A quote that is opened and never closed
+    swallows **the rest of the file** in `multiLine` mode:
+
+    ```python
+    un = csv_file("unterminated.csv", 'id,note\n1,"never closed\n2,b\n3,c\n')
+    spark.read.option("header", True).csv(un).collect()
+    # 3 rows: ('1', 'never closed'), ('2', 'b'), ('3', 'c')
+    spark.read.option("header", True).option("multiLine", True).csv(un).collect()
+    # 1 row:  ('1', 'never closed\n2,b\n3,c\n')
+    ```
+
+    Check row counts against something independent (a trailer record, a
+    count from the producer, `wc -l` on a sample) when you turn
+    `multiLine` on.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    `path` points to an RFC 4180 CSV file with a header, whose quoted
+    fields can contain line breaks and doubled quotes (`""`). Assign to
+    `df` a DataFrame that reads it correctly, with all columns as
+    strings.
+  CorrectAnswer: |
+    df = spark.read.option("header", True).option("multiLine", True).option("escape", '"').csv(path)
+  Hint: "Three options: header, multiLine and escape set to a double quote."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## NULL, Empty and NaN
+
+    Four options decide which text becomes NULL, an empty string or a
+    special number:
+
+    ```python
+    nv = csv_file("nulls.csv",
+        'id,s,x\n1,,1.5\n2,"",NaN\n3,NA,NA\n4,  ,-Inf\n5,null,Inf\n6,N/A,inf\n')
+    sch = "id INT, s STRING, x DOUBLE"
+    spark.read.option("header", True).schema(sch).csv(nv).show()
+    spark.read.option("header", True).schema(sch).option("nullValue", "NA").csv(nv).show()
+    ```
+
+    ```
+    +---+----+---------+
+    | id|   s|        x|
+    +---+----+---------+
+    |  1|NULL|      1.5|
+    |  2|NULL|      NaN|
+    |  3|  NA|     NULL|
+    |  4|    |-Infinity|
+    |  5|null| Infinity|
+    |  6| N/A|     NULL|
+    +---+----+---------+
+
+    +---+----+---------+
+    | id|   s|        x|
+    +---+----+---------+
+    |  1|NULL|      1.5|
+    |  2|    |      NaN|
+    |  3|NULL|     NULL|
+    |  4|    |-Infinity|
+    |  5|null| Infinity|
+    |  6| N/A|     NULL|
+    +---+----+---------+
+    ```
+
+    The first table is the default, the second uses `nullValue="NA"`.
+
+    - **By default you cannot tell an empty field from a quoted empty
+      string**: `,,` and `,"",` are both NULL, because `nullValue` and
+      `emptyValue` are both the empty string.
+    - With `nullValue="NA"`, `NA` is NULL, an unquoted empty field is
+      still NULL, and `""` becomes a real empty string (row 2).
+      `emptyValue` sets what `""` becomes (`emptyValue="<empty>"` turns
+      row 2's `s` into `<empty>`).
+    - `null`, `N/A` and spaces are just text. Normalize them afterwards,
+      as in "Columns and Expressions: Cleaning Values".
+    - In a `DOUBLE` column, `NaN`, `Inf` and `-Inf` (the `nanValue`,
+      `positiveInf` and `negativeInf` defaults) become the special
+      values. `inf` in lower case is not one of them, so row 6 is a
+      malformed value and becomes NULL. And row 3's `NA` in `x` is
+      NULL for the same reason, not because of `nullValue`: it is not a
+      number. More on malformed values below.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Whitespace: Different Rules for Different Types
+
+    Reading does **not** trim by default
+    (`ignoreLeadingWhiteSpace` and `ignoreTrailingWhiteSpace` are false),
+    and the type parsers disagree about spaces:
+
+    ```python
+    ws = csv_file("ws.csv", " 7 , 2.5 , 2026-01-01 \n")
+    spark.read.schema("a INT, b DOUBLE, c DATE").csv(ws).collect()
+    # [Row(a=None, b=2.5, c=datetime.date(2026, 1, 1))]
+    (spark.read.schema("a INT, b DOUBLE, c DATE")
+        .option("ignoreLeadingWhiteSpace", True).option("ignoreTrailingWhiteSpace", True)
+        .csv(ws).collect())
+    # [Row(a=7, b=2.5, c=datetime.date(2026, 1, 1))]
+    ```
+
+    The padded integer is NULL, the padded double and date parse. Turn on
+    both options for fixed-layout exports padded with spaces; leave them
+    off when spaces are meaningful in string columns. Note that this is
+    the CSV parser's own number parsing: `CAST(' 7 ' AS INT)` in SQL
+    trims and gives 7. When you write CSV, both options default to
+    **true**, which matters at the end of this lesson.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Dates, Timestamps and Locale
+
+    `dateFormat` and `timestampFormat` give the patterns for `DATE` and
+    `TIMESTAMP` columns (same pattern letters as "Columns and
+    Expressions: Cleaning Values"). Without them, only ISO-style text
+    parses, and anything else is NULL, **silently** in the default mode:
+
+    ```python
+    eu = "data/messy/delimited/orders_eu.csv"
+    plain = spark.read.option("header", True).option("sep", ";").option("comment", "#")
+    s = "order_id INT, sku STRING, customer STRING, amount STRING, order_date DATE, note STRING"
+    plain.schema(s).csv(eu).select("order_id", "amount", "order_date").show(3)
+    plain.schema(s).option("dateFormat", "dd.MM.yyyy").csv(eu).select("order_id", "amount", "order_date").show(3)
+    ```
+
+    ```
+    +--------+--------+----------+
+    |order_id|  amount|order_date|
+    +--------+--------+----------+
+    |    1001|1.234,50|      NULL|
+    |    1002|   12,50|      NULL|
+    |    1003|    7,00|      NULL|
+    +--------+--------+----------+
+    only showing top 3 rows
+    +--------+--------+----------+
+    |order_id|  amount|order_date|
+    +--------+--------+----------+
+    |    1001|1.234,50|2026-10-01|
+    |    1002|   12,50|2026-10-02|
+    |    1003|    7,00|      NULL|
+    +--------+--------+----------+
+    only showing top 3 rows
+    ```
+
+    Order 1003 is dated `31.09.2026`, which does not exist, so it stays
+    NULL even with the right format: a malformed row (see "Parse
+    Modes").
+
+    - **Month names** follow `locale` (default `en-US`). `6 janv. 2026`
+      with `dateFormat="d MMM yyyy"` is NULL until you add
+      `locale="fr-FR"`, then it is 2026-01-06.
+    - **Time zones**: timestamps without an offset are read in the
+      session time zone, or in the `timeZone` option if you set one.
+      `2026-01-05 10:00:00` read with `timeZone="America/Toronto"` is
+      15:00 UTC.
+    - **`TIMESTAMP_NTZ`** columns keep the wall-clock reading with no
+      zone at all (`timestampNTZFormat` sets their pattern).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Decimal Commas: A Silent 100x Error
+
+    The `locale` option also controls how `DECIMAL` columns are parsed.
+    Watch what the default `en-US` locale does with European amounts:
+
+    ```python
+    for t in ["DECIMAL(10,2)", "DOUBLE"]:
+        for loc in ["en-US", "de-DE"]:
+            r = plain.schema(f"order_id INT, sku STRING, customer STRING, amount {t}").option("locale", loc).csv(eu)
+            print(t, loc, [x["amount"] for x in r.limit(4).collect()])
+    ```
+
+    ```
+    DECIMAL(10,2) en-US [Decimal('1.23'), Decimal('1250.00'), Decimal('700.00'), Decimal('25.00')]
+    DECIMAL(10,2) de-DE [Decimal('1234.50'), Decimal('12.50'), Decimal('7.00'), Decimal('25.00')]
+    DOUBLE en-US [None, None, None, 25.0]
+    DOUBLE de-DE [None, None, None, 25.0]
+    ```
+
+    The file says 1.234,50, 12,50, 7,00 and 25. With the default locale,
+    `DECIMAL` reads the comma as a thousands separator: **12,50 became
+    1250.00 and 7,00 became 700.00**, and `1.234,50` became 1.23. No
+    error, no NULL, just wrong numbers, a hundred times too big. With
+    `locale="de-DE"` all four are right.
+
+    `DOUBLE` (and `INT`) columns don't use the locale: they reject both
+    the comma and grouping separators, so you get NULL instead. The same
+    applies to US-style grouping: `"1,234.50"` reads as `1234.50` into a
+    `DECIMAL` but as NULL into a `DOUBLE`.
+
+    So for money in CSV: use `DECIMAL`, set `locale` to the producer's
+    locale, and test a known row. Or read the column as `STRING` and
+    convert it yourself, as in "Columns and Expressions:
+    Cleaning Values".
+
+- Class: mult_question
+  Depth: all
+  Output: "A semicolon-separated file has the amount `12,50`. You read it as `DECIMAL(10,2)` with default options. What do you get?"
+  AnswerChoices: "1250.00;12.50;NULL;A malformed record error"
+  CorrectAnswer: "1250.00"
+  Hint: "The default locale is en-US, where a comma groups thousands."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Encodings
+
+    The CSV reader decodes UTF-8 unless you set `encoding` (unlike the
+    `text` source, it honours it). `legacy_latin1.tsv` was written in
+    ISO-8859-1:
+
+    ```python
+    lat = "data/messy/delimited/legacy_latin1.tsv"
+    spark.read.option("header", True).option("sep", "\t").csv(lat).select("name1", "city").show(2)
+    (spark.read.option("header", True).option("sep", "\t").option("encoding", "ISO-8859-1")
+        .csv(lat).select("name1", "city").show(2))
+    ```
+
+    ```
+    +-----+---------+
+    |name1|     city|
+    +-----+---------+
+    |  Zo�| Montr�al|
+    | Jos�|S�o Paulo|
+    +-----+---------+
+    only showing top 2 rows
+    +-----+---------+
+    |name1|     city|
+    +-----+---------+
+    |  Zoë| Montréal|
+    | José|São Paulo|
+    +-----+---------+
+    only showing top 2 rows
+    ```
+
+    **UTF-16 and UTF-32 need `multiLine`.** In line mode Spark finds
+    line breaks by looking for the byte `0x0A`, which in UTF-16 is only
+    half of a character, so the lines are cut in the wrong places:
+
+    ```python
+    u16 = csv_file("utf16.csv", "id,name\n1,Zoë\n2,Nguyễn\n", encoding="utf-16")
+    spark.read.option("header", True).option("encoding", "UTF-16").csv(u16).collect()
+    # [('1', 'Zoë�'), ('2', 'NguyÅṮ�'), ('�', None)]
+    spark.read.option("header", True).option("encoding", "UTF-16").option("multiLine", True).csv(u16).collect()
+    # [('1', 'Zoë'), ('2', 'Nguyễn')]
+    ```
+
+    Single-byte encodings (ISO-8859-1, US-ASCII) and UTF-8 work in both
+    modes.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## The Spark 4.0 Charset List
+
+    Since Spark 4.0 (SPARK-48857), the CSV reader accepts only a fixed
+    list of charsets, so that results don't depend on which JVM you run:
+
+    ```python
+    cp = csv_file("cp1252.csv", "id,name\n1,“quoted” €5\n", encoding="cp1252")
+    spark.read.option("header", True).option("encoding", "windows-1252").csv(cp)
+    ```
+
+    ```
+    [INVALID_PARAMETER_VALUE.CHARSET] The value of parameter(s) `charset` in
+    `CSVOptions` is invalid: expects one of the iso-8859-1, us-ascii, utf-16,
+    utf-16be, utf-16le, utf-32, utf-8, but got windows-1252. SQLSTATE: 22023
+    ```
+
+    Aliases such as `latin1` are rejected the same way; write
+    `ISO-8859-1`. Windows-1252 ("ANSI" in many Windows tools) is the
+    awkward one: it is almost Latin-1, so reading it as `ISO-8859-1`
+    *works* for letters but turns the extra characters into control
+    codes (`“quoted” €5` becomes `'\x93quoted\x94 \x805'`). The internal
+    setting `spark.sql.legacy.javaCharsets=true` restores the JVM's full
+    list, after which `windows-1252` decodes correctly. The migration
+    guide documents the same restriction for `encode` and `decode`.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Byte Order Marks and Comment Lines
+
+    Some tools (Excel's "CSV UTF-8", many Windows programs) start a UTF-8
+    file with the bytes `EF BB BF`, the **byte order mark** (BOM,
+    U+FEFF). Read naively, it sticks to the first column name. Spark
+    handles it for you:
+
+    ```python
+    bom = csv_file("bom.csv", "id,name\n1,Ada\n", encoding="utf-8-sig")   # writes the BOM
+    open(bom, "rb").read()[:6]                       # b'\xef\xbb\xbfid,'
+    spark.read.option("header", True).csv(bom).columns   # ['id', 'name'], 'id' has length 2
+    ```
+
+    The BOM is dropped in line mode (by the line reader) and in
+    `multiLine` mode (by the CSV parser). The `text` source drops it in
+    line mode too, but `text(..., wholetext=True)` keeps it as the first
+    character, so check for it if you split whole files yourself.
+
+    `comment` names one character; lines that **start** with it are
+    skipped, including before the header:
+
+    ```python
+    spark.read.option("header", True).option("sep", ";").csv(eu).columns
+    # ['# Export Kassensystem 2026-10-05']
+    spark.read.option("header", True).option("sep", ";").option("comment", "#").csv(eu).columns
+    # ['order_id', 'sku', 'customer', 'amount', 'order_date', 'note']
+    ```
+
+    Only the first character of the line counts: `  # indented` and a
+    value such as `1,# not a comment` are data. A longer marker such as
+    `//` fails with `OPTION_VALUE_EXCEEDS_ONE_CHARACTER`.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Parse Modes and the Corrupt Record Column
+
+    A CSV row is **malformed** when a value does not parse as its
+    column's type, or when the row has fewer or more fields than the
+    schema. `mode` decides what happens:
+
+    - `PERMISSIVE` (default): keep the row; bad fields become NULL.
+    - `DROPMALFORMED`: drop the row.
+    - `FAILFAST`: fail the query on the first malformed row.
+
+    In `PERMISSIVE` mode, Spark can keep the raw line of every malformed
+    row in a string column. Unlike JSON, CSV inference never adds this
+    column for you: declare it in the schema, as `STRING`, named
+    `_corrupt_record` or whatever `columnNameOfCorruptRecord` says:
+
+    ```python
+    bad = csv_file("bad.csv", "id,amount,day\n1,2.5,2026-01-01\n2,abc,2026-01-02\n"
+                              "3,4.0\n4,5.0,2026-01-04,EXTRA\n5,6.0,2026-02-30\n")
+    sch = "id INT, amount DOUBLE, day DATE"
+    spark.read.option("header", True).schema(sch + ", _corrupt_record STRING").csv(bad).show(truncate=False)
+    ```
+
+    ```
+    +---+------+----------+----------------------+
+    |id |amount|day       |_corrupt_record       |
+    +---+------+----------+----------------------+
+    |1  |2.5   |2026-01-01|NULL                  |
+    |2  |NULL  |2026-01-02|2,abc,2026-01-02      |
+    |3  |4.0   |NULL      |3,4.0                 |
+    |4  |5.0   |2026-01-04|4,5.0,2026-01-04,EXTRA|
+    |5  |6.0   |NULL      |5,6.0,2026-02-30      |
+    +---+------+----------+----------------------+
+    ```
+
+    All four problems are caught: a bad number, a missing field, an
+    extra field and an impossible date. The fields that did parse are
+    kept, so a flagged row is not empty. Without the corrupt column, the
+    same read gives five rows and no way to tell rows 2 to 5 from rows
+    with genuinely missing values.
+
+    Details that bite:
+
+    - The column must be a nullable `STRING`; `_corrupt_record INT`
+      fails at the first action with `INVALID_CORRUPT_RECORD_TYPE`.
+    - `FAILFAST` fails with `FAILED_READ_FILE.NO_HINT`, caused by
+      `MALFORMED_RECORD_IN_PARSING.WITHOUT_SUGGESTION` ("Malformed
+      records are detected in record parsing: [2,null,20455]") and the
+      underlying `NumberFormatException: For input string: "abc"`.
+    - **Querying only the corrupt column is refused**, (as "JSON Drift
+      and Quarantine" will show for JSON):
+
+      ```python
+      raw = spark.read.option("header", True).schema(sch + ", _corrupt_record STRING").csv(bad)
+      raw.filter(F.col("_corrupt_record").isNotNull()).count()
+      # [UNSUPPORTED_FEATURE.QUERY_ONLY_CORRUPT_RECORD_COLUMN] ...
+      raw.cache().filter(F.col("_corrupt_record").isNotNull()).count()   # 4
+      ```
+
+      The corrupt column is only filled while the other columns are
+      parsed. "JSON Drift and Quarantine" explains this error and its
+      fixes in detail; for CSV the fix is the same: cache, or select a
+      data column too.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## DROPMALFORMED and count(): Three Different Answers
+
+    CSV parsing is **lazy per column**: Spark parses only the columns a
+    query needs (`spark.sql.csv.parser.columnPruning.enabled`, true by
+    default). With `DROPMALFORMED`, that changes which rows are
+    malformed:
+
+    ```python
+    dm = spark.read.option("header", True).option("mode", "DROPMALFORMED").schema(sch).csv(bad)
+    len(dm.collect())          # 1: every column parsed, rows 2 to 5 dropped
+    dm.count()                 # 5: no column needed, nothing parsed, nothing dropped
+    dm.select("id").count()    # 5: every id parses fine
+    ```
+
+    With column pruning switched off, `count()` gives **3**: the rows
+    with the wrong number of fields are dropped, but the bad values in
+    rows 2 and 5 are still not converted, so they survive. After
+    `dm.cache()`, `count()` is 1 again, because caching materializes
+    every column.
+
+    The CSV docs say it directly: "corrupt records can be different
+    based on required set of fields". So `DROPMALFORMED` plus `count()`
+    is not a way to measure how many good rows you have, and
+    `DROPMALFORMED` in general hides data loss. Prefer `PERMISSIVE` with
+    a corrupt record column, and count the quarantine.
+
+- Class: mult_question
+  Depth: all
+  Output: "A CSV has 5 rows, 4 of them malformed. With `mode=DROPMALFORMED` and an explicit schema, `df.collect()` returns 1 row. What does `df.count()` return with default settings?"
+  AnswerChoices: "5;1;4;It fails"
+  CorrectAnswer: "5"
+  Hint: "count() needs no columns, and CSV only parses the columns a query needs."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Folders Whose Columns Change
+
+    The sales feed changed its layout twice. Read the folder as one CSV
+    and look:
+
+    ```python
+    folder = "data/messy/delimited/sales"
+    (spark.read.option("header", True).csv(folder)
+        .withColumn("file", F.col("_metadata.file_name")).show(truncate=False))
+    ```
+
+    ```
+    +----------+------+----------+--------+--------------------+
+    |id        |amount|day       |currency|file                |
+    +----------+------+----------+--------+--------------------+
+    |10        |13.00 |2026-10-03|EUR     |sales_2026-10-03.csv|
+    ...
+    |5         |3.10  |2026-10-01|NULL    |sales_2026-10-01.csv|
+    |2026-10-02|6     |12.00     |NULL    |sales_2026-10-02.csv|
+    |2026-10-02|7     |n/a       |NULL    |sales_2026-10-02.csv|
+    ...
+    ```
+
+    Spark took the column names from **one** file (here the day-3 file,
+    with four columns), skipped the first line of every file, and laid
+    every other file's values out **by position**. Day 2's dates are in
+    `id`. Nothing failed. With an explicit schema and the default
+    `enforceSchema`, the same thing happens; with
+    `enforceSchema=false`, the read fails on the first file that
+    differs, which at least tells you.
+
+    Two ways to match columns by name:
+
+    **1. Read each file with its own header and union by name.** List
+    the files (`binaryFile` lists them without reading content, as in
+    "Files as Files: binaryFile, Globs and Metadata"), read each one, and combine them with
+    `unionByName(other, allowMissingColumns=True)` (3.1), which matches
+    columns by name and fills columns a file doesn't have with NULL. The
+    exercise does this, with a corrupt record column per file. It
+    starts one small read per file, so it suits tens or hundreds of
+    files, not millions.
+
+    **2. One `VARIANT` column per row (4.1).** The option
+    `singleVariantColumn` (SPARK-51298, 4.1) reads every row into one
+    `VARIANT` value whose field names come from **each file's own
+    header**:
+
+    ```python
+    v = spark.read.option("header", True).option("singleVariantColumn", "v").csv(folder)
+    v.select("v", F.col("_metadata.file_name").alias("file")).show(5, truncate=False)
+    ```
+
+    ```
+    +-----------------------------------------------------------+--------------------+
+    |v                                                          |file                |
+    +-----------------------------------------------------------+--------------------+
+    |{"amount":13,"currency":"EUR","day":"2026-10-03","id":10}  |sales_2026-10-03.csv|
+    |{"amount":2.5,"currency":"CAD","day":"2026-10-03","id":11} |sales_2026-10-03.csv|
+    ...
+    |{"amount":10.5,"day":"2026-10-01","id":1}                  |sales_2026-10-01.csv|
+    +-----------------------------------------------------------+--------------------+
+    ```
+
+    ```python
+    v.select(F.try_variant_get("v", "$.id", "int").alias("id"),
+             F.try_variant_get("v", "$.amount", "decimal(10,2)").alias("amount"),
+             F.try_variant_get("v", "$.day", "date").alias("day"),
+             F.try_variant_get("v", "$.currency", "string").alias("currency"))
+    ```
+
+    Day 2's reordered columns now land in the right fields, and day 3's
+    `currency` is simply present where it exists. "VARIANT Basics:
+    Profiling and Nested Data" explains `VARIANT` and `try_variant_get`. Caveats, all verified on
+    4.2.0:
+
+    - Values inside the variant are **typed by inference**, so a SKU
+      `00123` is stored as the number 123: the leading-zero problem
+      again. Use this for feeds without such identifiers, or recover
+      them from another source.
+    - The schema may be only the variant column, or the variant column
+      plus a `STRING` corrupt record column; anything else fails with
+      `INVALID_SINGLE_VARIANT_COLUMN`. With the corrupt column, day 1's
+      short row `3,4.00` keeps its raw text there.
+    - The option is not in the 4.2 CSV options page; it is in the
+      `CSVOptions` source (`singleVariantColumn`).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## CSV Inside a Column: from_csv and schema_of_csv
+
+    CSV also turns up inside other data: a Kafka message, a log field,
+    a column of a database table. `from_csv` parses a string column with
+    a schema and returns a struct:
+
+    ```python
+    events = spark.createDataFrame([("evt1", "42;19.99;2026-10-01"), ("evt2", "7;abc;2026-10-02"),
+                                    ("evt3", None), ("evt4", "1;2")], "id STRING, payload STRING")
+    spark.range(1).select(F.schema_of_csv(F.lit("42;19.99;2026-10-01"), {"sep": ";"})).first()[0]
+    # 'STRUCT<_c0: INT, _c1: DOUBLE, _c2: DATE>'
+
+    (events.select("id", F.from_csv("payload",
+                "qty INT, price DOUBLE, day DATE, _corrupt_record STRING", {"sep": ";"}).alias("p"))
+           .select("id", "p.*").show(truncate=False))
+    ```
+
+    ```
+    +----+----+-----+----------+----------------+
+    |id  |qty |price|day       |_corrupt_record |
+    +----+----+-----+----------+----------------+
+    |evt1|42  |19.99|2026-10-01|NULL            |
+    |evt2|7   |NULL |2026-10-02|7;abc;2026-10-02|
+    |evt3|NULL|NULL |NULL      |NULL            |
+    |evt4|1   |2.0  |NULL      |1;2             |
+    +----+----+-----+----------+----------------+
+    ```
+
+    The same rules as the file reader apply (options as a dict, the
+    corrupt column in the schema), plus:
+
+    - `schema_of_csv` needs a **literal** example: passing a column
+      fails with `DATATYPE_MISMATCH.NON_FOLDABLE_INPUT`. Its inferred
+      names are `_c0`, `_c1`, ..., so write your own DDL for real use.
+    - Only `PERMISSIVE` and `FAILFAST`: `DROPMALFORMED` fails with
+      `PARSE_MODE_UNSUPPORTED`.
+    - A NULL input gives a NULL struct (`evt3`); malformed input gives a
+      struct with NULL fields, so test the fields, not the struct.
+    - `to_csv(struct, options)` goes the other way:
+      `F.to_csv(F.struct("id", "payload"), {"sep": "|"})` gives
+      `evt1|42;19.99;2026-10-01`.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Fixed-Width Files
+
+    Mainframes, banks and government systems still produce files where
+    each column is a fixed range of characters, with no separator at
+    all:
+
+    ```
+    HDR20261005STORES
+    0001Corner Store        Toronto     201903010001250050
+    0002Le Petit Marché     Montréal    202006150000000999
+    0003Pho Kitchen         Hà Nội      202111010007342210
+    0004Harbour Books       Halifax     202301200000000000
+    0005Broken Line
+    TRL000004
+    ```
+
+    There is no fixed-width reader in Spark; read lines with `text` and
+    cut them with `substring` (positions count from 1):
+
+    ```python
+    lines = spark.read.text("data/messy/delimited/stores_fixed.txt")
+    recs = lines.filter(~F.col("value").startswith("HDR") & ~F.col("value").startswith("TRL"))
+    stores = recs.select(
+        F.substring("value", 1, 4).alias("store_id"),
+        F.trim(F.substring("value", 5, 20)).alias("name"),
+        F.trim(F.substring("value", 25, 12)).alias("city"),
+        F.try_to_date(F.substring("value", 37, 8), "yyyyMMdd").alias("opened"),
+        (F.substring("value", 45, 10).try_cast("decimal(12,0)") / 100).cast("decimal(12,2)").alias("sales"),
+        F.length("value").alias("len"))
+    stores.show()
+    ```
+
+    ```
+    +--------+---------------+--------+----------+--------+---+
+    |store_id|           name|    city|    opened|   sales|len|
+    +--------+---------------+--------+----------+--------+---+
+    |    0001|   Corner Store| Toronto|2019-03-01|12500.50| 54|
+    |    0002|Le Petit Marché|Montréal|2020-06-15|    9.99| 54|
+    |    0003|    Pho Kitchen|  Hà Nội|2021-11-01|73422.10| 54|
+    |    0004|  Harbour Books| Halifax|2023-01-20|    0.00| 54|
+    |    0005|    Broken Line|        |      NULL|    NULL| 15|
+    +--------+---------------+--------+----------+--------+---+
+    ```
+
+    What the layout spec usually doesn't tell you:
+
+    - **Header and trailer records** (`HDR...`, `TRL000004`) carry batch
+      metadata; filter them out by their prefix, and use the trailer's
+      count (4 stores) to check you read everything.
+    - **Validate the length.** `substring` beyond the end of a line
+      returns `""`, so a truncated line becomes a row of empty values
+      (`0005`). Keep lines whose `length` is the record width, and
+      quarantine the rest.
+    - **Implied decimals**: `0001250050` with "2 implied decimals" is
+      12500.50. Cast to `DECIMAL` and divide, never via `DOUBLE`.
+    - **Characters or bytes?** `substring` counts characters. The
+      `Marché` line is 54 characters but 56 bytes in UTF-8. Many specs
+      written for single-byte encodings count bytes; if the file is
+      UTF-8 and the spec counts bytes, every accented letter shifts the
+      following columns. For a byte-based layout, read with `binaryFile`
+      and cut bytes with `substring` on the binary, then `decode`.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Writing CSV Safely
+
+    Writing has its own defaults, and they are not the reading defaults:
+
+    ```python
+    df = spark.createDataFrame([(1, "  padded  ", 'say "hi"', "a,b", "", None, "two\nlines")],
+        "id INT, pad STRING, q STRING, comma STRING, empty STRING, nul STRING, nl STRING")
+    out = os.path.join(tmp, "out_default")
+    df.coalesce(1).write.option("header", True).csv(out)
+    ```
+
+    `out` is a **folder**, not a file:
+
+    ```
+    ['._SUCCESS.crc', '.part-00000-...-c000.csv.crc', '_SUCCESS', 'part-00000-...-c000.csv']
+    ```
+
+    One `part-*.csv` per task, a `_SUCCESS` marker written when the job
+    commits, and checksum files. The part file holds:
+
+    ```
+    id,pad,q,comma,empty,nul,nl
+    1,padded,"say \"hi\"","a,b","",,"two
+    lines"
+    ```
+
+    Three surprises in two lines:
+
+    - **Whitespace was trimmed** (`padded`): the writer's
+      `ignoreLeadingWhiteSpace` and `ignoreTrailingWhiteSpace` default
+      to true.
+    - **Quotes were escaped with a backslash.** Python's `csv` module
+      (like Excel) reads that value as `say \hi\""`.
+    - The empty string is written `""` and NULL as nothing. Spark tells
+      them apart on write; by default it does not on read.
+
+    For files that other tools must read exactly, write RFC 4180:
+
+    ```python
+    (df.coalesce(1).write.mode("overwrite")
+       .option("header", True)
+       .option("escape", '"')
+       .option("ignoreLeadingWhiteSpace", False)
+       .option("ignoreTrailingWhiteSpace", False)
+       .option("nullValue", "NULL")      # only if the reader knows this marker
+       .csv(out))
+    ```
+
+    ```
+    id,pad,q,comma,empty,nul,nl
+    1,  padded  ,"say ""hi""","a,b","",NULL,"two
+    lines"
+    ```
+
+    Python's `csv.reader` now returns `['1', '  padded  ', 'say "hi"',
+    'a,b', '', 'NULL', 'two\nlines']`, and Spark reads it back exactly
+    with `multiLine`, `escape='"'` and `nullValue="NULL"`. `quoteAll`
+    quotes every field, which some strict consumers want.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## More Writing Rules
+
+    - **Existing output**: the default save mode is "error if exists",
+      so writing to `out` again fails with `PATH_ALREADY_EXISTS` ("Set
+      mode as "overwrite" to overwrite the existing path").
+      `mode("overwrite")` replaces the folder; `mode("append")` adds
+      part files.
+    - **One file**: `coalesce(1)` makes one task write everything, so it
+      is slow for big data and the file name is still `part-...csv`
+      inside a folder. If a consumer needs `report.csv`, write to a
+      temporary folder and move the single part file afterwards (on a
+      local disk, `glob` plus `shutil.move`), or keep the folder: every
+      Spark reader and most tools read a folder of parts.
+    - **Nested types fail**: a struct, array or map column gives
+      `UNSUPPORTED_DATA_TYPE_FOR_DATASOURCE` ("The CSV datasource doesn't
+      support the column `s` of the type ..."). Turn it into text first
+      with `to_json`.
+    - **Dates and timestamps** are written as `2026-01-05` and
+      `2026-01-05T10:00:00.000Z` (in the session time zone) unless you
+      set `dateFormat` and `timestampFormat` for the write too.
+    - **Compression**: `option("compression", "gzip")` writes
+      `part-...csv.gz`, which every Spark reader decompresses by its
+      extension. A gzip file cannot be split, so one task reads each.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write `report` (a DataFrame) to the folder `out` as CSV with a
+    header, replacing anything already there, using RFC 4180 quote
+    escaping and without trimming values. Use one chained statement.
+  CorrectAnswer: |
+    report.write.mode("overwrite").option("header", True).option("escape", '"').option("ignoreLeadingWhiteSpace", False).option("ignoreTrailingWhiteSpace", False).csv(out)
+  Hint: "mode('overwrite'), then four options: header, escape, and the two ignore...WhiteSpace options set to False."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Under the Hood: Parsing, Splitting and Limits
+
+    - **The parser** is univocity-parsers, configured from `CSVOptions`
+      in `sql/catalyst/.../csv/CSVOptions.scala`
+      (`asParserSettings` and `asWriterSettings`). Errors such as
+      `TextParsingException` come from it, which is why some CSV
+      failures carry a library message rather than a Spark error
+      condition.
+    - **Splitting**: in line mode a large file is cut into byte ranges
+      (`spark.sql.files.maxPartitionBytes`, 128 MB by default) and each
+      task starts at the first line break after its range begins. This
+      is why line mode cannot respect quoted line breaks: a task cannot
+      know whether it starts inside a quote. `multiLine` gives up
+      splitting for correctness.
+    - **Column pruning** passes only the required columns to the parser,
+      which is fast and is the reason for the `DROPMALFORMED` counts
+      above. It is disabled automatically in `multiLine` mode.
+    - **Limits**: `maxColumns` (20480) and `maxCharsPerColumn`
+      (unlimited) protect the parser. Exceeding them fails with a
+      `TextParsingException`, for example "Length of parsed input (6)
+      exceeds the maximum number of characters defined in your parser
+      settings (5)". A runaway quote in a huge `multiLine` file is the
+      classic way to build a gigantic value; a `maxCharsPerColumn` limit
+      turns that into an error instead of an out-of-memory task.
+    - **Inference** (`CSVInferSchema`) tries, per value, integer, long,
+      decimal, double, date (with `preferDate`), timestamp without time
+      zone, timestamp and boolean before falling back to string, then
+      merges the types per column across all rows.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Five Files, Read Right
+
+    Implement six functions, one per file plus a writer. Every one is
+    a few options or a few lines; the work is choosing the right ones.
+
+    1. `read_products(spark, path)`: `products.csv` with
+       `PRODUCT_SCHEMA`, line breaks and doubled quotes handled, `NA` as
+       NULL, and `in_stock` (`yes`/`no`) turned into a boolean.
+    2. `read_orders_eu(spark, path)`: `orders_eu.csv` with
+       `ORDER_SCHEMA` (it ends with `_corrupt_record STRING`), the
+       header checked against the schema, `;`, `#` comments, decimal
+       commas and `dd.MM.yyyy` dates, plus a `file` column from
+       `_metadata`.
+    3. `read_legacy(spark, path)`: `legacy_latin1.tsv`, decoded
+       correctly, with every column renamed to `LEGACY_NAMES`.
+    4. `read_sales(spark, folder)`: every file of the sales feed with
+       columns matched **by name**, returning `(sales, rejects)`.
+       Rejects are rows with the wrong number of fields
+       (`wrong_column_count`) or a value that does not parse
+       (`bad_value`).
+    5. `read_fixed(spark, path)`: `stores_fixed.txt` by `FIXED_LAYOUT`,
+       returning `(stores, rejects)`.
+    6. `write_report(df, out_dir)`: one CSV file that Python's `csv`
+       module reads back exactly; return its path.
+
+    The harness first shows that the default reader gets `products.csv`
+    wrong (17 rows, raw doubled quotes), then checks: 15 products
+    matching Python's own `csv` module, SKUs with their leading zeros,
+    the embedded line break, the quoted empty string versus NULL; 18
+    orders with exactly the two bad ones quarantined and the amounts'
+    sum equal to a Python computation of the decimal commas; accents in
+    the legacy file; 11 sales plus 2 rejects with day 2's reordered
+    columns right; 4 stores as promised by the trailer, with the right
+    names, dates and amounts; and a report file whose tricky values
+    (commas, quotes, line breaks, padding, an empty string) survive the
+    round trip.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "products: .option('multiLine', True).option('escape', '\"').option('nullValue', 'NA'). orders: sep ';', comment '#', locale 'de-DE', dateFormat 'dd.MM.yyyy', enforceSchema False. legacy: sep '\\t', encoding 'ISO-8859-1', then .toDF(*LEGACY_NAMES). sales: per file, header = spark.read.text(p).first()['value'].split(','), schema of `c` STRING columns plus _corrupt_record STRING, then unionByName(allowMissingColumns=True). writer: coalesce(1), escape '\"', both ignore...WhiteSpace False."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    In this lesson you learned:
+
+    - **Defaults to remember**: `sep=","`, `header=false`, every column
+      `STRING`, a backslash as `escape` (not RFC 4180's `""`),
+      `multiLine=false`, `nullValue` and `emptyValue` both empty, no
+      trimming on read but trimming on write, UTF-8, `en-US` locale.
+    - **Headers**: duplicates get their position appended, blanks become
+      `_cN`; backticks for odd names; `toDF` renames by position. With a
+      schema, `enforceSchema=true` ignores the header and fills columns
+      by position; set it to `false` to have the header checked.
+    - **`inferSchema`** costs a full extra pass, drops leading zeros,
+      turns a column with one odd value into a string, and with
+      `samplingRatio` can turn unseen values into NULL. Infer once,
+      then pass an explicit schema.
+    - **Quoting**: set `escape='"'` for files from other tools;
+      `unescapedQuoteHandling` (3.1) for stray quotes; `multiLine` for
+      line breaks inside fields, at the cost of splitting and with the
+      runaway-quote risk.
+    - **Values**: `nullValue`, `emptyValue`, `nanValue`; padded integers
+      are NULL unless you trim; `dateFormat`/`timestampFormat`/`timeZone`;
+      `locale` for month names and **decimal commas** (`12,50` read as
+      `DECIMAL` with `en-US` is 1250.00).
+    - **Encodings**: `encoding` works in line mode for single-byte
+      charsets and UTF-8, UTF-16 needs `multiLine`; 4.0 allows only a
+      fixed charset list (`INVALID_PARAMETER_VALUE.CHARSET`). BOMs are
+      dropped for you; `comment` skips lines starting with one character.
+    - **Malformed rows**: declare `_corrupt_record STRING` and use
+      `PERMISSIVE`; don't query it alone; `DROPMALFORMED` with `count()`
+      gives a different number than `collect()`.
+    - **Changing layouts**: a folder read lays files out by position;
+      read per file and `unionByName(allowMissingColumns=True)`, or use
+      `singleVariantColumn` (4.1).
+    - **`from_csv`/`schema_of_csv`/`to_csv`** for CSV in a column;
+      **fixed width** with `text` and `substring`, validating length.
+    - **Writing**: a folder of part files; `escape='"'` and no trimming
+      for exact round trips; nested types need `to_json`.
+
+    Next: **JSON Drift and Quarantine**, where the format describes
+    itself and the trouble is that the description keeps changing.

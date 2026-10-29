@@ -1,0 +1,31 @@
+{
+  "schema": 2,
+  "case_id": "CASE-0001",
+  "opened": "2026-03-02T09:15:00Z",
+  "status": "open",
+  "priority": "P2",
+  "tags": [
+    "billing",
+    "refund"
+  ],
+  "meta": {
+    "customer": {
+      "id": "C017",
+      "tier": "gold"
+    },
+    "channel": "email",
+    "sla_hours": 24
+  },
+  "attachments": [
+    {
+      "name": "request.eml",
+      "sha256": "0e01161d7e5754501d4402b863f7954070fdc8a34a9403abaefb1748049a54e9",
+      "bytes": 263
+    },
+    {
+      "name": "invoice_1001.pdf",
+      "sha256": "b9ab3215219966997c3f8085148590634433c8bd88ee4914e544d870305aa7c9",
+      "bytes": 708
+    }
+  ]
+}

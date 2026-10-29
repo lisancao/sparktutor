@@ -1,0 +1,1255 @@
+- Class: meta
+  Lesson: "Streaming Internals: Checkpoints, State and Real-Time Mode"
+  EstimatedMinutes: 90
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    You have run streaming queries since "Streaming Files: Your First
+    Structured Streaming Job", built your own offsets and an idempotent
+    sink in "Streaming Readers and Writers", and sessionized messy
+    clicks with state, watermarks and dead letters in the intermediate
+    lesson "Streaming Messy Data: Drift, Dead Letters and State". This
+    lesson assumes all of that and opens the engine up. Everything here
+    is something you can see on disk, in a plan, or in the 4.2.0 source.
+
+    By the end you will be able to:
+
+    - Read every file in a checkpoint by hand (`metadata`, `offsets/`,
+      `commits/`, `sources/`, `state/`) and say what the next run of
+      the query will do before you start it
+    - Explain the offset/commit protocol in `MicroBatchExecution`, why a
+      batch is replayed, and why some batches have no input at all
+    - Decode a state store delta file byte by byte, and know what the
+      RocksDB provider writes instead
+    - Inspect live state with the state data source (`statestore`,
+      `state-metadata`), including `transformWithState` variables,
+      timers and the change feed
+    - Explain how Python `transformWithState` talks to the JVM, when
+      timers fire, how TTL works, and the traps in each
+    - Predict which state schema changes survive a restart, with the
+      exact error for each one that does not
+    - Run Real-Time Mode on a laptop, hit each of its 4.2.0
+      restrictions, and measure what a Python sink does to its latency
+
+    Source paths in this lesson are relative to the root of the Spark
+    4.2.0 repository (`git checkout v4.2.0`). The streaming engine lives
+    in `sql/core/src/main/scala/org/apache/spark/sql/execution/streaming/`;
+    paths below shorten that prefix to `streaming/`.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## A Checkpoint Is a Set of Logs
+
+    Run a windowed count over a folder of JSON twice (two files, each
+    run with `trigger(availableNow=True)`), then list the checkpoint:
+
+    ```python
+    import json, os, shutil, tempfile
+    from pyspark.sql import functions as F
+
+    work = tempfile.mkdtemp()
+    inbox, ck, out = f"{work}/inbox", f"{work}/ck", f"{work}/out"
+    os.makedirs(inbox)
+
+    def drop(name, rows):
+        with open(f"{inbox}/{name}", "w") as f:
+            f.writelines(json.dumps(r) + "\n" for r in rows)
+
+    def run():
+        q = (spark.readStream.schema("user STRING, ts TIMESTAMP").json(inbox)
+             .withWatermark("ts", "10 minutes")
+             .groupBy(F.window("ts", "5 minutes"), "user").count()
+             .writeStream.format("parquet").option("path", out)
+             .option("checkpointLocation", ck)
+             .outputMode("append").trigger(availableNow=True).start())
+        q.awaitTermination()
+        print([(p.batchId, p.numInputRows) for p in q.recentProgress])
+
+    spark.conf.set("spark.sql.shuffle.partitions", "2")
+    spark.conf.set("spark.sql.session.timeZone", "UTC")
+    drop("a.json", [{"user": "u1", "ts": "2026-10-01T10:00:00"},
+                    {"user": "u2", "ts": "2026-10-01T10:01:00"}])
+    run()
+    drop("b.json", [{"user": "u1", "ts": "2026-10-01T10:20:00"}])
+    run()
+    for d, _, files in sorted(os.walk(ck)):
+        for name in sorted(files):
+            if not name.endswith(".crc"):
+                path = os.path.join(d, name)
+                print(os.path.relpath(path, ck), os.path.getsize(path))
+    ```
+
+    ```text
+    [(0, 2), (1, 0)]
+    [(2, 1), (3, 0)]
+    commits/0 41        offsets/0 1031       sources/0/0 88
+    commits/1 41        offsets/1 1043       sources/0/1 88
+    commits/2 41        offsets/2 1043       metadata 45
+    commits/3 41        offsets/3 1043
+    state/0/0/1.delta 107    state/0/1/1.delta 107
+    state/0/0/2.delta 46     state/0/1/2.delta 46
+    state/0/0/3.delta 107    state/0/1/3.delta 46
+    state/0/0/4.delta 94     state/0/1/4.delta 94
+    state/0/0/_metadata/schema 466
+    state/0/_metadata/metadata 150
+    ```
+
+    (The listing is rearranged into columns; every file also has a
+    `.crc` twin.) Each folder is written by one class:
+
+    | Path | Written by | Holds |
+    |---|---|---|
+    | `metadata` | `StreamMetadata` (`streaming/runtime/StreamMetadata.scala`) | the query `id`, stable across restarts |
+    | `offsets/<batch>` | `OffsetSeqLog` (`streaming/checkpointing/OffsetSeqLog.scala`) | what batch N will read, written *before* it runs |
+    | `commits/<batch>` | `CommitLog` (`streaming/checkpointing/CommitLog.scala`) | that batch N finished, written *after* the sink |
+    | `sources/<i>/<n>` | the source itself (here `FileStreamSourceLog`) | the file source's own log of files it has seen |
+    | `state/<op>/<partition>/` | the state store provider | one store per stateful operator and shuffle partition |
+    | `state/<op>/_metadata/` | `OperatorStateMetadataWriter` (`streaming/state/OperatorStateMetadata.scala`) | which operator owns the state |
+
+    The `.crc` files come from Hadoop's local `ChecksumFileSystem`; on
+    S3 or ADLS you will not see them. Every log file is written to a
+    temporary name and renamed into place by `CheckpointFileManager`,
+    which is why a half-written batch file never appears.
+
+    Two runs, four batches. Batches 1 and 3 read zero rows: they are
+    **no-data batches**, which the next sections explain.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Think of the checkpoint as a ship's log kept in several books. One
+    book lists the course for each leg before the ship leaves port
+    (`offsets/`), another gets a stamp when the leg is done
+    (`commits/`), and the cargo hold has its own inventory pages
+    (`state/`). After a storm, the captain compares the first two books
+    to find the last leg that really finished.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Offsets and Commits, Byte by Byte
+
+    Every log file starts with a version line and then JSON. Here are
+    `metadata`, `offsets/0` and `commits/0` from the run above (the
+    `conf` map is shortened):
+
+    ```text
+    metadata:
+    {"id":"f59ea917-034c-4199-bbf6-0926083741a4"}
+
+    offsets/0:
+    v1
+    {"batchWatermarkMs":0,"batchTimestampMs":1793219188602,"conf":{
+      "spark.sql.streaming.stateStore.providerClass":"org.apache.spark.sql.execution.streaming.state.HDFSBackedStateStoreProvider",
+      "spark.sql.streaming.stateStore.encodingFormat":"unsaferow",
+      "spark.sql.streaming.stateStore.compression.codec":"lz4",
+      "spark.sql.shuffle.partitions":"2", ...}}
+    {"logOffset":0}
+
+    commits/0:
+    v1
+    {"nextBatchWatermarkMs":1790848260000}
+    ```
+
+    An offsets file has three parts:
+
+    1. `v1`: the offset log format. 4.2.0 can also write `v2`, with one
+       `sourceId:offset` line per source instead of a list by position
+       (selected by the internal `spark.sql.streaming.offsetLog.formatVersion`,
+       new in 4.2.0, default 1); it goes with the 4.2 work on adding
+       and removing sources by name (SPARK-54909).
+    2. `OffsetSeqMetadata`: the batch's watermark, the batch's
+       processing timestamp, and a `conf` map.
+    3. One line per source, in source order: whatever that source's
+       offset serializes to. The file source's offset `{"logOffset":0}`
+       points into its own log, `sources/0/0`, which lists the files:
+
+    ```text
+    v1
+    {"path":"file:///.../inbox/a.json","timestamp":1793219187200,"batchId":0}
+    ```
+
+    The commit file stores only the watermark for the *next* batch:
+    `nextBatchWatermarkMs` is 10:01 minus 10 minutes as epoch
+    milliseconds, the max event time seen in batch 0 minus the delay.
+    (The commit log also has formats `v2` and `v3`, which add state
+    store checkpoint ids and per-sink metadata. The version follows the
+    internal `spark.sql.streaming.stateStore.checkpointFormatVersion`,
+    default 1, so you will rarely meet them.)
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Settings That a Checkpoint Pins
+
+    The `conf` map in every offsets file is
+    `OffsetSeqMetadata.relevantSQLConfs` (in
+    `streaming/checkpointing/OffsetSeq.scala`): the state store
+    provider class, the state encoding format, the compression codec,
+    the state format versions of each operator, the RocksDB format
+    version, the multiple-watermark policy and a few more. They are
+    recorded on the first batch, and on every restart
+    `OffsetSeqMetadata.setSessionConf` copies them back over your
+    session, logging a warning if you tried to change one.
+
+    `spark.sql.shuffle.partitions` is in that map too (through an
+    internal alias), because it fixes how many state store partitions
+    each stateful operator has. Change it and restart:
+
+    ```python
+    spark.conf.set("spark.sql.shuffle.partitions", "5")
+    drop("c.json", [{"user": "u3", "ts": "2026-10-01T10:40:00"}])
+    run()
+    print(spark.conf.get("spark.sql.shuffle.partitions"))
+    print(sorted(os.listdir(f"{ck}/state/0")))
+    ```
+
+    ```text
+    [(4, 1), (5, 0)]
+    5
+    ['0', '1', '_metadata']
+    ```
+
+    The query still has two state partitions, and the driver log says
+    `WARN OffsetSeqMetadata: Updating the value of conf
+    'spark.sql.streaming.internal.stateStore.partitions' in current
+    session from '5' to '2'.` (the internal alias under which the
+    checkpoint stores the shuffle partition count). The same thing
+    happens if you set `spark.sql.streaming.stateStore.providerClass`
+    to RocksDB and restart a query that began on the HDFS provider: it
+    keeps writing `.delta` files, while `spark.conf.get` in your session
+    still shows the RocksDB class, because the checkpoint's value is
+    applied to the query's own copy of the session.
+
+    Changing the provider needs a new checkpoint. Changing the number
+    of state partitions has an escape hatch new in 4.2.0, marked
+    experimental and reachable only through an underscore name in
+    Classic mode: `spark._streamingCheckpointManager.repartition(checkpoint, n)`
+    (`StreamingCheckpointManager` in `pyspark/sql/streaming/query.py`,
+    `OfflineStateRepartitionRunner` in `streaming/state/`). The query
+    must be stopped. It refuses the HDFS provider
+    (`STATE_REPARTITION_INVALID_CHECKPOINT.UNSUPPORTED_PROVIDER`); on a
+    RocksDB checkpoint with two batches it wrote a third batch
+    (`offsets/2` and `commits/2`) that reads no input and rewrites the
+    state into four partitions, and the restarted query continued on
+    four partitions with correct counts. In the same run the state data
+    source could no longer read that checkpoint and `state-metadata`
+    still reported two partitions, so treat it as the experiment it is
+    labelled, on a copy of the checkpoint.
+
+- Class: mult_question
+  Depth: all
+  Output: "A stateful query started with spark.sql.shuffle.partitions=200. You restart it from the same checkpoint with the setting at 8. How many state store partitions does the operator use after the restart?"
+  AnswerChoices: "200, because the value in the checkpoint's offsets file replaces the session setting;8, because the new session setting applies on restart;The query fails with a partition mismatch error;8 for new keys and 200 for old keys"
+  CorrectAnswer: "200, because the value in the checkpoint's offsets file replaces the session setting"
+  Hint: "Look at what setSessionConf does with the conf map stored in offsets/N."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Restart Protocol
+
+    `MicroBatchExecution.populateStartOffsets`
+    (`streaming/runtime/MicroBatchExecution.scala`) decides where a
+    restarted query begins. It reads the newest offsets file N and the
+    newest commit file M:
+
+    | Checkpoint state | What the next run does |
+    |---|---|
+    | no offsets at all | a new query: batch 0. If `commits/` or `state/` already hold files it fails with `STATE_STORE_CHECKPOINT_LOCATION_NOT_EMPTY` (internal `spark.sql.streaming.verifyCheckpointDirectoryEmptyOnStart`, 4.1, default `true`) |
+    | M == N | batch N finished: plan batch N + 1, starting from N's end offsets and the watermark in `commits/N` |
+    | M == N - 1 | batch N was planned but never committed: **re-run batch N with exactly the offsets recorded in `offsets/N`** |
+    | M < N - 1 | logged as a warning; the same as above |
+
+    The middle row is the heart of exactly-once. The order inside each
+    batch (in `runBatch` and `markMicroBatchEnd`) is:
+
+    1. write `offsets/N` (the plan)
+    2. run the batch: tasks read the source range, update the state
+       store (which writes state version N + 1) and write to the sink
+    3. the sink commits
+    4. write `commits/N`
+
+    A crash anywhere before step 4 replays batch N. The replay reads the
+    same offsets, starts from the same state version N, and hands the
+    sink the same batch id, so a source that can re-read a range and a
+    sink that is idempotent per batch id give exactly-once results. A
+    crash between 3 and 4 is the case the sink must handle: the data
+    is already out, and it will arrive again.
+
+    **No-data batches.** After the data runs out, the engine asks each
+    stateful operator `shouldRunAnotherBatch(newWatermark)`. If the
+    watermark moved past something the operator is holding (a window
+    to emit, state to evict, a timer to fire), Spark plans one more
+    batch with no new input (`spark.sql.streaming.noDataMicroBatches.enabled`,
+    default `true`). That is batch 1 and batch 3 above: they wrote the
+    windows that the new watermark closed. With `availableNow`, the
+    query stops only when neither new data nor a no-data batch is due.
+
+- Class: mult_question
+  Depth: all
+  Output: "A checkpoint has offsets/0 to offsets/7 and commits/0 to commits/6. What does the next run do first?"
+  AnswerChoices: "Re-runs batch 7 with the offsets stored in offsets/7;Starts batch 8 from the end of batch 7;Deletes offsets/7 and plans a new batch 7 from the latest source offsets;Fails because the logs disagree"
+  CorrectAnswer: "Re-runs batch 7 with the offsets stored in offsets/7"
+  Hint: "The plan for batch 7 was written, but nobody stamped it as done."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## State on Disk: the HDFS-Backed Provider
+
+    The default provider, `HDFSBackedStateStoreProvider`
+    (`streaming/state/HDFSBackedStateStoreProvider.scala`), keeps each
+    partition's state as a hash map in executor memory and writes one
+    **delta file per version**. Batch N produces version N + 1, so
+    `state/0/1/2.delta` is partition 1's change in batch 1. Every
+    `spark.sql.streaming.stateStore.minDeltasForSnapshot` deltas
+    (default 10) a background maintenance task (every
+    `spark.sql.streaming.stateStore.maintenanceInterval`, default 60s)
+    writes a `<version>.snapshot` with the whole map, and old files are
+    deleted once more than `spark.sql.streaming.minBatchesToRetain`
+    (default 100) versions exist. Short test runs never reach a
+    snapshot; a production checkpoint shows both kinds of file.
+
+    The format is in `writeUpdateToDeltaFile` and
+    `writeRemoveToDeltaFile`: a stream compressed with the codec in
+    `spark.sql.streaming.stateStore.compression.codec` (default `lz4`),
+    holding records of
+
+    ```text
+    int keySize, key bytes, int valueSize, value bytes     (an update)
+    int keySize, key bytes, int -1                         (a removal)
+    ...
+    int -1                                                 (end of file)
+    ```
+
+    where the key and value are `UnsafeRow` bytes and the ints are big
+    endian (Java's `DataOutputStream`). Here is a file from a simple
+    `groupBy("user").count()`:
+
+    ```text
+    $ xxd state/0/1/1.delta
+    00000000: 4c5a 3442 6c6f 636b 2528 0000 0034 0000  LZ4Block%(...4..
+    00000010: 0083 038c 0853 0000 0018 0001 00a3 0200  .....S..........
+    00000020: 0000 1000 0000 7532 1100 020f 0001 0200  ......u2........
+    00000030: c001 0000 0000 0000 00ff ffff ff4c 5a34  .............LZ4
+    00000040: 426c 6f63 6b15 0000 0000 0000 0000 0000  Block...........
+    ```
+
+    `LZ4Block` is the framing of lz4-java's `LZ4BlockOutputStream`:
+    a token byte (`0x25`: method LZ4, level 5), the compressed and
+    original lengths as little-endian ints (`0x28` = 40, `0x34` = 52),
+    a checksum, then an LZ4 block. The file ends with an empty block
+    (token `0x15`, raw, length 0). You can read the whole thing with
+    the standard library:
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Decoding a Delta File in Pure Python
+
+    ```python
+    import glob, struct
+
+    def lz4_block(src):                     # LZ4 block format, decompression only
+        out, i = bytearray(), 0
+        while i < len(src):
+            token = src[i]; i += 1
+            n = token >> 4                  # literal length
+            if n == 15:
+                while True:
+                    b = src[i]; i += 1; n += b
+                    if b != 255: break
+            out += src[i:i + n]; i += n
+            if i >= len(src): break         # the last sequence has literals only
+            offset = src[i] | (src[i + 1] << 8); i += 2
+            m = token & 15                  # match length minus 4
+            if m == 15:
+                while True:
+                    b = src[i]; i += 1; m += b
+                    if b != 255: break
+            for _ in range(m + 4):          # byte by byte: a match may overlap itself
+                out.append(out[-offset])
+        return bytes(out)
+
+    def lz4_java_stream(data):              # LZ4BlockOutputStream framing
+        out, i = bytearray(), 0
+        while i < len(data):
+            assert data[i:i + 8] == b"LZ4Block"
+            method = data[i + 8] & 0xF0     # 0x10 raw, 0x20 LZ4
+            clen, olen, _checksum = struct.unpack_from("<iii", data, i + 9)
+            body = data[i + 21:i + 21 + clen]
+            out += body if method == 0x10 else lz4_block(body)
+            i += 21 + clen
+        return bytes(out)
+
+    def records(raw):                       # the delta file records
+        i = 0
+        while True:
+            klen, = struct.unpack_from(">i", raw, i); i += 4
+            if klen == -1: return
+            key = raw[i:i + klen]; i += klen
+            vlen, = struct.unpack_from(">i", raw, i); i += 4
+            if vlen == -1:
+                yield key, None
+                continue
+            yield key, raw[i:i + vlen]; i += vlen
+
+    def unsafe_field(row, ordinal, nfields):
+        """UnsafeRow: a null bitset of 8-byte words, one 8-byte slot per
+        field, then the variable-length region. A string slot holds
+        (offset << 32 | size); a long slot holds the value."""
+        slot, = struct.unpack_from("<q", row, ((nfields + 63) // 64) * 8 + 8 * ordinal)
+        return slot
+
+    def unsafe_string(row, ordinal, nfields):
+        slot = unsafe_field(row, ordinal, nfields)
+        return row[slot >> 32:(slot >> 32) + (slot & 0xFFFFFFFF)].decode()
+
+    spark.conf.set("spark.sql.shuffle.partitions", "2")   # undo the previous example
+    work = tempfile.mkdtemp()
+    inbox, ck = f"{work}/in", f"{work}/ck"
+    os.makedirs(inbox)
+    for i, users in enumerate([["u1", "u2", "u1"], ["u2", "u3"]]):
+        with open(f"{inbox}/{i}.json", "w") as f:
+            f.writelines(json.dumps({"user": u}) + "\n" for u in users)
+        (spark.readStream.schema("user STRING").json(inbox).groupBy("user").count()
+         .writeStream.format("console").outputMode("update")
+         .option("checkpointLocation", ck).trigger(availableNow=True)
+         .start().awaitTermination())
+
+    for path in sorted(glob.glob(f"{ck}/state/0/*/*.delta")):
+        raw = lz4_java_stream(open(path, "rb").read())
+        print(path.split("state/")[1], len(raw), "bytes:",
+              [(unsafe_string(k, 0, 1), None if v is None else unsafe_field(v, 0, 1))
+               for k, v in records(raw)])
+    ```
+
+    ```text
+    0/0/1.delta 52 bytes: [('u1', 2)]
+    0/0/2.delta 4 bytes: []
+    0/1/1.delta 52 bytes: [('u2', 1)]
+    0/1/2.delta 100 bytes: [('u2', 2), ('u3', 1)]
+    ```
+
+    `u1` hashed to partition 0 and `u2`, `u3` to partition 1. Partition
+    0 had nothing to change in batch 1, so its version-2 delta is just
+    the end marker: four bytes of `ff ff ff ff`. The second batch did
+    not write `u1` again, which is why a store has to replay deltas on
+    top of the latest snapshot to rebuild itself, and why snapshots
+    exist.
+
+    The schema of those rows is in `state/0/0/_metadata/schema` (key
+    and value `StructType`s as JSON, written by
+    `StateSchemaCompatibilityChecker`), and the operator that owns them
+    is in `state/0/_metadata/metadata`:
+
+    ```text
+    v1
+    {"operatorInfo":{"operatorId":0,"operatorName":"stateStoreSave"},
+     "stateStoreInfo":[{"storeName":"default","numColsPrefixKey":0,"numPartitions":2}]}
+    ```
+
+- Class: mult_question
+  Depth: advanced
+  Output: "With the HDFS-backed provider, a delta file for one partition is 4 bytes long. What does it contain?"
+  AnswerChoices: "Only the end-of-file marker -1: no key in that partition changed in the batch;A pointer to the previous snapshot;The number of keys in the partition;A corrupted file that Spark will rebuild"
+  CorrectAnswer: "Only the end-of-file marker -1: no key in that partition changed in the batch"
+  Hint: "finalizeDeltaFile writes one int before closing the stream."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Reading State with the State Data Source
+
+    Decoding bytes by hand is a way to understand the format, not a
+    tool. The tool is the **state data source** (4.0), in
+    `sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/v2/state/`:
+    `format("statestore")` (`StateDataSource`) reads the rows of a
+    store, and `format("state-metadata")` (`StateMetadataSource`)
+    reads the operator metadata. Both are batch readers over a
+    checkpoint path; the query does not have to be running.
+
+    ```python
+    (spark.read.format("statestore").load(ck)
+         .selectExpr("key.user", "value.count", "partition_id").show())
+    (spark.read.format("statestore").option("readChangeFeed", "true")
+         .option("changeStartBatchId", 0).load(ck).show(truncate=False))
+    ```
+
+    ```text
+    +----+-----+------------+
+    |user|count|partition_id|
+    +----+-----+------------+
+    |  u1|    2|           0|
+    |  u2|    2|           1|
+    |  u3|    1|           1|
+    +----+-----+------------+
+
+    +--------+-----------+----+-----+------------+
+    |batch_id|change_type|key |value|partition_id|
+    +--------+-----------+----+-----+------------+
+    |0       |update     |{u1}|{2}  |0           |
+    |0       |update     |{u2}|{1}  |1           |
+    |1       |update     |{u2}|{2}  |1           |
+    |1       |update     |{u3}|{1}  |1           |
+    +--------+-----------+----+-----+------------+
+    ```
+
+    The change feed is exactly the delta files decoded above, with the
+    batch id attached. The options (from `StateSourceOptions` in
+    `StateDataSource.scala`):
+
+    | Option | Meaning |
+    |---|---|
+    | `batchId` | read the state as of this batch (default: the last committed one) |
+    | `operatorId`, `storeName` | which operator and store, when a query has several |
+    | `joinSide` | `left` or `right` for stream-stream join state |
+    | `readChangeFeed`, `changeStartBatchId`, `changeEndBatchId` | read changes between batches instead of a snapshot |
+    | `snapshotStartBatchId`, `snapshotPartitionId` | rebuild one partition from a given snapshot (debugging corrupt checkpoints) |
+    | `stateVarName` | for `transformWithState`: which state variable |
+    | `readRegisteredTimers` | for `transformWithState`: read the timers instead |
+    | `flattenCollectionTypes` | for list and map state: one row per element (default `true`) |
+
+    On a query with no stateful operator, `statestore` fails with
+    `STDS_FAILED_TO_READ_STATE_SCHEMA`, while `state-metadata` simply
+    returns no rows.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    The checkpoint of a streaming aggregation is at `/data/ck`. Store in
+    `changes` a DataFrame with every change the state store recorded
+    from batch 3 onwards.
+  CorrectAnswer: |
+    changes = (spark.read.format("statestore")
+               .option("readChangeFeed", "true")
+               .option("changeStartBatchId", 3)
+               .load("/data/ck"))
+  Hint: "format('statestore') with the readChangeFeed and changeStartBatchId options, loaded from the checkpoint path."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The RocksDB State Store
+
+    The HDFS provider keeps all state in executor memory, which limits
+    how much state a query can hold. `RocksDBStateStoreProvider`
+    (`streaming/state/RocksDBStateStoreProvider.scala`, with the engine
+    in `RocksDB.scala` and the file handling in `RocksDBFileManager.scala`)
+    keeps a RocksDB instance per partition on the executor's local
+    disk and uploads it to the checkpoint at each commit.
+
+    ```python
+    spark.conf.set("spark.sql.streaming.stateStore.providerClass",
+        "org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider")
+    ```
+
+    Set it before the query's first batch; afterwards the checkpoint
+    pins it. What it writes depends on **changelog checkpointing**
+    (`spark.sql.streaming.stateStore.rocksdb.changelogCheckpointing.enabled`,
+    default `false` in 4.2.0):
+
+    - **off:** every commit uploads a `<version>.zip` holding RocksDB's
+      small files (`CURRENT`, `MANIFEST-*`, `OPTIONS-*`, the write-ahead
+      log) and a `metadata` JSON that lists which SST files make up the
+      version. The SST files themselves go to a shared `SSTs/` folder
+      under unique names, so versions share unchanged files.
+    - **on:** every commit uploads only a `<version>.changelog` (the
+      changed keys, like an HDFS delta), and a full snapshot zip is
+      uploaded in the background every `minDeltasForSnapshot` versions.
+      Commits get cheaper; recovery replays changelogs.
+
+    From the exercise's checkpoint (changelog checkpointing off):
+
+    ```text
+    state/0/0/1.zip ... state/0/0/6.zip
+    state/0/0/SSTs/000008-bda65361-ff58-4a3c-947f-dbf32d35b29e.sst
+    state/0/0/SSTs/000024-e4fdf144-f22f-4e35-8e7d-0c0f55adcb1d.sst
+    ...
+    6.zip: OPTIONS-000023, CURRENT, MANIFEST-000021, 000020.log, metadata
+    metadata: v1
+    {"sstFiles":[{"localFileName":"000024.sst",
+                  "dfsSstFileName":"000024-e4fdf144-....sst","sizeBytes":1626}, ...],
+     "numKeys":4,
+     "columnFamilyMapping":{"seen":3,"$eventTimers_timestampToKey":5,
+                            "session":2,"default":1,"$eventTimers_keyToTimestamp":4}, ...}
+    ```
+
+    and from a `groupBy().count()` with changelog checkpointing on,
+    after four batches: only `state/0/0/1.changelog` to
+    `4.changelog`, no zip yet.
+
+    Other RocksDB settings worth knowing, all under
+    `spark.sql.streaming.stateStore.rocksdb.` (defaults from
+    `RocksDBConf` in `RocksDB.scala`): `boundedMemoryUsage` (`false`)
+    and `maxMemoryUsageMB` (`500`) to cap the memory of all instances
+    on an executor, `blockCacheSizeMB` (`8`), `compactOnCommit`
+    (`false`), and `formatVersion` (`5`, pinned by the checkpoint).
+
+    Column families matter for the next section: `transformWithState`
+    gives every state variable its own column family in one RocksDB
+    instance (`session`, `seen` above) and keeps event-time timers in
+    two more, `$eventTimers_keyToTimestamp` (prefix-scanned by key) and
+    `$eventTimers_timestampToKey` (range-scanned in time order, so
+    finding expired timers is one ordered scan). The HDFS provider has
+    no column families, and `validateStateStoreProvider` in
+    `streaming/operators/stateful/transformwithstate/TransformWithStateExecBase.scala`
+    allows only `RocksDBStateStoreProvider`. With the default provider
+    the query fails:
+
+    ```python
+    from pyspark.sql.streaming import StatefulProcessor
+
+    class Noop(StatefulProcessor):
+        def init(self, handle):
+            pass
+        def handleInputRows(self, key, rows, timerValues):
+            return iter([])
+        def close(self):
+            pass
+
+    PROVIDER = "spark.sql.streaming.stateStore.providerClass"
+    spark.conf.set(PROVIDER,
+        "org.apache.spark.sql.execution.streaming.state.HDFSBackedStateStoreProvider")
+    try:
+        (spark.readStream.schema("user STRING").json(inbox).groupBy("user")
+         .transformWithState(Noop(), "user STRING", "Update", "None")
+         .writeStream.format("console").option("checkpointLocation", tempfile.mkdtemp())
+         .trigger(availableNow=True).start().awaitTermination())
+    except Exception as e:
+        print(str(e).splitlines()[0])
+    spark.conf.set(PROVIDER,
+        "org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider")
+    ```
+
+    ```text
+    [UNSUPPORTED_FEATURE.STORE_BACKEND_NOT_SUPPORTED_FOR_TWS] The feature is not
+    supported: Store backend org.apache.spark.sql.execution.streaming.state.HDFSBackedStateStoreProvider
+    is not supported by TransformWithState operator. Please use RocksDBStateStoreProvider.
+    ```
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "You turn on RocksDB changelog checkpointing. What does a normal commit upload to the checkpoint now?"
+  AnswerChoices: "A <version>.changelog with the changed keys, with full snapshots uploaded in the background;A full <version>.zip of the RocksDB instance every batch;Nothing until the query stops;A .delta file in the HDFS provider's format"
+  CorrectAnswer: "A <version>.changelog with the changed keys, with full snapshots uploaded in the background"
+  Hint: "The point of the setting is to make commits cheaper."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## transformWithState in Python, from the Inside
+
+    "Streaming Messy Data: Drift, Dead Letters and State" used
+    `transformWithState` to sessionize clicks. Here is what runs when
+    you do. Python has two flavours on `GroupedData`:
+    `transformWithStateInPandas` (4.0, pandas DataFrames in and out)
+    and `transformWithState` (4.1, `Row` objects in and out). Both
+    plan to the same physical operator,
+    `TransformWithStateInPySparkExec`
+    (`sql/core/src/main/scala/org/apache/spark/sql/execution/python/streaming/`),
+    shown in plans as `TransformWithStateInPySpark ... python_row` or
+    `... pandas`.
+
+    For each partition of each batch, the executor:
+
+    1. filters rows older than the watermark (in `EventTime` mode) and
+       groups the rest by key;
+    2. starts a Python worker with `TransformWithStateInPySparkPythonRunner`,
+       which streams the grouped rows to Python as Arrow batches;
+    3. opens a **state server** for that task,
+       `TransformWithStateInPySparkStateServer`, on a local socket (a
+       Unix domain socket or a TCP port), and tells the worker where
+       it is;
+    4. Python calls your `init()`, then `handleInputRows(key, rows,
+       timerValues)` for each key with data, then
+       `handleExpiredTimer(key, timerValues, expiredTimerInfo)` for each
+       expired timer, then `close()`;
+    5. commits the RocksDB store when the task ends.
+
+    Every state call in Python (`self.session.get()`,
+    `self.seen.containsKey(...)`, `registerTimer`) is a request to the
+    state server: a protobuf message defined in
+    `sql/core/src/main/protobuf/org/apache/spark/sql/execution/streaming/StateMessage.proto`
+    (`StateRequest`, `StateResponse`, `ValueStateCall`, `MapStateCall`,
+    `TimerRequest`...), answered by the JVM from RocksDB. So **each
+    state access is a round trip between processes**. Reading a value
+    once per key and keeping it in a local variable, as the exercise
+    does, is not a micro-optimisation; it is the difference between
+    one round trip and dozens per key.
+
+    The query plan shows the pieces:
+
+    ```text
+    ~WriteToMicroBatchDataSourceV1 FileSink[...]
+    +- ~TransformWithStateInPySpark transformWithStateUDF(user#313, page#314,
+         ts#315-T600000ms)#317, 1, [user#318, start#319, ...], Append, EventTime, python_row, false, 0
+       :- ~Project [user#313, user#313, page#314, ts#315-T600000ms]
+       :  +- ~EventTimeWatermark ..., ts#315: timestamp, 10 minutes
+       :     +- ~StreamingExecutionRelation FileStreamSource[...]
+       +- LocalRelation <empty>
+    ```
+
+    The second child, `LocalRelation <empty>`, is the slot for
+    `initialState`; the operator is a binary node because initial
+    state must be co-partitioned with the input.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Timers, Precisely
+
+    In `EventTime` mode a timer fires when its expiry is **less than
+    or equal to** the watermark used for eviction in that batch
+    (`TimerStateImpl.getExpiredTimers`, the `<=` comparison in
+    `streaming/operators/stateful/transformwithstate/timers/TimerStateImpl.scala`).
+    A timer registered at exactly 10:00:00 with the watermark reaching
+    exactly 10:00:00 fired in the next batch in my run, with
+    `expiredTimerInfo.getExpiryTimeInMs()` equal to
+    `timerValues.getCurrentWatermarkInMs()`.
+
+    Within one task, keys with new rows are handled first and expired
+    timers after them: the Python serializers in
+    `python/pyspark/sql/pandas/serializers.py` yield every
+    `PROCESS_DATA` group, then one `PROCESS_TIMER` step, then
+    `COMPLETE`. And the watermark lags the data. In the exercise, user
+    `u4`'s last click is at 10:05:44, so its timer is at 10:35:44. The
+    batch that brings u4's next click (10:58:40, 53 minutes later) runs
+    with an eviction watermark of 10:02:28, so the timer has not
+    fired. Only `handleInputRows` can see the gap: it emits the old
+    session itself, starts a new one and moves the timer. A processor
+    that closes sessions only in `handleExpiredTimer` would merge the
+    two sessions into one.
+
+    Two traps I hit while writing this lesson:
+
+    - **Parameter names are part of the API.** PySpark calls
+      `handleExpiredTimer(key=..., timerValues=..., expiredTimerInfo=...)`
+      with keyword arguments. A processor that names its parameters
+      `(self, key, tv, info)` fails at the first expired timer with
+      `TypeError: T.handleExpiredTimer() got an unexpected keyword
+      argument 'timerValues'`.
+    - **`ProcessingTime` mode never lets `availableNow` finish.** In
+      4.2.0 `shouldRunAnotherBatch` returns `true` unconditionally for
+      `timeMode="ProcessingTime"` (the code carries a TODO to check for
+      registered timers), so after the data runs out the query plans
+      no-data batch after no-data batch. A test query with
+      `availableNow` and `ProcessingTime` passed 750 batches before I
+      killed it. Use `processingTime=` triggers with an explicit
+      `stop()` for such queries, or `EventTime` mode.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## A Timestamp Trap in Python State
+
+    Store a `TIMESTAMP` in a value state, read it back in a later
+    batch, and compare it with the input. This processor records what
+    it sees (session time zone UTC, machine time zone
+    America/Los_Angeles):
+
+    ```python
+    from pyspark.sql import Row
+    from pyspark.sql.streaming import StatefulProcessor
+
+    spark.conf.set("spark.sql.session.timeZone", "UTC")
+    spark.conf.set("spark.sql.streaming.stateStore.providerClass",
+        "org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider")
+
+    class Probe(StatefulProcessor):
+        def init(self, handle):
+            self.v = handle.getValueState("v", "t TIMESTAMP")
+        def handleInputRows(self, key, rows, timerValues):
+            prev = self.v.get()
+            for r in rows:
+                self.v.update((r.ts,))
+                yield Row(k=key[0], input_repr=repr(r.ts), input_ts=r.ts,
+                          state_repr=repr(prev[0]) if prev else None,
+                          state_ts=prev[0] if prev else None)
+        def close(self):
+            pass
+
+    probe = tempfile.mkdtemp()
+    os.makedirs(f"{probe}/in")
+    for name, ts in [("a.json", "2026-10-01T10:00:00"), ("b.json", "2026-10-01T11:00:00")]:
+        with open(f"{probe}/in/{name}", "w") as f:
+            f.write(json.dumps({"k": "a", "ts": ts}) + "\n")
+    os.utime(f"{probe}/in/a.json", (1, 1))              # a.json is the older file
+    q = (spark.readStream.schema("k STRING, ts TIMESTAMP").option("maxFilesPerTrigger", 1)
+         .json(f"{probe}/in").groupBy("k")
+         .transformWithState(Probe(), "k STRING, input_repr STRING, input_ts TIMESTAMP, "
+                             "state_repr STRING, state_ts TIMESTAMP", "Update", "None")
+         .writeStream.format("memory").queryName("probe").outputMode("update")
+         .option("checkpointLocation", f"{probe}/ck").trigger(availableNow=True).start())
+    q.awaitTermination()
+    spark.table("probe").show(truncate=False, vertical=True)
+    ```
+
+    ```text
+    -RECORD 0-----------------------------------------------------------------
+     k          | a
+     input_repr | datetime.datetime(2026, 10, 1, 10, 0, tzinfo=zoneinfo.ZoneInfo(key='UTC'))
+     input_ts   | 2026-10-01 10:00:00
+     state_repr | NULL
+     state_ts   | NULL
+    -RECORD 1-----------------------------------------------------------------
+     k          | a
+     input_repr | datetime.datetime(2026, 10, 1, 11, 0, tzinfo=zoneinfo.ZoneInfo(key='UTC'))
+     input_ts   | 2026-10-01 11:00:00
+     state_repr | datetime.datetime(2026, 10, 1, 3, 0)
+     state_ts   | 2026-10-01 03:00:00
+    ```
+
+    The previous batch stored 10:00 UTC. Input rows arrive as
+    timezone-aware datetimes in the session time zone, but the value
+    comes back from state as a **naive datetime in the Python worker's
+    local time zone** (03:00 in Los Angeles is 10:00 UTC). Comparing the
+    two raises `TypeError: can't compare offset-naive and offset-aware
+    datetimes`, and emitting the naive value writes 03:00, seven hours
+    off. On a machine whose zone equals the session zone you see only
+    the `TypeError`, which makes this easy to miss in tests and hit in
+    production. Store event times in state as `LONG` epoch
+    milliseconds (`int(r.ts.timestamp() * 1000)`), as the exercise
+    does, and convert at the edges.
+
+- Class: mult_question
+  Depth: advanced
+  Output: "In EventTime mode, a key has a timer at 09:39 and new rows for it arrive in a batch whose eviction watermark is 10:02. In what order does Python see the calls for that key?"
+  AnswerChoices: "handleInputRows first, then handleExpiredTimer if the timer still exists;handleExpiredTimer first, then handleInputRows;Only handleExpiredTimer, the new rows wait for the next batch;Only handleInputRows, timers never fire in a batch with data"
+  CorrectAnswer: "handleInputRows first, then handleExpiredTimer if the timer still exists"
+  Hint: "The exercise relies on this order: the new click closes the old session and deletes its timer."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## State TTL
+
+    Every state variable takes an optional `ttlDurationMs`. TTL is
+    measured in **processing time**: each update sets the expiry to the
+    batch's processing timestamp plus the duration, expired values stop
+    being returned, and Spark deletes them in later batches. That is
+    why TTL exists only in `ProcessingTime` mode (`validateTTLConfig` in
+    `StatefulProcessorHandleImpl.scala`). In `EventTime` mode
+    `getValueState("v", "n INT", ttlDurationMs=60000)` fails in
+    `init()`:
+
+    ```text
+    PySparkRuntimeError: Error initializing value state:
+    [STATEFUL_PROCESSOR_INCORRECT_TIME_MODE_TO_ASSIGN_TTL] Cannot use TTL for
+    state=v in timeMode=EventTime, use TimeMode.ProcessingTime() instead. SQLSTATE: 42802
+    ```
+
+    A run with a 2 second TTL, a `processingTime="500 milliseconds"`
+    trigger and three files arriving 1 s, 1 s and 4 s apart:
+
+    ```python
+    import time
+
+    class Counter(StatefulProcessor):
+        def init(self, handle):
+            self.v = handle.getValueState("v", "n INT", ttlDurationMs=2000)
+        def handleInputRows(self, key, rows, timerValues):
+            prev = self.v.get() if self.v.exists() else None
+            n = (prev[0] if prev else 0) + sum(1 for _ in rows)
+            self.v.update((n,))
+            yield Row(k=key[0], before=prev[0] if prev else None, after=n)
+        def close(self):
+            pass
+
+    ttl = tempfile.mkdtemp()
+    os.makedirs(f"{ttl}/in")
+    seen = []
+    q = (spark.readStream.schema("k STRING").json(f"{ttl}/in").groupBy("k")
+         .transformWithState(Counter(), "k STRING, before INT, after INT",
+                             "Update", "ProcessingTime")
+         .writeStream.foreachBatch(
+             lambda df, b: seen.extend((b, r.before, r.after) for r in df.collect()))
+         .option("checkpointLocation", f"{ttl}/ck")
+         .trigger(processingTime="500 milliseconds").start())
+    for i, pause in enumerate([1, 1, 4]):
+        time.sleep(pause)
+        with open(f"{ttl}/in/{i}.json", "w") as f:
+            f.write(json.dumps({"k": "a"}) + "\n")
+    time.sleep(3)
+    q.stop()
+    print("(batch, before, after):", seen)
+    print("batches run:", q.lastProgress.batchId + 1)
+    ```
+
+    ```text
+    (batch, before, after): [(0, None, 1), (1, 1, 2), (9, None, 1)]
+    batches run: 15
+    ```
+
+    The third file found the counter gone: it had expired between
+    batches 1 and 9. (The batch numbers depend on timing; the `None`
+    in the third row does not.) And 15 batches ran for three files, which is the
+    `ProcessingTime` no-data batch behaviour from the previous section
+    again: TTL cleanup needs those batches.
+
+    For event-time expiry (close a session 30 minutes after its last
+    click in event time), use timers, as the exercise does. TTL and
+    timers answer different questions: TTL bounds how long state
+    lingers on the wall clock, timers act on the data's own clock.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Which Changes Survive a Restart
+
+    Changing a stateful query and restarting it on the old checkpoint
+    goes through `StateSchemaCompatibilityChecker`
+    (`streaming/state/StateSchemaCompatibilityChecker.scala`) and the
+    operator metadata check. I restarted a one-variable
+    `transformWithState` query with a changed value schema, once with
+    each `spark.sql.streaming.stateStore.encodingFormat` (4.0; default
+    `unsaferow`, and pinned by the checkpoint at the first batch). The
+    second column shows what the restarted query read from state:
+
+    | Change to the value state | `unsaferow` | `avro` |
+    |---|---|---|
+    | none | `(1,)` | `(1,)` |
+    | rename `n INT` to `count INT` | `(1,)`: accepted, names are ignored | `(None,)`: **silently lost** |
+    | add a field | `STATE_STORE_VALUE_SCHEMA_NOT_COMPATIBLE` | `(1, None)` |
+    | drop a field | (not tested) | `(1,)` |
+    | widen `INT` to `LONG` | `STATE_STORE_VALUE_SCHEMA_NOT_COMPATIBLE` | `(1,)` |
+    | narrow `LONG` to `INT` | (not tested) | `STATE_STORE_INVALID_VALUE_SCHEMA_EVOLUTION` |
+    | `INT` to `STRING` | (not tested) | `STATE_STORE_INVALID_VALUE_SCHEMA_EVOLUTION` |
+    | value state to list state | (not tested) | `STATE_STORE_INVALID_VARIABLE_TYPE_CHANGE` |
+
+    The rules behind the table:
+
+    - With `unsaferow`, the check is
+      `DataType.equalsIgnoreNameAndCompatibleNullability`: same types in
+      the same positions, names ignored. Rows are read by position, so
+      a rename works; the tested changes failed, and by this rule any
+      other change should too.
+    - With `avro`, value schemas may evolve
+      (`schemaEvolutionEnabled = usingAvro && ...` in
+      `statefulOperators.scala`): the new schema must be able to read
+      every old one under Avro's resolution rules (checked with Avro's
+      `SchemaValidatorBuilder().canReadStrategy`). Avro matches fields
+      **by name**, so a rename is a drop plus an add, and the old value
+      reads as `None`. Spark gives no warning.
+    - The number of value schema versions per state variable is capped
+      by `spark.sql.streaming.stateStore.valueStateSchemaEvolutionThreshold`
+      (default 16), after which you get
+      `STATE_STORE_VALUE_SCHEMA_EVOLUTION_THRESHOLD_EXCEEDED`.
+
+    Changes outside the value schema, on any operator:
+
+    | Change | Error |
+    |---|---|
+    | different grouping key (`groupBy("u")` to `groupBy(upper("u"), "u")`) | `STATE_STORE_KEY_SCHEMA_NOT_COMPATIBLE` |
+    | different stateful operator (`count()` to `dropDuplicates`) | `STREAMING_STATEFUL_OPERATOR_NOT_MATCH_IN_STATE_METADATA` |
+    | `state/` deleted, offsets kept | `STREAMING_STATEFUL_OPERATOR_MISSING_STATE_DIRECTORY` |
+    | `metadata` file deleted, offsets kept | `STREAMING_CHECKPOINT_MISSING_METADATA_FILE` |
+
+    If you expect a value schema to change, start the query with
+    `encodingFormat` set to `avro` (you cannot switch later), only add
+    fields or widen types, and never rename. The schema history lives
+    in `state/<op>/_stateSchema/default/` (one file per evolution,
+    referenced from the `v2` operator metadata in
+    `state/<op>/_metadata/v2/<batch>`).
+
+- Class: mult_question
+  Depth: all
+  Output: "A transformWithState query started with encodingFormat avro. You rename a value state field from n to count and restart. What happens?"
+  AnswerChoices: "The query runs and the field reads as None for existing keys;The query fails with STATE_STORE_VALUE_SCHEMA_NOT_COMPATIBLE;The value is read by position, so nothing changes;Spark migrates the field to the new name"
+  CorrectAnswer: "The query runs and the field reads as None for existing keys"
+  Hint: "Avro resolves fields by name, and the evolution check only asks whether the new schema can read the old one."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Inspecting transformWithState State
+
+    For `transformWithState`, `statestore` needs `stateVarName` (or
+    `readRegisteredTimers`), and `state-metadata` lists the variables.
+    After the exercise's first run (its checkpoint is `exercise_ck` here):
+
+    ```python
+    (spark.read.format("statestore").option("stateVarName", "session")
+         .load(exercise_ck).orderBy("key").show(truncate=False))
+    (spark.read.format("statestore").option("readRegisteredTimers", "true")
+         .load(exercise_ck).show(truncate=False))
+    (spark.read.format("statestore").option("stateVarName", "seen")
+         .load(exercise_ck).orderBy("key").show(5, truncate=False))
+    (spark.read.format("state-metadata").load(exercise_ck)
+         .select("operatorName", "numPartitions", "minBatchId", "maxBatchId",
+                 "operatorProperties").show(truncate=False, vertical=True))
+    ```
+
+    ```text
+    +----+----------------------------------------+------------+
+    |key |value                                   |partition_id|
+    +----+----------------------------------------+------------+
+    |{u2}|{1791190923000, 1791193734000, 4, 43.33}|1           |
+    |{u3}|{1791192604000, 1791194329000, 5, 39.26}|1           |
+    |{u4}|{1791193101000, 1791194744000, 3, 0.0}  |0           |
+    |{u5}|{1791195005000, 1791195148000, 2, 0.0}  |0           |
+    +----+----------------------------------------+------------+
+
+    +----+-----------------------+------------+
+    |key |expiration_timestamp_ms|partition_id|
+    +----+-----------------------+------------+
+    |{u4}|1791196544000          |0           |
+    |{u5}|1791196948000          |0           |
+    |{u2}|1791195534000          |1           |
+    |{u3}|1791196129000          |1           |
+    +----+-----------------------+------------+
+
+    +----+------------+---------------+------------+
+    |key |user_map_key|user_map_value |partition_id|
+    +----+------------+---------------+------------+
+    |{u2}|{c004}      |{1791190923000}|1           |
+    |{u2}|{c005}      |{1791191728000}|1           |
+    ...
+
+    -RECORD 0----------------------------------------------------------------
+     operatorName       | transformWithStateInPySparkExec
+     numPartitions      | 2
+     minBatchId         | 0
+     maxBatchId         | 2
+     operatorProperties | {"timeMode":"EventTime","outputMode":"Append","stateVariables":[
+                            {"stateName":"session","stateVariableType":"ValueState","ttlEnabled":false},
+                            {"stateName":"$eventTimers_keyToTimestamp","stateVariableType":"TimerState",...},
+                            {"stateName":"seen","stateVariableType":"MapState","ttlEnabled":false}]}
+    ```
+
+    Pass `stateVarName` to a checkpoint of any other operator and the
+    read fails with `STDS_INVALID_OPTION_VALUE.WITH_MESSAGE`: "Providing
+    state variable names is only supported with the transformWithState
+    operator. Found operator=stateStoreSave."
+
+    Map state flattens to `user_map_key` and `user_map_value` columns
+    (one row per entry); list state flattens to one row per element.
+    Each timer is 30 minutes after its session's last click, which is
+    exactly what the exercise checks.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Real-Time Mode
+
+    Micro-batches have a floor on latency: planning, scheduling and
+    committing each batch takes time, and a record that arrives just
+    after a batch started waits for the next one. **Real-Time Mode**
+    (4.1 in Scala, SPARK-53737; PySpark trigger in 4.2, SPARK-54660)
+    changes the shape of a batch: tasks are launched once per long
+    batch and keep reading and writing records as they arrive, until
+    the batch duration is up. The checkpoint protocol is unchanged
+    (offsets before, commits after), so the batch duration is the
+    checkpoint interval, not the latency.
+
+    The trigger is `.trigger(realTime="5 seconds")` on `writeStream`,
+    with `outputMode("update")`; the next section runs a full query.
+
+    The Learning Spark course's "Structured Streaming" lesson lists the
+    restrictions; here
+    is where they live and what each one looks like. The allowlist is
+    `RealTimeModeAllowlist` (`streaming/runtime/RealTimeModeAllowlist.scala`):
+    sinks console, `foreach`, Kafka and a test-only memory sink;
+    operators such as project, filter, generate (explode), union,
+    broadcast hash join and the watermark node. I tried each case:
+
+    | Query | Result in 4.2.0 |
+    |---|---|
+    | file source | `STREAMING_REAL_TIME_MODE.INPUT_STREAM_NOT_SUPPORTED` (`FileStreamSource`), when the query runs |
+    | rate source | `STREAMING_REAL_TIME_MODE.INPUT_STREAM_NOT_SUPPORTED` (`RateStreamMicroBatchStream`) |
+    | append output mode | `STREAMING_REAL_TIME_MODE.OUTPUT_MODE_NOT_SUPPORTED`, at `start()` |
+    | `foreachBatch` sink | `STREAMING_REAL_TIME_MODE.OPERATOR_OR_SINK_NOT_IN_ALLOWLIST` (`ForeachBatchSink`), at `start()` |
+    | `groupBy().count()` | `OPERATOR_OR_SINK_NOT_IN_ALLOWLIST` (`HashAggregateExec`, `ShuffleExchangeExec`), when the query runs |
+    | a Python UDF | `OPERATOR_OR_SINK_NOT_IN_ALLOWLIST` (`ArrowEvalPythonExec`), when the query runs |
+    | `realTime="1 second"` | `INVALID_STREAMING_REAL_TIME_MODE_TRIGGER_INTERVAL`: below `spark.sql.streaming.realTimeMode.minBatchDuration` (default 5000 ms) |
+    | projection and filter, console sink | runs |
+
+    `spark.sql.streaming.realTimeMode.allowlistCheck=false` turns the
+    operator and sink check off "at your own risk", in the words of
+    the error. Python UDFs not being on the list is the big one for
+    this course: in 4.2.0 a Real-Time Mode query cannot run Python per
+    row except in a `foreach` sink.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Running Real-Time Mode on a Laptop
+
+    The only built-in source that supports it is Kafka
+    (`KafkaMicroBatchStream` implements `SupportsRealTimeMode`). The
+    main jar also ships a source meant for Spark's own tests,
+    `LowLatencyMemoryStream`
+    (`streaming/sources/LowLatencyMemoryStream.scala`). Through
+    `spark._jvm` in Classic mode you can use it to watch Real-Time Mode
+    run without a broker. Treat it strictly as a lab instrument:
+
+    ```python
+    import time
+    from pyspark.sql import DataFrame
+
+    jvm = spark._jvm
+    LL = jvm.org.apache.spark.sql.execution.streaming.sources.LowLatencyMemoryStream
+    stream = LL.apply(spark._jsparkSession, 1, jvm.org.apache.spark.sql.Encoders.STRING())
+    rt_df = DataFrame(stream.toDF(), spark)
+
+    def add(value):
+        values = jvm.java.util.ArrayList()
+        values.add(value)
+        stream.addData(jvm.scala.jdk.javaapi.CollectionConverters.asScala(values))
+
+    rt_dir = tempfile.mkdtemp()
+    sink_log = f"{rt_dir}/sink.log"
+
+    def write_row(row):                       # a Python foreach sink
+        with open(sink_log, "a") as f:
+            f.write(json.dumps({"v": row.value, "seen_ms": int(time.time() * 1000)}) + "\n")
+
+    q = (rt_df.writeStream.foreach(write_row).option("checkpointLocation", f"{rt_dir}/ck")
+         .outputMode("update").trigger(realTime="15 seconds").start())
+    t0 = time.time(); time.sleep(3)
+    sent = {}
+    for i in range(10):
+        sent[f"m{i}"] = int(time.time() * 1000); add(f"m{i}"); time.sleep(1.0)
+    time.sleep(14)
+    q.stop()
+    for line in open(sink_log):
+        r = json.loads(line)
+        print(r["v"], "added at %.1fs" % (sent[r["v"]] / 1000 - t0),
+              "latency_ms", r["seen_ms"] - sent[r["v"]])
+    ```
+
+    Ten records, one per second, into one 15 second batch:
+
+    ```text
+    m0 added at 3.0s latency_ms 12030
+    m1 added at 4.0s latency_ms 11020
+    m2 added at 5.0s latency_ms 10017
+    ...
+    m8 added at 11.0s latency_ms 3997
+    m9 added at 12.0s latency_ms 2993
+    ```
+
+    Every record reached Python when the batch ended. The engine was
+    streaming; the Python sink was not. `PythonForeachWriter`
+    (`sql/core/src/main/scala/org/apache/spark/sql/execution/python/streaming/PythonForeachWriter.scala`)
+    pickles rows with `SerDeUtil.AutoBatchedPickler`, whose batch size
+    starts at 1 and doubles while batches are under 1 MB, and the
+    `PythonRunner` writer thread fills a buffer of `spark.buffer.size`
+    bytes (default 65536) before it sends anything to the worker. A
+    trickle of tiny rows never fills it. Start the session with
+    `.config("spark.buffer.size", "64")` and the same run gives:
+
+    ```text
+    m0 added at 3.0s latency_ms 1040
+    m1 added at 4.0s latency_ms 2017
+    m2 added at 5.0s latency_ms 1014
+    m3 added at 6.0s latency_ms 4016
+    m4 added at 7.0s latency_ms 3013
+    m5 added at 8.0s latency_ms 2011
+    m6 added at 9.0s latency_ms 1008
+    m7 added at 10.0s latency_ms 5450
+    ...
+    ```
+
+    Now the pickler's doubling shows: records arrive in groups of 1, 2,
+    4 and then the rest, each group waiting for its last member. The
+    lesson for real systems: Real-Time Mode's latency is a property of
+    the whole path, and in 4.2.0 a Python stage in it batches. Low
+    latency pipelines keep the hot path in the JVM (Kafka in, Kafka
+    out) and do Python work elsewhere. "The Python Worker Protocol"
+    takes these runner classes apart.
+
+- Class: mult_question
+  Depth: advanced
+  Output: "A Real-Time Mode query with a 15 second batch writes to a Python foreach sink. Records arrive one per second. With default settings, when does Python see them?"
+  AnswerChoices: "All at the end of the batch, because the rows wait in the pickler and the socket buffer;Each within milliseconds, because Real-Time Mode streams records;Every 5 seconds, at the minimum batch duration;Never, because foreach is not allowed in Real-Time Mode"
+  CorrectAnswer: "All at the end of the batch, because the rows wait in the pickler and the socket buffer"
+  Hint: "Think about AutoBatchedPickler and spark.buffer.size, not about the engine."
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: A Sessionizer You Can Audit
+
+    The checkout service drops its events into a folder in four files
+    (`data/messy/checkout_events/drop_1.jsonl` to `drop_4.jsonl`): some
+    events are re-sent with the same `event_id`, one arrives out of
+    order inside the watermark, and one is hours late. A streaming
+    query reads one drop per batch, cuts each user's clicks into
+    sessions (a gap of more than 30 minutes ends one) with
+    `transformWithState` on RocksDB, and writes closed sessions with
+    `foreachBatch`.
+
+    Complete:
+
+    1. `checkpoint_status(checkpoint)`: with plain Python, report the
+       newest offsets and commits batch ids, whether the next run will
+       replay a batch, the next batch id, and `batchWatermarkMs` from
+       the newest offsets file. Ignore `.crc` files.
+    2. `Sessionizer.handleInputRows`: skip re-sent `event_id`s (map
+       state `seen`), close the current session with `"gap"` when a
+       click comes more than `GAP_MS` after its last one, extend it
+       otherwise, and keep exactly one timer at `last_ms + GAP_MS`.
+    3. `Sessionizer.handleExpiredTimer`: emit the session with
+       `"timer"` and clear the state.
+    4. `write_batch(df, batch_id, out_dir)`: make the sink exactly-once
+       under replays.
+    5. `open_sessions(spark, checkpoint)`: read the open sessions and
+       their timers with the state data source.
+
+    The harness first tests `checkpoint_status` on hand-made
+    checkpoints, then runs the query over drops 1 and 2 and checks the
+    state you read against a plain-Python reference sessionization. It
+    adds drops 3 and 4 and crashes the query right after your sink
+    wrote batch 4 (your `checkpoint_status` must then predict the
+    replay), restarts, and checks that the output holds every closed
+    session exactly once and matches the reference.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "checkpoint_status: next_batch is latest_offset when it has no matching commit, else latest_offset + 1. In handleInputRows, read the session once, loop over sorted(rows, key=lambda r: r.ts), yield the closed session on a gap, then delete the listTimers() and registerTimer(s[1] + GAP_MS). write_batch: write each batch to its own folder with mode('overwrite'). open_sessions: join the stateVarName='session' read with the readRegisteredTimers read on key.user."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - A checkpoint is logs: `offsets/N` (the plan, written before the
+      batch, with pinned settings such as the state store provider and
+      the number of state partitions), `commits/N` (written after the
+      sink), the source's own log, and `state/` per operator and
+      partition.
+    - On restart, an `offsets/N` without `commits/N` means batch N is
+      replayed with the same offsets, state version and batch id.
+      Sinks must be idempotent per batch id. No-data batches run when
+      the watermark moves past something a stateful operator holds.
+    - The HDFS provider writes LZ4-compressed delta files of
+      `UnsafeRow` key/value records (version = batch id + 1) and
+      periodic snapshots. RocksDB uploads zips plus shared SST files,
+      or changelogs when changelog checkpointing is on.
+    - The state data source (`statestore`, `state-metadata`) reads any
+      checkpoint as a table, including the change feed,
+      `transformWithState` variables and timers.
+    - Python `transformWithState` (`transformWithStateInPandas` 4.0,
+      row-based 4.1) runs on RocksDB only. Every state call is a
+      protobuf round trip to a per-task state server. Event-time
+      timers fire at expiry <= watermark, after the input rows.
+      `handleExpiredTimer`'s parameter names matter, timestamps read
+      back from state are naive local times, and `ProcessingTime` mode
+      keeps `availableNow` running forever in 4.2.0.
+    - TTL is processing-time only. Value state evolves only with the
+      `avro` encoding format chosen at the start, and an Avro rename
+      silently drops the old value.
+    - Real-Time Mode keeps tasks running for the whole batch. In 4.2.0
+      it accepts Kafka sources, console, `foreach` and Kafka sinks,
+      update mode and stateless operators, no Python UDFs, and a Python
+      `foreach` sink batches records by design.
+
+    Next: **Determinism, Retries and Fault Injection**, where the replays
+    you just watched in streaming meet their batch cousins (task
+    retries, stage retries after lost shuffle files) and you prove a
+    pipeline correct by breaking it on purpose.

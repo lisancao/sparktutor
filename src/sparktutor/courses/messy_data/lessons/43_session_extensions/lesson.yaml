@@ -1,0 +1,677 @@
+- Class: meta
+  Lesson: "Catalyst Extensions: Rules and Native Functions"
+  EstimatedMinutes: 75
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    "How Catalyst Plans Python" showed how a query moves through the
+    analyzer and the optimizer, and how a Python UDF becomes an
+    `ArrowEvalPython` or `BatchEvalPython` node that ships rows to a
+    Python worker. "A DSv2 Connector in Java" plugged a data source into
+    Spark from Java. This lesson plugs into Catalyst itself, through
+    `SparkSessionExtensions`, with three pieces of Java:
+
+    - a **native function**, `is_png(bytes)`, written as a Catalyst
+      `Expression`, plus a second version built on `StaticInvoke` that
+      takes part in whole-stage code generation
+    - an **optimizer rule** that finds a Python UDF called `is_png` and
+      replaces it with the native expression, so the query no longer
+      needs a Python worker, without changing a single result (NULLs
+      included)
+    - a **check rule** that rejects a messy-data mistake (grouping by a
+      whole file's bytes) at analysis time
+
+    By the end of this lesson you will be able to:
+
+    - Write an extension class and load it with `spark.sql.extensions`
+    - Implement a Catalyst `Expression` from Java, and know the five
+      traps that a Scala case class would have hidden (Scala traits,
+      `Serializable`, `nullable`, input type checks, `NullType`)
+    - Register it with `injectFunction` and call it from SQL, `F.expr`
+      and `F.call_function`
+    - Explain why `CodegenFallback` takes an operator out of whole-stage
+      code generation and how `StaticInvoke` keeps it in
+    - Write a `Rule[LogicalPlan]` in Java, watch it fire with
+      `spark.sql.planChangeLog.*`, and decide when a rewrite is safe
+    - Measure a native function against Python UDFs without fooling
+      yourself
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Injection Points
+
+    `SparkSessionExtensions`
+    (`sql/core/src/main/scala/org/apache/spark/sql/SparkSessionExtensions.scala`)
+    is a holder of builders. Your extension class receives it once for
+    each new session and calls `inject*` methods. The ones in 4.2.0, and
+    where they act:
+
+    | Method | Builder type (Scala) | Acts in |
+    |---|---|---|
+    | `injectParser` | `(SparkSession, ParserInterface) => ParserInterface` | parsing SQL text (wrap the previous parser) |
+    | `injectResolutionRule`, `injectHintResolutionRule`, `injectPostHocResolutionRule` | `SparkSession => Rule[LogicalPlan]` | the analyzer |
+    | `injectCheckRule` | `SparkSession => LogicalPlan => Unit` | after analysis: throw to reject a plan |
+    | `injectPlanNormalizationRule` | `SparkSession => Rule[LogicalPlan]` | normalizing plans for cache lookup |
+    | `injectOptimizerRule` | `SparkSession => Rule[LogicalPlan]` | the optimizer's operator batches |
+    | `injectPreCBORule` | `SparkSession => Rule[LogicalPlan]` | once after operator optimization, before rules that use statistics |
+    | `injectPlannerStrategy` | `SparkSession => Strategy` | logical to physical planning |
+    | `injectColumnar` | `SparkSession => ColumnarRule` | physical plan, row/columnar transitions |
+    | `injectQueryPostPlannerStrategyRule`, `injectQueryStagePrepRule`, `injectRuntimeOptimizerRule`, `injectQueryStageOptimizerRule` | various | adaptive query execution |
+    | `injectFunction`, `injectTableFunction` | `(FunctionIdentifier, ExpressionInfo, Seq[Expression] => ...)` | the function registry |
+
+    The class is marked `@DeveloperApi @Experimental @Unstable` and its
+    doc says: "We make NO guarantee about the stability regarding binary
+    compatibility and source compatibility of methods here." Catalyst
+    classes (`Expression`, `LogicalPlan`, `PythonUDF`) are internal too.
+    An extension is compiled against one Spark version; test it again
+    on every upgrade, as Delta Lake does with one build per Spark minor
+    version.
+
+    Three ways to load an extension class:
+
+    - `spark.sql.extensions`: a **static**, comma-separated list of
+      classes with a no-argument constructor, applied in order (for
+      function name conflicts, the last one wins). It must be set before
+      the session starts.
+    - `SparkSession.builder.withExtensions(...)`: Scala and Java only.
+    - A `META-INF/services/org.apache.spark.sql.SparkSessionExtensionsProvider`
+      file listing classes that implement `SparkSessionExtensionsProvider`
+      (3.2), found with `ServiceLoader` when a session is created.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Think of Catalyst as a factory line with stations: parse, check,
+    resolve, optimize, plan, run. Extensions let you add a worker at a
+    station. A check rule is an inspector who stops the line. An
+    optimizer rule is a worker who swaps a slow part for a faster one
+    that does the same job. A native function is a new tool everyone on
+    the line can use.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Extension Class in Java
+
+    The setting expects a `Function1[SparkSessionExtensions, Unit]`. In
+    Java that is `scala.runtime.AbstractFunction1` with `BoxedUnit` as
+    the result type:
+
+    ```java
+    public class Extensions extends AbstractFunction1<SparkSessionExtensions, BoxedUnit> {
+      @Override public BoxedUnit apply(SparkSessionExtensions ext) {
+        ext.injectOptimizerRule(session -> new PngRule());
+        ext.injectCheckRule(session -> plan -> { /* ... */ return BoxedUnit.UNIT; });
+        return BoxedUnit.UNIT;
+      }
+    }
+    ```
+
+    Scala 2.13 compiles `Function1` to an interface whose only abstract
+    method is `apply`, so Java lambdas can stand in for Scala functions
+    (`session -> new PngRule()`). A Scala function returning `Unit` is a
+    Java function returning `BoxedUnit.UNIT`.
+
+    The session is created as in "A DSv2 Connector in Java", with one
+    more static setting:
+
+    ```python
+    spark = (SparkSession.builder.master("local[2]")
+             .config("spark.jars", jar)
+             .config("spark.sql.extensions", "jext.Extensions")
+             .getOrCreate())
+    ```
+
+    With `spark-submit`, the same is
+    `--jars jext.jar --conf spark.sql.extensions=jext.Extensions`. The
+    Maven project from the previous lesson builds these sources
+    unchanged (only the `artifactId` differs); `spark-sql_2.13` brings
+    `spark-catalyst` along as a dependency.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## A Catalyst Expression, by Hand
+
+    Spark's built-in functions are Scala case classes that extend
+    `Expression` (`sql/catalyst/.../expressions/Expression.scala`). The
+    case class generates `equals`, `hashCode`, `copy`, the `Product`
+    methods that tree operations use, and `Serializable`. From Java you
+    write each of these yourself. The shape of `is_png`:
+
+    ```java
+    public class IsPng extends Expression implements CodegenFallback, Serializable {
+      private final Expression child;
+      public IsPng(Expression child) { this.child = child; }
+
+      public static boolean check(byte[] b) { ... }          // the actual test
+
+      @Override public Object eval(InternalRow row) {        // interpreted evaluation
+        Object v = child.eval(row);
+        return v == null ? null : check((byte[]) v);
+      }
+      @Override public ExprCode doGenCode(CodegenContext ctx, ExprCode ev) {
+        return CodegenFallback.super.doGenCode(ctx, ev);
+      }
+      @Override public DataType dataType() { return DataTypes.BooleanType; }
+      @Override public boolean nullable() { return child.nullable(); }
+      @Override public Seq<Expression> children() { ... }    // a Scala Seq of one child
+      @Override public Expression withNewChildrenInternal(IndexedSeq<Expression> c) { ... }
+      // productArity, productElement, canEqual, equals, hashCode
+    }
+    ```
+
+    Building this lesson hit five traps, each worth knowing by its
+    message.
+
+    **1. Scala traits do not always work from Java.** The natural base
+    class for one child is `UnaryExpression`. From Java it does not
+    compile:
+
+    ```text
+    error: IsPng is not abstract and does not override abstract method
+    withNewChildrenInternal(IndexedSeq<Expression>) in TreeNode
+    ```
+
+    and implementing that method gives `name clash ... have the same
+    erasure, yet neither overrides the other`. The method lives in the
+    Scala trait `UnaryLike`, with a generic signature that `javac`
+    cannot reconcile. Extending `Expression` directly and writing
+    `children()` and `withNewChildrenInternal` yourself avoids the
+    trait. In the same way, `CodegenFallback` provides `doGenCode` as a
+    Java default method, but `Expression` declares it abstract and Java
+    lets the class declaration win, so you must override it and call
+    `CodegenFallback.super.doGenCode(ctx, ev)` explicitly.
+
+    **2. Expressions travel to executors.** Without `Serializable` the
+    first query fails before any task starts:
+
+    ```text
+    org.apache.spark.SparkException: Task not serializable
+    Caused by: java.io.NotSerializableException: jext.IsPng
+    Serialization stack:
+        - object not serializable (class: jext.IsPng, value: is_png(null))
+    ```
+
+    **3. `nullable` is a promise.** `nullable()` returns
+    `child.nullable()`, so for a non-NULL literal Spark generates code
+    that never checks for NULL. An `eval` that returns `null` anyway
+    (as the exercise's starter does) crashes in generated code:
+
+    ```text
+    Caused by: java.lang.NullPointerException
+        at org.apache.spark.sql.catalyst.expressions.GeneratedClass$SpecificUnsafeProjection.apply(Unknown Source)
+    ```
+
+    **4. Check input types during analysis.** Without
+    `checkInputDataTypes`, `is_png('not binary')` passes analysis and
+    fails in a task with a `ClassCastException`. With it:
+
+    ```text
+    [DATATYPE_MISMATCH.TYPE_CHECK_FAILURE_WITH_HINT] Cannot resolve "is_png(not binary)" due
+    to data type mismatch: is_png expects BINARY, got string. SQLSTATE: 42K09
+    ```
+
+    **5. An untyped NULL has its own type.** The first version accepted
+    only `BinaryType` and rejected `is_png(NULL)` with `... got void`.
+    A bare `NULL` literal has `NullType` (shown as `void`); built-in
+    functions accept it through implicit casts. `is_png` accepts
+    `NullType` explicitly and returns NULL for it.
+
+- Class: mult_question
+  Depth: all
+  Output: "Your Java Expression returns nullable() = child.nullable() but its eval() returns null for a non-NULL input. What happens with a non-NULL literal argument?"
+  AnswerChoices: "Generated code assumes a non-null value and fails with a NullPointerException;Spark returns NULL as usual;The analyzer rejects the expression;Spark falls back to interpreted mode and returns false"
+  CorrectAnswer: "Generated code assumes a non-null value and fails with a NullPointerException"
+  Hint: "nullable() tells the code generator whether it needs a null check at all."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Registering and Calling the Function
+
+    `injectFunction` takes a Scala `Tuple3`: the name, an
+    `ExpressionInfo` (what `DESCRIBE FUNCTION` shows) and a builder from
+    the argument list to an expression:
+
+    ```java
+    ext.injectFunction(new Tuple3<>(
+        new FunctionIdentifier("is_png"),
+        new ExpressionInfo(IsPng.class.getName(), null, "is_png",
+            "is_png(bytes) - true if bytes start with the PNG signature", ""),
+        (Function1<Seq<Expression>, Expression>) args -> {
+          if (args.size() != 1) throw new IllegalArgumentException("is_png takes 1 argument, got " + args.size());
+          return new IsPng(args.apply(0));
+        }));
+    ```
+
+    ```python
+    spark.sql("DESCRIBE FUNCTION EXTENDED is_png").show(truncate=False)
+    ```
+
+    ```text
+    +-----------------------------------------------------------------+
+    |function_desc                                                    |
+    +-----------------------------------------------------------------+
+    |Function: is_png                                                 |
+    |Class: jext.IsPng                                                |
+    |Usage: is_png(bytes) - true if bytes start with the PNG signature|
+    |Extended Usage:\n    No example/argument for is_png.\n           |
+    +-----------------------------------------------------------------+
+    ```
+
+    The builder runs during analysis, before the arguments are resolved,
+    so it can check how many there are but not their types (that is
+    `checkInputDataTypes`' job). `is_png(X'00', X'01')` fails with
+    `pyspark.errors.exceptions.captured.IllegalArgumentException: is_png
+    takes 1 argument, got 2`.
+
+    From Python there is no `F.is_png`. Use the name:
+
+    ```python
+    imgs = (spark.read.format("binaryFile").option("recursiveFileLookup", "true")
+            .load(os.path.abspath("data/messy/images")))
+    imgs.select("path", F.call_function("is_png", "content"))    # 3.5
+    imgs.select("path", F.expr("is_png(content)"))
+    ```
+
+    `F.call_function` (3.5) is the better one in libraries: it takes
+    `Column`s, so no SQL string has to be built. A thin Python wrapper
+    is a good way to ship a native function to Python users:
+
+    ```python
+    def is_png(col):
+        """True if the bytes start with the PNG signature (native, jext)."""
+        return F.call_function("is_png", col)
+    ```
+
+    `recursiveFileLookup` matters here: `data/messy/images` has
+    subfolders (`products/`, `scans/`) and `binaryFile` does not descend
+    into folders that are not `key=value` partitions, so without it the
+    read returns no rows at all.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    The extension is loaded and `imgs` is a `binaryFile` DataFrame.
+    Create `pngs`, the rows of `imgs` for which the native function
+    `is_png` is true on `content`, calling it by name from Python with
+    `F.call_function`.
+  CorrectAnswer: |
+    pngs = imgs.filter(F.call_function("is_png", F.col("content")))
+  Hint: "F.call_function(name, *cols) builds a call to any registered function. Use it inside filter()."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Code Generation: CodegenFallback vs StaticInvoke
+
+    `CodegenFallback` means "generated code should call my `eval`". It
+    is correct but has a cost you can see in the plan. Compare
+    `is_png` with `is_png_fast`, the same check registered as a
+    `StaticInvoke` of `IsPng.check`:
+
+    ```text
+    == Physical Plan ==
+    Project [is_png(content#3) AS is_png(content)#8]
+    +- FileScan binaryFile [content#3] ...
+    ```
+
+    ```text
+    == Physical Plan ==
+    *(1) Project [static_invoke(jext.IsPng.check(content#3)) AS static_invoke(jext.IsPng.check(content))#9]
+    +- FileScan binaryFile [content#3] ...
+    ```
+
+    The `*(1)` marks an operator inside whole-stage code generation; the
+    first `Project` has none. The reason is in
+    `sql/core/.../execution/WholeStageCodegenExec.scala`:
+
+    ```scala
+    private def supportCodegen(e: Expression): Boolean = e match {
+      case e: LeafExpression => true
+      // CodegenFallback requires the input to be an InternalRow
+      case e: CodegenFallback => false
+      case _ => true
+    }
+    ```
+
+    One `CodegenFallback` expression takes its whole operator out of
+    the fused stage. `StaticInvoke`
+    (`sql/catalyst/.../expressions/objects/objects.scala`) generates a
+    direct call to a static Java method, with NULL propagation handled
+    for you (`propagateNull = true`). Many built-ins are written this
+    way: `UrlEncode` is a `RuntimeReplaceable` whose `replacement` is a
+    `StaticInvoke` of `UrlCodec.encode`. From Java, a function builder
+    that returns a `StaticInvoke` is the shortest path to a native
+    function with real code generation:
+
+    ```java
+    (Function1<Seq<Expression>, Expression>) args -> new StaticInvoke(
+        IsPng.class, DataTypes.BooleanType, "check", args,
+        CollectionConverters.asScala(List.<AbstractDataType>of(DataTypes.BinaryType)).toSeq(),
+        true, true, true, Option.empty())
+    ```
+
+    (Java has no default arguments, so all nine constructor parameters
+    are spelled out: class, result type, method name, arguments, input
+    types, `propagateNull`, `returnNullable`, `isDeterministic`,
+    `scalarFunction`.) The display name is less friendly
+    (`static_invoke(jext.IsPng.check(...))`); a `RuntimeReplaceable`
+    wrapper in Scala gives both a nice name and the `StaticInvoke`.
+
+    One more thing the extended plan shows: your expression can run on
+    the **driver**. For `SELECT is_png(content) FROM VALUES (X'00')`,
+    the optimized plan is just `LocalRelation [is_png(content)#30]`: the
+    optimizer evaluated the expression with `eval` while folding a local
+    relation. Expressions must not assume they run in a task.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "A Project contains one expression that implements CodegenFallback. What happens to whole-stage code generation for that Project?"
+  AnswerChoices: "The Project is not fused into a whole-stage codegen stage;Only that expression is interpreted, the rest of the Project is fused;Spark fails because codegen is mandatory;Nothing, CodegenFallback is only used in tests"
+  CorrectAnswer: "The Project is not fused into a whole-stage codegen stage"
+  Hint: "Look at supportCodegen in WholeStageCodegenExec: case e: CodegenFallback => false."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## A Rule That Replaces a Python UDF
+
+    Messy-data code is full of small Python UDFs that wrap a check like
+    this one. Each one costs a round trip to a Python worker per batch
+    of rows. If your team already has a native version, an optimizer
+    rule can swap it in without anyone changing their code:
+
+    ```python
+    @F.udf("boolean")
+    def is_png(b):
+        return b is not None and bytes(b[:8]) == b"\x89PNG\r\n\x1a\n"
+
+    imgs.filter(is_png("content")).select("path").explain()
+    ```
+
+    Without the rule (here with the same UDF under another name, so the
+    rule leaves it alone), the plan sends every file's bytes to Python:
+
+    ```text
+    *(1) Project [path#0]
+    +- *(1) Filter pythonUDF0#6: boolean
+       +- ArrowEvalPython [looks_like_png(content#3)#4], [pythonUDF0#6], 101
+          +- FileScan binaryFile [path#0,content#3] Batched: false, DataFilters: [], ...
+    ```
+
+    (`ArrowEvalPython` with eval type `101` is the Arrow-optimized
+    Python UDF, the default for regular Python UDFs in 4.2.0 per the
+    PySpark migration guide.) With the rule:
+
+    ```text
+    *(1) Project [path#0]
+    +- Filter coalesce(is_png(content#3), false)
+       +- FileScan binaryFile [path#0,content#3] Batched: false, DataFilters: [coalesce(is_png(content#3), false)], ...
+    ```
+
+    No Python node, and the condition is now a plain Catalyst
+    expression, so it even appears among the scan's `DataFilters`.
+
+    The rule in Java:
+
+    ```java
+    public class PngRule extends Rule<LogicalPlan> {
+      @Override public LogicalPlan apply(LogicalPlan plan) {
+        return (LogicalPlan) plan.transformAllExpressions(
+            new AbstractPartialFunction<Expression, Expression>() {
+              @Override public boolean isDefinedAt(Expression e) { return matches(e); }
+              @Override public <A1 extends Expression, B1> B1 applyOrElse(A1 e, Function1<A1, B1> otherwise) {
+                if (!matches(e)) return otherwise.apply(e);
+                return (B1) replacement((PythonUDF) e);
+              }
+            });
+      }
+    }
+    ```
+
+    `transformAllExpressions` takes a Scala `PartialFunction`; from Java
+    that is `scala.runtime.AbstractPartialFunction` with `isDefinedAt`
+    and `applyOrElse`. `PythonUDF`
+    (`sql/catalyst/.../expressions/PythonUDF.scala`) is a case class
+    with `name`, `func`, `dataType`, `children`, `evalType`,
+    `udfDeterministic` and `resultId`.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## When Is a Rewrite Safe?
+
+    A rule that changes results is a bug that no test of yours will
+    catch, because users never see the original. `PngRule` rewrites only
+    when every one of these holds:
+
+    - the UDF's `name()` is `is_png` (the function's `__name__` in
+      Python; it is a contract between your team and the rule)
+    - `udfDeterministic()` is true (a UDF marked `asNondeterministic()`
+      may have side effects or randomness the native code lacks)
+    - it returns `BOOLEAN` and takes exactly one `BINARY` argument
+
+    And the replacement must match the UDF on **every** input. The
+    Python function returns `False` for `None`; the native `is_png`
+    returns NULL for NULL, like every SQL function. A plain swap would
+    turn `False` into NULL, and `filter(~is_png(content))` would lose
+    the NULL rows. The rule therefore emits
+    `coalesce(is_png(content), false)`. The exercise checks this with a
+    NULL row unioned onto the files.
+
+    Two more properties a rule needs:
+
+    - **It must reach a fixed point.** Optimizer batches run their rules
+      repeatedly until the plan stops changing. After the rewrite the
+      expression is a `Coalesce`, not a `PythonUDF`, so the rule finds
+      nothing the second time. A rule that always produces a "new" plan
+      runs until the batch's iteration limit.
+    - **It must run before Python extraction.** Rules from
+      `injectOptimizerRule` join the operator optimization batches
+      (`customOperatorOptimizationRules` in
+      `BaseSessionStateBuilder.scala`). In `SparkOptimizer.scala` the
+      "Extract Python UDFs" batch, which pulls `PythonUDF`s out into
+      `ArrowEvalPython` and `BatchEvalPython` nodes, comes after all of
+      them (its comment on `postHocOptimizationBatches` says it runs
+      even after those).
+
+    Watch the rule fire with the plan change log:
+
+    ```python
+    spark.conf.set("spark.sql.planChangeLog.level", "WARN")
+    spark.conf.set("spark.sql.planChangeLog.rules", "jext.PngRule")
+    imgs.select(is_png("content").alias("png")).collect()
+    ```
+
+    ```text
+    === Applying Rule jext.PngRule ===
+    !Project [is_png(content#11)#12 AS png#13]                                  Project [coalesce(is_png(content#11), false) AS png#13]
+     +- Relation [path#8,modificationTime#9,length#10L,content#11] binaryFile   +- Relation [path#8,modificationTime#9,length#10L,content#11] binaryFile
+
+    Output Information:
+    !Project <output=png#13[nullable=true]>   Project <output=png#13[nullable=false]>
+    ...
+    === Result of Batch Operator Optimization before Inferring Filters ===
+    ```
+
+    The log names the batch, and the output information shows a bonus:
+    the column became non-nullable, which later rules can use.
+
+- Class: mult_question
+  Depth: all
+  Output: "The Python UDF is_png returns False for None. Your rule replaces it with the native is_png alone (no coalesce). What changes for a NULL content value?"
+  AnswerChoices: "The result becomes NULL instead of False, so filters and counts can change;Nothing, NULL and False are treated the same in filters;The query fails because the types differ;The rule cannot run on NULL values"
+  CorrectAnswer: "The result becomes NULL instead of False, so filters and counts can change"
+  Hint: "Native SQL functions return NULL for NULL input. Think about filter(~is_png(content))."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Check Rules
+
+    A check rule receives the analyzed plan and throws to reject it:
+
+    ```java
+    ext.injectCheckRule(session -> plan -> {
+      plan.foreach(node -> {
+        if (node instanceof Aggregate a) {
+          a.groupingExpressions().foreach(g -> {
+            if (g.resolved() && g.dataType() instanceof BinaryType)
+              throw new IllegalArgumentException("Grouping by a BINARY column (" + g.sql()
+                  + ") compares whole file contents; group by sha2(" + g.sql() + ", 256) instead");
+            return BoxedUnit.UNIT;
+          });
+        }
+        return BoxedUnit.UNIT;
+      });
+      return BoxedUnit.UNIT;
+    });
+    ```
+
+    Grouping a `binaryFile` read by `content` hashes and compares whole
+    files in the shuffle; a fixed-size hash does the same deduplication
+    with a fraction of the shuffle bytes. The rule turns that advice into
+    an error:
+
+    ```python
+    imgs.groupBy("content").count()
+    ```
+
+    ```text
+    pyspark.errors.exceptions.captured.IllegalArgumentException: Grouping by a BINARY column
+    (content) compares whole file contents; group by sha2(content, 256) instead
+    ```
+
+    It fails at the `count()` that builds the DataFrame, before any
+    action: classic sessions analyze each new DataFrame eagerly, and
+    check rules are part of analysis. That is also a warning: check
+    rules see **every** analyzed plan, including every intermediate
+    DataFrame. A rule that rejects "a binaryFile read without a limit"
+    would reject `spark.read.format("binaryFile").load(...)` itself.
+    Check constructs that are wrong anywhere they appear.
+
+    A Java `IllegalArgumentException` reaches Python as PySpark's
+    `IllegalArgumentException`. Spark's own error classes (such as
+    `DATATYPE_MISMATCH`) need entries in Spark's error registry, which
+    an extension cannot add to, so clear standard exceptions are the
+    honest choice.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "Your check rule rejects any plan that reads binaryFile without a LIMIT. In a classic session, when does spark.read.format('binaryFile').load(path) fail?"
+  AnswerChoices: "Immediately at load(), because classic sessions analyze the new DataFrame eagerly;Only at the first action;Never, check rules only see the final query;Only when explain() is called"
+  CorrectAnswer: "Immediately at load(), because classic sessions analyze the new DataFrame eagerly"
+  Hint: "Check rules run as part of analysis, and every DataFrame is analyzed when it is created."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## How Much Faster? Measuring Honestly
+
+    The benchmark: 2,000,000 cached binary values (a third of them
+    start with the PNG signature), `local[2]`, Java 17, on the 16-core
+    machine used for this lesson. Each query counts the matches; each
+    time is the best of three runs after a warm-up, and the ratio is
+    against `is_png_fast`:
+
+    | Version | Best time | Ratio |
+    |---|---|---|
+    | `is_png_fast` (StaticInvoke, codegen) | 0.071 s | 1.0 |
+    | Python UDF `is_png`, rewritten by `PngRule` | 0.077 s | 1.1 |
+    | `is_png` (CodegenFallback) | 0.093 s | 1.3 |
+    | built-in `substring(b, 1, 8) = X'89504E47...'` | 0.104 s | 1.5 |
+    | pandas UDF | 0.319 s | 4.5 |
+    | Python UDF (Arrow, the 4.2.0 default) | 0.616 s | 8.7 |
+
+    Read it carefully. The rewritten UDF runs at native speed because it
+    **is** the native expression; the Python worker never starts. The
+    Python UDF costs about nine times the native check here, the pandas
+    UDF about four and a half. On a real folder the files' I/O usually
+    dominates and the ratios shrink, so measure your own job before
+    promising a speed-up. Note also that the built-in `substring`
+    comparison was not the fastest: a static Java method can beat a
+    composition of built-ins.
+
+    **The benchmarking trap.** The first version of this benchmark ran
+    the same DataFrame object three times, and every Python UDF took
+    about 20 ms for 2 million rows. That was not Python being fast:
+    re-running a DataFrame reuses its physical plan, and the shuffle
+    files of its earlier run, so only the final aggregation step ran
+    again. Build a **new** DataFrame for each timed run, and sanity-check
+    that a timing is physically possible before you believe it.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: A Native is_png and a Rule That Uses It
+
+    The exercise file holds the extension as Java strings in `JAVA`:
+    `IsPng` (the expression), `PngRule` (the optimizer rule) and
+    `Extensions` (which registers `is_png`, `is_png_fast`, the rule and
+    the check rule; complete as given). Complete two TODOs:
+
+    1. **`IsPng.check(byte[] b)` and `IsPng.eval(InternalRow row)`**:
+       `check` is true if `b` has at least 8 bytes and they equal `SIG`.
+       `eval` evaluates the child; NULL gives `null`, otherwise
+       `check((byte[]) value)`.
+    2. **`PngRule.matches(Expression e)` and
+       `PngRule.replacement(PythonUDF u)`**: match only a deterministic
+       `PythonUDF` named `is_png` with one `BINARY` argument and a
+       `BOOLEAN` result; replace it with `coalesce(is_png(child),
+       false)`.
+
+    The harness checks: `is_png` on literals (signature, longer, too
+    short, empty, wrong first byte, typed and untyped NULL); a
+    `DATATYPE_MISMATCH` for a string argument; `is_png` over
+    `data/messy/images` against the bytes read in Python; that the
+    Python UDF `is_png` disappears from the plan (no `EvalPython`),
+    becomes `coalesce(is_png(...), false)` and gives the UDF's results
+    including `False` for a NULL row, in a select and in a filter; that
+    UDFs with another name, a string result or `asNondeterministic()`
+    are left in Python; that `is_png_fast` is inside whole-stage codegen
+    and `is_png` is not; and that the check rule rejects `GROUP BY
+    content` but allows `GROUP BY sha2(content, 256)`.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "check: if (b.length < SIG.length) return false; then compare b[i] with SIG[i]. eval: Object v = child.eval(row); return v == null ? null : check((byte[]) v). matches: e instanceof PythonUDF u && u.name().equals(\"is_png\") && u.udfDeterministic() && u.dataType().equals(DataTypes.BooleanType) && u.children().size() == 1 && u.children().apply(0).dataType().equals(DataTypes.BinaryType)."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - `SparkSessionExtensions` offers injection points for the parser,
+      analyzer, check rules, optimizer, planner, columnar and AQE rules,
+      and functions. Load an extension with the static
+      `spark.sql.extensions` (or a `SparkSessionExtensionsProvider`
+      service file). The API is experimental and unstable: build per
+      Spark version.
+    - From Java: extend `AbstractFunction1<SparkSessionExtensions,
+      BoxedUnit>`, use lambdas for Scala functions, and
+      `AbstractPartialFunction` for `transform*` calls.
+    - A Java `Expression` must be `Serializable`, implement the tree and
+      `Product` methods, keep its `nullable()` promise, check input types
+      in `checkInputDataTypes` (accepting `NullType`), and call
+      `CodegenFallback.super.doGenCode` explicitly.
+    - `CodegenFallback` takes the operator out of whole-stage codegen;
+      a `StaticInvoke` of a static method keeps it in.
+    - `F.call_function` (3.5) and `F.expr` call native functions from
+      Python; a thin wrapper makes them feel built in.
+    - Optimizer rules run in the operator batches, before Python UDFs are
+      extracted, so they can replace a `PythonUDF` with native code. A
+      safe rewrite matches name, determinism and types exactly and keeps
+      the UDF's NULL behaviour; `spark.sql.planChangeLog.*` shows it fire.
+    - Check rules run on every analyzed plan (eagerly in classic
+      sessions) and reject plans by throwing.
+    - Benchmark with a new DataFrame per run; a reused one can skip most
+      of its work.
+
+    Next: **Spark Connect Plugins**, where the same JVM code has to
+    reach a client that has no Py4J gateway: relation, expression and
+    command plugins, and custom protobuf messages from Python.

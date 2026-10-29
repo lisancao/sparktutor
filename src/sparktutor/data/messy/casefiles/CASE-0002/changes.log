@@ -1,0 +1,7 @@
+2026-03-03T09:00:00Z | status | new -> open | binh
+2026-03-03T09:07:00Z | status | open -> triage | ana
+2026-03-03T09:14:00Z | priority | P2 -> P2 | ana
+2026-03-03T09:21:00Z | status | waiting -> open | dev
+2026-03-03T09:28:00Z | status | open -> resolved | chloe
+2026-03-03T09:35:00Z | priority | P2 -> P1 | binh
+2026-03-03T10:42:00Z | status | resolved -> closed | emma

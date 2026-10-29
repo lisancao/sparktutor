@@ -1,0 +1,30 @@
+{
+  "schema": 2,
+  "case_id": "CASE-0002",
+  "opened": "2026-03-03T14:02:00Z",
+  "status": "closed",
+  "priority": "P3",
+  "tags": [
+    "phone",
+    "audio"
+  ],
+  "meta": {
+    "channel": "phone",
+    "recording": {
+      "seconds": 2.5,
+      "rate": 8000
+    }
+  },
+  "attachments": [
+    {
+      "name": "call.wav",
+      "sha256": "af9e4ca7f2e76876539f245f576e5986c21c39b48ba5bb5408a7784b732b9188",
+      "bytes": 40044
+    },
+    {
+      "name": "screenshot.png",
+      "sha256": "cb1cb4cd2aeee229503df8da697e35a09ec34600b64f1b792c6b351ef76d1233",
+      "bytes": 80
+    }
+  ]
+}

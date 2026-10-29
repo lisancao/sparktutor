@@ -1,0 +1,967 @@
+- Class: meta
+  Lesson: "Final Project: Your Own Connector"
+  EstimatedMinutes: 240
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    This is the last lesson of the course, and it is a project rather
+    than a lesson: you build a complete connector for a messy format you
+    have not seen before, and a harness grades every capability on its
+    own so you can work through it in stages.
+
+    "Capstone: An Unstructured Ingestion Source and a Catalog Pipeline"
+    at the end of the intermediate level built one
+    reader with one pushed filter and an inbox stream. This project asks
+    for everything a connector your team could rely on needs, at once:
+
+    | Capability | Built on (by title) |
+    |---|---|
+    | partitions planned by bytes | "Reading a Custom File Format, in Parallel" |
+    | loose metadata as VARIANT | "VARIANT Basics: Profiling and Nested Data" |
+    | exact filter pushdown, safe from the 4.2.0 leak | "Filter Pushdown", "From Wrong Results to a Fix: An Upstream Case Study" |
+    | a writer with an atomic commit | "Writers" |
+    | a stream with byte offsets, admission control and restart | "Streaming Readers and Writers" |
+    | logs you can read back from executors | "Packaging, Registration, Testing and Debugging" |
+    | a test suite that runs without Spark, and catches broken code | "Packaging, Registration, Testing and Debugging" |
+    | a written design review | everything above |
+
+    It is harder than the capstone in three ways. There are three
+    tables with three grains instead of one. The format has two
+    versions and planted problems that must become data, not crashes.
+    And the harness checks properties, not just answers: that no batch
+    exceeds its byte budget, that a failed write leaves the folder
+    byte-for-byte as it was, that a stream and a batch read of the same
+    folder agree row for row, and that your tests fail on deliberately
+    broken versions of your own functions.
+
+    The lesson describes the format, the contract and each stage's
+    design problems. It shows the reference solution's output, but not
+    its code; that is in `solution.py` for when you are done or stuck.
+    A Java (DSv2) path is described at the end for those who did "A
+    DSv2 Connector in Java"; the harness grades the Python one.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Format: Case Files
+
+    `data/messy/casefiles` is an export from a made-up help desk, the
+    kind of thing ticketing and legal systems produce:
+
+    ```text
+    casefiles/
+      CASE-0001/
+        case.json          the index: metadata plus the list of attachments
+        attachments/       request.eml, invoice_1001.pdf
+        changes.log        one line per change to the case
+      CASE-0002/ ... CASE-0010/, case-0009/
+      README.txt  .DS_Store  _staging/job-3f2a/CASE-0099/   (not cases)
+    ```
+
+    A version 2 index (`CASE-0004/case.json`, start):
+
+    ```json
+    {
+      "schema": 2,
+      "case_id": "CASE-0004",
+      "opened": "2026-03-09T10:00:00Z",
+      "status": "waiting",
+      "priority": "P2",
+      "tags": [
+        "damaged"
+      ],
+      "meta": {
+        "customer": {
+          "id": "C021",
+          "tier": "silver"
+        },
+        "order": 1044
+      },
+      "attachments": [
+        {
+          "name": "phot
+    ```
+
+    Each attachment entry has `name`, `sha256` and `bytes`. Older cases
+    use version 1, with other names and types for the same things
+    (`CASE-0007/case.json`):
+
+    ```json
+    {
+      "id": "case-0007",
+      "created": 1772616600,
+      "state": "OPEN",
+      "prio": 2,
+      "labels": "billing, vip",
+      "attachments": [
+        "photo.png"
+      ],
+      "extra": {
+        "imported_from": "legacy-crm",
+        "legacy_id": 7731
+      }
+    }
+    ```
+
+    The change log is one change per line,
+    `<ISO timestamp> | <field> | <old> -> <new> | <actor>`
+    (`CASE-0006/changes.log`):
+
+    ```text
+    2026-03-12T09:00:00Z | status | new -> open | ana
+    2026-03-12T09:07:00Z | status | open -> triage | ana
+    2026-03-12T09:14:00Z | priority | P2 -> P1 | emma
+    2026-03-12T08:00:00Z | status | open -> resolved | emma
+    ```
+
+    (The last line is out of order: its time is earlier than the line
+    before it.) The generator is `scripts/messy_gen/casefiles.py`; its
+    `PROBLEMS` dictionary lists what is planted where:
+
+    | Case | Problem |
+    |---|---|
+    | CASE-0001 | none (a comment line and a trailing blank line in the log) |
+    | CASE-0002 | none, but `call.wav` is 40044 bytes, far more than the rest |
+    | CASE-0003 | the log's last line has no newline |
+    | CASE-0004 | the index lists `scan.png`, which is not on disk; a malformed log line |
+    | CASE-0005 | `stray.tmp` is on disk but not in the index |
+    | CASE-0006 | `receipt.pdf` does not match its `sha256`; an out-of-order log line |
+    | CASE-0007 | version 1 index |
+    | CASE-0008 | `case.json` is truncated (invalid JSON) |
+    | case-0009 | lowercase folder, UTF-8 BOM and CRLF line endings, `+02:00` offset |
+    | CASE-0010 | priority `"urgent"`; a blank line and a line without `->` in the log |
+
+    The BOM is visible in the first bytes of `case-0009/case.json`
+    (`od -c`):
+
+    ```text
+    0000000 357 273 277   {  \n           "   s   c   h   e   m   a   "   :
+    ```
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Contract
+
+    One data source, `format("casefile")`, three tables chosen with an
+    option, as JDBC chooses a table with `dbtable`:
+
+    ```text
+    cases        case_id string, folder string, schema_version int, opened timestamp,
+                 status string, priority int, tags array<string>, meta variant,
+                 attachments int, bytes long, problems array<string>
+    attachments  case_id string, folder string, name string, kind string, size long,
+                 sha256 string, expected_sha256 string, status string
+    changes      case_id string, line int, ts timestamp, field string, old string,
+                 new string, actor string, raw string, problem string
+    ```
+
+    | Option | Default | Meaning |
+    |---|---|---|
+    | `table` | `cases` | which table |
+    | `maxPartitionBytes` | `16384` | target bytes per partition |
+    | `pushdown` | `false` | `true` to use the reader that pushes filters |
+    | `audit` | none | a folder; tasks write a marker per case folder they open |
+    | `maxBytesPerTrigger` | `1024` | streaming: bytes of change log per micro-batch |
+
+    Writing: `df.write.format("casefile").mode("append" | "overwrite").save(path)`
+    writes one case folder per row of a DataFrame shaped like `cases`.
+    Streaming: `spark.readStream.format("casefile").option("table", "changes")`.
+
+    The exercise file gives you the schemas, the small helpers
+    (`parse_ts`, `kind_of`, `parse_priority`, `parse_tags`,
+    `change_rows`, `read_manifest`, `complete_lines`, `get_log`) and the
+    skeleton of every class, with a docstring that states what each
+    method must do. You write the rest. Every unfinished part raises
+    `TODO("<name> (stage <stage>)")`, and the harness prints one line
+    per stage:
+
+    ```text
+    FAIL  parsing          0.0s  TODO: parse_index (stage parsing)
+    FAIL  planning         0.0s  TODO: plan_by_bytes (stage planning)
+    FAIL  offline_tests    0.0s  write at least 5 tests in OfflineTests, found 1
+    FAIL  design_review    0.0s  DESIGN_REVIEW still contains TODO
+    FAIL  batch            3.1s  TODO: CaseFileReader.partitions (stage batch)
+    ...
+    0 of 10 stages passed
+    ```
+
+    Set `ONLY = ["parsing"]` at the top of the file to run one stage
+    while you work on it; the run then ends with "Set ONLY = None to
+    grade every stage", so you cannot forget to grade the whole thing.
+    The plain Python stages run before any SparkSession exists.
+
+- Class: mult_question
+  Depth: all
+  Output: "Why does the connector expose three tables through a table option instead of one wide table?"
+  AnswerChoices: "A case, an attachment and a change line are different grains, and one schema for all three would be mostly NULLs;Python data sources can only return three columns;Spark requires one table per folder;Pushdown only works on narrow tables"
+  CorrectAnswer: "A case, an attachment and a change line are different grains, and one schema for all three would be mostly NULLs"
+  Hint: "How many rows does one case produce in each table?"
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Stage parsing: Two Versions, One Shape
+
+    `parse_index(raw, folder)` turns the bytes of any `case.json` into
+    one dict. The mapping:
+
+    | Field | Version 2 | Version 1 |
+    |---|---|---|
+    | recognised by | `"schema": 2` | no `schema` key, has `id` |
+    | `case_id` | `case_id`, upper case | `id`, upper case |
+    | `opened` | ISO 8601 with `Z` or an offset, to UTC | `created`, epoch seconds |
+    | `status` | `status`, lower case | `state`, lower case |
+    | `priority` | `"P1"` to `"P4"` | `prio`, 1 to 4 |
+    | `tags` | a list | `labels`, comma separated |
+    | `meta` | `meta` | `extra` |
+    | attachments | `{name, sha256, bytes}` | names only (no checksum) |
+
+    The rules that keep messy input from becoming crashes:
+
+    - **Decode with `utf-8-sig`.** It removes a byte order mark if
+      there is one and is plain UTF-8 otherwise. `json.loads` on a
+      string that starts with a BOM fails.
+    - **A broken index is a row, not an exception.** Invalid JSON, or a
+      document that is neither version, gives `case_id` from the folder
+      name, every other field NULL, and `problems = ['bad_index']`. One
+      truncated file must not fail a query over thousands of cases.
+    - **Unknown values become NULL plus a problem.** `"urgent"` is not a
+      priority: `priority` NULL, `problems = ['bad_priority']`. A missing
+      priority is just NULL.
+    - **Timestamps are aware and in UTC.** `datetime.fromisoformat`
+      accepts `Z` only from Python 3.11; replacing `Z` by `+00:00`
+      works everywhere (the given `parse_ts` does it).
+
+    The reference parser on the version 1 case:
+
+    ```text
+    {'case_id': 'CASE-0007', 'schema_version': 1, 'opened': datetime.datetime(2026, 3, 4, 9, 30, tzinfo=datetime.timezone.utc), 'status': 'open', 'priority': 2, 'tags': ['billing', 'vip'], 'problems': []}
+    ```
+
+    `parse_change_line(line)` returns `{ts, field, old, new, actor}` or
+    `None`. Strip a trailing `\r` first: CRLF files split on `\n` leave
+    it at the end of every line, and it would end up in `actor`. A line
+    without `->`, or with a timestamp that does not parse, is not a
+    change. The given `change_rows` turns a block of lines into table
+    rows: comments and blank lines produce nothing, and a line that is
+    not a change produces a row with `raw` and `problem = 'unparsed'`,
+    so nothing in the log disappears silently.
+
+    `attachment_status(expected_sha, actual_sha, listed, on_disk)`
+    decides between `ok`, `sha_mismatch`, `unverified` (listed without
+    a checksum, as in version 1), `missing` and `unlisted`.
+
+- Class: mult_question
+  Depth: all
+  Output: "CASE-0008's case.json is truncated. What should a query over the cases table do?"
+  AnswerChoices: "Return a row for CASE-0008 with NULL fields and problems ['bad_index'];Fail the query with a JSON error;Skip CASE-0008 silently;Retry the read until the file parses"
+  CorrectAnswer: "Return a row for CASE-0008 with NULL fields and problems ['bad_index']"
+  Hint: "One bad file must not fail a query over every other case, and nothing should disappear without a trace."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Stage planning: Partitions by Bytes
+
+    `plan_by_bytes(items, target)` groups `(key, size)` pairs so each
+    group holds at most `target` bytes, with **first fit decreasing**:
+    largest first (ties by key), each into the first group that still
+    has room, a new group otherwise; an item bigger than the target gets
+    a group of its own. On the harness's example:
+
+    ```text
+    plan_by_bytes([("a", 50), ("b", 30), ("c", 30), ("d", 20), ("big", 500)], 60)
+    [['big'], ['a'], ['b', 'c'], ['d']]
+    ```
+
+    What is an item? It depends on the table, because the cost of a
+    task is the bytes it reads:
+
+    - **attachments**: one item per file on disk, `((folder, name), size)`.
+      Computing a checksum reads every byte, so the 40 KB recording
+      should not share a task with the other files.
+    - **cases**: one item per folder, sized by its `case.json`; the
+      cases table never reads attachment bytes (it only lists names and
+      sizes).
+    - **changes**: one item per folder, sized by its `changes.log`.
+
+    The reference plan for the attachments, with the default target:
+
+    ```text
+    1 [('CASE-0002', 'call.wav')]
+    13 [('CASE-0001', 'invoice_1001.pdf'), ('CASE-0006', 'receipt.pdf'), ('case-0009', 'lettre.eml')]
+    ```
+
+    (one partition with the recording, one with the other 13 files; the
+    first three keys of each are shown.) Files of one case can land in
+    different partitions, so decide which task emits the rows that have
+    no file at all (`scan.png` of CASE-0004). The reference gives them
+    to the task that holds the folder's first file by name.
+
+    `list_case_folders(root)` decides what a case is: a folder with a
+    `case.json`, not starting with `_` or `.`, and not a job folder
+    (`name@job`, below). With a manifest it returns exactly what the
+    manifest lists. `README.txt`, `.DS_Store` and `_staging/` are not
+    cases.
+
+    A gotcha for this stage: if your `partitions()` raises
+    `NotImplementedError` (a natural placeholder), Spark does not fail.
+    `write_read_func_and_partitions` in
+    `python/pyspark/sql/worker/plan_data_source_read.py` catches it, for
+    readers written against an old base class, and plans a single
+    `InputPartition(None)` instead. Your `read()` then receives a
+    partition it does not expect. That is why the exercise's
+    placeholders raise their own `TODO` exception.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Using `plan_by_bytes`, plan the items `[("x", 10), ("y", 10), ("z", 10)]`
+    with a target of 20 bytes, and store the result in `groups`.
+  CorrectAnswer: |
+    groups = plan_by_bytes([("x", 10), ("y", 10), ("z", 10)], 20)
+  Hint: "Call the function with the list and the target; the result is [['x', 'y'], ['z']]."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Stage batch: Three Tables, One Reader
+
+    `CaseFileReader.read()` dispatches on the table. What the reference
+    returns for `data/messy/casefiles` (session time zone UTC):
+
+    ```text
+    +---------+---------+--------------+-------------------+--------+--------+-----------------+---------------------+
+    |case_id  |folder   |schema_version|opened             |status  |priority|tags             |problems             |
+    +---------+---------+--------------+-------------------+--------+--------+-----------------+---------------------+
+    |CASE-0001|CASE-0001|2             |2026-03-02 09:15:00|open    |2       |[billing, refund]|[]                   |
+    |CASE-0002|CASE-0002|2             |2026-03-03 14:02:00|closed  |3       |[phone, audio]   |[]                   |
+    |CASE-0003|CASE-0003|2             |2026-03-05 08:30:00|triage  |1       |[escalation]     |[]                   |
+    |CASE-0004|CASE-0004|2             |2026-03-09 10:00:00|waiting |2       |[damaged]        |[missing_attachment] |
+    |CASE-0005|CASE-0005|2             |2026-03-11 16:45:00|open    |4       |[]               |[unlisted_attachment]|
+    |CASE-0006|CASE-0006|2             |2026-03-12 11:20:00|resolved|3       |[billing]        |[]                   |
+    |CASE-0007|CASE-0007|1             |2026-03-04 09:30:00|open    |2       |[billing, vip]   |[]                   |
+    |CASE-0008|CASE-0008|NULL          |NULL               |NULL    |NULL    |[]               |[bad_index]          |
+    |CASE-0009|case-0009|2             |2026-03-21 08:30:00|open    |2       |[damaged, fr]    |[]                   |
+    |CASE-0010|CASE-0010|2             |2026-03-25 09:00:00|open    |NULL    |[vip]            |[bad_priority]       |
+    +---------+---------+--------------+-------------------+--------+--------+-----------------+---------------------+
+    ```
+
+    The case-level problems come from the index and from comparing the
+    listed names with the files on disk (`missing_attachment`,
+    `unlisted_attachment`; not reported for a `bad_index` case, whose
+    list is unknown). A checksum mismatch is **not** a case problem: the
+    cases table never reads attachment bytes, so it cannot know. That
+    is a design decision; the attachments table is where checksums live:
+
+    ```text
+    +---------+-----------+-----+----+------------+
+    |case_id  |name       |kind |size|status      |
+    +---------+-----------+-----+----+------------+
+    |CASE-0004|scan.png   |image|NULL|missing     |
+    |CASE-0005|stray.tmp  |other|60  |unlisted    |
+    |CASE-0006|receipt.pdf|pdf  |472 |sha_mismatch|
+    |CASE-0007|photo.png  |image|75  |unverified  |
+    |CASE-0008|note.txt   |text |30  |unlisted    |
+    +---------+-----------+-----+----+------------+
+    ```
+
+    (the rows whose status is not `ok`; the other 10 are). The changes
+    table keeps the physical line number, so a row can always be traced
+    back to its line, and a malformed line stays visible:
+
+    ```text
+    +----+-------------------+--------+-------+------+-----+-------------------------------------------------+--------+
+    |line|ts                 |field   |old    |new   |actor|raw                                              |problem |
+    +----+-------------------+--------+-------+------+-----+-------------------------------------------------+--------+
+    |1   |2026-03-25 09:00:00|status  |new    |open  |emma |NULL                                             |NULL    |
+    |2   |2026-03-25 09:07:00|status  |open   |triage|emma |NULL                                             |NULL    |
+    |4   |NULL               |NULL    |NULL   |NULL  |NULL |2026-03-25T09:30:00Z | status | open triage | dev|unparsed|
+    |5   |2026-03-25 09:14:00|priority|P2     |P1    |emma |NULL                                             |NULL    |
+    |6   |2026-03-25 09:21:00|status  |waiting|open  |ana  |NULL                                             |NULL    |
+    +----+-------------------+--------+-------+------+-----+-------------------------------------------------+--------+
+    ```
+
+    Line 3 of CASE-0010's log is blank, so there is no row 3. In batch
+    mode the last line of CASE-0003's log counts even without a newline
+    (the file is complete); in a stream it will not, as you will see.
+
+    The harness checks the 10 cases and their problems, the 15
+    attachment rows by status in 2 partitions, the 44 change rows and
+    the two unparsed lines, and that the BOM of `case-0009` does not
+    hide its first line.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Stage variant: Loose Metadata as VARIANT
+
+    `meta` has different keys in every case and comes from a different
+    field in each version: the textbook case for VARIANT ("VARIANT
+    Basics: Profiling and Nested Data"). A Python data source returns a
+    VARIANT value as a `pyspark.sql.types.VariantVal`, and
+    `VariantVal.parseJson` (4.0) builds one from a JSON string:
+
+    ```python
+    from pyspark.sql.types import VariantVal
+
+    meta = VariantVal.parseJson(json.dumps(index["meta"])) if index["meta"] is not None else None
+    ```
+
+    The column is then queryable without a schema:
+
+    ```python
+    cases.select("case_id",
+                 F.expr("variant_get(meta, '$.customer.tier', 'string')").alias("tier"),
+                 F.expr("try_variant_get(meta, '$.sla_hours', 'int')").alias("sla_hours"),
+                 F.expr("schema_of_variant(meta)").alias("meta_schema")).orderBy("case_id").show(truncate=False)
+    ```
+
+    ```text
+    +---------+------+---------+----------------------------------------------------------------------------------------------------+
+    |case_id  |tier  |sla_hours|meta_schema                                                                                         |
+    +---------+------+---------+----------------------------------------------------------------------------------------------------+
+    |CASE-0001|gold  |24       |OBJECT<channel: STRING, customer: OBJECT<id: STRING, tier: STRING>, sla_hours: BIGINT>              |
+    |CASE-0002|NULL  |NULL     |OBJECT<channel: STRING, recording: OBJECT<rate: BIGINT, seconds: DECIMAL(2,1)>>                     |
+    |CASE-0003|NULL  |NULL     |OBJECT<customer: OBJECT<id: STRING>, escalated: BOOLEAN>                                            |
+    |CASE-0004|silver|NULL     |OBJECT<customer: OBJECT<id: STRING, tier: STRING>, order: BIGINT>                                   |
+    |CASE-0005|NULL  |NULL     |OBJECT<browser: STRING, channel: STRING>                                                            |
+    |CASE-0006|gold  |NULL     |OBJECT<customer: OBJECT<id: STRING, tier: STRING>, refund: OBJECT<amount: STRING, currency: STRING>>|
+    |CASE-0007|NULL  |NULL     |OBJECT<imported_from: STRING, legacy_id: BIGINT>                                                    |
+    |CASE-0008|NULL  |NULL     |NULL                                                                                                |
+    |CASE-0009|NULL  |NULL     |OBJECT<channel: STRING, customer: OBJECT<id: STRING, name: STRING>, lang: STRING>                   |
+    |CASE-0010|gold  |4        |OBJECT<customer: OBJECT<id: STRING, tier: STRING>, sla_hours: BIGINT>                               |
+    +---------+------+---------+----------------------------------------------------------------------------------------------------+
+    ```
+
+    Note `seconds: DECIMAL(2,1)`: JSON `2.5` becomes an exact decimal
+    in VARIANT, not a double. The harness also checks that
+    `Hélène Côté` survives the trip from a BOM-prefixed file to a
+    VARIANT and back.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Stage pushdown: Exact, Opt-in, and Safe From the Leak
+
+    The pushdown reader takes over:
+
+    | Table | Column | Filters |
+    |---|---|---|
+    | all | `case_id` | `EqualTo`, `In` |
+    | cases | `status` | `EqualTo`, `In` |
+    | cases | `opened` | `GreaterThan`, `GreaterThanOrEqual`, `LessThan`, `LessThanOrEqual` |
+
+    and applies them while listing folders, so tasks never open a case
+    that cannot match. `case_id` is known from the folder name; `status`
+    and `opened` need the index, read on the driver during planning.
+    Apply them **exactly** as Spark would: a NULL `status` matches no
+    `EqualTo`, a NULL `opened` passes no comparison. Several filters on
+    one column intersect.
+
+    Timestamps arrive as timezone-aware `datetime` objects in UTC,
+    already converted from the session time zone. With
+    `spark.sql.session.timeZone` set to `America/Toronto`,
+    `t >= timestamp'2026-03-01 00:00:00'` reached `pushFilters` as:
+
+    ```text
+    GreaterThanOrEqual(attribute=('t',), value=datetime.datetime(2026, 3, 1, 5, 0, tzinfo=zoneinfo.ZoneInfo(key='UTC')))
+    ```
+
+    so compare them with aware UTC values, never naive ones. The plan
+    shows what was pushed, with a surprise:
+
+    ```text
+    (1) BatchScan casefile
+    Output [11]: [case_id#167, folder#168, schema_version#169, opened#170, status#171, ...]
+    PushedFilters: [EqualTo(status,open), GreaterThanOrEqual(opened,2026-03-09 17:00:00.0)]
+    ```
+
+    That query asked for `opened >= timestamp'2026-03-10 00:00:00'` with
+    the session in UTC. `PushedFilters` prints the value as a JVM
+    timestamp in the **JVM's default time zone** (the machine's, here
+    `America/Los_Angeles`, UTC-7 on that date), not the session's. The
+    filter is right; only its display is local. Do not "fix" your
+    comparison to match the plan.
+
+    **Why two reader classes.** You learned in "Filter Pushdown" that a
+    reader which defines `pushFilters` fails every query with
+    `DATA_SOURCE_PUSHDOWN_DISABLED` when
+    `spark.sql.python.filterPushdown.enabled` is false, and in "From
+    Wrong Results to a Fix: An Upstream Case Study" that with the flag
+    on, 4.2.0 (and the identical code of 4.1.0 and the 4.3 branch) can
+    leak a pushed read into other scans of the same relation. Spark decides
+    whether pushdown is implemented by looking at the reader **object**
+    that `reader()` returns, so a data source can choose:
+
+    ```python
+    def reader(self, schema):
+        if self.options.get("pushdown", "false").lower() == "true":
+            return PushdownCaseFileReader(self.options, schema)
+        return CaseFileReader(self.options, schema)
+    ```
+
+    The default reader has no `pushFilters`: it works with the flag off
+    and cannot leak. Users who want pushdown opt in, and get a helper
+    that loads afresh for every table reference:
+
+    ```python
+    cf = CaseFiles(spark, "data/messy/casefiles", pushdown="true")
+    open_cases = cf.table("cases").filter("status = 'open'")
+    joined = cf.table("cases").alias("c").join(cf.table("attachments").alias("a"), "case_id")
+    ```
+
+    The harness checks the flag-off path, the `PushedFilters` line,
+    audit markers that prove only matching folders were opened (the
+    five open cases; three cases in a date window; two cases by id),
+    a reused DataFrame on the default reader (10, 5, 10), and a join of
+    two `CaseFiles` tables.
+
+- Class: mult_question
+  Depth: all
+  Output: "Your casefile source returns a reader without pushFilters unless the option pushdown is 'true'. A user runs it with spark.sql.python.filterPushdown.enabled=false and no options. What happens?"
+  AnswerChoices: "The query works, and Spark evaluates every filter itself;It fails with DATA_SOURCE_PUSHDOWN_DISABLED;It fails at register();Filters are silently ignored"
+  CorrectAnswer: "The query works, and Spark evaluates every filter itself"
+  Hint: "The pushdown check looks at the reader object reader() returned, not at the DataSource class."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Stage writer: Publish by Swapping a Pointer
+
+    The writer in "Writers" staged files and moved them into place in
+    `commit()`. Moving many folders is not atomic: a reader that lists
+    the folder halfway through sees half a write, and an overwrite that
+    deletes old folders first leaves nothing at all for a moment. The
+    design here never moves or renames data:
+
+    ```text
+    write()   (each task)   CASE-0006@<job>/case.json, attachments/, changes.log
+                            (job folders: invisible, list_case_folders skips name@job)
+    commit()  (driver)      1. reject duplicates in this job, and appends of existing ids
+                            2. write the new manifest to a temporary file
+                            3. os.replace(tmp, _manifest.json)        <- the commit point
+                            4. delete folders the new manifest no longer lists
+    abort()   (driver)      delete every *@<job> folder
+    ```
+
+    `_manifest.json` maps each `case_id` to its folder. Readers that
+    find a manifest read exactly what it lists, so the new data appears
+    all at once, in the single `os.replace` (atomic on POSIX when both
+    paths are on one file system), and an overwrite never shows an empty
+    table. This is the idea behind table formats such as Delta Lake:
+    immutable data, published by replacing one small pointer.
+
+    `commit()` raising is a normal way to refuse a write. When it raises,
+    Spark logs "Data source write support ... is aborting" and calls
+    `abort()` with every task's message, so the job folders are deleted
+    there:
+
+    ```text
+    ERROR AppendDataExec: Data source write support org.apache.spark.sql.execution.datasources.v2.python.PythonBatchWrite@4f93ade9 is aborting.
+    ERROR AppendDataExec: Data source write support org.apache.spark.sql.execution.datasources.v2.python.PythonBatchWrite@4f93ade9 aborted.
+    ```
+
+    Gotcha when you test this: a failure injected with
+    `F.raise_error(...)` in the DataFrame being written does **not**
+    test `abort()`. The JVM computes the rows it feeds to the Python
+    writer on its own thread; in testing, the task failed before
+    `write()` had written a single folder, even with
+    `spark.sql.execution.arrow.maxRecordsPerBatch` set to 2, so an
+    `abort()` that does nothing still "passed". The harness instead
+    sends a row whose `case_id` is not `CASE-dddd`, sorted last into one
+    task, and your `write()` must reject it with a `ValueError`
+    containing "invalid case_id" after writing four folders. Then a
+    broken `abort()` is caught:
+
+    ```text
+    FAIL  writer  7.4s  a failed write must leave the manifest and the folder exactly as they
+    were (abort() should delete this job's folders); new entries: ['CASE-0006@ac40da3e',
+    'CASE-0007@ac40da3e', 'CASE-0008@ac40da3e', 'CASE-0009@ac40da3e']
+    ```
+
+    The stage also checks a duplicate `case_id` in one write ("duplicate"
+    in the error), appending an existing case ("already exists"), that
+    rejected commits change nothing, an overwrite that removes the
+    replaced folders, and a round trip of `case_id`, `status`,
+    `priority`, `opened` and `meta` through write and read.
+
+- Class: mult_question
+  Depth: all
+  Output: "In this writer, when do the new cases become visible to readers?"
+  AnswerChoices: "When os.replace puts the new _manifest.json in place, all at once;As soon as each task finishes writing its folders;When abort() runs;After the replaced folders are deleted"
+  CorrectAnswer: "When os.replace puts the new _manifest.json in place, all at once"
+  Hint: "Readers that find a manifest only read what it lists."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Stage streaming: Byte Offsets and Partial Lines
+
+    The changes table also streams, for logs that keep growing. The
+    offset is a byte position per log, plus a line count so rows keep
+    their line numbers:
+
+    ```text
+    {"v": 1, "pos": {"CASE-0001": [343, 8], "CASE-0002": [51, 1]}}
+    ```
+
+    (that is the end offset of the reference's first micro-batch: all
+    343 bytes and 8 lines of CASE-0001's log, and the first line of
+    CASE-0002's.) The design rules:
+
+    - **Only complete lines.** A line counts once its newline has been
+      written. The writer of a log may be halfway through a line when
+      `latestOffset` runs; consuming it would split one change across
+      two rows. The given `complete_lines(path, start)` returns the end
+      byte of every complete line after `start`.
+    - **Admission control by bytes.** `getDefaultReadLimit()` returns
+      `ReadMaxBytes(maxBytesPerTrigger)` (4.2, `limit.max_bytes`).
+      `latestOffset(start, limit)` takes whole lines, folder by folder,
+      while they fit, and always at least one line so a stream with one
+      huge line still moves. With `ReadAllAvailable` it takes
+      everything.
+    - **AvailableNow** freezes a target per log in
+      `prepareForTriggerAvailableNow`, as in "Streaming Readers and
+      Writers".
+    - **`read()` reads its byte range only**, and numbers lines from
+      the offset's count. A BOM can only be at byte 0, and
+      `change_rows` strips it.
+
+    With `maxBytesPerTrigger` 400 the reference's first run made these
+    batches (batch id, rows):
+
+    ```text
+    [(0, 7), (1, 7), (2, 8), (3, 7), (4, 7), (5, 7)]
+    ```
+
+    That is 43 rows, one fewer than the batch reader's 44: CASE-0003's
+    last line has no newline yet. The harness then appends to that log
+    (completing the old line, adding a full line and a new partial one),
+    adds a new case folder, restarts from the checkpoint (4 new rows),
+    completes the partial line and restarts again (1 row). Its oracle is
+    the batch reader: after the last run, the rows the stream wrote to
+    its Parquet sink must equal `spark.read.format("casefile")` of the
+    same folder, row for row, with no line twice. It also reads every
+    `offsets/<batch>` file of the checkpoint and checks that no batch
+    consumed more than 400 bytes.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Stage logs: Tell Someone What Was Wrong
+
+    Problems are data (the `problems` and `status` columns), but an
+    operator also wants to see them without writing a query. The reader
+    logs one warning per problem under the logger `casefile`
+    (`"CASE-0004 missing_attachment"`, `"CASE-0006 sha_mismatch receipt.pdf"`),
+    and the harness reads them back with `python_worker_logs()`, polling
+    because they arrive asynchronously ("Packaging, Registration,
+    Testing and Debugging").
+
+    A gotcha from building the reference: with a module-level
+    `log = logging.getLogger("casefile")` plus
+    `log.addHandler(logging.NullHandler())`, every warning still
+    appeared on the job's stderr. A `Logger` pickles **by name** (since
+    Python 3.7), so the worker gets a fresh logger with no handlers, and
+    Python's last-resort handler prints the warning. Get the logger where
+    you log, and add the handler there (the given `get_log()` does).
+    The `NullHandler` only silences records nobody collects: with
+    `spark.sql.pyspark.worker.logging.enabled` on, they still reach
+    `python_worker_logs()`.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Stage offline_tests: Tests That Catch Broken Code
+
+    `OfflineTests` is a plain `unittest.TestCase` that needs no Spark:
+    parsers, statuses, the planner, and a reader driven by hand
+    (`partitions()` then `read()`, with `schema=None`; the reader then
+    takes the column names from the DDL string, because building a
+    `StructType` from DDL needs a running session). The harness checks
+    that no SparkContext exists before and after, that there are at
+    least five tests, and that they pass.
+
+    Passing is the easy half. A test suite is only as good as the bugs
+    it catches, so the harness also does **mutation testing**: it swaps
+    one of your functions for a broken version, runs your suite again,
+    and expects at least one failure. The broken versions are:
+
+    - a planner that ignores the byte target, and one that splits by
+      count instead of bytes
+    - an index parser that forgets the BOM, treats version 1 as broken,
+      ignores time zone offsets, or accepts any priority
+    - a change parser that keeps the `\r` of CRLF lines, or accepts
+      lines without `->`
+    - a checksum check that always says ok
+
+    A surviving mutant is reported by name ("your tests did not catch:
+    an index parser that forgets the BOM"). The swap replaces the
+    module-level name, so call your functions by name in the tests (not
+    through a saved reference). Write each test so it would fail for
+    one specific bug; a single test that checks everything at once
+    tells you less when it fails.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Stage design_review: Write It Down
+
+    A connector outlives its author. `DESIGN_REVIEW` in the exercise is
+    a Markdown string with five sections; the harness checks they exist,
+    have at least 30 words each, that Failure modes has at least four
+    bullets, and that Decisions mentions partitions, offsets, the
+    manifest and VARIANT. The template:
+
+    ```markdown
+    ## Decisions
+    For each choice: what you chose, the alternatives, and why.
+    Tables and grain, partition planning, VARIANT for metadata, stream
+    offsets, the commit protocol, pushdown.
+
+    ## Trade-offs
+    What each choice costs, and at what scale you would choose differently.
+
+    ## Failure modes
+    - One bullet per failure: what happens, what the user sees, what is
+      left on disk. Task failure, rejected commit, the driver dying at
+      the worst moment, a log rewritten instead of appended, a corrupt
+      index, a filter you push but apply wrongly.
+
+    ## Testing
+    What runs without Spark, what needs a session, and what each test
+    would catch.
+
+    ## What I would change for production
+    The next three things, in order.
+    ```
+
+    Questions worth answering in yours: what happens if the driver dies
+    between `os.replace` and the cleanup? What if a log shrinks? Which
+    planted problem does your connector *not* report (the reference does
+    not flag out-of-order change lines; why not, in a stream)?
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## The Java Path
+
+    If you did "A DSv2 Connector in Java", you can build the same
+    connector on the JVM. The pieces map one to one:
+
+    | Python data source | DSv2 (Java) |
+    |---|---|
+    | `DataSource.name()`, `schema()` | `TableProvider` + `DataSourceRegister.shortName()`, `inferSchema` |
+    | `reader()` | `Table` with `SupportsRead.newScanBuilder` |
+    | `pushFilters` | `SupportsPushDownV2Filters.pushPredicates` |
+    | (no equivalent in 4.2) | `SupportsPushDownRequiredColumns.pruneColumns` |
+    | `partitions()` | `Batch.planInputPartitions` |
+    | `read()` | `PartitionReaderFactory` + `PartitionReader<InternalRow>` |
+    | `writer()`, `commit()`, `abort()` | `SupportsWrite`, `BatchWrite.commit/abort`, `DataWriter` |
+    | `DataSourceStreamReader` | `MicroBatchStream` with `SupportsAdmissionControl` |
+
+    Java buys you column pruning (the cases table could skip `meta`),
+    aggregate pushdown (`COUNT(*)` from the folder listing), reporting
+    partitioning and statistics, and no Python worker on the read path.
+    It costs a build, a jar on every executor, and `InternalRow` and
+    `UTF8String` instead of tuples. A scan builder for the cases table,
+    compiled with `javac --release 17 -cp "<pyspark>/jars/*"`:
+
+    ```java
+    package demo;
+
+    import java.util.ArrayList;
+    import java.util.List;
+
+    import org.apache.spark.sql.connector.expressions.NamedReference;
+    import org.apache.spark.sql.connector.expressions.filter.Predicate;
+    import org.apache.spark.sql.connector.read.Scan;
+    import org.apache.spark.sql.connector.read.ScanBuilder;
+    import org.apache.spark.sql.connector.read.SupportsPushDownRequiredColumns;
+    import org.apache.spark.sql.connector.read.SupportsPushDownV2Filters;
+    import org.apache.spark.sql.types.StructType;
+
+    /** The cases table: pushes "=" and "IN" on case_id and status, and prunes columns. */
+    public class CasesScanBuilder implements ScanBuilder, SupportsPushDownV2Filters,
+        SupportsPushDownRequiredColumns {
+      private StructType schema;
+      private final List<Predicate> pushed = new ArrayList<>();
+
+      public CasesScanBuilder(StructType schema) { this.schema = schema; }
+
+      @Override
+      public Predicate[] pushPredicates(Predicate[] predicates) {
+        List<Predicate> rest = new ArrayList<>();
+        for (Predicate p : predicates) {
+          boolean onKey = p.children().length > 0 && p.children()[0] instanceof NamedReference ref
+              && List.of("case_id", "status").contains(String.join(".", ref.fieldNames()));
+          if (onKey && (p.name().equals("=") || p.name().equals("IN"))) {
+            pushed.add(p);          // applied when listing case folders
+          } else {
+            rest.add(p);            // Spark evaluates these after the scan
+          }
+        }
+        return rest.toArray(new Predicate[0]);
+      }
+
+      @Override
+      public Predicate[] pushedPredicates() { return pushed.toArray(new Predicate[0]); }
+
+      @Override
+      public void pruneColumns(StructType required) { this.schema = required; }
+
+      @Override
+      public Scan build() {
+        // A real connector returns a Scan whose toBatch() plans InputPartitions by
+        // bytes and whose PartitionReaderFactory reads case folders into InternalRows.
+        throw new UnsupportedOperationException("sketch: " + pushed + " " + schema.simpleString());
+      }
+    }
+    ```
+
+    The 4.2.0 leak lived in the Python wrapper's provider, not in DSv2
+    itself: Spark creates a scan builder per scan
+    (`createScanBuilder` in `V2ScanRelationPushDown`), so a Java
+    connector that keeps pushdown state in its `ScanBuilder` and `Scan`,
+    never in its `TableProvider` or `Table`, cannot leak this way. To
+    grade a Java version yourself, run the harness's Spark stages
+    against `format("<your short name>")`; the plain Python stages and
+    the design review apply unchanged.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: The casefile Connector
+
+    Build the connector stage by stage. Each stage is graded on its own,
+    and the run ends with "N of 10 stages passed":
+
+    1. **parsing**: `parse_index`, `parse_change_line`,
+       `attachment_status`
+    2. **planning**: `plan_by_bytes`, `list_case_folders`
+    3. **offline_tests**: at least five tests in `OfflineTests` that
+       pass, need no Spark, and catch every broken version listed in the
+       lesson
+    4. **design_review**: fill in `DESIGN_REVIEW`
+    5. **batch**: `CaseFileReader.partitions`, `case_row`,
+       `attachment_rows` (with one `get_log().warning` per problem)
+    6. **variant**: `meta` as a `VariantVal` in `case_row`
+    7. **pushdown**: `CaseFileSource.reader` (the class choice),
+       `CaseFileReader.wanted`, `PushdownCaseFileReader.pushFilters`,
+       `CaseFiles.table`
+    8. **writer**: `CaseFileWriter.write`, `commit`, `abort`
+    9. **streaming**: `ChangesStreamReader.pending`,
+       `prepareForTriggerAvailableNow`, `latestOffset`, `partitions`,
+       `read`
+    10. **logs**: checked from the warnings you added in batch
+
+    Set `ONLY` at the top of the file to run some stages while you
+    work. Read each method's docstring: it is the specification.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Work in the order above; later stages reuse earlier functions. parse_index: decode with utf-8-sig and return a bad_index row on JSONDecodeError. plan_by_bytes: sorted(items, key=lambda kv: (-kv[1], kv[0])). commit(): check duplicates and clashes before writing the manifest; os.replace is the commit point. latestOffset: walk self.pending(start) in folder order, add (end - begin) per line, stop before the budget would be exceeded but always take one line."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Taking It Further
+
+    - **A catalog file.** Pushdown on `status` reads every index during
+      planning. Write a small summary file (case id, status, opened) in
+      `commit()` and plan from it instead.
+    - **Vacuum.** Folders that a crashed commit left behind, or that a
+      manifest stopped listing before cleanup ran, are garbage. Add a
+      `vacuum(root, keep_jobs=...)` function, and think about readers
+      that are still using an old manifest.
+    - **Shrinking logs.** If a log is ever shorter than its offset, the
+      stream should fail loudly rather than read garbage. Add the check
+      to `latestOffset`.
+    - **Package it** as `pyspark_casefile` with a `DefaultSource`, as in
+      "Packaging, Registration, Testing and Debugging", with
+      `OfflineTests` as its pytest suite.
+    - **Ship it** to a cluster ("Shipping Python Dependencies to a
+      Cluster") and watch it with the event log and listeners
+      ("Observability: Listeners, Metrics and Profiling Executors").
+    - **Prove it** under retries ("Determinism, Retries and Fault
+      Injection"): run the writer with `local[2,3]` and a `write()` that
+      fails on its first attempt, and show the output is identical.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Closing: What You Can Do Now
+
+    You started this course by reading a folder of files as files. You
+    can now:
+
+    - Read anything Spark has a reader for, and know what it does with
+      bad input: CSV, JSON with drift, XML, Avro and Protobuf, text,
+      binary files, images and audio, with schemas you control and
+      quarantine for what does not fit.
+    - Model messy data with structs, arrays, maps and VARIANT, and know
+      when VARIANT is the right choice and how it is stored.
+    - Build Python data sources that read, push down, write, stream and
+      ship, and the same thing in Java against DSv2 when Python is not
+      enough.
+    - Read a query plan, a Parquet footer, a VARIANT value, a
+      checkpoint and an event log as evidence, and reason about what
+      the engine will do before it does it.
+    - Take a wrong result from symptom to a regression test, a fix and
+      a JIRA.
+
+    Where to go next:
+
+    - **Contribute to Spark.** The method of "From Wrong Results to a
+      Fix: An Upstream Case Study" is how contributions start: a minimal repro, a JIRA, a test
+      that fails, the smallest fix. The contributing guide
+      (https://spark.apache.org/contributing.html) and the developer
+      tools page (https://spark.apache.org/developer-tools.html) explain
+      the process and the build. Python data sources are a young API
+      with open issues; reviewing and testing release candidates is
+      valuable work too.
+    - **Read the Spark docs and source side by side.** The Python data
+      source guide lives in `python/docs/source/tutorial/sql/python_data_source.rst`
+      in the Spark repository; when the docs and the code disagree, you
+      now know how to find out which is right, and the docs take pull
+      requests like the code does.
+    - **The other SparkTutor courses.** "Learning Spark 4.2: From
+      Fundamentals to Production" for the rest of Spark (SQL, joins,
+      tuning, MLlib), "Spark 4.2 Declarative Pipelines" for building the
+      pipelines your connectors feed, and "What's New in Apache Spark
+      4.x" to keep up with each release.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - The final project is a connector for a new messy format: three
+      tables through one source, two index versions normalized into one
+      shape, and planted problems that become rows and warnings instead
+      of exceptions.
+    - Partitions are planned by bytes with first fit decreasing, over
+      what each table actually reads.
+    - Loose metadata is VARIANT, built with `VariantVal.parseJson`.
+    - Pushdown is exact and opt-in: a reader without `pushFilters` by
+      default (no `DATA_SOURCE_PUSHDOWN_DISABLED`, no 4.2.0 leak), a
+      pushdown reader on request, and a helper that loads afresh per
+      table reference. Pushed timestamps arrive as aware UTC datetimes;
+      `PushedFilters` displays them in the JVM's time zone.
+    - Writes are invisible until one `os.replace` of a manifest;
+      `commit()` refuses duplicates and clashes, and Spark then calls
+      `abort()`. A `raise_error` in the input does not exercise `abort()`;
+      a failure inside `write()` does.
+    - The stream uses byte offsets per log, reads complete lines only,
+      admits by bytes, restarts from its checkpoint and agrees with the
+      batch reader row for row.
+    - Logs come back through `python_worker_logs()`; a `Logger` pickles
+      by name, so configure it in the worker.
+    - Tests are judged by the bugs they catch: mutation testing against
+      broken versions of your own functions.
+
+    This is the end of the course. Thank you for working through it.

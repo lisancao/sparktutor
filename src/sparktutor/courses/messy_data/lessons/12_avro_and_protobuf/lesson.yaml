@@ -1,0 +1,1103 @@
+- Class: meta
+  Lesson: "Binary Records: Avro and Protobuf"
+  EstimatedMinutes: 60
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    The formats so far ("CSV and Delimited Files", "JSON Drift and
+    Quarantine", "XML") are text: you can open them in an editor, and
+    every record spells out its own field names. Systems that move a lot
+    of records between programs (Kafka topics, RPC calls, event
+    pipelines, data lake files) usually use **binary record formats**
+    instead. The two you will meet most are **Apache Avro** and
+    **Protocol Buffers** (Protobuf).
+
+    They are messy in a different way. Nothing is human-readable, a
+    record does not say what its fields are, and the schema that
+    explains the bytes lives somewhere else: in a file header, in a
+    schema registry, or in a `.proto` file in another team's repository.
+    Most failures are not parse errors but **silent wrong answers** from
+    reading bytes with the wrong schema. This lesson teaches you to
+    recognise them.
+
+    You already know structs, arrays and maps from "Complex Types and
+    Higher-Order Functions"; both formats decode into exactly those
+    types. By the end of this lesson you will be able to:
+
+    - Add the `spark-avro` and `spark-protobuf` modules to a session,
+      and recognise the errors when they are missing
+    - Read and write `.avro` files, choose a compression codec, and read
+      a folder whose files were written with different schema versions
+    - Evolve an Avro schema safely (added fields with defaults, removed
+      fields, renames with aliases) and predict which changes fail
+    - Decode Avro bytes in a column with `from_avro`, including the
+      Confluent wire format that Kafka producers use
+    - Decode Protobuf with `from_protobuf` and a descriptor set (from
+      `protoc` or built in Python), and explain why a proto3 `0` comes
+      back as NULL
+    - Turn undecodable messages into a dead-letter table instead of a
+      failed job
+
+    The sample data is in `data/messy/binary/`: dumps of an `orders`
+    topic (Avro) and a `payments` topic (Protobuf), with the schemas a
+    registry would hold.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Why Binary Records Exist
+
+    Here is the same order three ways:
+
+    | Format | Bytes | What the record carries |
+    |--------|-------|-------------------------|
+    | JSON | `{"order_id": "O-2001", "user_id": 5, "amount": 103.93, "ts": 1790841600000}` (75 bytes) | field names, values as text |
+    | Avro | `0C 4F 2D 32 30 30 31 0A EC 51 B8 1E 85 FB 59 40 80 E0 D1 E7 9E 68` (22 bytes) | values only, in schema order |
+    | Protobuf | field number and type tag, then the value, for each field that is set | numbered fields, no names |
+
+    Binary formats are smaller and faster to parse because the names and
+    types are written once, in a **schema**, instead of in every record.
+    The price is that the bytes are meaningless without that schema.
+    The schemas also carry **evolution rules**: which changes a producer
+    may make (add a field, remove one, rename one) so that old readers
+    and new readers keep working.
+
+    | | Avro | Protobuf |
+    |---|---|---|
+    | Schema language | JSON (`.avsc`) | `.proto` files, compiled to descriptors |
+    | Fields identified by | position, resolved by name | number |
+    | Schema travels | in the file header (`.avro` files); outside the bytes for single messages | always outside the bytes |
+    | Typical home | data lake files, Kafka with a schema registry | RPC (gRPC), Kafka, mobile and service events |
+    | Spark functions | `format("avro")`, `from_avro`, `to_avro`, `schema_of_avro` | `from_protobuf`, `to_protobuf` |
+
+    In Spark, Avro has had a file data source since 2.4 and the Python
+    `from_avro`/`to_avro` functions since 3.0; Protobuf support arrived in
+    3.4. There is no `.proto` file data source: Protobuf in Spark is
+    always bytes in a column.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Think of a JSON record as a filled-in form where every box has its
+    label printed next to it. An Avro record is the same form with the
+    labels torn off: just the answers, in order. To read it you need the
+    blank form (the schema) that says "the first answer is the order id,
+    the second is the user id". Hold the wrong blank form against it and
+    you will still read *something*, just not the truth.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Adding the Modules
+
+    Avro and Protobuf support ship with Apache Spark but are not on the
+    default classpath; each is a separate module (a jar). Without them:
+
+    ```python
+    spark.read.format("avro").load(path)
+    ```
+
+    ```
+    AnalysisException: Failed to find data source: avro. Avro is built-in
+    but external data source module since Spark 2.4. Please deploy the
+    application as per the deployment section of Apache Avro Data Source
+    Guide.
+    ```
+
+    (In 4.2.0 that message has no named error condition yet; it is
+    `_LEGACY_ERROR_TEMP_1139`.) The functions fail with named
+    conditions:
+
+    ```
+    [AVRO_NOT_LOADED_SQL_FUNCTIONS_UNUSABLE] Cannot call the TO_AVRO SQL
+    function because the Avro data source is not loaded.
+
+    [PROTOBUF_NOT_LOADED_SQL_FUNCTIONS_UNUSABLE] Cannot call the
+    FROM_PROTOBUF SQL function because the Protobuf data source is not
+    loaded.
+    ```
+
+    Outside SparkTutor, add the modules when you start Spark. The
+    Scala version (`_2.13`) and the Spark version (`4.2.0`) must match
+    your installation:
+
+    ```bash
+    spark-submit --packages org.apache.spark:spark-avro_2.13:4.2.0,org.apache.spark:spark-protobuf_2.13:4.2.0 job.py
+    pyspark --packages org.apache.spark:spark-avro_2.13:4.2.0
+    ```
+
+    or in code, before the session starts:
+
+    ```python
+    spark = (SparkSession.builder
+             .config("spark.jars.packages", "org.apache.spark:spark-avro_2.13:4.2.0")
+             .getOrCreate())
+    ```
+
+    `--packages` downloads the jar from Maven Central (and its
+    dependencies) the first time. The Protobuf module bundles a shaded
+    copy of the Protobuf Java library, so it needs nothing else.
+
+    Inside SparkTutor, the first line of an exercise asks for them:
+
+    ```python
+    # spark-connectors: avro, protobuf
+    ```
+
+    and the tutor passes the two jars to `spark-submit`. The exercise
+    in this lesson starts with that line.
+
+    In Python the functions live in their own modules:
+
+    ```python
+    from pyspark.sql.avro.functions import from_avro, to_avro
+    from pyspark.sql.protobuf.functions import from_protobuf, to_protobuf
+    ```
+
+    and since 4.0 they are SQL functions too (`from_avro`, `to_avro`,
+    `schema_of_avro`, `from_protobuf`, `to_protobuf`).
+
+- Class: mult_question
+  Depth: all
+  Output: "A job calls `spark.read.format('avro')` and fails with \"Failed to find data source: avro\". What is the fix?"
+  AnswerChoices: "Start Spark with the spark-avro module, for example --packages org.apache.spark:spark-avro_2.13:4.2.0;pip install avro;Use format('com.databricks.spark.avro');Rename the files to .avro"
+  CorrectAnswer: "Start Spark with the spark-avro module, for example --packages org.apache.spark:spark-avro_2.13:4.2.0"
+  Hint: "The data source is part of Apache Spark but lives in a separate jar that must be on the classpath."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Avro Files
+
+    Writing and reading Avro files works like Parquet:
+
+    ```python
+    ev = spark.read.json("data/messy/events/events_2026-10-01.json")
+    ev.write.format("avro").save(out)
+    spark.read.format("avro").load(out).show(3)
+    ```
+
+    ```
+    +------+--------+-------------------+-------+
+    |amount|   event|                 ts|user_id|
+    +------+--------+-------------------+-------+
+    |  6.13|    view|2026-10-01T10:00:00|      0|
+    | 16.02|purchase|2026-10-01T10:01:00|      1|
+    | 38.14|    view|2026-10-01T10:02:00|      2|
+    ```
+
+    An Avro **object container file** starts with the magic bytes
+    `Obj\x01`, then a header map with the writer's schema as JSON, the
+    codec, and a 16-byte sync marker; then blocks of records. The start
+    of the file Spark just wrote:
+
+    ```
+    b'Obj\x01\x06\x16avro.schema\xb4\x03{"type":"record","name":"topLevelRecord",
+    "fields":[{"name":"amount","type":["double","null"]},{"name":"event",
+    "type":["string","null"]},{"name":"ts","type":["string","null"]},
+    {"name":"user_id","type":["long","null"]}]}0org.apache.spark.version
+    \n4.2.0\x14avro.codec\x0csnappy\x00...'
+    ```
+
+    Three things to notice:
+
+    - **The schema is in the file.** That is why an Avro file needs no
+      inference pass: Spark reads the header and knows the schema.
+    - **A nullable Spark column becomes a union with `null`**:
+      `["double","null"]`. A `NOT NULL` column becomes the plain type.
+    - **The record is named `topLevelRecord`** unless you set
+      `recordName` (and `recordNamespace`) when writing, for example
+      `.option("recordName", "Order").option("recordNamespace", "shop")`
+      to produce a schema other teams can register as `shop.Order`.
+
+    Compression is per block, chosen with `option("compression", ...)`
+    or `spark.sql.avro.compression.codec` (default `snappy`). For the 20
+    events above (1,589 bytes of JSON), one file each:
+
+    | codec | bytes |
+    |-------|-------|
+    | `uncompressed` | 1,116 |
+    | `snappy` (default) | 645 |
+    | `deflate` | 571 |
+    | `zstandard` | 613 |
+
+    The allowed values are `uncompressed`, `deflate`, `snappy`,
+    `bzip2`, `xz` and `zstandard`; anything else, such as `gzip`, fails
+    with `[CODEC_SHORT_NAME_NOT_FOUND] Cannot find a short name for the
+    codec gzip`. Tiny files are dominated by the header; the ratios on
+    real data will differ.
+
+    Files do not need the `.avro` extension to be read (a file called
+    `data.bin` in the folder is read too); use the general
+    `pathGlobFilter` option (`"*.avro"`) to select files. The old
+    `ignoreExtension` option is deprecated.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## How Spark Types Map to Avro
+
+    Writing a row with one column of each common type, Spark 4.2.0
+    produced this Avro schema (the literals were `NOT NULL`, so there
+    are no unions):
+
+    | Spark type | Avro type written | Read back as |
+    |------------|-------------------|--------------|
+    | `DATE` | `int`, logicalType `date` | `date` |
+    | `TIMESTAMP` | `long`, `timestamp-micros` | `timestamp` |
+    | `TIMESTAMP_NTZ` | `long`, `local-timestamp-micros` | `timestamp_ntz` |
+    | `DECIMAL(4,2)` | `fixed` (2 bytes), logicalType `decimal` | `decimal(4,2)` |
+    | `MAP<STRING, INT>` | `map` of `int` | `map<string,int>` |
+    | `ARRAY<INT>` | `array` of `int` | `array<int>` |
+    | `BINARY` | `bytes` | `binary` |
+    | `TINYINT`, `SMALLINT` | `int` | `integer` (widened) |
+    | `FLOAT` | `float` | `float` |
+
+    And in the other direction, `schema_of_avro` (SQL, 4.0) shows what
+    an Avro schema becomes without reading any data:
+
+    | Avro type | Spark type |
+    |-----------|------------|
+    | `enum` | `STRING` (the symbol name) |
+    | `fixed` | `BINARY` |
+    | `timestamp-millis` and `timestamp-micros` | `TIMESTAMP` |
+    | `string` with logicalType `uuid` | `STRING` |
+    | `["null", "string"]` | nullable `STRING` |
+    | `["null", "double", "string"]` | `STRUCT<member0: DOUBLE, member1: STRING>` |
+
+    That last row is the one that bites. A union of several non-null
+    types (common in schemas generated from loosely typed sources)
+    becomes a struct with one field per branch, named by position:
+    exactly one is set per row. Add a branch to the union and the
+    positions move. The option `enableStableIdentifiersForUnionType`
+    (`true`) names the fields after the types instead,
+    `STRUCT<member_double: DOUBLE, member_string: STRING>`, which
+    survives that change.
+
+    Two Spark types cannot be written to Avro at all: `VARIANT` fails
+    with `[UNSUPPORTED_DATA_TYPE_FOR_DATASOURCE] The Avro datasource
+    doesn't support the column `v` of the type "VARIANT"`, and so do
+    the 4.2 geospatial types. Convert a VARIANT with `to_json` first.
+
+    When an exact Avro schema matters (an enum instead of a string, a
+    schema another team owns), pass it when writing with
+    `option("avroSchema", schema_json)`. Spark then checks the data
+    against it: a value outside an enum fails the write with
+    `IncompatibleSchemaException: ... "BLUE" cannot be written since
+    it's not defined in enum "RED", "GREEN"`.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Avro Schema Evolution
+
+    Avro resolves two schemas when it reads: the **writer's schema**
+    (the one the bytes were written with) and the **reader's schema**
+    (the one you want). Fields are matched **by name**, and the rules
+    decide what happens to every difference:
+
+    | Change in the reader | Result |
+    |----------------------|--------|
+    | field added, with a `default` | filled with the default |
+    | field added, nullable with `"default": null` | NULL |
+    | field added, no default | fails: `AvroTypeException: Found topLevelRecord, expecting topLevelRecord, missing required field region` |
+    | field removed | silently skipped |
+    | field renamed, old name in `aliases` | read under the new name |
+    | `long` in the writer read as `int` | fails: `AvroTypeException: Found long, expecting int` |
+    | `int` read as `long`, `float` as `double` | promoted |
+    | non-null type read as a `["null", ...]` union | works |
+
+    For files, the reader's schema is the `avroSchema` option. Here two
+    folders were written with an older and a newer schema (`currency`
+    was added in the newer one):
+
+    ```python
+    reader = json.dumps({"type": "record", "name": "topLevelRecord", "fields": [
+        {"name": "order_id", "type": "string"},
+        {"name": "user_id", "type": "long"},
+        {"name": "amount", "type": "double"},
+        {"name": "currency", "type": "string", "default": "CAD"}]})
+    spark.read.format("avro").option("avroSchema", reader).load(folder).show()
+    ```
+
+    ```
+    +--------+-------+------+--------+---+
+    |order_id|user_id|amount|currency|day|
+    +--------+-------+------+--------+---+
+    |     O-2|      8|  30.0|     USD|  2|
+    |     O-1|      7|  12.5|     CAD|  1|
+    +--------+-------+------+--------+---+
+    ```
+
+    The old file's row got the default. A rename uses an alias in the
+    reader: `{"name": "total", "type": "double", "aliases": ["amount"]}`
+    reads the writer's `amount` as `total`.
+
+    The errors above show up at the first action, wrapped in
+    `[FAILED_READ_FILE.NO_HINT] Encountered error while reading file
+    ...`, with the Avro message in the cause. Read the cause.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Mixed-Folder Trap
+
+    Without `avroSchema`, which schema does Spark use for a folder whose
+    files were written by different versions? **One file's.** Spark
+    opens the first file it can in its file listing and uses that file's
+    schema for everything; there is no merging. On the two-version folder
+    above, without the option:
+
+    ```
+    root
+     |-- order_id: string (nullable = true)
+     |-- user_id: long (nullable = true)
+     |-- amount: double (nullable = true)
+     |-- day: integer (nullable = true)
+    ```
+
+    `currency` is gone, for every row, without a warning. Which file is
+    "first" is not something to rely on: in a second test where the
+    newer file sat in the folder that sorts first, Spark still picked the
+    older one. `option("mergeSchema", "true")` is accepted and does
+    nothing (the 4.2.0 Avro source has no such option).
+
+    Two ways to get every field:
+
+    - **`option("avroSchema", ...)`** with the newest schema, as above:
+      Avro fills in defaults for older files.
+    - **A Spark schema**, `.schema("order_id STRING, currency STRING")`:
+      Spark matches columns by name and gives NULL where a file lacks
+      one (no Avro default). A type that does not match fails with
+      `IncompatibleSchemaException: Cannot convert Avro field 'amount'
+      to SQL field 'amount' because schema is incompatible (avroType =
+      "double", sqlType = STRING)`.
+
+    The first keeps Avro's evolution rules (defaults, aliases); use it
+    when you have the registry's schema.
+
+- Class: mult_question
+  Depth: all
+  Output: "A folder holds Avro files written with schema v1 and with v2 (v2 added a field `currency` with a default). You read it with no options. What happens to `currency`?"
+  AnswerChoices: "It may be missing for every row, because Spark takes the schema from one file;It is merged in and NULL for v1 rows;It is filled with the default for v1 rows;The read fails with a schema mismatch"
+  CorrectAnswer: "It may be missing for every row, because Spark takes the schema from one file"
+  Hint: "Avro inference does not merge schemas. Pass the newest schema with the avroSchema option."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Avro Bytes in a Column
+
+    In a Kafka topic, each message value is **one Avro record with no
+    header**: no magic bytes, no schema, just the values. Spark decodes
+    such a column with `from_avro(col, writer_schema_json)` and encodes
+    with `to_avro(struct, schema_json)`:
+
+    ```python
+    V1 = json.dumps({"type": "record", "name": "Order", "namespace": "shop", "fields": [
+        {"name": "order_id", "type": "string"}, {"name": "user_id", "type": "long"},
+        {"name": "amount", "type": "double"}]})
+
+    rows = spark.createDataFrame([("O-1", 7, 12.5), ("O-2", -1, 0.0)],
+        "order_id STRING NOT NULL, user_id BIGINT NOT NULL, amount DOUBLE NOT NULL")
+    b = rows.select(to_avro(F.struct("order_id", "user_id", "amount"), V1).alias("value"))
+    ```
+
+    ```
+    +----------------------------------------+
+    |value                                   |
+    +----------------------------------------+
+    |[06 4F 2D 31 0E 00 00 00 00 00 00 29 40]|
+    |[06 4F 2D 32 01 00 00 00 00 00 00 00 00]|
+    +----------------------------------------+
+    ```
+
+    Read the first one byte by byte:
+
+    - `06`: the string length. Avro writes `int` and `long` in
+      **zigzag** varint form, which maps 0, -1, 1, -2, 2, ... to 0, 1, 2,
+      3, 4, ..., so 3 becomes 6.
+    - `4F 2D 31`: `O-1` in UTF-8.
+    - `0E`: the long 7, zigzagged to 14. In the second row, -1 is `01`.
+    - `00 00 00 00 00 00 29 40`: the double 12.5, 8 bytes little-endian.
+
+    No field names, no types, no lengths for fixed-size values. A
+    nullable field adds one byte in front of its value, the union
+    branch: with nullable columns and the default schema, the same row is
+    `00 06 4F 2D 31 00 0E ...`. Without a schema argument, `to_avro`
+    derives one from the Spark type.
+
+    `from_avro("value", V1)` turns the bytes back into
+    `{O-1, 7, 12.5}`. In SQL (4.0):
+
+    ```sql
+    SELECT o.order_id, o.amount FROM (
+      SELECT from_avro(value, '<schema json>', map('mode', 'PERMISSIVE')) AS o FROM t)
+    ```
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Schema Is Not in the Bytes
+
+    Because a message has no schema, `from_avro` believes whatever schema
+    you give it. The 4.2.0 docstring says it plainly: "The specified
+    schema must match the read data, otherwise the behavior is undefined:
+    it may fail or return arbitrary result." All of these were run:
+
+    | Bytes written with | Decoded with | Result |
+    |--------------------|--------------|--------|
+    | v2 (v1 plus `currency`) | v1 | **succeeds**: v1's fields, the trailing bytes ignored |
+    | v1 | v2 as the writer schema | fails: `java.io.EOFException` (the bytes ran out) |
+    | v1 | a schema with the fields in another order | fails: `Malformed data. Length is negative: -40` |
+    | v1 with a 5-byte header in front | v1 | **succeeds with garbage**: `order_id` empty, `user_id` 0, `amount` 2.57602727545058E... |
+
+    The first and last rows are the dangerous ones: no error, wrong
+    data. You will meet the last one again in a moment.
+
+    To read with evolution, pass **both** schemas: the writer's as the
+    second argument and the reader's as the `avroSchema` option:
+
+    ```python
+    from_avro("value", V1, {"avroSchema": V2})     # v1 bytes, v2 shape
+    ```
+
+    ```
+    +--------+-------+------+--------+
+    |order_id|user_id|amount|currency|
+    +--------+-------+------+--------+
+    |     O-1|      7|  12.5|     CAD|
+    |     O-2|     -1|   0.0|     CAD|
+    +--------+-------+------+--------+
+    ```
+
+    The output type always follows the `avroSchema` option when it is
+    set, so messages written with different versions can all be decoded
+    into one shape. That is how the exercise unifies the topic.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Parse Modes for from_avro
+
+    `from_avro` takes a `mode` option, and the default is **FAILFAST**:
+    one bad message fails the whole job.
+
+    ```
+    org.apache.spark.SparkException: Malformed records are detected in
+    record parsing. Current parse Mode: FAILFAST. To process malformed
+    records as null result, try setting the option 'mode' as 'PERMISSIVE'.
+    ```
+
+    (In 4.2.0 this error has no error condition, only the message; the
+    real reason, such as `java.io.EOFException`, is in its cause.)
+
+    With `{"mode": "PERMISSIVE"}`, a bad message gives a **struct of
+    NULLs, not NULL**, and a NULL input gives NULL:
+
+    ```
+    +------------------+------+--------+
+    |                 o|isnull|order_id|
+    +------------------+------+--------+
+    |{NULL, NULL, NULL}| false|    NULL|      <- truncated bytes
+    |              NULL|  true|    NULL|      <- NULL value
+    +------------------+------+--------+
+    ```
+
+    So `o IS NULL` does not find bad messages. Test a field the schema
+    says can never be NULL, such as `o.order_id IS NULL`. (In
+    PERMISSIVE mode every field of the result is nullable, for this
+    reason.) `DROPMALFORMED` is not supported: `[PARSE_MODE_UNSUPPORTED]
+    The function `from_avro` doesn't support the DROPMALFORMED mode.
+    Acceptable modes are PERMISSIVE and FAILFAST.`, the same rule as
+    `from_json` in "JSON Drift and Quarantine".
+
+- Class: mult_question
+  Depth: all
+  Output: "You decode a column with `from_avro(value, schema, {'mode': 'PERMISSIVE'})` and filter `o IS NULL` to find corrupt messages. You find none, but you know some are corrupt. Why?"
+  AnswerChoices: "In PERMISSIVE mode from_avro returns a struct of NULLs for bad bytes, not NULL;PERMISSIVE mode repairs corrupt messages;Corrupt messages are dropped in PERMISSIVE mode;IS NULL does not work on struct columns"
+  CorrectAnswer: "In PERMISSIVE mode from_avro returns a struct of NULLs for bad bytes, not NULL"
+  Hint: "Look at what the lesson's PERMISSIVE output printed for the truncated message."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Confluent Wire Format
+
+    Most Kafka producers that use a schema registry (Confluent's
+    serializers, and many compatible ones) do not write the bare Avro
+    record. They put a 5-byte header in front:
+
+    | Bytes | Meaning |
+    |-------|---------|
+    | 1 | magic byte, `0` |
+    | 2 to 5 | the schema id in the registry, a 4-byte big-endian integer |
+    | 6 onward | the Avro record |
+
+    The first message in `data/messy/binary/orders_topic.jsonl`:
+
+    ```
+    00 | 00 00 00 01 | 0C 4F 2D 32 30 30 31 0A EC 51 B8 1E 85 FB 59 40 80 E0 D1 E7 9E 68
+    magic  id 1        "O-2001"            user 5  amount 103.93 (8 bytes)  ts (long)
+    ```
+
+    **`from_avro` does not know about this header.** Give it the whole
+    value and it decodes the header as data: `00` is an empty string,
+    the next `00` is the long 0, and 8 bytes that straddle the header and
+    the record become a nonsense double. No error, in any mode; this is
+    the garbage row in the table two sections back. It is the most
+    common Avro bug in Spark jobs that read Kafka.
+
+    Split the header off with built-in functions (positions are 1-based
+    and `substring` works on `BINARY` too):
+
+    ```python
+    framed = raw.select("*",
+        (F.hex(F.substring("value", 1, 1)) == "00").alias("framed"),
+        F.conv(F.hex(F.substring("value", 2, 4)), 16, 10).cast("int").alias("schema_id"),
+        F.expr("substring(value, 6)").alias("payload"))
+    ```
+
+    `F.hex` turns the four id bytes into the text `00000001`, and `conv`
+    reads that as a base-16 number. Then decode `payload`, choosing the
+    writer schema by `schema_id`. Apache Spark 4.2 has no schema
+    registry client: the options of `from_avro` are the ones above, and
+    fetching schemas by id is up to you (download them once from the
+    registry's REST API, or keep them in files, as this lesson does).
+    Some vendor platforms add registry integration; that is not part of
+    Apache Spark.
+
+    Check `framed` too: a producer configured without the registry
+    writes bare records, and the "schema id" you read from them is
+    nonsense (one message in the sample topic gives `1328362041`).
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    `raw` has a BINARY column `value` holding Confluent-framed Avro
+    messages. Assign to `payloads` a DataFrame with one column,
+    `payload`, holding the Avro bytes without the 5-byte header.
+  CorrectAnswer: |
+    payloads = raw.select(F.expr("substring(value, 6)").alias("payload"))
+  Hint: "The record starts at byte 6 (substring positions are 1-based)."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## One Shape for Every Version
+
+    The sample orders topic has messages written with schema ids 1 and
+    2. Version 2 (`schemas/orders-value-2.avsc`) renamed `amount` to
+    `total` (with `"aliases": ["amount"]`), and added `currency`
+    (default `"CAD"`), `coupon` (nullable, default null) and `items`
+    (default `[]`). One expression decodes both into the version 2
+    shape:
+
+    ```python
+    opts = {"avroSchema": V2, "mode": "PERMISSIVE"}
+    o = (F.when(F.col("schema_id") == 1, from_avro("payload", V1, opts))
+          .when(F.col("schema_id") == 2, from_avro("payload", V2, opts)))
+    ```
+
+    ```
+    +------+------+----------+--------+------+--------+------+---------------------------+
+    |offset|key   |schema_id |order_id|total |currency|coupon|items                      |
+    +------+------+----------+--------+------+--------+------+---------------------------+
+    |0     |O-2001|1         |O-2001  |103.93|CAD     |NULL  |[]                         |
+    |5     |O-2003|NULL      |NULL    |NULL  |NULL    |NULL  |NULL                       |
+    |13    |O-2013|2         |O-2013  |95.63 |CAD     |FALL10|[{P3, 3}, {P1, 1}, {P2, 2}]|
+    |17    |O-2900|7         |NULL    |NULL  |NULL    |NULL  |NULL                       |
+    |26    |O-2960|1328362041|NULL    |NULL  |NULL    |NULL  |NULL                       |
+    ...
+    ```
+
+    Both `from_avro` calls return the same type because the output
+    follows `avroSchema`, so `when` accepts them. A version 1 message
+    shows its `amount` under `total` and gets the defaults. Offset 5 is a
+    **tombstone** (a NULL value, which in a compacted Kafka topic means
+    "delete this key"), offset 17 uses a schema id that was never
+    registered, and offset 26 has no header. The `timestamp-millis`
+    field `ts` arrives as a Spark `TIMESTAMP`.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Protobuf: Schemas Are Descriptors
+
+    A Protobuf schema is a `.proto` file. `data/messy/binary/schemas/payments.proto`:
+
+    ```protobuf
+    syntax = "proto3";
+    package shop;
+
+    enum Method { METHOD_UNSPECIFIED = 0; CARD = 1; CASH = 2; GIFT_CARD = 3; }
+
+    message Payment {
+      string payment_id = 1;
+      string order_id = 2;
+      int64 amount_cents = 3;
+      Method method = 4;
+      repeated string flags = 5;
+      optional string note = 6;
+    }
+    ```
+
+    Spark does not read `.proto` text. It needs the compiled form, a
+    **descriptor set** (a `FileDescriptorSet`, itself a Protobuf
+    message). `protoc` makes one:
+
+    ```bash
+    protoc --include_imports --descriptor_set_out=payments.desc payments.proto
+    ```
+
+    (`--include_imports` matters as soon as your `.proto` imports
+    another, such as `google/protobuf/timestamp.proto`.) The sample data
+    ships that file as `schemas/payments.desc`. There are three ways to
+    hand a schema to `from_protobuf`:
+
+    ```python
+    from_protobuf("payload", "shop.Payment", "data/messy/binary/schemas/payments.desc")
+    from_protobuf("payload", "shop.Payment", binaryDescriptorSet=desc_bytes)   # 3.5
+    from_protobuf("payload", "com.example.protos.Payment")   # a compiled Java class
+    ```
+
+    - **A descriptor file path.** In PySpark the file is read by your
+      Python driver process (`open(path, "rb")`), so it must be a local
+      path on the driver, not an `s3://` URL.
+    - **The bytes**, if you fetch the descriptor from a registry or
+      build it in code.
+    - **A Java class** from a jar on the classpath, compiled with
+      Protobuf shaded to `org.sparkproject.spark_protobuf.protobuf.*`
+      (the docstring points to a helper project for that). Rarely worth
+      it from Python.
+
+    The message name can be the full name (`shop.Payment`) or, when it
+    is unique, the short one (`Payment`). A name that is not in the
+    descriptor fails at analysis:
+    `[PROTOBUF_MESSAGE_NOT_FOUND] Unable to locate Message shop.Pay in
+    Descriptor.`
+
+    Without `protoc`, build the descriptor set in Python with the
+    `protobuf` package (installed with `pyspark[connect]`):
+
+    ```python
+    from google.protobuf import descriptor_pb2
+    FD = descriptor_pb2.FieldDescriptorProto
+
+    fds = descriptor_pb2.FileDescriptorSet()
+    f = fds.file.add(name="payments.proto", package="shop", syntax="proto3")
+    m = f.message_type.add(name="Payment")
+    m.field.add(name="payment_id", number=1, type=FD.TYPE_STRING, label=FD.LABEL_OPTIONAL)
+    m.field.add(name="amount_cents", number=3, type=FD.TYPE_INT64, label=FD.LABEL_OPTIONAL)
+    # ... one line per field; an enum is f.enum_type.add(...)
+    desc_bytes = fds.SerializeToString()
+    ```
+
+    That is handy for tests, as long as it matches what the producers
+    compiled; in production, take the producers' descriptor.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Protobuf on the Wire
+
+    A Protobuf message is a list of `(field number, wire type, value)`
+    entries. The key byte is `field_number << 3 | wire_type`, where wire
+    type 0 is a varint and 2 is length-delimited (strings, bytes, nested
+    messages, packed lists). Payment `P-2`, with `amount_cents = 0` and
+    `method = CASH`, encodes as:
+
+    ```
+    0A 03 50 2D 32   field 1 (payment_id), length 3, "P-2"
+    12 03 4F 2D 32   field 2 (order_id), length 3, "O-2"
+    20 02            field 4 (method), varint 2 = CASH
+    ```
+
+    Field 3 is not there at all. In **proto3**, a singular field that
+    holds its default value (0, `""`, `false`, the enum value numbered 0)
+    is **not written**, so a reader cannot tell "zero" from "not set".
+    That is the whole story behind a gotcha that surprises everyone.
+
+    Because fields are identified by number, Protobuf evolution has its
+    own rules: renaming a field is free (names are not on the wire),
+    adding a field is safe, and reusing or retyping a number is not.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Why a 0 Comes Back as NULL
+
+    Decode three payments with the defaults, then with
+    `emit.default.values`:
+
+    ```python
+    from_protobuf("value", "shop.Payment", binaryDescriptorSet=desc)
+    ```
+
+    ```
+    +----------+--------+------------+------+-------------+------+
+    |payment_id|order_id|amount_cents|method|        flags|  note|
+    +----------+--------+------------+------+-------------+------+
+    |       P-1|     O-1|        1250|  CARD|[fraud_check]|thanks|
+    |       P-2|     O-2|        NULL|  CASH|           []|  NULL|
+    |       P-3|    NULL|         500|  NULL|           []|      |
+    +----------+--------+------------+------+-------------+------+
+    ```
+
+    ```python
+    from_protobuf("value", "shop.Payment", options={"emit.default.values": "true"},
+                  binaryDescriptorSet=desc)
+    ```
+
+    ```
+    +----------+--------+------------+------------------+-------------+------+
+    |payment_id|order_id|amount_cents|            method|        flags|  note|
+    +----------+--------+------------+------------------+-------------+------+
+    |       P-1|     O-1|        1250|              CARD|[fraud_check]|thanks|
+    |       P-2|     O-2|           0|              CASH|           []|  NULL|
+    |       P-3|        |         500|METHOD_UNSPECIFIED|           []|      |
+    +----------+--------+------------+------------------+-------------+------+
+    ```
+
+    Row by row:
+
+    - **`amount_cents` 0 (P-2) and `order_id` `""` (P-3)** were not on
+      the wire, so by default Spark returns NULL. With
+      `emit.default.values` they come back as `0` and `""`.
+    - **`method` `METHOD_UNSPECIFIED` (P-3)** is the zero enum value:
+      NULL by default, the name with the option. That is why well-made
+      proto3 enums start with an `..._UNSPECIFIED = 0` value: it lets
+      "the producer did not say" be told apart from a real choice. Map
+      it to NULL yourself after decoding (`F.nullif`).
+    - **`note` is declared `optional`**, so presence is tracked: P-3's
+      `""` comes back as `""` and P-2's unset note stays NULL, with or
+      without the option.
+    - **`flags` is `repeated`**: an empty list is `[]`, never NULL.
+
+    Which is right? If NULL must mean "unknown", the default is right
+    for `optional` fields only. For plain proto3 fields, the wire format
+    cannot say "unknown", so `emit.default.values` gives you the
+    producer's actual value (a free order is 0 cents, not an unknown
+    amount). Decide per topic, and write the decision down.
+
+- Class: mult_question
+  Depth: all
+  Output: "A proto3 message has `int64 amount_cents = 3;`. A producer sends amount_cents = 0. What does from_protobuf return for it with default options?"
+  AnswerChoices: "NULL, because proto3 does not write fields that hold their default value;0;An error, because the field is missing;-1"
+  CorrectAnswer: "NULL, because proto3 does not write fields that hold their default value"
+  Hint: "Look for field 3 in the bytes of payment P-2."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## How Protobuf Types Map to Spark
+
+    A message with a nested message, a timestamp, a map, a `oneof` and
+    an `Any`, decoded with default options:
+
+    | Protobuf | Spark |
+    |----------|-------|
+    | `string`, `bytes`, `bool` | `string`, `binary`, `boolean` |
+    | `int32`, `int64` | `integer`, `bigint` |
+    | `uint64` | `bigint`: 2^64 - 1 reads as `-1` |
+    | `enum` | `string` (the value's name) |
+    | a nested message | `struct` |
+    | `repeated` | `array` (never NULL, `[]` when empty) |
+    | `map<string, string>` | `map<string,string>` |
+    | `google.protobuf.Timestamp` | `timestamp` |
+    | `google.protobuf.Int32Value` (a wrapper type) | `struct<value: int>` |
+    | `oneof payload { int32 click_x = 5; string search_q = 6; }` | two columns, `click_x` and `search_q`; at most one is set |
+    | `google.protobuf.Any` | `struct<type_url: string, value: binary>` |
+
+    The options that change this, all read in the 4.2.0
+    `ProtobufOptions` source and checked here:
+
+    | Option | Effect |
+    |--------|--------|
+    | `emit.default.values` | zero values instead of NULL (above) |
+    | `enums.as.ints` | `method` becomes an `integer` (`1` for CARD) |
+    | `upcast.unsigned.ints` | `uint32` as `bigint`, `uint64` as `decimal(20,0)` (2^64 - 1 reads correctly) |
+    | `unwrap.primitive.wrapper.types` | `Int32Value` as a plain `int` (an `Int32Value(0)` still reads NULL unless `emit.default.values` is also set) |
+    | `convert.any.fields.to.json` | an `Any` as a JSON string, for example `{"@type":"type.googleapis.com/demo.Item","sku":"P9","qty":1}`, if its type is in the descriptor set |
+    | `recursive.fields.max.depth` | how deep to unroll a recursive message |
+    | `retain.empty.message.types` | keep empty messages as a struct with a dummy field instead of dropping them |
+    | `mode` | `FAILFAST` (default) or `PERMISSIVE` |
+
+    A recursive message (`message Node { string name = 1; Node child =
+    2; }`) cannot become a Spark type by default:
+    `[RECURSIVE_PROTOBUF_SCHEMA] Found recursive reference in Protobuf
+    schema, which can not be processed by Spark by default:
+    demo.Node.child. try setting the option `recursive.fields.max.depth`
+    1 to 10.` With depth `1` the recursive field is dropped
+    (`struct<name:string>`); `2` keeps one level
+    (`struct<name:string,child:struct<name:string>>`), and so on. Deeper
+    data is cut off at that depth.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Protobuf Evolution and Bad Messages
+
+    The evolution cases, run on 4.2.0:
+
+    | Writer and reader | Result |
+    |-------------------|--------|
+    | newer writer added field 7, older reader | field 7 silently ignored |
+    | older writer, newer reader with field 7 | field 7 is NULL |
+    | writer changed field 1 from `string` to `int64` | `PROTOBUF_FIELD_TYPE_MISMATCH` |
+    | truncated bytes | `MALFORMED_PROTOBUF_MESSAGE` |
+    | empty bytes (`b""`) | a valid message with every field unset |
+
+    In **FAILFAST** (the default) any failure stops the job:
+
+    ```
+    [MALFORMED_PROTOBUF_MESSAGE] Malformed Protobuf messages are detected
+    in message deserialization. Parse Mode: FAILFAST. To process
+    malformed protobuf message as null result, try setting the option
+    'mode' as 'PERMISSIVE'.
+    ```
+
+    with the reason in the cause: `InvalidProtocolBufferException: While
+    parsing a protocol message, the input ended unexpectedly in the
+    middle of a field` for truncated bytes, or `[PROTOBUF_FIELD_TYPE_MISMATCH]
+    Type mismatch encountered for field: ...` for a retyped field.
+
+    In **PERMISSIVE** mode a bad message gives **NULL**. Note the
+    difference: `from_protobuf` returns NULL, `from_avro` returns a
+    struct of NULLs. Code that handles both must test both ways, which
+    is what the exercise's `classify` does.
+
+    A 4.2.0 quirk worth knowing: the field named in
+    `PROTOBUF_FIELD_TYPE_MISMATCH` is looked up by using the field
+    *number* as a list *position*. When field 1 (`sku`) of a message
+    `Item {sku = 1; qty = 2; note = 3}` was retyped, the error named
+    `demo.Item.qty`; and when the retyped number is not smaller than the
+    number of fields, the cause is an `ArrayIndexOutOfBoundsException`
+    instead. Compare the writer's and reader's descriptors rather than
+    trusting the name.
+
+    Encoding has its own checks, at analysis time:
+
+    - a struct field that is not in the message:
+      `[UNABLE_TO_CONVERT_TO_PROTOBUF_MESSAGE_TYPE] Unable to convert SQL
+      type "STRUCT<...>" to Protobuf type Payment` (also for a field of
+      the wrong type);
+    - an enum string that is not a value:
+      `[CANNOT_CONVERT_SQL_VALUE_TO_PROTOBUF_ENUM_TYPE] Cannot convert SQL
+      `method` to Protobuf field 'method' because BITCOIN is not in
+      defined values for enum`;
+    - fields of the message that the struct lacks are simply not
+      written.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "With mode PERMISSIVE, what do from_avro and from_protobuf return for bytes they cannot decode?"
+  AnswerChoices: "from_avro returns a struct of NULLs and from_protobuf returns NULL;Both return NULL;Both return a struct of NULLs;Both drop the row"
+  CorrectAnswer: "from_avro returns a struct of NULLs and from_protobuf returns NULL"
+  Hint: "The lesson showed both outputs. Only one of them makes `IS NULL` work."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Confluent Framing for Protobuf
+
+    The Confluent wire format for Protobuf adds one more piece after the
+    5-byte header: the **message indexes**, which say which message in
+    the schema file this is (a schema can define several, and nested
+    ones). Confluent's documentation describes them as an array of
+    zigzag varints, length first, with the common case "the first
+    message in the file" shortened to a single `0` byte. A payment from
+    the sample topic:
+
+    ```
+    00 | 00 00 00 03 | 00 | 0A 08 50 41 59 2D 39 30 30 34 12 06 4F 2D 32 30 30 34 20 03
+    magic  id 3      index   "PAY-9004"                    "O-2004"            GIFT_CARD
+    ```
+
+    So the Protobuf payload starts at byte 7 here. Every message in the
+    sample topic uses the first message type, so the index is always
+    the single `0` byte; a topic whose producers use other message types
+    needs a small parser for the index list (check the first byte: `0`
+    means one byte, anything else is a length). Note that this payment
+    has no field 3: it was paid 0 cents.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Choosing a Format, and Where Each Bites
+
+    | Situation | Reach for | Watch out for |
+    |-----------|-----------|---------------|
+    | files in a lake that other engines read | Avro or Parquet | Avro is row-oriented: whole records are read even if you need one column; Parquet suits analytics better |
+    | a Kafka topic with a schema registry | Avro or Protobuf, whatever the producers use | the 5-byte header, unknown schema ids |
+    | service-to-service events from typed code | Protobuf | proto3 zero values, enum zero values |
+    | data whose shape you do not control at all | land it as VARIANT (next to the raw bytes) | Avro cannot store VARIANT; `to_json` it |
+
+    In every case, keep the raw bytes (or a pointer to them) alongside
+    what you decoded. When a schema problem is found later, you can
+    decode again; if you only kept the decoded columns, the wrong answers
+    are permanent.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Window Functions in One Page
+
+    The exercise asks for "the latest message per key", a job that comes
+    up again and again with messy data (the newest version of a record,
+    the closest store per delivery, the top results per query). A
+    **window function** computes a value for each row from the other
+    rows in its group, without collapsing the group the way `groupBy`
+    does. `row_number()` numbers the rows of each group in a chosen
+    order, so "latest per key" is "row number 1, newest first":
+
+    ```python
+    from pyspark.sql import Window
+
+    msgs = spark.createDataFrame(
+        [("O-1", 10, "10:00", "placed"), ("O-1", 14, "10:05", "paid"),
+         ("O-2", 11, "10:01", "placed"), ("O-2", 12, "10:03", "cancelled"),
+         ("O-2", 13, "10:03", "refunded")],
+        "key string, offset long, ts string, status string")
+
+    latest = Window.partitionBy("key").orderBy(F.col("offset").desc())
+    (msgs.withColumn("rn", F.row_number().over(latest))
+         .filter(F.col("rn") == 1)
+         .drop("rn")
+         .orderBy("key")
+         .show())
+    ```
+
+    ```
+    +---+------+-----+--------+
+    |key|offset|   ts|  status|
+    +---+------+-----+--------+
+    |O-1|    14|10:05|    paid|
+    |O-2|    13|10:03|refunded|
+    +---+------+-----+--------+
+    ```
+
+    `partitionBy` says which rows belong together (one group per key),
+    and `orderBy` says how to number them inside each group.
+
+    **Ties.** Order `O-2` by `ts` instead and two messages share `10:03`.
+    `row_number()` still gives exactly one row the number 1, but which
+    of the tied rows gets it is not defined and can change from run to
+    run. (`rank()` gives both tied rows 1, so filtering on it would keep
+    two rows.) Make the order deterministic by adding a **tie-breaker**,
+    a column that is unique within the group, as the last sort key:
+
+    ```python
+    by_ts = Window.partitionBy("key").orderBy(F.col("ts").desc(), F.col("offset").desc())
+    ```
+
+    With it, `O-2` always resolves to offset 13, `refunded`.
+
+    **The same in SQL.** A window function cannot go in `WHERE`
+    (`WINDOW_FUNCTION_NOT_ALLOWED_IN_CLAUSE`), because `WHERE` runs
+    before windows are computed, so the classic form numbers the rows in
+    a subquery and filters outside it:
+
+    ```sql
+    SELECT key, offset, ts, status FROM (
+      SELECT *, row_number() OVER (PARTITION BY key ORDER BY ts DESC, offset DESC) AS rn
+      FROM msgs)
+    WHERE rn = 1
+    ```
+
+    Spark 4.2 adds `QUALIFY`, a filter that runs after window functions,
+    so the subquery goes away:
+
+    ```sql
+    SELECT key, offset, ts, status FROM msgs
+    QUALIFY row_number() OVER (PARTITION BY key ORDER BY ts DESC, offset DESC) = 1
+    ```
+
+    Both return the same two rows as the DataFrame version.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Two Topics, One Typed Table
+
+    `data/messy/binary/` has dumps of an Avro `orders` topic and a
+    Protobuf `payments` topic, both in the Confluent wire format, with
+    the schemas in `schemas/`. Build the clean table and a dead-letter
+    table. The first line of the starter, `# spark-connectors: avro,
+    protobuf`, loads both modules.
+
+    1. `read_topic(spark, path)`: read a dump with `TOPIC_SCHEMA` and
+       turn `value` from base64 into BINARY (`F.unbase64`).
+    2. `split_confluent(df, message_indexes=False)`: add `framed`,
+       `schema_id` and `payload` (skip the message-index byte too when
+       `message_indexes` is true).
+    3. `decode_orders(framed, schemas)`: `schemas` maps id to writer
+       schema; decode every message into a column `o` with the newest
+       schema's shape, in PERMISSIVE mode.
+    4. `classify(decoded, record, known_ids)`: add `problem`:
+       `tombstone`, `no confluent header`, `unknown schema id`,
+       `corrupt`, or NULL.
+    5. `current_orders(classified)`: the latest message per key by
+       offset, deleting keys whose latest message is a tombstone (a
+       window function, as in "Window Functions in One Page" above).
+    6. `decode_payments(framed, desc_path)`: `from_protobuf` with the
+       descriptor file, PERMISSIVE, and `emit.default.values`.
+    7. `order_table(orders, payments)`: one row per current order with
+       `paid_cents`, `method` (NULL for `METHOD_UNSPECIFIED`) and `paid`.
+    8. `dead_letters(...)`: every unusable message from both topics with
+       its topic, offset, key, problem and raw bytes.
+
+    The harness decodes both topics with a small pure-Python Avro and
+    Protobuf decoder (it reads the same bytes this lesson walked
+    through) and checks: the header fields, version 1 messages read in
+    the version 2 shape (alias and defaults), every problem at its
+    offset, the tombstoned key gone, totals, currencies, item counts and
+    timestamps per order, the 0-cent payment read as 0, the method
+    mapping, and the exact set of dead letters.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Header: (F.hex(F.substring('value', 1, 1)) == '00'), F.conv(F.hex(F.substring('value', 2, 4)), 16, 10).cast('int'), F.expr('substring(value, 6)'). Orders: opts = {'avroSchema': schemas[max(schemas)], 'mode': 'PERMISSIVE'} and F.when(F.col('schema_id') == 1, from_avro('payload', schemas[1], opts)).when(... == 2, ...). Corrupt: F.col(f'{record}.order_id').isNull(). Current: row_number over Window.partitionBy('key').orderBy(F.col('offset').desc()). Payments: from_protobuf('payload', 'shop.Payment', desc_path, {'mode': 'PERMISSIVE', 'emit.default.values': 'true'})."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    In this lesson you learned:
+
+    - **The modules**: `spark-avro` and `spark-protobuf` are separate
+      jars (`--packages org.apache.spark:spark-avro_2.13:4.2.0`, or
+      `# spark-connectors: avro, protobuf` in SparkTutor); without them
+      you get "Failed to find data source: avro" or
+      `AVRO_NOT_LOADED_SQL_FUNCTIONS_UNUSABLE` /
+      `PROTOBUF_NOT_LOADED_SQL_FUNCTIONS_UNUSABLE`.
+    - **Avro files** carry their schema in the header (`Obj\x01`),
+      compress per block (`snappy` by default), turn nullable columns
+      into unions, and cannot hold VARIANT.
+    - **Avro evolution** resolves writer and reader schemas by name:
+      defaults fill added fields, aliases handle renames, a new field
+      without a default or a narrowing type fails. A folder of mixed
+      versions is read with **one file's schema** unless you pass
+      `avroSchema`.
+    - **Avro bytes** (`from_avro`/`to_avro`) have no schema: a wrong
+      schema can fail, or silently succeed with wrong data. Pass the
+      writer schema as the argument and the reader schema as
+      `avroSchema`. FAILFAST is the default; PERMISSIVE gives a struct
+      of NULLs.
+    - **The Confluent wire format** puts a 0 byte and a 4-byte schema id
+      in front (plus message indexes for Protobuf). `from_avro` does not
+      strip it and decodes it as garbage; strip it with `substring`.
+    - **Protobuf** needs a descriptor set (`protoc --include_imports
+      --descriptor_set_out`, or `descriptor_pb2`), identifies fields by
+      number, ignores unknown fields, and in proto3 does not write zero
+      values: they read as NULL unless `emit.default.values` is set.
+      PERMISSIVE gives NULL, and `MALFORMED_PROTOBUF_MESSAGE` is the
+      FAILFAST error.
+    - **Keep the raw bytes** and a dead-letter table: decoding problems
+      are found later, and you will want to decode again.
+
+    Next: **Documents to Rows**, where the input is whole documents
+    (e-mails, PDFs, Markdown) and the job is to turn each one into rows.

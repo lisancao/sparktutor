@@ -1,0 +1,419 @@
+- Class: meta
+  Lesson: Types, Arrow and Performance
+  EstimatedMinutes: 40
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    Every reader so far yielded Python tuples, one per row. That is the
+    easiest way to write a data source and often fast enough. When it is
+    not, the fix is to hand Spark **Arrow record batches**: columns of
+    typed values, thousands of rows at a time.
+
+    Arrow is also where most of the confusing errors come from, because
+    Arrow types are stricter than Python's. Spark 4.2 made the check
+    stricter still.
+
+    By the end of this lesson you will be able to:
+
+    - Explain what Spark does with the tuples your reader yields
+    - Predict which Python values convert to which Spark types, including
+      the ones that convert **silently and wrongly**
+    - Yield `pyarrow.RecordBatch` objects with exactly the right schema
+    - Read `DATA_SOURCE_RETURN_SCHEMA_MISMATCH`,
+      `DATA_SOURCE_INVALID_RETURN_TYPE` and the bare `ArrowInvalid` and
+      `AssertionError` failures
+    - Conform Arrow data from another library to your declared schema
+    - Measure the difference, and know when it matters
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What Happens to Your Tuples
+
+    A Python data source's `read()` runs in a Python worker, but Spark
+    itself runs in the JVM. Rows have to cross from one to the other, and
+    in Spark 4.2 they always cross as Arrow. When you yield tuples,
+    PySpark does the conversion for you (`records_to_arrow_batches` in
+    `pyspark/sql/worker/plan_data_source_read.py`):
+
+    1. Collect up to `spark.sql.execution.arrow.maxRecordsPerBatch`
+       (default 10000) rows.
+    2. For each row, check it is a tuple, list or `Row` with the right
+       number of fields, and run a small converter per column (timestamps
+       to UTC, decimals rescaled, dicts and `Row`s into structs).
+    3. Build one Arrow array per column with `pyarrow` and send the batch.
+
+    Step 2 is a Python function call per value, which is where the time
+    goes. If `read()` yields `pyarrow.RecordBatch` objects instead,
+    PySpark skips all three steps and sends your batches as they are
+    (Arrow batch reads arrived in 4.0, SPARK-48493).
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Imagine shipping a library to another city. Tuples are like handing
+    the movers one book at a time: they check the title, wrap it, and put
+    it in a box. Arrow batches are like handing them boxes you already
+    packed and labeled. The second way is much faster, but if your label
+    says "novels" and the box holds atlases, the movers refuse the box.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Which Python Values Fit Which Spark Types
+
+    With tuples, the declared schema decides the Arrow type of each
+    column, and `pyarrow` converts your Python value to it. Measured on
+    4.2.0 with a one-column source:
+
+    | Declared | You yield | Result |
+    |---|---|---|
+    | `int` | `7` | 7 |
+    | `int` | `None` | NULL |
+    | `int` | `1.5` | **1, silently truncated** |
+    | `int` | `True` | fails: `ArrowTypeError: Expected integer, got bool` |
+    | `int` | `"7"` | fails: `ArrowInvalid: Could not convert '7' with type str: tried to convert to int32` |
+    | `int` | `2**40` | fails: `ArrowInvalid: Value 1099511627776 too large to fit in C integer type` |
+    | `double` | `2` | 2.0 |
+    | `decimal(5,2)` | `Decimal("1.25")` | 1.25 |
+    | `decimal(5,2)` | `1.25` (a float) | fails: bare `AssertionError` |
+    | `date` | `"2026-10-01"` | fails: `ArrowTypeError` |
+    | `timestamp` | `"2026-10-01 10:00:00"` | fails: bare `AssertionError` |
+    | `binary` | `b"\x00\x01"` | the bytes |
+    | `binary` | `"ab"` | fails: bare `AssertionError` |
+    | `array<int>` | `[1, 2]` | the array |
+    | `map<string,int>` | `{"k": 1}` | the map |
+    | `struct<a:int,b:string>` | `(1, "x")` or `{"a": 1, "b": "x"}` | the struct |
+    | `variant` | `VariantVal.parseJson(...)` | the value (a dict fails with `MALFORMED_VARIANT`) |
+
+    The failures all surface as `PYTHON_EXCEPTION` from the task, with the
+    Python error at the bottom of the traceback. Three takeaways from the
+    table:
+
+    - **Parse strings yourself.** Dates, timestamps, numbers and decimals
+      must arrive as `datetime.date`, `datetime.datetime`, `int`/`float`
+      and `decimal.Decimal`.
+    - **The bare `AssertionError`** (no message at all) means a converter
+      got the wrong Python type for a decimal, timestamp or binary column.
+      Look at that column first.
+    - **A float in an int column loses data without an error.** Convert
+      explicitly (`int(round(x))`) or declare the column `double`.
+
+- Class: mult_question
+  Depth: all
+  Output: "Your schema says `qty int` and read() yields `(2.7,)` for a row. What does Spark return for that row?"
+  AnswerChoices: "2, truncated without an error;3, rounded;2.7, because Spark widens the column;An ArrowInvalid error"
+  CorrectAnswer: "2, truncated without an error"
+  Hint: "pyarrow converts a Python float to an integer array by dropping the fraction."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Time Zone Trap
+
+    A `timestamp` column (with local time zone semantics) stores an
+    instant. For each `datetime` you yield, the converter calls
+    `value.astimezone(timezone.utc)`. On a **naive** datetime (no
+    `tzinfo`), Python's `astimezone` assumes the **operating system's
+    local time zone of the Python worker**, not
+    `spark.sql.session.timeZone`. With the session time zone set to UTC,
+    yielding `datetime(2026, 10, 1, 10, 0)` and casting the result to a
+    string gives:
+
+    | Worker's `TZ` | Naive datetime | Aware (`tzinfo=timezone.utc`) |
+    |---|---|---|
+    | `UTC` | 2026-10-01 10:00:00 | 2026-10-01 10:00:00 |
+    | `America/Los_Angeles` | **2026-10-01 17:00:00** | 2026-10-01 10:00:00 |
+    | `Asia/Ho_Chi_Minh` | **2026-10-01 03:00:00** | 2026-10-01 10:00:00 |
+
+    The same code gives different data on a laptop and on a cluster whose
+    machines run in UTC. Two fixes:
+
+    - For instants, always yield **aware** datetimes
+      (`datetime(..., tzinfo=timezone.utc)`, or
+      `datetime.fromisoformat("2026-10-01T10:00:00+00:00")`).
+    - For wall-clock values with no zone (a local opening hour), declare
+      the column `timestamp_ntz` and yield naive datetimes. An aware
+      datetime in a `timestamp_ntz` column fails with the bare
+      `AssertionError`.
+
+    One more surprise when you check your work: `collect()` turns
+    `timestamp` values back into naive datetimes in the **driver's** local
+    time zone, so printing collected rows can look shifted even when the
+    stored instant is right. Compare `cast("string")` results (which use
+    the session time zone) instead.
+
+- Class: mult_question
+  Depth: all
+  Output: "The session time zone is UTC, the Python workers run with TZ=America/Los_Angeles, and read() yields the naive datetime 2026-10-01 10:00 for a timestamp column. What instant is stored?"
+  AnswerChoices: "2026-10-01 17:00 UTC;2026-10-01 10:00 UTC;2026-10-01 03:00 UTC;The read fails because the datetime is naive"
+  CorrectAnswer: "2026-10-01 17:00 UTC"
+  Hint: "The converter calls astimezone(utc), and Python reads a naive datetime as local time of the process."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Tuples, Lists and Rows
+
+    `read()` may yield tuples, lists, `pyspark.sql.Row` objects or Arrow
+    batches. Anything else (a dict, a scalar, a pandas DataFrame) fails:
+
+    - A dict or a scalar:
+      `[DATA_SOURCE_INVALID_RETURN_TYPE] Unsupported return type ('dict')
+      from Python data source 'probe'. Expected types: tuple, list,
+      pyspark.sql.types.Row, pyarrow.RecordBatch.`
+    - A tuple with the wrong number of fields:
+      `[DATA_SOURCE_RETURN_SCHEMA_MISMATCH] ... Expected: 2 columns,
+      Found: 1 columns.`
+    - A pandas DataFrame gives that same "columns" message with its
+      **row** count, because PySpark measures it with `len()`. If the
+      numbers in the message look like row counts, you yielded a
+      DataFrame.
+
+    Tuples are matched to columns **by position**. A `Row` with field
+    names is matched **by name**, so `Row(b="x", a=1)` fills `a` and `b`
+    correctly whatever the order, and a `Row` whose names differ from the
+    schema fails with `DATA_SOURCE_RETURN_SCHEMA_MISMATCH` listing both
+    sets of names. The price is speed: in the measurement below, `Row`
+    objects were about three times slower than tuples.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "read() yields `{\"id\": 1, \"name\": \"a\"}` for each row. What happens?"
+  AnswerChoices: "The task fails with DATA_SOURCE_INVALID_RETURN_TYPE;Spark matches the keys to column names;Spark treats the dict as one struct column;The dict keys become rows"
+  CorrectAnswer: "The task fails with DATA_SOURCE_INVALID_RETURN_TYPE"
+  Hint: "The supported row types are tuple, list, Row and pyarrow.RecordBatch."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Yielding Arrow Batches
+
+    To skip the per-row conversion, build the columns yourself:
+
+    ```python
+    import pyarrow as pa
+
+    SCHEMA = "id int, sensor string, value double, ts timestamp"
+    ARROW_SCHEMA = pa.schema([
+        ("id", pa.int32()),
+        ("sensor", pa.string()),
+        ("value", pa.float64()),
+        ("ts", pa.timestamp("us", tz="UTC")),
+    ])
+
+    def read_arrow(lo, hi, size):
+        for start in range(lo, hi, size):
+            ids = range(start, min(start + size, hi))
+            yield pa.RecordBatch.from_arrays([
+                pa.array(ids, pa.int32()),
+                pa.array([f"s{i % 10}" for i in ids], pa.string()),
+                pa.array([i * 0.5 for i in ids], pa.float64()),
+                pa.array([BASE + timedelta(seconds=i) for i in ids],
+                         pa.timestamp("us", tz="UTC")),
+            ], schema=ARROW_SCHEMA)
+    ```
+
+    The Spark to Arrow mapping you need most:
+
+    | Spark | Arrow |
+    |---|---|
+    | `tinyint`, `smallint`, `int`, `bigint` | `int8`, `int16`, `int32`, `int64` |
+    | `float`, `double` | `float32`, `float64` |
+    | `string` | `string` (not `large_string`) |
+    | `binary` | `binary` |
+    | `boolean` | `bool` |
+    | `date` | `date32` |
+    | `timestamp` | `timestamp("us", tz="UTC")` |
+    | `timestamp_ntz` | `timestamp("us")` |
+    | `decimal(p,s)` | `decimal128(p, s)` |
+
+    When in doubt, ask PySpark: `to_arrow_schema` in
+    `pyspark.sql.pandas.types` is the function the reader uses. With a
+    session running,
+    `to_arrow_schema(_parse_datatype_string(SCHEMA), timezone="UTC")`
+    (`_parse_datatype_string` is in `pyspark.sql.types`) prints the exact
+    schema to match. Both are internal helpers, so use them to check, not
+    in production code.
+
+    Batch size is yours to choose. Bigger batches mean fewer calls and
+    more memory per task; a few thousand to a few tens of thousands of
+    rows is a good range.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The 4.2 Type Check
+
+    Before 4.2, Spark checked only the number and names of the columns in
+    the first batch. A batch with an `int64` column where the schema said
+    `int` got through, and the job could then fail with a cryptic error
+    from Arrow's `VectorLoader` in the JVM. Spark 4.2 compares the first batch's whole
+    Arrow schema with the expected one (the PySpark 4.2 migration guide
+    lists the change):
+
+    ```text
+    [DATA_SOURCE_RETURN_SCHEMA_MISMATCH] Return schema mismatch in the
+    result from 'read' method. Expected: id: int32
+    label: string columns, Found: id: int64
+    label: string columns. Make sure the returned values match the
+    required output schema.
+    ```
+
+    The comparison is `pyarrow.Schema.equals`, which is strict about more
+    than types. Each of these fails with the same error even though the
+    values are fine:
+
+    - the right columns in a **different order**
+    - `large_string` instead of `string`
+    - a field marked **not nullable** (`pa.field("id", pa.int32(),
+      nullable=False)`)
+    - a **naive** `timestamp("us")` for a `timestamp` column
+
+    And one gap: only the **first** batch is checked. A later batch with a
+    different schema fails with the less helpful
+    `pyarrow.lib.ArrowInvalid: Tried to write record batch with different
+    schema`. Mixing styles fails too. A batch first and then tuples gives
+    `[UDF_RETURN_TYPE] Return type of the user-defined function should be
+    iterator of pyarrow.RecordBatch, but is iterator of tuple`; tuples
+    first and then a batch gives `DATA_SOURCE_RETURN_SCHEMA_MISMATCH`
+    with the batch's row count as its "column" count. Pick one style per
+    reader.
+
+- Class: mult_question
+  Depth: all
+  Output: "Your first RecordBatch has columns (sensor string, id int32) for the schema `id int, sensor string`. What happens on Spark 4.2?"
+  AnswerChoices: "It fails with DATA_SOURCE_RETURN_SCHEMA_MISMATCH, because the order differs;Spark reorders the columns by name;It works, because the names match;Spark casts sensor to int"
+  CorrectAnswer: "It fails with DATA_SOURCE_RETURN_SCHEMA_MISMATCH, because the order differs"
+  Hint: "The check is pyarrow.Schema.equals against the expected schema, field by field in order."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Conforming Someone Else's Arrow Data
+
+    Libraries that return Arrow (a database driver, a Parquet reader, a
+    vendor SDK) choose their own types: `int64` for every integer, naive
+    timestamps, columns in their own order. Do not rebuild the arrays by
+    hand; reorder by name and cast:
+
+    ```python
+    def conform(batch):
+        return batch.select(ARROW_SCHEMA.names).cast(ARROW_SCHEMA)
+    ```
+
+    `RecordBatch.select` and `RecordBatch.cast` exist in every pyarrow
+    that PySpark 4.2 accepts (its minimum is 18.0.0). The cast is
+    **safe** by default: an `int64` value that does not fit in `int32`
+    raises `ArrowInvalid: Integer value 1099511627776 not in range:
+    -2147483648 to 2147483647` instead of wrapping around. Casting a
+    naive `timestamp("us")` to `timestamp("us", tz="UTC")` reads the
+    naive values as UTC, which is usually what such libraries mean, but
+    check yours.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    `batch` is a `pyarrow.RecordBatch` with the right columns in the wrong
+    order and with `int64` where `ARROW_SCHEMA` says `int32`. Create
+    `fixed`: the same data with exactly `ARROW_SCHEMA`.
+  CorrectAnswer: |
+    fixed = batch.select(ARROW_SCHEMA.names).cast(ARROW_SCHEMA)
+  Hint: "Select the columns by name in the target order, then cast to the target schema."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## How Much Faster?
+
+    An indicative measurement on a 16-core machine (`local[4]`, 2 million
+    rows of `id bigint, sensor string, value double` over 4 partitions,
+    aggregated with `sum` and `count_distinct`, best of three runs):
+
+    | `read()` yields | Time |
+    |---|---|
+    | `Row` objects | 1.34 s |
+    | tuples | 0.42 s |
+    | Arrow batches built from Python lists | 0.22 s |
+    | Arrow batches built from NumPy arrays | 0.17 s |
+
+    Arrow halved the time, and it is the same Python work otherwise
+    (building the values). The rest of the gap closes when the values
+    never become Python objects at all: NumPy arithmetic, or batches that
+    come straight from a library. The exercise prints its own timings;
+    yours will differ.
+
+    When does it matter? If your reader spends its time waiting for the
+    network (the API source in "Reading from an API") or parsing files
+    with Python code, the conversion is a small share and tuples are
+    fine. If it produces many small rows quickly (a generator, a database
+    cursor, a columnar file), Arrow is worth it.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Details for Tuning
+
+    - `spark.sql.execution.arrow.maxRecordsPerBatch` (default 10000) sets
+      how many tuples PySpark packs into each batch. It does not change
+      the size of batches you yield yourself.
+    - The type check compares the first batch only, so a reader that
+      switches schemas half way (for example after a schema change in a
+      file) must conform every batch, as `conform` does.
+    - On Spark Connect the type rules do not change. The reader runs in
+      a Python worker on the server side, so pass absolute paths, as in
+      "Reading a Custom File Format, in Parallel".
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Three Ways to Yield Sensor Readings
+
+    The `sensors` source has a `mode` option. `reading(i)` builds one row
+    as a tuple and `vendor_batches` imitates a library with its own Arrow
+    types; both are written. Complete:
+
+    1. `ARROW_SCHEMA`: the Arrow schema for
+       `id int, sensor string, value double, ts timestamp`.
+    2. `read_tuples(lo, hi)`: yield `reading(i)` for each row.
+    3. `read_arrow(lo, hi, size)`: the same rows as batches of at most
+       `size` rows with exactly `ARROW_SCHEMA`.
+    4. `conform(batch)`: reorder and cast a vendor batch to
+       `ARROW_SCHEMA`.
+
+    The harness first tests your functions as plain Python (no Spark),
+    then checks that all three modes return identical counts, sums,
+    sensors and time ranges, that the source has 4 partitions, and that
+    unconformed vendor batches are rejected with
+    `DATA_SOURCE_RETURN_SCHEMA_MISMATCH`. It prints the time per mode.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "pa.array(values, type) builds one column; pa.RecordBatch.from_arrays([...], schema=ARROW_SCHEMA) builds the batch. For the timestamps use BASE + datetime.timedelta(seconds=i), which is already timezone-aware."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - Tuples you yield are converted to Arrow by PySpark, one value at a
+      time; `RecordBatch`es you yield are sent as they are (4.0,
+      SPARK-48493).
+    - The **declared schema** decides the conversion. Strings are never
+      parsed for you, a float in an int column is **silently truncated**,
+      and a bare `AssertionError` points at a decimal, timestamp or
+      binary column with the wrong Python type.
+    - Naive datetimes in a `timestamp` column are read in the **worker's
+      OS time zone**. Yield aware datetimes, or use `timestamp_ntz`.
+    - Tuples match by position, named `Row`s by name (and slowly);
+      dicts fail with `DATA_SOURCE_INVALID_RETURN_TYPE`.
+    - Spark 4.2 checks the first batch's whole Arrow schema
+      (`DATA_SOURCE_RETURN_SCHEMA_MISMATCH`): types, order, nullability,
+      `string` versus `large_string`, time zone.
+    - Conform foreign Arrow data with `batch.select(names).cast(schema)`.
+    - Arrow pays off when conversion, not I/O, is the bottleneck.
+
+    Next: **Filter Pushdown**, where your reader learns which rows the
+    query wants and skips files it does not need to open.

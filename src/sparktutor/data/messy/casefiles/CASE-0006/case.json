@@ -1,0 +1,27 @@
+{
+  "schema": 2,
+  "case_id": "CASE-0006",
+  "opened": "2026-03-12T11:20:00Z",
+  "status": "resolved",
+  "priority": "P3",
+  "tags": [
+    "billing"
+  ],
+  "meta": {
+    "customer": {
+      "id": "C044",
+      "tier": "gold"
+    },
+    "refund": {
+      "amount": "12.00",
+      "currency": "CAD"
+    }
+  },
+  "attachments": [
+    {
+      "name": "receipt.pdf",
+      "sha256": "1f7a23b2dadf420078bb896d0bcadf66f5c886e280836e60c7f0c9c5b33bcd3b",
+      "bytes": 472
+    }
+  ]
+}

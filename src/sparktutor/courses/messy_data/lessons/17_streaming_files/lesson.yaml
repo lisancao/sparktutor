@@ -1,0 +1,842 @@
+- Class: meta
+  Lesson: "Streaming Files: Your First Structured Streaming Job"
+  EstimatedMinutes: 55
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    "Plans, Partitions and Caching" ended with a trap: a DataFrame keeps
+    the file list it made at `load()`, so files that land later are
+    invisible to it. Messy data rarely arrives all at once. Exports land
+    in a folder every night, devices upload every minute, a partner
+    drops a file whenever they feel like it. You want each new file read
+    once, the results updated, and nothing read twice, even when your
+    job stops and starts again.
+
+    That is what **Structured Streaming** does. This lesson follows
+    chapter 8 of *Learning Spark* at the basics level, on a folder of
+    the drifting JSON events. By the end you will be able to:
+
+    - Explain the streaming model: an unbounded table, micro-batches,
+      triggers, output modes, sinks and checkpoints
+    - Stream the JSON files of a folder with an explicit schema, and say
+      why the schema is required
+    - Run a query that processes what is there and stops
+      (`trigger(availableNow=True)`), so jobs and tests finish
+    - Limit batch sizes with `maxFilesPerTrigger` and
+      `maxBytesPerTrigger`, and know in which order files are read
+    - Test with the memory sink and `foreachBatch`, and read
+      `lastProgress` and `recentProgress`
+    - Restart from a checkpoint and process only the new files, and
+      write output that stays correct when Spark replays a batch
+    - Count events in event-time windows with a watermark, and see late
+      data dropped
+
+    "Images and Audio" already streamed `binaryFile` uploads; this
+    lesson is the full picture behind that example. Drift, dead-letter
+    output and custom state come later, in the intermediate "Streaming
+    Messy Data: Drift, Dead Letters and State".
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Picture an inbox tray on a desk. A clerk checks it every so often,
+    takes out whatever arrived since the last check, processes those
+    papers, and writes in a notebook which ones they took. If the clerk
+    goes home and someone else takes over in the morning, the notebook
+    says exactly where to continue. The tray is the folder, each check
+    is a micro-batch, and the notebook is the checkpoint.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Model: A Table That Keeps Growing
+
+    Structured Streaming treats a source as a table that rows keep being
+    appended to. You write the query as if it were a normal DataFrame
+    query; Spark runs it again and again on the new rows only, and keeps
+    whatever it needs between runs (for example running counts).
+
+    | Piece | What it is | In this lesson |
+    |-------|------------|----------------|
+    | **Source** | where new rows come from | files landing in a folder |
+    | **Micro-batch** | one run of the query over the rows that are new since the last run | one or more new files |
+    | **Trigger** | when the next micro-batch starts | `availableNow`: everything there now, then stop |
+    | **Sink** | where results go | `memory` (a table in the driver), `foreachBatch` (your function), files |
+    | **Output mode** | which result rows go to the sink after each batch | `append`, `update`, `complete` |
+    | **Checkpoint** | a folder where Spark records what it read and what it committed | one per query, kept forever |
+
+    The "Structured Streaming" lesson of the learning_spark course
+    covers Kafka, joins, Real-Time Mode and `transformWithState`. This
+    lesson stays with files and gets every detail of them right.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## A Stream Needs a Schema
+
+    `spark.readStream` works like `spark.read`, with one difference that
+    matters right away:
+
+    ```python
+    from pyspark.sql import SparkSession, functions as F
+
+    spark = (SparkSession.builder.master("local[4]")
+             .config("spark.sql.session.timeZone", "UTC")
+             .config("spark.sql.shuffle.partitions", "4")
+             .getOrCreate())
+
+    spark.readStream.json(inbox)
+    ```
+
+    ```
+    IllegalArgumentException: Schema must be specified when creating a streaming
+    source DataFrame. If some files already exist in the directory, then depending
+    on the file format you may be able to create a static DataFrame on that
+    directory with 'spark.read.load(directory)' and infer schema from it.
+    ```
+
+    A batch read can look at every file to infer a schema. A stream
+    cannot: tomorrow's files do not exist yet, and the schema must stay
+    the same for the life of the query. So you give it one. For the
+    events, that is the drift-absorbing schema from "JSON Drift and
+    Quarantine":
+
+    ```python
+    EVENT_SCHEMA = """
+        event STRING, event_type STRING, user_id BIGINT,
+        user STRUCT<id: BIGINT, plan: STRING, geo: STRUCT<country: STRING>>,
+        amount STRING,
+        items ARRAY<STRUCT<sku: STRING, qty: INT>>,
+        ts TIMESTAMP,
+        _corrupt STRING
+    """
+    events = (spark.readStream
+              .schema(EVENT_SCHEMA)
+              .option("columnNameOfCorruptRecord", "_corrupt")
+              .json(inbox))
+    ```
+
+    You can switch inference on with
+    `spark.sql.streaming.schemaInference` set to `true`, but look at
+    what it does with only day 1 in the folder:
+
+    ```
+    inferred: struct<amount:double,event:string,ts:string,user_id:bigint>
+    ```
+
+    The schema is inferred once, at `readStream`, from the files that
+    happen to be there, and then fixed. Day 2's nested `user` and
+    `items` would be silently dropped, and `ts` stays a string. For
+    data that drifts, always write the schema.
+
+- Class: mult_question
+  Depth: all
+  Output: "Why does spark.readStream.json(folder) without .schema(...) fail by default?"
+  AnswerChoices: "A stream's schema must be fixed before files that do not exist yet arrive, so Spark will not guess it;JSON cannot be streamed;The folder is empty;Streaming only supports Parquet"
+  CorrectAnswer: "A stream's schema must be fixed before files that do not exist yet arrive, so Spark will not guess it"
+  Hint: "Inference reads the data. Which data would a stream infer from?"
+
+- Class: text
+  Depth: all
+  Output: |
+    ## A Streaming DataFrame Is a Plan, Not Data
+
+    `events.isStreaming` is `True`, and an action fails:
+
+    ```python
+    events.count()
+    ```
+
+    ```
+    AnalysisException: Queries with streaming sources must be executed with
+    writeStream.start(), or from a streaming table or flow definition within a
+    Spark Declarative Pipeline.;
+    ```
+
+    `count()`, `show()` and `collect()` ask for a final answer, and a
+    stream never has one. You can still `explain()` it; the source shows
+    up as a `StreamingRelation`:
+
+    ```
+    == Physical Plan ==
+    *(1) Filter (isnotnull(user_id#12L) AND (user_id#12L = 1))
+    +- StreamingRelation FileSource[/tmp/work/inbox], [event#10, event_type#11, user_id#12L, ...]
+    ```
+
+    Everything you know about DataFrames still applies to the query
+    itself: `filter`, `select`, `withColumn`, `coalesce` over drifting
+    names, `groupBy`. Only the start and the end change.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The First Query
+
+    Count parsed events per kind, over everything that ever arrived.
+    Day 1 is already in the inbox:
+
+    ```python
+    counts = (events.filter(F.col("_corrupt").isNull())
+              .groupBy(F.coalesce("event_type", "event").alias("kind"))
+              .count())
+
+    query = (counts.writeStream
+             .format("memory")
+             .queryName("event_counts")
+             .outputMode("complete")
+             .option("checkpointLocation", os.path.join(work, "checkpoints", "counts"))
+             .trigger(availableNow=True)
+             .start())
+    query.awaitTermination()
+
+    spark.table("event_counts").orderBy("kind").show()
+    ```
+
+    ```
+    +--------+-----+
+    |    kind|count|
+    +--------+-----+
+    |purchase|    9|
+    |    view|   11|
+    +--------+-----+
+    ```
+
+    Line by line:
+
+    - `writeStream` is the streaming `write`. `start()` launches the
+      query in the background and returns a `StreamingQuery`.
+    - `format("memory")` with `queryName("event_counts")` keeps the
+      output in a table in the driver, readable with
+      `spark.table("event_counts")`. It is for tests and small results
+      only.
+    - `outputMode("complete")` writes the whole result table after every
+      batch, which is what you want for running totals.
+    - `checkpointLocation` is where Spark records its progress. One
+      folder per query, never shared.
+    - `trigger(availableNow=True)` (3.3) processes everything available
+      when the query starts, in as many batches as the limits require,
+      then stops. Without it the query runs until you stop it.
+    - `awaitTermination()` blocks until the query has stopped.
+
+    `spark.sql.shuffle.partitions` set to `4` at the top matters more
+    here than in batch jobs: a streaming aggregation keeps its running
+    counts in a **state store** with one piece per shuffle partition.
+    With the default 200, this tiny query wrote 200 state folders and
+    its first batch took about three times as long on the machine used
+    to write this course (4.4 against 1.6 seconds). The number is
+    recorded in the
+    checkpoint on the first run and kept: changing the setting later has
+    no effect on that query.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Reading Progress
+
+    Every micro-batch produces a progress report. `query.lastProgress`
+    is the latest one, `query.recentProgress` a list of recent ones:
+
+    ```python
+    print(query.lastProgress.prettyJson)
+    ```
+
+    ```
+    {
+        "id": "d6f0e6a9-29da-47b9-ab17-5159a60ea2fc",
+        "runId": "fc3481a9-f071-44e2-a551-56d11ab8552a",
+        "name": "event_counts",
+        "timestamp": "2026-10-28T20:53:13.877Z",
+        "batchId": 0,
+        "batchDuration": 1584,
+        "numInputRows": 20,
+        "inputRowsPerSecond": 0.0,
+        "processedRowsPerSecond": 12.6,
+        "durationMs": {
+            "addBatch": 1246,
+            "commitOffsets": 59,
+            "getBatch": 22,
+            "latestOffset": 84,
+            "queryPlanning": 131,
+            "triggerExecution": 1582,
+            "walCommit": 27
+        },
+        "stateOperators": [
+            {
+                "operatorName": "stateStoreSave",
+                "numRowsTotal": 2,
+                "numRowsUpdated": 2,
+                ...
+                "numRowsDroppedByWatermark": 0,
+                "numShufflePartitions": 4,
+                "numStateStoreInstances": 4,
+                ...
+            }
+        ],
+        "sources": [
+            {
+                "description": "FileStreamSource[file:/tmp/work/inbox]",
+                "startOffset": null,
+                "endOffset": {
+                    "logOffset": 0
+                },
+                "numInputRows": 20,
+                ...
+            }
+        ],
+        "sink": {
+            "description": "MemorySink",
+            "numOutputRows": 2
+        }
+    }
+    ```
+
+    The fields you will use most:
+
+    - `id` stays the same across restarts (it lives in the checkpoint);
+      `runId` changes every time the query starts.
+    - `batchId` counts micro-batches from 0, across restarts.
+    - `numInputRows` is how many rows this batch read. Twenty: day 1.
+    - `durationMs` splits the batch time: `addBatch` is running your
+      query and writing to the sink; `walCommit` and `commitOffsets`
+      are the two checkpoint writes.
+    - `stateOperators[0].numRowsTotal` is the size of the running state:
+      2 groups.
+    - `sources[0].endOffset` is the file source's position: `logOffset`
+      0 means "the first batch of files I recorded".
+
+    Read fields as attributes (`p.numInputRows`, `p.batchId`). In Spark
+    Classic the progress object also behaves like a dict, but on Spark
+    Connect `p["numInputRows"]` returns `None` while `p.numInputRows`
+    returns 20 (checked on 4.2.0).
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    `query` has finished. Assign to `sizes` the list of `numInputRows`
+    of all its recent micro-batches, in order.
+  CorrectAnswer: |
+    sizes = [p.numInputRows for p in query.recentProgress]
+  Hint: "recentProgress is a list of progress objects; read numInputRows as an attribute so it works on Spark Connect too."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Restarting: Only the New Files
+
+    Day 2 lands. Run exactly the same code again, with the same
+    checkpoint folder:
+
+    ```python
+    deliver("events_2026-10-02.json", inbox)
+    query = run_counts()          # the code above, in a function
+    print([(p.batchId, p.numInputRows) for p in query.recentProgress])
+    print(sorted(map(tuple, spark.table("event_counts").collect())))
+    ```
+
+    ```
+    [(1, 20)]
+    [('purchase', 29), ('view', 11)]
+    ```
+
+    Batch 1 read only the 20 new rows, and the counts cover both days:
+    the running counts came back from the state store in the checkpoint.
+    That is the whole point of the checkpoint. Run it once more with
+    nothing new:
+
+    ```
+    [(2, 0)]
+    0
+    ```
+
+    No rows read, and one more surprise: `spark.table("event_counts")`
+    is now **empty**. The memory sink lives only for one run of the
+    query; this run produced no batch, so it wrote nothing. The counts
+    are safe in the checkpoint's state, and they come back with the next
+    batch that has data. The memory sink is a testing tool, not storage.
+
+    `deliver` copies a file into the inbox under a hidden name and then
+    renames it:
+
+    ```python
+    def deliver(name, inbox):
+        hidden = os.path.join(inbox, "." + name + ".tmp")
+        shutil.copy(os.path.join("data/messy/events", name), hidden)
+        os.rename(hidden, os.path.join(inbox, name))
+    ```
+
+    Spark's file listing skips hidden names such as this one (the exact
+    rule is in "Setup, a First Session and a Tour of the Sample Data"),
+    and a rename on the same file system is atomic. Without that, a slow copy can be picked up half written.
+    Producers that write into your inbox should do the same.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What Is in the Checkpoint
+
+    After those runs, the checkpoint folder holds (checksum `.crc` files
+    left out, and only one of the four state folders shown):
+
+    ```
+    . ['metadata']
+    commits ['0', '1']
+    offsets ['0', '1']
+    sources/0 ['0', '1']
+    state/0/0 ['1.delta', '2.delta']
+    ```
+
+    - `metadata`: the query `id`.
+    - `offsets/N`: written **before** batch N runs: which source
+      position it covers, plus the settings that must not change (the
+      shuffle partition count is in there):
+
+      ```
+      v1
+      {"batchWatermarkMs":0,"batchTimestampMs":1793220812989,"conf":{..."spark.sql.shuffle.partitions":"4",...}}
+      {"logOffset":1}
+      ```
+
+    - `sources/0/N`: the file source's own log of which files belong to
+      each batch:
+
+      ```
+      v1
+      {"path":"file:///tmp/work/inbox/events_2026-10-02.json","timestamp":1793220812910,"batchId":1}
+      ```
+
+    - `commits/N`: written **after** batch N finished writing to the
+      sink.
+    - `state/0/<partition>/`: the running counts, one versioned file per
+      batch.
+
+    On start, Spark compares the two logs. If the last offset has a
+    matching commit, it plans a new batch from the files that are not
+    in `sources/` yet. If not, the last batch did not finish, and Spark
+    runs it again with exactly the same files. The advanced "Streaming
+    Internals: Checkpoints, State and Real-Time Mode" opens every one of
+    these files properly.
+
+- Class: mult_question
+  Depth: all
+  Output: "A streaming query is restarted with the same checkpoint. offsets/ has 0, 1 and 2, commits/ has 0 and 1. What does Spark do first?"
+  AnswerChoices: "Run batch 2 again with the same files recorded for it;Skip batch 2 and plan batch 3;Start over from batch 0;Fail because the checkpoint is corrupt"
+  CorrectAnswer: "Run batch 2 again with the same files recorded for it"
+  Hint: "An offset without a commit means the batch started but did not finish."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## How Much per Batch, and in What Order
+
+    With all three days in a folder (modification times one hour apart,
+    day 1 oldest), the batch sizes for different options:
+
+    ```python
+    def stream(**opts):
+        reader = (spark.readStream.schema(EVENT_SCHEMA)
+                  .option("columnNameOfCorruptRecord", "_corrupt"))
+        for key, value in opts.items():
+            reader = reader.option(key, value)
+        return reader.json(box)
+
+    def sizes(name, **opts):
+        q = (stream(**opts).select("ts").writeStream.format("memory").queryName(name)
+             .option("checkpointLocation", os.path.join(work, "checkpoints", name))
+             .trigger(availableNow=True).start())
+        q.awaitTermination()
+        return [p.numInputRows for p in q.recentProgress]
+
+    print(sizes("l1", maxFilesPerTrigger=1))    # and so on, one checkpoint each
+    ```
+
+    ```
+    no limit                [61]
+    maxFilesPerTrigger 1    [20, 20, 21]
+    maxFilesPerTrigger 2    [40, 21]
+    maxBytesPerTrigger 1    [20, 20, 21]
+    2 + latestFirst         [41, 20]
+    ```
+
+    - `maxFilesPerTrigger` caps the files per batch. Use it so a backlog
+      (the first run over a folder with a year of files) becomes many
+      reasonable batches instead of one enormous one.
+    - `maxBytesPerTrigger` caps by size; a batch always takes at least
+      one file, so `1` means one file per batch. You cannot set both:
+      the query fails at start with `Options 'maxFilesPerTrigger' and
+      'maxBytesPerTrigger' can't be both set at the same time`.
+    - Files are taken **oldest modification time first**, not by name.
+      `latestFirst=True` reverses that (day 3 and day 2 first, then day
+      1), useful when fresh data matters more than old data.
+    - `maxFileAge` (default `7d`) lets the source forget very old
+      entries; it is measured from the newest file seen, and it is
+      ignored when `latestFirst` is combined with a per-batch limit.
+
+    Because a file is identified by its path:
+
+    - **A file that changes after it was read is not read again.**
+      Appending a line to day 1 and running again read nothing:
+      `numInputRows` 0. Files in an inbox must be complete when they
+      appear, and never edited.
+    - **Moving or renaming a file makes it new.** `fileNameOnly=true`
+      compares only the file name, for sources that move files between
+      folders.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## foreachBatch: Any Batch Code You Like
+
+    `foreachBatch` hands each micro-batch to your function as an
+    ordinary DataFrame, plus its batch id. Anything a batch DataFrame
+    can do, the function can do: write two tables, call `MERGE`, run
+    checks.
+
+    ```python
+    seen = []
+    def look(batch_df, batch_id):
+        files = sorted(r.file for r in batch_df.select("file").distinct().collect())
+        seen.append((batch_id, batch_df.isStreaming, files))
+
+    q = (stream(maxFilesPerTrigger=2)
+         .withColumn("file", F.col("_metadata.file_name"))
+         .writeStream.foreachBatch(look)
+         .option("checkpointLocation", os.path.join(work, "checkpoints", "look"))
+         .trigger(availableNow=True).start())
+    q.awaitTermination()
+    for s in seen: print(s)
+    ```
+
+    ```
+    (0, False, ['events_2026-10-01.json', 'events_2026-10-02.json'])
+    (1, False, ['events_2026-10-03.json'])
+    ```
+
+    `batch_df.isStreaming` is `False`: inside the function you are back
+    in batch land. Gotchas:
+
+    - **Select file metadata in the stream, not in the function.**
+      `batch_df.select("_metadata.file_name")` inside `look` fails with
+      `[UNRESOLVED_COLUMN.WITH_SUGGESTION] A column ... with name
+      _metadata.file_name cannot be resolved`: by then the batch is a
+      plain DataFrame (a `LogicalRDD` in its plan) with no file behind
+      it. Add `file` with `withColumn` before `writeStream`, as above.
+    - **Each action on `batch_df` runs the batch's query again.** If
+      the function writes `batch_df` to two places, call
+      `batch_df.persist()` first and `batch_df.unpersist()` at the end.
+    - **On Spark Connect the function runs on the server**, in its own
+      Python process. Appending to a Python list in your script, as
+      `look` does, leaves the list empty on Connect (checked on 4.2.0).
+      Write results somewhere instead: a table, a file.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## When a Batch Fails, and Why Writes Must Be Idempotent
+
+    A `foreachBatch` function that fails on its first call, the way a
+    full disk or a dropped connection would:
+
+    ```python
+    calls = []
+    def fragile(batch_df, batch_id):
+        calls.append((batch_id, batch_df.count()))
+        if len(calls) == 1:
+            raise ValueError(f"disk full while writing batch {batch_id}")
+    ```
+
+    The first run fails, and `awaitTermination()` raises:
+
+    ```
+    StreamingQueryException: [STREAM_FAILED] Query [id = ..., runId = ...] terminated
+    with exception: [FOREACH_BATCH_USER_FUNCTION_ERROR] An error occurred in the user
+    provided function in foreach batch sink. Reason: ... ValueError: disk full while
+    writing batch 0
+    ```
+
+    The checkpoint now has `offsets: ['0']` and `commits: []`. Start the
+    same query again and it runs batch 0 again, with the same 61 rows:
+
+    ```
+    calls: [(0, 61), (0, 61)]
+    ```
+
+    Your function saw batch 0 twice. If the first call had written half
+    its output before failing, a plain `append` would now hold that half
+    plus a full copy. Spark guarantees each batch is *processed* until it
+    succeeds; it is up to the sink to make a repeated batch harmless.
+    The usual ways, all keyed by `batch_id`:
+
+    - overwrite a location named after the batch
+      (`.../batch_id=7`), as the exercise does
+    - `MERGE` on a key, so a repeated row updates instead of duplicating
+      ("Landing Messy Data in Delta Lake")
+    - record the last `batch_id` written and skip ones already done
+
+    Spark's own file sink (`format("parquet")` and friends) already
+    does this with a `_spark_metadata` log next to the data, and it
+    refuses to start without a checkpoint:
+
+    ```
+    AnalysisException: checkpointLocation must be specified either through
+    option("checkpointLocation", ...) or SparkSession.conf.set("spark.sql.streaming.checkpointLocation", ...).
+    ```
+
+- Class: mult_question
+  Depth: all
+  Output: "Your foreachBatch function appends each batch to a Parquet folder with mode('append'). A batch fails halfway and the query restarts. What can happen?"
+  AnswerChoices: "The batch runs again and the half it wrote the first time is duplicated;Nothing, Spark undoes the partial write;The batch is skipped;The query refuses to restart"
+  CorrectAnswer: "The batch runs again and the half it wrote the first time is duplicated"
+  Hint: "Spark replays the uncommitted batch. Your function decides whether a replay is harmless."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Output Modes
+
+    | Mode | Writes after each batch | Allowed for |
+    |------|--------------------------|-------------|
+    | `append` (default) | only new rows that will never change | queries without aggregation; aggregations with a watermark |
+    | `update` | rows that changed in this batch | aggregations (and simple queries, where it means the same as append) |
+    | `complete` | the whole result table | aggregations only |
+
+    Spark checks the mode when the query starts:
+
+    ```
+    append   [STREAMING_OUTPUT_MODE.UNSUPPORTED_OPERATION] Invalid streaming output mode:
+             append. This output mode is not supported for streaming aggregations without
+             watermark on streaming DataFrames/DataSets. SQLSTATE: 42KDE
+    complete [STREAMING_OUTPUT_MODE.UNSUPPORTED_OPERATION] Invalid streaming output mode:
+             complete. This output mode is not supported for no streaming aggregations on
+             streaming DataFrames/DataSets. SQLSTATE: 42KDE
+    ```
+
+    Without a watermark Spark can never know a count is final, so
+    `append` is refused for aggregations; with nothing aggregated there
+    is no "whole result table" to repeat, so `complete` is refused.
+
+    The memory sink adds its own rule: it can only restart from a
+    checkpoint in `complete` mode. Restarting an `append`-mode memory
+    query fails with `AnalysisException: This query does not support
+    recovering from checkpoint location. Delete .../offsets to start
+    over.` (error class `_LEGACY_ERROR_TEMP_1299`).
+
+    The memory, console, `foreach`, `foreachBatch` and `noop` sinks may
+    run without any `checkpointLocation` (`SOURCES_ALLOW_ONE_TIME_QUERY`
+    in `DataStreamWriter.scala`). They get a temporary checkpoint that
+    is thrown away, so every run starts from scratch and reads the whole
+    folder again. Fine for a quick look, wrong for a job.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Triggers
+
+    | Trigger | Behaviour |
+    |---------|-----------|
+    | none | start the next micro-batch as soon as the last one ends, forever |
+    | `processingTime="2 seconds"` | start a batch every 2 seconds, forever |
+    | `availableNow=True` (3.3) | everything available at start, in batches that respect the limits, then stop |
+    | `once=True` | one batch with everything, then stop; deprecated since 3.4 in favour of `availableNow` |
+    | `realTime="5 seconds"` (PySpark 4.2) | Real-Time Mode, for Kafka; see the learning_spark course |
+
+    A query that runs forever needs stopping:
+
+    ```python
+    q = (stream().select("ts").writeStream.format("memory").queryName("ticking")
+         .option("checkpointLocation", os.path.join(work, "checkpoints", "ticking"))
+         .trigger(processingTime="2 seconds").start())
+    print(q.awaitTermination(5), q.isActive, q.status)
+    q.stop()
+    print(q.isActive, q.status)
+    ```
+
+    ```
+    False True {'message': 'Waiting for next trigger', 'isDataAvailable': False, 'isTriggerActive': False}
+    False {'message': 'Stopped', 'isDataAvailable': False, 'isTriggerActive': False}
+    ```
+
+    `awaitTermination(5)` waits at most 5 seconds and returns whether
+    the query ended. `spark.streams.active` lists every running query,
+    which is handy in a `finally:` block to stop them all.
+
+    For scheduled jobs (every hour, every night) `availableNow` gives
+    you streaming's bookkeeping (each file once, restart where you
+    stopped) with batch-job economics: nothing runs between schedules.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Event Time, Windows and Watermarks
+
+    So far the counts were over all time. Real questions are about time
+    periods: purchases per day, errors per minute. The events carry
+    their own timestamp `ts` (**event time**), which is not the time the
+    file arrived. Group by a window of event time, and give Spark a
+    **watermark**: how late an event may arrive and still be counted.
+
+    ```python
+    per_day = (stream(maxFilesPerTrigger=1)
+               .filter(F.col("_corrupt").isNull())
+               .withWatermark("ts", "1 hour")
+               .groupBy(F.window("ts", "1 day"))
+               .count())
+    ```
+
+    After each batch, the watermark is the latest `ts` seen minus one
+    hour. Read in order (day 1, day 2, day 3), in `append` mode:
+
+    ```
+    batch rows watermark                 dropped
+    0     20   1970-01-01T00:00:00.000Z  0
+    1     20   2026-10-01T09:19:00.000Z  0
+    2     21   2026-10-02T10:19:00.000Z  0
+    3     0    2026-10-03T11:19:00.000Z  0
+    +-------------------+-----+
+    |          day_start|count|
+    +-------------------+-----+
+    |2026-10-01 00:00:00|   20|
+    |2026-10-02 00:00:00|   20|
+    +-------------------+-----+
+    ```
+
+    - The watermark used by a batch comes from the batches before it, so
+      batch 0 runs with none (shown as 1970).
+    - `append` emits a window once, when the watermark passes its end.
+      After the last file the watermark is 11:19 on day 3, so the day 3
+      window is still open and nothing has been written for it. It will
+      appear when later data moves the watermark past midnight. Batch 3
+      read nothing: Spark ran it only to emit windows the new watermark
+      had closed.
+    - `update` mode on the same data writes all three windows, each with
+      its count so far.
+
+    Now deliver the days out of order: day 2, day 3, and day 1 last.
+
+    ```
+    0     20   1970-01-01T00:00:00.000Z  0
+    1     21   2026-10-02T10:19:00.000Z  0
+    2     20   2026-10-03T11:19:00.000Z  1
+    +-------------------+-----+
+    |          day_start|count|
+    +-------------------+-----+
+    |2026-10-02 00:00:00|   20|
+    |2026-10-03 00:00:00|   20|
+    +-------------------+-----+
+    ```
+
+    Day 1's events arrived when the watermark was already on day 3,
+    much later than the hour allowed, so they were dropped. The progress
+    shows `numRowsDroppedByWatermark: 1` and not 20, because Spark
+    pre-aggregates each batch before the state store sees it and counts
+    what is dropped there. The watermark is a trade: a longer delay
+    keeps more late data, a shorter one keeps less state and emits
+    results sooner.
+
+    Also: one-day windows start at midnight **UTC** whatever the
+    session time zone (they are aligned to the epoch; `window` has a
+    `startTime` argument to shift them), which is one more reason to set
+    the session time zone to UTC. And event-time rules apply only to
+    stateful queries; `select`, `filter` and `foreachBatch` see every
+    row regardless of the watermark.
+
+- Class: mult_question
+  Depth: all
+  Output: "A windowed count with withWatermark('ts', '1 hour') runs in append mode with availableNow. The newest event is at 11:19 on day 3. Is the day 3 window written to the sink when the query stops?"
+  AnswerChoices: "No, it waits until a later batch moves the watermark past its end;Yes, availableNow flushes every window at the end;Yes, but with a NULL count;No, day 3 events are dropped as late"
+  CorrectAnswer: "No, it waits until a later batch moves the watermark past its end"
+  Hint: "Append mode writes a window only when it can never change again."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## What Comes Next for Messy Streams
+
+    This lesson kept the data clean on purpose. Real inboxes bring more,
+    and the intermediate level takes each one on:
+
+    - corrupt lines and schema drift in a running stream, dead-letter
+      output, `cleanSource` to archive processed files, and
+      `dropDuplicatesWithinWatermark`: "Streaming Messy Data: Drift,
+      Dead Letters and State"
+    - your own streaming source and sink with the Python Data Source
+      API: "Streaming Readers and Writers"
+    - landing each batch in a table with `MERGE`: the next lesson,
+      "Landing Messy Data in Delta Lake"
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: An Incremental Counter Over an Inbox
+
+    The harness delivers the event files into an inbox one day at a
+    time and runs your queries again after each delivery, always with
+    the same checkpoints.
+
+    1. `read_inbox(spark, inbox)`: a streaming DataFrame over the JSON
+       files with `EVENT_SCHEMA`, `_corrupt` as the corrupt record
+       column, one file per micro-batch, plus a `file` column (the file
+       name, from `_metadata`) and a `kind` column (`event_type`, or the
+       old name `event`).
+    2. `run_counter(spark, inbox, checkpoint)`: count parsed events
+       (`_corrupt` is NULL) per `kind` into the memory sink
+       `event_counts` in complete mode, with `availableNow`; wait; return
+       the `numInputRows` of each micro-batch.
+    3. `write_ledger(batch_df, batch_id, ledger)`: one row per file in
+       the batch with `file`, `rows`, `bad` (corrupt lines) and
+       `latest_ts`, written so that running the same batch again
+       replaces its rows: overwrite `ledger/batch_id=<batch_id>`.
+    4. `run_ledger(spark, inbox, checkpoint, ledger)`: stream the inbox
+       through `write_ledger` with `foreachBatch` and `availableNow`;
+       return the finished query.
+
+    The harness checks: each run reads only the new file; the counts
+    after each day match the files (counted with Python's `json`);
+    a run with nothing new reads nothing; the truncated day 3 line is
+    not counted but appears as `bad` in the ledger. Then it deletes the
+    last commit file, as if the job had crashed after writing, and
+    checks that Spark replays batch 2 and the ledger still has exactly
+    one row per file.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "readStream.schema(EVENT_SCHEMA).option('columnNameOfCorruptRecord', '_corrupt').option('maxFilesPerTrigger', 1).json(inbox), then withColumn('file', F.col('_metadata.file_name')) and withColumn('kind', F.coalesce('event_type', 'event')). Counter: writeStream.format('memory').queryName('event_counts').outputMode('complete').option('checkpointLocation', ...).trigger(availableNow=True). Ledger: groupBy('file').agg(F.count('*'), F.count('_corrupt'), F.max('ts')) then .write.mode('overwrite').parquet(f'{ledger}/batch_id={batch_id}')."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    In this lesson you learned:
+
+    - **The model**: an unbounded table processed in micro-batches;
+      source, trigger, sink, output mode and checkpoint
+    - **File streams need a schema**; `schemaInference` guesses once
+      from the files present and never updates
+    - **Streaming DataFrames** can be explained but not counted;
+      results come out through `writeStream...start()`
+    - **`availableNow`** (3.3) processes what is there and stops; set
+      `spark.sql.shuffle.partitions` small for local stateful queries,
+      and know it is fixed in the checkpoint
+    - **Progress**: `batchId`, `numInputRows`, `durationMs`,
+      `stateOperators`, `sources[].endOffset`; read them as attributes
+      (Connect returns `None` for dict access)
+    - **Checkpoints** hold offsets (before), commits (after), the file
+      log and state; a restart processes only new files, and an offset
+      without a commit is replayed
+    - **Files are read once by path**, oldest modification time first;
+      deliver them atomically (hidden name, then rename) and never edit
+      them; `maxFilesPerTrigger` or `maxBytesPerTrigger`, not both
+    - **`foreachBatch`** gives a batch DataFrame: add `_metadata` columns
+      before it, persist if you write twice, make writes idempotent by
+      `batch_id`; on Connect it runs on the server
+    - **Output modes** are checked at start; the memory sink restarts
+      only in complete mode and forgets its table between runs
+    - **Windows and watermarks**: append emits a window once the
+      watermark passes it, late events are dropped, windows align to
+      UTC
+
+    Next: **Landing Messy Data in Delta Lake**, where each batch lands in
+    a table that enforces its schema, merges duplicates away and
+    remembers every version.

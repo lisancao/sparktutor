@@ -1,0 +1,654 @@
+- Class: meta
+  Lesson: "Spark Connect Plugins"
+  EstimatedMinutes: 70
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    "A DSv2 Connector in Java" and "Catalyst Extensions: Rules and
+    Native Functions" put Java code into the Spark JVM and tested it
+    through `spark._jvm` and `df._jdf`. "How Catalyst Plans Python"
+    showed that a Spark Connect client does not build JVM objects at
+    all: it sends an **unresolved plan as protobuf**, and the server's
+    `SparkConnectPlanner` turns it into a Catalyst plan. A Connect
+    client has no Py4J gateway, so none of those back doors exist.
+
+    Spark Connect's answer is **plugins**: JVM classes on the server
+    that translate your own protobuf messages into Catalyst plans,
+    expressions or side effects. This lesson builds all three kinds and
+    calls them from a Python client:
+
+    - `plan_nodes(df, stage)`: a **relation plugin** that returns the
+      analyzed, optimized or physical plan of any DataFrame as rows, so
+      a Connect client can test plan shapes (the thing you could not do
+      without `_jdf`)
+    - `has_magic(col, b"\x89PNG")`: an **expression plugin**, a typed
+      `Column` built from a custom message
+    - `note(spark, text)`: a **command plugin** that changes state on
+      the server
+
+    By the end of this lesson you will be able to:
+
+    - Say what needs a plugin and what does not (server-side jars and
+      SQL extensions already work over Connect)
+    - Name the plugin interfaces and settings in 4.2.0, and the errors
+      they produce
+    - Read and write the protobuf wire format of a
+      `google.protobuf.Any`, and explain why plugins receive `byte[]`
+    - Start a local Connect server with a plugin jar from PySpark
+    - Build custom messages in Python without `protoc`, and wrap them in
+      a client `LogicalPlan`, `Expression` or `Command`
+    - Explain what Connect artifacts (`spark.addArtifacts`) can and
+      cannot deliver
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What Works Over Connect Without a Plugin
+
+    Before writing a plugin, check whether you need one. A Connect
+    server is an ordinary Spark driver, so anything that is reachable
+    **by name** from the DataFrame API or SQL works from a Connect client
+    once the jar is on the server:
+
+    - a DSv2 source with a short name: `spark.read.format("jdocs")`
+    - a function injected by an extension: with the previous lesson's
+      jar and `spark.sql.extensions=jext.Extensions` on the server, a
+      Connect client ran both of these:
+
+      ```python
+      spark.sql("SELECT is_png(X'89504E470D0A1A0A') AS p").collect()
+      spark.range(1).select(F.call_function("is_png", F.lit(b"\x89PNG\r\n\x1a\n"))).collect()
+      ```
+
+      ```text
+      [Row(p=True)]
+      [Row(is_png(X'89504E470D0A1A0A')=True)]
+      ```
+
+    - optimizer and check rules, which run on whatever plan the server
+      builds
+
+    What does **not** work is anything that needs the client to hold a
+    JVM object:
+
+    ```text
+    [JVM_ATTRIBUTE_NOT_SUPPORTED] Attribute `_jvm` is not supported in Spark Connect as it
+    depends on the JVM. If you need to use this attribute, do not use Spark Connect when
+    creating your session. ...
+    ```
+
+    Plugins fill that gap. Use one when you need a **new operator** or
+    **typed arguments** that SQL cannot express (nested messages, byte
+    strings, lists of structures), when you want the server to compute
+    something from its own JVM state (a plan, a catalog, a cache), or
+    when a command has a side effect the API does not offer.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Think of the Connect client as a customer ordering by mail. The
+    order form (the protobuf plan) has boxes for every standard item.
+    For anything else there is one box marked "special request", where
+    you staple a sealed envelope with a label on it. A plugin is the
+    clerk at the warehouse who knows that label, opens the envelope and
+    knows what to do with what is inside.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Extension Points
+
+    Three protobuf messages have a slot for "anything", a
+    `google.protobuf.Any`
+    (`sql/connect/common/src/main/protobuf/spark/connect/`):
+
+    | Message | Field | Plugin interface | Setting (static) |
+    |---|---|---|---|
+    | `Relation` (`relations.proto`) | `google.protobuf.Any extension = 998;` | `RelationPlugin` | `spark.connect.extensions.relation.classes` |
+    | `Expression` (`expressions.proto`) | `google.protobuf.Any extension = 999;` | `ExpressionPlugin` | `spark.connect.extensions.expression.classes` |
+    | `Command` (`commands.proto`) | `google.protobuf.Any extension = 999;` | `CommandPlugin` | `spark.connect.extensions.command.classes` |
+
+    The interfaces are in
+    `sql/connect/server/src/main/java/org/apache/spark/sql/connect/plugin/`:
+
+    ```java
+    public interface RelationPlugin {
+        Optional<LogicalPlan> transform(byte[] relation, SparkConnectPlanner planner);
+    }
+    public interface ExpressionPlugin {
+        Optional<Expression> transform(byte[] relation, SparkConnectPlanner planner);
+    }
+    public interface CommandPlugin {
+        boolean process(byte[] command, SparkConnectPlanner planner);
+    }
+    ```
+
+    Extensions arrived in 3.4 (SPARK-41629) as Scala traits that took a
+    protobuf `Any`. Spark 4.0 moved them to Java interfaces
+    (SPARK-47062, "Make Spark Connect Plugins Java Compatible"); as a
+    Java `Optional<Void>` cannot be non-empty, a command plugin returns
+    `boolean`. Two more interfaces sit in the same folder:
+    `GetStatusPlugin` (setting
+    `spark.connect.extensions.getStatus.classes`, 4.1) extends the
+    `GetStatus` RPC, and `MLBackendPlugin` (4.0, experimental) swaps
+    Spark ML implementations.
+
+    How the server uses them is in `SparkConnectPlanner.scala` and
+    `SparkConnectPluginRegistry.scala`:
+
+    - For a `Relation` whose type is `EXTENSION`, the planner calls
+      `transform(extension.toByteArray, this)` on each configured plugin
+      **in order** and takes the first non-empty result. Returning
+      `Optional.empty()` means "not mine". If nobody answers:
+
+      ```text
+      [CONNECT_INVALID_PLAN.NO_HANDLER_FOR_EXTENSION] The Spark Connect plan is invalid. No
+      handler found for extension type: type.googleapis.com/jplug.Note SQLSTATE: 56K00
+      ```
+
+    - Plugin classes are instantiated with their **no-argument
+      constructor** (otherwise `CONNECT.PLUGIN_CTOR_MISSING`; an
+      exception in the constructor gives `CONNECT.PLUGIN_RUNTIME_ERROR`).
+      The javadoc asks that they "should not rely on internal state":
+      one instance serves every session.
+    - The registry is built **lazily**, the first time any extension is
+      planned, from `SparkEnv.get.conf`, and then cached for the whole
+      server process.
+
+- Class: mult_question
+  Depth: all
+  Output: "Two relation plugins are configured. A message arrives whose type URL the first plugin does not know. What should the first plugin do?"
+  AnswerChoices: "Return Optional.empty(), so the planner asks the next plugin;Throw an exception so the client sees the problem;Return an empty LocalRelation;Return Optional.of(null)"
+  CorrectAnswer: "Return Optional.empty(), so the planner asks the next plugin"
+  Hint: "transformRelationPlugin maps over the registry and takes the first transform that isPresent."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Bytes on the Wire
+
+    Why `byte[]` and not a protobuf object? Spark Connect ships its own
+    copy of protobuf-java **shaded**: inside `spark-connect_2.13-4.2.0.jar`
+    the class is `org/sparkproject/connect/protobuf/Any.class`, not
+    `com.google.protobuf.Any`. A plugin compiled against
+    `com.google.protobuf` would not link against that. Bytes keep the
+    interface independent of Spark's internal protobuf. A plugin can then
+    use its own (relocated) protobuf-java and classes generated by
+    `protoc`, or, for small messages, read the wire format itself.
+
+    The wire format is short enough to read by hand. Each field is a
+    **key**, a varint equal to `field_number << 3 | wire_type`, then the
+    value: a varint for wire type 0, or a varint length and that many
+    bytes for wire type 2 (strings, bytes and embedded messages). This
+    lesson's message is:
+
+    ```text
+    message PlanNodes { bytes input = 1; string stage = 2; }   // package jplug
+    ```
+
+    Packed into an `Any` in Python:
+
+    ```python
+    from google.protobuf import any_pb2
+
+    msg = PlanNodes(input=b"ab", stage="physical")
+    print(msg.SerializeToString())
+    a = any_pb2.Any()
+    a.Pack(msg)
+    print(a.type_url, a.SerializeToString())
+    ```
+
+    ```text
+    b'\n\x02ab\x12\x08physical'
+    type.googleapis.com/jplug.PlanNodes b'\n#type.googleapis.com/jplug.PlanNodes\x12\x0e\n\x02ab\x12\x08physical'
+    ```
+
+    Decode it: `\n` is `0x0a` = field 1, wire type 2 (`1 << 3 | 2`);
+    `#` is `0x23` = 35 bytes of type URL. `\x12` = field 2, wire type 2;
+    `\x0e` = 14 bytes of value, which is the `PlanNodes` message itself:
+    field 1 (`\n`) of length 2 (`ab`), field 2 (`\x12`) of length 8
+    (`physical`). The Java side's `Wire.fields(byte[])` (about forty
+    lines, in the exercise) does exactly this and returns a map from field
+    number to value.
+
+    Notice that `bytes input = 1` and an embedded message field
+    `spark.connect.Relation input = 1` look **identical** on the wire:
+    both are wire type 2 with a length. That is why the client can
+    declare `input` as `bytes`, put a serialized `Relation` in it, and
+    the server can parse it as a `Relation` with
+    `ConnectProtoUtils.parseRelationWithRecursionLimit(bytes, 1024)`
+    (`sql/connect/common/.../ConnectProtoUtils.scala`, `@DeveloperApi`).
+    The recursion limit guards against deeply nested plans; Spark's own
+    example plugin (`SparkConnectPluginRegistrySuite.scala`) uses 1024.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "On the protobuf wire, what is the key byte for field number 2 with wire type 2 (length-delimited)?"
+  AnswerChoices: "0x12;0x22;0x0a;0x02"
+  CorrectAnswer: "0x12"
+  Hint: "key = field_number << 3 | wire_type = 2 * 8 + 2 = 18."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Relation Plugin
+
+    ```java
+    public class PlanNodesPlugin implements RelationPlugin {
+      public static final String TYPE_URL = "type.googleapis.com/jplug.PlanNodes";
+
+      @Override public Optional<LogicalPlan> transform(byte[] any, SparkConnectPlanner planner) {
+        Map<Integer, Object> a = Wire.fields(any);                  // Any: 1 = type_url, 2 = value
+        if (!TYPE_URL.equals(Wire.string(a, 1, ""))) return Optional.empty();
+        Map<Integer, Object> msg = Wire.fields(Wire.bytes(a, 2));
+        String stage = Wire.string(msg, 2, "optimized");
+        Relation input = ConnectProtoUtils.parseRelationWithRecursionLimit(Wire.bytes(msg, 1), 1024);
+        LogicalPlan child = planner.transformRelation(input);
+        SparkSession session = planner.session();                   // org.apache.spark.sql.classic
+        QueryExecution qe = Dataset.ofRows(session, child).queryExecution();
+        QueryPlan<?> root = switch (stage) {
+          case "analyzed" -> qe.analyzed();
+          case "optimized" -> qe.optimizedPlan();
+          case "physical" -> qe.executedPlan();
+          default -> throw new IllegalArgumentException("stage must be analyzed, optimized or physical, ...");
+        };
+        List<Row> rows = new ArrayList<>();
+        walk(root, null, 0, rows);
+        return Optional.of(session.createDataFrame(rows, SCHEMA).logicalPlan());
+      }
+    }
+    ```
+
+    Three pieces of the planner API do the work:
+
+    - `planner.transformRelation(Relation)` (`@DeveloperApi`) turns the
+      embedded client plan into a Catalyst `LogicalPlan`, exactly as if
+      the client had sent it alone. Your plugin can wrap any DataFrame
+      the user has.
+    - `planner.session()` (`@Since("4.0.0") @DeveloperApi`) is the
+      **classic** `SparkSession` behind this client's Connect session,
+      with its conf and catalog. Through it the plugin has the whole
+      JVM API: `Dataset.ofRows`, `queryExecution()`, `createDataFrame`.
+    - The result is a `LogicalPlan`. Here it is the plan of a small
+      `DataFrame` built from `java.util.List<Row>` (a `LocalRelation`),
+      but it could be any operator, including one of your own.
+
+    `walk` visits `children()` depth first. One node needs care:
+    `AdaptiveSparkPlanExec`, the root of a physical plan under adaptive
+    execution, keeps its plan in `executedPlan()` rather than in
+    `children()`, so the walk steps into it.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Starting a Server With the Plugin
+
+    `SparkSession.builder.remote("local[2]")` (3.4) does not connect to
+    an existing server: it starts one **inside your Python process** and
+    connects to it. `_start_connect_server` in
+    `python/pyspark/sql/connect/session.py` creates a classic
+    `SparkContext` with your builder options plus
+    `spark.plugins=org.apache.spark.sql.connect.SparkConnectPlugin`, so
+    static settings reach the server:
+
+    ```python
+    spark = (SparkSession.builder
+        .remote("local[2]")
+        .config("spark.jars", jar)
+        .config("spark.connect.extensions.relation.classes", "jplug.PlanNodesPlugin")
+        .config("spark.connect.extensions.expression.classes", "jplug.MagicPlugin")
+        .config("spark.connect.extensions.command.classes", "jplug.NotePlugin")
+        .getOrCreate())
+    ```
+
+    Two surprises from running this on 4.2.0:
+
+    - **Harmless warnings.** After the server is up, the client also
+      tries to set every builder option on the Connect session and
+      static ones refuse, so you get one warning per static setting:
+
+      ```text
+      UserWarning: Failed to set spark.jars to Some(/tmp/jplug_45uludc1/jplug.jar) due to
+      [CANNOT_MODIFY_CONFIG] Cannot modify the value of the Spark config: "spark.jars".
+      UserWarning: Failed to set spark.connect.extensions.relation.classes to
+      Some(jplug.PlanNodesPlugin) due to [CANNOT_MODIFY_STATIC_CONFIG] ...
+      ```
+
+      The server already has them; the plugins work. The exercise hides
+      these with `warnings.filterwarnings("ignore", message="Failed to set")`.
+    - **Port 15002.** The local server listens on the default Connect
+      port, 15002, and the client connects to `localhost:15002`. If some
+      other process already listens there (another Connect server, a
+      container), the client can end up talking to **that** server,
+      which knows nothing about your plugin. If your plugin is "not
+      found" for no reason, check what owns the port
+      (`lsof -i :15002` or `ss -ltnp`).
+
+    Outside PySpark, a Spark distribution starts a standalone server
+    with `sbin/start-connect-server.sh`, which runs `spark-submit` with
+    the class `org.apache.spark.sql.connect.service.SparkConnectServer`;
+    pass the same `--jars` and `--conf` options. (The pip package of
+    pyspark does not include `sbin/start-connect-server.sh`.)
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    `jar` is the path of your plugin jar. Create `spark`, a Spark
+    Connect session backed by a local server with 2 cores, that loads
+    the jar and registers `jplug.PlanNodesPlugin` as a relation plugin.
+  CorrectAnswer: |
+    spark = SparkSession.builder.remote("local[2]").config("spark.jars", jar).config("spark.connect.extensions.relation.classes", "jplug.PlanNodesPlugin").getOrCreate()
+  Hint: "remote('local[2]') starts the server; both settings are static, so they go on the builder."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Client Side in Python
+
+    The 4.2 Python client has no public API for extensions, but its
+    internal classes are designed to be subclassed: every DataFrame wraps
+    a `pyspark.sql.connect.plan.LogicalPlan`, whose `plan(session)`
+    returns a `proto.Relation`. Treat what follows as code that may need
+    changes on a Spark upgrade, like any use of internals.
+
+    **Messages without protoc.** `google.protobuf` (installed with
+    `pyspark[connect]`) can build message classes at run time from a
+    `FileDescriptorProto`:
+
+    ```python
+    from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
+
+    FD = descriptor_pb2.FieldDescriptorProto
+    fdp = descriptor_pb2.FileDescriptorProto(name="jplug/messages.proto", package="jplug",
+                                             syntax="proto3")
+    m = fdp.message_type.add(name="PlanNodes")
+    m.field.add(name="input", number=1, type=FD.TYPE_BYTES, label=FD.LABEL_OPTIONAL)
+    m.field.add(name="stage", number=2, type=FD.TYPE_STRING, label=FD.LABEL_OPTIONAL)
+    pool = descriptor_pool.DescriptorPool()
+    pool.Add(fdp)
+    PlanNodes = message_factory.GetMessageClass(pool.FindMessageTypeByName("jplug.PlanNodes"))
+    ```
+
+    A real project writes a `.proto` file and generates both the Python
+    module and the Java classes with `protoc`; the bytes are the same.
+
+    **A relation.** Subclass `LogicalPlan`, build the `Relation`, pack
+    the message into its `extension` field, and wrap the plan in a
+    Connect `DataFrame`:
+
+    ```python
+    from pyspark.sql.connect.dataframe import DataFrame
+    from pyspark.sql.connect.plan import LogicalPlan
+
+    class PlanNodesRelation(LogicalPlan):
+        def __init__(self, child, stage):
+            super().__init__(child)
+            self._stage = stage
+
+        def plan(self, session):
+            rel = self._create_proto_relation()          # sets common.plan_id
+            msg = PlanNodes(input=self._child.plan(session).SerializeToString(), stage=self._stage)
+            rel.extension.Pack(msg)                       # type.googleapis.com/jplug.PlanNodes
+            return rel
+
+    def plan_nodes(df, stage="optimized"):
+        return DataFrame(PlanNodesRelation(df._plan, stage), df.sparkSession)
+    ```
+
+    `self._child.plan(session)` serializes the user's DataFrame, which
+    is how the server receives it as `input`. `_create_proto_relation()`
+    sets `common.plan_id`, which the server uses to resolve column
+    references such as `df["x"]` back to this node.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Plans From a Connect Client
+
+    ```python
+    df = spark.range(10).filter("id > 3").groupBy((F.col("id") % 2).alias("k")).count()
+    plan_nodes(df).show(truncate=False)
+    plan_nodes(df, "physical").show(truncate=False)
+    ```
+
+    ```text
+    +---+------+-----+---------+------------------------------------------------------------------------------------------+
+    |id |parent|depth|node     |detail                                                                                    |
+    +---+------+-----+---------+------------------------------------------------------------------------------------------+
+    |0  |NULL  |0    |Aggregate|Aggregate [_groupingexpression#5L], [_groupingexpression#5L AS k#2L, count(1) AS count#3L]|
+    |1  |0     |1    |Project  |Project [(id#1L % 2) AS _groupingexpression#5L]                                           |
+    |2  |1     |2    |Filter   |Filter (id#1L > 3)                                                                        |
+    |3  |2     |3    |Range    |Range (0, 10, step=1, splits=Some(2))                                                     |
+    +---+------+-----+---------+------------------------------------------------------------------------------------------+
+
+    +---+------+-----+-------------+------------------------------------------------------------------------------------------+
+    |id |parent|depth|node         |detail                                                                                    |
+    +---+------+-----+-------------+------------------------------------------------------------------------------------------+
+    |0  |NULL  |0    |HashAggregate|HashAggregate(keys=[_groupingexpression#33L], functions=[count(1)])                       |
+    |1  |0     |1    |Exchange     |Exchange hashpartitioning(_groupingexpression#33L, 200), ENSURE_REQUIREMENTS, [plan_id=25]|
+    |2  |1     |2    |HashAggregate|HashAggregate(keys=[_groupingexpression#33L], functions=[partial_count(1)])               |
+    |3  |2     |3    |Project      |Project [(id#29L % 2) AS _groupingexpression#33L]                                         |
+    |4  |3     |4    |Filter       |Filter (id#29L > 3)                                                                       |
+    |5  |4     |5    |Range        |Range (0, 10, step=1, splits=2)                                                           |
+    +---+------+-----+-------------+------------------------------------------------------------------------------------------+
+    ```
+
+    The result is an ordinary DataFrame: filter it, join it, assert on
+    it. A test on a Connect client can now say "the Parquet scan has
+    `PushedFilters: [IsNotNull(k), EqualTo(k,3)]`" or "this query has
+    exactly one `ArrowEvalPython` node" (the exercise checks both),
+    which the `explain()` string only lets you do by parsing text.
+
+    Note what the plugin does **not** do: it runs no job. Planning the
+    input (`queryExecution().executedPlan()`) happens on the server's
+    driver; the rows are made there too. `transform` is called while the
+    server plans the client's query, so keep it fast and free of side
+    effects; a plan may be planned more than once (`explain()`,
+    `schema`, `collect()` each send it).
+
+- Class: mult_question
+  Depth: all
+  Output: "In a RelationPlugin, how does the plugin get a Catalyst LogicalPlan for a spark.connect.Relation embedded in its message?"
+  AnswerChoices: "Parse the bytes with ConnectProtoUtils.parseRelationWithRecursionLimit and call planner.transformRelation;Call df._jdf on the client and send the JVM object id;Use Py4J to ask the client for the plan;Re-parse the SQL text of the DataFrame"
+  CorrectAnswer: "Parse the bytes with ConnectProtoUtils.parseRelationWithRecursionLimit and call planner.transformRelation"
+  Hint: "The client only sends protobuf. The planner API turns protobuf relations into logical plans."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Expression and Command Plugins
+
+    An **expression plugin** returns a Catalyst `Expression`. The client
+    side subclasses `pyspark.sql.connect.expressions.Expression` and
+    implements `to_plan(session)`, which returns a `proto.Expression`
+    with the message packed into its `extension`; a `Column` wraps it:
+
+    ```python
+    class HasMagicExpression(Expression):
+        def __init__(self, child, magic):
+            super().__init__()
+            self._child, self._magic = child, magic
+
+        def to_plan(self, session):
+            e = pb.Expression()
+            e.extension.Pack(HasMagic(child=self._child.to_plan(session).SerializeToString(),
+                                      magic=self._magic))
+            return e
+
+    def has_magic(col, magic):
+        return Column(HasMagicExpression(col._expr, magic))
+
+    imgs.select("path", has_magic(F.col("content"), b"\x89PNG").alias("png"))
+    ```
+
+    On the server, `MagicPlugin` parses the child with
+    `ConnectProtoUtils.parseExpressionWithRecursionLimit`, resolves it
+    with `planner.transformExpression`, and returns
+    `EqualTo(Substring(child, 1, n), Literal(magic))`. The user gets a
+    function that takes raw bytes as an argument, with no SQL string
+    escaping.
+
+    A **command plugin** has a side effect and returns `true` if it
+    handled the message. The client sends a `proto.Command` through the
+    client's `execute_command`:
+
+    ```python
+    cmd = pb.Command()
+    cmd.extension.Pack(Note(text="checked by the plugins exercise"))
+    spark.client.execute_command(cmd)
+    spark.conf.get("jplug.note")      # 'checked by the plugins exercise'
+    ```
+
+    `NotePlugin` stores the text with
+    `planner.session().conf().set("jplug.note", text)`, so the client can
+    read it back through the normal conf API. The planner calls command
+    plugins in order, and the first that returns `true` wins; if none
+    does, the error is the same `NO_HANDLER_FOR_EXTENSION`.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Artifacts: What They Can and Cannot Deliver
+
+    `spark.addArtifacts(*paths, pyfile=False, archive=False, file=False)`
+    uploads files from the client into the **session's** artifact
+    directory: `.py` files and zips for Python UDFs (`pyfile=True`),
+    archives, plain files, and jars. Artifact jars go on a classloader
+    for that session only (local servers started by `remote(...)` set
+    `spark.sql.artifact.isolation.enabled=true`), which is enough for a
+    Scala or Java UDF the client registers.
+
+    Can an artifact deliver a plugin? An experiment: a server started
+    with `spark.connect.extensions.relation.classes=jplug.PlanNodesPlugin`
+    but **without** the jar on `spark.jars`:
+
+    ```python
+    plan_nodes(spark.range(3)).collect()   # before addArtifacts
+    spark.addArtifacts(jplug_jar)
+    plan_nodes(spark.range(3)).collect()   # after
+    ```
+
+    ```text
+    before addArtifacts: UnknownException (java.lang.ClassNotFoundException) jplug.PlanNodesPlugin
+    after addArtifacts:  [Row(id=0, parent=None, depth=0, node='Range', detail='Range (0, 3, step=1, splits=Some(2))')]
+    ```
+
+    It worked, but read the registry source before relying on it. The
+    plugin list is built lazily on first use and the failed attempt left
+    it unbuilt, so the second attempt ran inside a session whose
+    classloader had the jar. From then on the cached instance serves
+    **every** session of the server, loaded from one user's artifact.
+    That is a side effect of lazy, process-wide initialization in
+    `SparkConnectPluginRegistry`, not a supported way to install
+    plugins. Put plugin jars on the server's classpath (`spark.jars`,
+    `--jars`, or the image), and use artifacts for per-session code.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "Why should a Spark Connect plugin jar go on the server's classpath rather than be shipped with spark.addArtifacts?"
+  AnswerChoices: "Plugins are configured server-wide and cached for the whole process, while artifacts belong to one session;addArtifacts cannot upload jars;Artifacts are only visible to Python workers;Plugins must be written in Scala"
+  CorrectAnswer: "Plugins are configured server-wide and cached for the whole process, while artifacts belong to one session"
+  Hint: "Look at SparkConnectPluginRegistry: one registry per server, built once."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Building a Plugin Project
+
+    The Maven `pom.xml` from "A DSv2 Connector in Java" builds the
+    plugins with one more `provided` dependency:
+
+    ```xml
+    <dependency>
+      <groupId>org.apache.spark</groupId>
+      <artifactId>spark-connect_2.13</artifactId>
+      <version>${spark.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    ```
+
+    With it, the lesson's plugin sources compiled with `mvn package`
+    into `target/jplug-0.1.0.jar`. If your plugin uses protobuf-java
+    itself (generated message classes), bundle it with the
+    `maven-shade-plugin` and **relocate** it to your own package, so it
+    cannot clash with the protobuf that Spark already relocated to
+    `org.sparkproject.connect.protobuf`. A client in another language
+    (Go, Rust, Scala) uses the same `.proto` file to send the same
+    message: that is the point of a protocol extension.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: plan_nodes, End to End
+
+    The exercise file contains the Java for three plugins (`Wire`, the
+    wire-format reader; `PlanNodesPlugin`; `MagicPlugin`; `NotePlugin`),
+    the Python message classes built with `descriptor_pb2`, and the
+    client classes. It compiles the jar, starts a local Connect server
+    with `remote("local[2]")` and the three plugin settings, and tests
+    everything from the client. Complete two TODOs, one on each side of
+    the wire:
+
+    1. **`PlanNodesPlugin.transform` (Java)**: decode the `Any`, return
+       `Optional.empty()` for another type URL, parse the embedded
+       `Relation` and plan it with `planner.transformRelation`, pick the
+       analyzed, optimized or physical plan by `stage` (an unknown stage
+       throws `IllegalArgumentException` with the message in the
+       comment), walk it with `walk`, and return the rows as a
+       `LogicalPlan`.
+    2. **`PlanNodesRelation.plan` (Python)**: build a `Relation` with
+       `_create_proto_relation()`, pack a `jplug.PlanNodes` holding the
+       child's serialized relation and the stage into
+       `rel.extension`, and return it.
+
+    The harness checks that the session is a Connect session without
+    `_jvm`; that the optimized plan of `range(10).filter(...).select(...)`
+    is `Project`, `Filter`, `Range` with consistent `parent` ids; the
+    analyzed stage and the error for an unknown stage; that a Parquet
+    scan in the physical plan shows its pushed filter and that a Python
+    UDF shows up as an `EvalPython` node; that an unhandled extension
+    fails with `NO_HANDLER_FOR_EXTENSION`; `has_magic` over
+    `data/messy/images`; and that the `Note` command changes the
+    session conf.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Java: Map<Integer, Object> a = Wire.fields(any); if (!TYPE_URL.equals(Wire.string(a, 1, \"\"))) return Optional.empty(); Map<Integer, Object> msg = Wire.fields(Wire.bytes(a, 2)); then parseRelationWithRecursionLimit(Wire.bytes(msg, 1), 1024). Python: rel = self._create_proto_relation(); rel.extension.Pack(MESSAGES[\"PlanNodes\"](input=self._child.plan(session).SerializeToString(), stage=self._stage)); return rel."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - A Connect client sends protobuf, not JVM objects: no `_jvm`
+      (`JVM_ATTRIBUTE_NOT_SUPPORTED`), no `_jdf`. Jars on the server
+      still give you data sources by name and SQL extension functions.
+    - `Relation`, `Expression` and `Command` each carry a
+      `google.protobuf.Any extension`. `RelationPlugin`,
+      `ExpressionPlugin` and `CommandPlugin` (Java interfaces since 4.0,
+      SPARK-47062) receive it as `byte[]`, configured with the static
+      `spark.connect.extensions.{relation,expression,command}.classes`.
+    - Plugins are asked in order; `Optional.empty()` (or `false`) means
+      "not mine"; nobody answering gives
+      `CONNECT_INVALID_PLAN.NO_HANDLER_FOR_EXTENSION`.
+    - Bytes, because Spark's protobuf is shaded. The wire format is keys
+      (`field << 3 | type`) and values; `bytes` and embedded messages
+      share wire type 2, so a client can send a `Relation` as `bytes`.
+    - On the server: `ConnectProtoUtils.parse*WithRecursionLimit`,
+      `planner.transformRelation` / `transformExpression`, and
+      `planner.session()`, the classic session with the full JVM API.
+    - `remote("local[2]")` starts a server in-process with your static
+      settings (and warns harmlessly that it cannot set them again).
+    - On the client: message classes from `descriptor_pb2`, a
+      `LogicalPlan` subclass for relations, an `Expression` subclass for
+      columns, `client.execute_command` for commands. These are internal
+      APIs.
+    - Put plugin jars on the server classpath. An artifact jar happened
+      to work once in 4.2.0 because of lazy initialization, and then
+      serves every session.
+
+    Next: **Parquet from the Inside**, where you leave the JVM APIs and
+    read the bytes of a Parquet file: row groups, pages, encodings,
+    statistics and the footer that decides what Spark can skip.

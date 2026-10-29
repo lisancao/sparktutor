@@ -439,10 +439,14 @@
     - The **RocksDB state store** is required; the default HDFS-backed
       provider does not support this operator.
     - State variables: `getValueState`, `getListState`, `getMapState`, each
-      with an optional `ttlDurationMs` for automatic expiry.
+      with an optional `ttlDurationMs` for automatic expiry (TTL needs
+      `timeMode="ProcessingTime"`; other modes fail with
+      `STATEFUL_PROCESSOR_INCORRECT_TIME_MODE_TO_ASSIGN_TTL`).
     - **Timers**: with `timeMode="ProcessingTime"` or `"EventTime"`,
       `handle.registerTimer(ms)` schedules a callback to
-      `handleExpiredTimer`.
+      `handleExpiredTimer(self, key, timerValues, expiredTimerInfo)`.
+      Spark passes those as keyword arguments, so keep the parameter
+      names exactly.
     - `key` is a tuple of the grouping values, hence `key[0]`.
     - An optional `initialState` seeds state on the first batch; 4.2 made
       that path faster (SPARK-54392).

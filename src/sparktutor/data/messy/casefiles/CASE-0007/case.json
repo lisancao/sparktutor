@@ -1,0 +1,14 @@
+{
+  "id": "case-0007",
+  "created": 1772616600,
+  "state": "OPEN",
+  "prio": 2,
+  "labels": "billing, vip",
+  "attachments": [
+    "photo.png"
+  ],
+  "extra": {
+    "imported_from": "legacy-crm",
+    "legacy_id": 7731
+  }
+}

@@ -1,0 +1,734 @@
+- Class: meta
+  Lesson: Distributed Connected Components
+  EstimatedMinutes: 85
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    "Deduplication and Entity Resolution" in the intermediate level
+    scored pairs of records and grouped the matches into entities with
+    a simple iterative label propagation. "Building LSH and an IVF
+    Vector Index" produced pairs of near-duplicate listings. Both end
+    with the same question: given pairs that say "these two are the
+    same", which records belong together? That is the **connected
+    components** of a graph whose nodes are records and whose edges are
+    matches.
+
+    This lesson builds the algorithm that scales, **large-star /
+    small-star** (Kiveris, Lattanzi, Mirrokni, Rastogi and Vassilvitskii,
+    "Connected Components in MapReduce and Beyond", SoCC 2014), from
+    DataFrame operations, and spends as much time on what kills
+    iterative DataFrame programs as on the algorithm itself: plans that
+    grow until the driver runs out of memory.
+
+    By the end of this lesson you will be able to:
+
+    - Explain why label propagation needs as many rounds as the graph's
+      diameter, and measure it
+    - Define large-star and small-star, say what each preserves, and
+      prove a local test for convergence
+    - Write each star operation so it reads its input once, and say why
+      that matters
+    - Recognise the two ways a loop over DataFrames grows its plan (a
+      plan tree that multiplies, and cached plans that print their
+      history), read the evidence, and cut it with `checkpoint()` or
+      `localCheckpoint()`
+    - Find giant components and hub nodes before they become one slow
+      task
+    - Test a distributed graph algorithm against a union-find, on graphs
+      chosen to break it
+    - Explain why connected components turns a few bad matches into one
+      huge false entity
+
+- Class: text
+  Depth: all
+  Output: |
+    ## From Matches to Entities
+
+    "Deduplication and Entity Resolution" made the case: entities are
+    the **connected components** of the match graph (its transitive
+    closure), labelled here by their smallest node id. What changes at
+    scale is the shape of the input. Match output is messy in its own
+    way:
+
+    - the same pair in both directions, `(a, b)` and `(b, a)`
+    - the same pair several times (several blocking passes or rules)
+    - self-pairs `(a, a)` from a self-join that forgot `a < b`
+    - NULL ends from a failed lookup
+    - records with no match at all, which are still entities
+
+    So the first step is always the same cleanup: drop NULLs and
+    self-loops, orient each edge as `(least, greatest)`, deduplicate.
+    Records with no edges come back at the end from the vertex table.
+
+    ```python
+    def clean_edges(raw):
+        return (raw.filter(F.col("src").isNotNull() & F.col("dst").isNotNull()
+                           & (F.col("src") != F.col("dst")))
+                .select(F.least("src", "dst").alias("src"), F.greatest("src", "dst").alias("dst"))
+                .distinct())
+    ```
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Label Propagation and the Diameter
+
+    The intermediate lesson's loop gave every record its own id as a
+    label and, each round, the smallest label among itself and its
+    neighbours. A label moves **one edge per round**, so the loop needs
+    as many rounds as the graph's **diameter** (the longest shortest
+    path), plus one to see that nothing changed. That lesson's customers
+    converged in 4 rounds; match graphs with chains (A and B share a
+    phone, B and C an e-mail, and so on) do not.
+
+    On a path of 100 nodes with ids in order, measured on the machine
+    used to write this lesson (`local[4]`), a label propagation loop
+    like that lesson's against this lesson's algorithm:
+
+    ```text
+    naive LP chain 100 rounds 100 20.7s
+    LS/SS chain 100 rounds 7 3.2s
+    ```
+
+    A path of a million nodes would take a million rounds of label
+    propagation; by the trend measured in "Rounds in Practice" below,
+    large-star / small-star needs about 20.
+
+    GraphX's `ConnectedComponents`
+    (`graphx/src/main/scala/org/apache/spark/graphx/lib/ConnectedComponents.scala`)
+    is the same propagation written with `Pregel`: it gives each vertex
+    "the lowest vertex id in the connected component", one superstep per
+    hop.
+
+- Class: mult_question
+  Depth: all
+  Output: "Label propagation on a path of 5,000 nodes whose ids increase along the path needs about how many rounds?"
+  AnswerChoices: "About 5,000, one per edge of the path;About 13, the base-2 log of 5,000;Exactly 2;It depends only on the number of partitions"
+  CorrectAnswer: "About 5,000, one per edge of the path"
+  Hint: "The smallest label starts at one end and moves one edge per round."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Large-Star and Small-Star
+
+    The algorithm rewrites the **edge set** instead of passing labels.
+    Write `Γ(u)` for the neighbours of `u`, and `m(u)` for the smallest
+    of `u` and its neighbours.
+
+    **Large-star(u):** connect every neighbour `v` of `u` with `v > u`
+    to `m(u)`. Emit `(v, m(u))`. Edges to smaller neighbours are dropped
+    (they are handled from the other side).
+
+    **Small-star(u):** take only the neighbours `v <= u` (orient every
+    edge from its larger end to its smaller end), let `m` be the
+    smallest of them, and connect `u` and each of them to `m`. Emit
+    `(v, m)` for each, and `(u, m)`, without self-loops.
+
+    Each operation **preserves connectivity** (two nodes connected
+    before are connected after) and never invents a connection, and
+    neither ever replaces a component's minimum. Large-star makes a node
+    the centre of a star of its larger neighbours; small-star collapses
+    a node's smaller neighbours onto their minimum. Alternating them,
+    long paths fold up quickly: the paper bounds the number of rounds by
+    `O(log² n)`.
+
+    On the path 1-2-3-4-5 plus the edge 6-7, the edges after each step:
+
+    ```text
+    1 large: [(2, 1), (3, 1), (4, 2), (5, 3), (7, 6)] small: [(2, 1), (3, 1), (4, 2), (5, 3), (7, 6)] converged: False
+    2 large: [(2, 1), (3, 1), (4, 1), (5, 1), (7, 6)] small: [(2, 1), (3, 1), (4, 1), (5, 1), (7, 6)] converged: True
+    3 large: [(2, 1), (3, 1), (4, 1), (5, 1), (7, 6)] small: [(2, 1), (3, 1), (4, 1), (5, 1), (7, 6)] converged: True
+    ```
+
+    In round 1, node 2 (neighbours 1 and 3) makes 3 point to 1, node 3
+    (neighbours 2 and 4) makes 4 point to 2, node 4 makes 5 point to 3.
+    In round 2, node 2 now has neighbours 1 and 4, so 4 points to 1, and
+    so on. Round 3 changes nothing: that is the fixed point.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## When to Stop: a Local Test
+
+    At the fixed point every component is a **star around its smallest
+    node**: each other node has exactly one edge, to the minimum. You
+    could detect it by comparing the edge set with the previous round
+    (`exceptAll` both ways), but there is a cheaper test that looks at
+    one edge set only. With edges stored as `(src, dst)`, `src > dst`:
+
+    1. every `src` has exactly one `dst`, and
+    2. no node is both a `src` and a `dst`.
+
+    Why it is enough: by (1) each non-centre node points to one node,
+    and by (2) that node points nowhere, so each component is a star
+    whose centre is the `dst`. Every edge has `src > dst`, so the centre
+    is smaller than all its leaves: it is the minimum. And both
+    conditions are necessary, because the stars around the minimum
+    satisfy them.
+
+    ```python
+    def is_converged(edges):
+        most = edges.groupBy("src").count().agg(F.max("count")).first()[0]
+        if most is not None and most > 1:
+            return False
+        centres = edges.select(F.col("dst").alias("node"))
+        leaves = edges.select(F.col("src").alias("node"))
+        return centres.intersect(leaves).limit(1).count() == 0
+    ```
+
+    Condition (1) alone is not enough: in `(2, 1), (3, 2)` every `src`
+    has one `dst`, but 2 is both a leaf and a centre. Condition (2) alone is not enough either:
+    `(3, 1), (3, 2)` has no node on both sides, but 3 has two edges and 2
+    is not yet labelled 1. The exercise tests both cases.
+
+    The result is then a lookup: the final edges map each `src` to its
+    component's minimum, the minimum itself and every isolated vertex
+    map to themselves.
+
+- Class: mult_question
+  Depth: all
+  Output: "The edges (src > dst) are (5, 2), (7, 2), (9, 4). Is the algorithm converged?"
+  AnswerChoices: "Yes, every src has one dst and no node is on both sides;No, node 2 has two leaves;No, 4 is not the smallest node overall;No, convergence needs the edge set of the previous round"
+  CorrectAnswer: "Yes, every src has one dst and no node is on both sides"
+  Hint: "Two components, {2, 5, 7} and {4, 9}, each a star around its minimum."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Star Operations as DataFrames
+
+    Both operations need "the minimum over a node's neighbours", for
+    every edge of that node. Two ways to get it:
+
+    - aggregate the minimum per node with `groupBy`, then **join** it
+      back to the edges
+    - compute it with a **window**, `F.min("v").over(Window.partitionBy("u"))`,
+      which keeps every edge row and adds the minimum
+
+    Large-star also needs each edge in both directions. Again two ways:
+    `edges.union(swapped)`, or one `explode` of an array of two structs.
+
+    The lesson's version uses the window and the explode:
+
+    ```python
+    def large_star(edges):
+        both = edges.select(F.explode(F.array(
+            F.struct(F.col("src").alias("u"), F.col("dst").alias("v")),
+            F.struct(F.col("dst").alias("u"), F.col("src").alias("v")))).alias("e")).select("e.u", "e.v")
+        m = F.least(F.min("v").over(Window.partitionBy("u")), F.col("u"))
+        return (both.withColumn("m", m)
+                .filter(F.col("v") > F.col("u"))
+                .select(F.col("v").alias("src"), F.col("m").alias("dst"))
+                .distinct())
+    ```
+
+    Its physical plan has one shuffle by `u` for the window and one for
+    the `distinct`:
+
+    ```text
+    HashAggregate(keys=[src#318L, dst#319L], functions=[])
+    +- Exchange hashpartitioning(src#318L, dst#319L, 4), ENSURE_REQUIREMENTS
+       +- HashAggregate(keys=[src#318L, dst#319L], functions=[])
+          +- Project [v#314L AS src#318L, least(_we0#317L, u#313L) AS dst#319L]
+             +- Filter (isnotnull(v#314L) AND (v#314L > u#313L))
+                +- Window [min(v#314L) windowspecdefinition(u#313L, specifiedwindowframe(RowFrame,
+                   unboundedpreceding$(), unboundedfollowing$())) AS _we0#317L], [u#313L]
+                   +- Sort [u#313L ASC NULLS FIRST], false, 0
+                      +- Exchange hashpartitioning(u#313L, 4), ENSURE_REQUIREMENTS
+                         +- Project [e#312.u AS u#313L, e#312.v AS v#314L]
+                            +- Filter isnotnull(e#312.u)
+                               +- Generate explode(array(struct(u, src#2L, v, dst#3L),
+                                  struct(u, dst#3L, v, src#2L))), false, [e#312]
+                                  +- ...
+    ```
+
+    Small-star is the same shape: orient with `greatest`/`least`, the
+    window minimum per `u`, one explode emitting `(v, m)` and `(u, m)`,
+    a filter for self-loops, `distinct`.
+
+    The choice of window and explode over join and union looks like
+    style. The next two sections show it is the difference between a
+    program that finishes and one that cannot.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Rounds in Practice
+
+    With the join form, on graphs built to be awkward (`local[4]`,
+    checkpointing every two rounds, each result compared with a
+    union-find):
+
+    ```text
+    chain sorted: n=2000 rounds=11 ok=True 7.8s
+    chain random ids: n=2000 rounds=9 ok=True 3.5s
+    chain reversed: n=2000 rounds=11 ok=True 3.8s
+    star: n=5000 rounds=1 ok=True 0.5s
+    star hub max: n=5001 rounds=1 ok=True 0.5s
+    random: n=2399 rounds=5 ok=True 1.9s
+    chain sorted 20000: n=20000 rounds=15 ok=True 6.9s
+    ```
+
+    About `log2 n` for paths (`log2 2000 ≈ 11`, `log2 20000 ≈ 14.3`),
+    slightly fewer when ids are random along the path, one round for a
+    star whatever the hub's id, five for a random sparse graph with many
+    small components. The window form needs the same rounds (it
+    computes the same edges). Ten times the nodes cost four more
+    rounds; label propagation would have needed ten times the rounds.
+
+    Rounds count the whole graph: they are the maximum over components.
+    That is why the exercise can run every test graph at once, as a
+    disjoint union in separate id ranges, and check each part.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Lineage I: Plans That Multiply
+
+    "Deduplication and Entity Resolution" showed the optimized plan of
+    its label propagation doubling every round without
+    `localCheckpoint()`, and noted that `cache()` alone does not help.
+    This section and the next show where that growth comes from, how
+    fast it can be, and what it does to the driver. A loop like this one
+    rebinds `edges` every round:
+
+    ```python
+    while not done:
+        edges = small_star(large_star(edges)).cache()
+    ```
+
+    Every DataFrame is a plan, and the new plan **contains** the old one.
+    If a step refers to its input once, the plan grows by a constant
+    each round. If it refers to it twice, the plan doubles. The join
+    form refers to its input a lot: the union reads `edges` twice, the
+    `groupBy` and the join each read the union (4 copies), and
+    small-star's join and its extra `(u, m)` rows read the oriented
+    edges three times. **Twelve** copies of the previous plan per round,
+    so the analyzed plan has `12^r` leaves after `r` rounds. Measured on
+    a 20,000-node path, with `cache()` every round (leaves of the
+    analyzed plan, characters of its string):
+
+    ```text
+    1 (12, 8202)
+    2 (144, 153569)
+    3 (1728, 2466353)
+    ```
+
+    Then, in the fourth round:
+
+    ```text
+    py4j.protocol.Py4JJavaError: An error occurred while calling o5717.collectToPython.
+    : java.lang.OutOfMemoryError: Java heap space
+        at java.base/java.util.Arrays.copyOf(Arrays.java:3481)
+        ...
+        at org.apache.spark.sql.catalyst.util.StringConcat.append(StringConcat.scala:42)
+        at org.apache.spark.sql.execution.QueryExecution.$anonfun$explainString$1(QueryExecution.scala:466)
+        ...
+        at org.apache.spark.sql.catalyst.trees.TreeNode.generateTreeString(TreeNode.scala:1058)
+    ```
+
+    `cache()` did not help: it changes what the **physical** plan reads
+    (an `InMemoryTableScan` of the cached rows) but not the logical plan
+    the analyzer and optimizer walk, which keeps the full tree. The data
+    was tiny; the driver died of the plan.
+
+    That is the reason for the window and the explode: with them, each
+    star operation's analyzed plan has **one leaf**. You can check it in
+    one line, and the exercise does:
+
+    ```python
+    small_star(large_star(edges))._jdf.queryExecution().analyzed().collectLeaves().length()
+    ```
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    `df` is a DataFrame in a classic session. Set `leaves` to the number
+    of leaf nodes of its analyzed logical plan, read through the JVM.
+  CorrectAnswer: |
+    leaves = df._jdf.queryExecution().analyzed().collectLeaves().length()
+  Hint: "df._jdf.queryExecution().analyzed() is the plan; collectLeaves() returns a Scala Seq with length()."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Lineage II: Cached Plans That Remember
+
+    With one leaf per round the analyzed plan grows by about 20 lines a
+    round, which is harmless. The window form with `cache()` every round
+    still died, in round 13, and the time of each `count()` doubled on
+    the way:
+
+    ```text
+    round      9      10     11     12
+    count()    0.43s  0.77s  1.25s  2.36s     (round 13: OutOfMemoryError: Java heap space)
+    ```
+
+    The culprit is in the **optimized** plan. When a cached DataFrame
+    appears in a later plan, the `CacheManager` substitutes an
+    `InMemoryRelation`, and an `InMemoryRelation` prints the physical
+    plan it was cached from. Under adaptive execution that plan is an
+    `AdaptiveSparkPlan isFinalPlan=true`, which prints both its final
+    and its initial plan, and each of them contains the previous
+    round's `InMemoryRelation`, which prints its own history twice.
+    Lines of the optimized plan and `InMemoryTableScan` nodes in the
+    executed plan, per round:
+
+    ```text
+    1 executed plan lines 68 InMemoryTableScan 1 optimized lines 66
+    2 executed plan lines 189 InMemoryTableScan 3 optimized lines 187
+    3 executed plan lines 431 InMemoryTableScan 7 optimized lines 429
+    4 executed plan lines 915 InMemoryTableScan 15 optimized lines 913
+    5 executed plan lines 1883 InMemoryTableScan 31 optimized lines 1881
+    6 executed plan lines 3819 InMemoryTableScan 63 optimized lines 3817
+    7 executed plan lines 7691 InMemoryTableScan 127 optimized lines 7689
+    8 executed plan lines 15435 InMemoryTableScan 255 optimized lines 15433
+    ```
+
+    `2^r - 1` scans: doubling. And who prints the plan on every action,
+    even if you never call `explain()`? `SQLExecution.withNewExecutionId0`
+    (`sql/core/src/main/scala/org/apache/spark/sql/execution/SQLExecution.scala`)
+    calls `queryExecution.explainString(planDescriptionMode)` to fill
+    `physicalPlanDescription` of the `SparkListenerSQLExecutionStart`
+    event behind the SQL tab of the UI. Every action renders the whole
+    plan as text, and that is where the heap ran out.
+
+    `spark.sql.maxPlanStringLength` (3.0, unlimited by default) caps the
+    string. With it set to `8k`, the run no longer crashed but kept
+    doubling, because the tree is still walked in full:
+
+    ```text
+    14 19999 4.10s
+    15 19999 7.97s
+    16 19999 15.78s
+    17 19999 31.43s
+    18 19999 67.45s
+    ```
+
+    A cap treats the symptom. The cure is to give each round a plan
+    with no history at all.
+
+- Class: mult_question
+  Depth: all
+  Output: "A loop caches its DataFrame every round, and each step reads its input only once. Why can the driver still run out of memory after a dozen rounds?"
+  AnswerChoices: "Each InMemoryRelation prints the adaptive plan it came from, which contains the previous round's relation twice, so plan strings double;cache() stores every round's rows on the driver;The window operator keeps all previous windows in memory;Python keeps a reference to every DataFrame"
+  CorrectAnswer: "Each InMemoryRelation prints the adaptive plan it came from, which contains the previous round's relation twice, so plan strings double"
+  Hint: "Count InMemoryTableScan nodes per round: 1, 3, 7, 15."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Checkpoints Cut the Plan
+
+    "Deduplication and Entity Resolution" introduced both checkpoints,
+    including how to set `spark.checkpoint.dir` (4.0) when the session
+    starts on Spark Connect. In short, `checkpoint()` and
+    `localCheckpoint()` compute the DataFrame and return a new one whose
+    plan is just the saved rows:
+
+    ```text
+    LogicalRDD [src#2L, dst#3L], false
+    ```
+
+    One node, no history. Both are **eager** by default (they run a job
+    right away; `eager=False` defers it to the first action).
+
+    | | `checkpoint()` | `localCheckpoint()` |
+    |---|---|---|
+    | Where | files under `sparkContext.setCheckpointDir(...)` | blocks in the executors' block managers |
+    | Survives losing an executor | yes, data is reread from the files | no: the RDD docs warn of "an irrecoverable job failure", and against dynamic allocation |
+    | Needs | a checkpoint directory (on a cluster, a shared file system) | nothing |
+    | Speed | writes and rereads files | faster |
+
+    Without a directory:
+
+    ```text
+    org.apache.spark.SparkException: Checkpoint directory has not been set in the SparkContext
+    ```
+
+    With one, each checkpoint is an `rdd-<id>` folder under a folder
+    with a random UUID name that `setCheckpointDir` creates (in the
+    lesson's run: `87e62939-.../rdd-467/part-00000`). Spark does not delete them when
+    you are done unless `spark.cleaner.referenceTracking.cleanCheckpoints`
+    is on; clean the directory yourself.
+
+    How often? Checkpointing every round of the join form on the
+    20,000-node path:
+
+    ```text
+    localCheckpoint every round: rounds 15 7.0s    leaves per round: 1
+    localCheckpoint every 2:     rounds 15 7.9s    leaves per round: 12, 1, 12, 1, ...
+    localCheckpoint every 3:     rounds 15 17.2s   leaves per round: 12, 144, 1, ...
+    ```
+
+    For a step that multiplies its plan, checkpoint every round or two.
+    For single-read steps, every two to five rounds is plenty, and the
+    rounds in between can `cache()`. The pattern for a cached round, so
+    that old data does not pile up in memory:
+
+    ```python
+    nxt = small_star(large_star(edges)).cache()
+    nxt.count()          # materialize the new edges while the old ones are still cached
+    edges.unpersist()    # then drop the old ones
+    edges = nxt
+    ```
+
+    Unpersisting before the new edges are materialized would make Spark
+    recompute the old edges from their own plan.
+
+- Class: mult_question
+  Depth: all
+  Output: "Your connected components job uses localCheckpoint() and an executor is lost mid-job. What happens?"
+  AnswerChoices: "The job fails, because the checkpointed blocks lived only on executors;Spark recomputes the lost blocks from the original lineage;Spark reads them back from the checkpoint directory;Nothing, local checkpoints are replicated"
+  CorrectAnswer: "The job fails, because the checkpointed blocks lived only on executors"
+  Hint: "A local checkpoint cuts the lineage, so there is nothing left to recompute from."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Skew: Giant Components and Hubs
+
+    Near convergence, every node of a component points to its minimum,
+    so the minimum has an edge to every node of the component. In the
+    next large-star, all of those edges share one `u` and go to one
+    window partition. On a converged component of 200,000 nodes plus
+    50,000 small pairs, rows per shuffle partition when partitioned by
+    `u`:
+
+    ```text
+    rows per partition when partitioned by u: [37595, 37615, 37638, 37619, 37542, 237300, 37281, 37410]
+    top degrees [(0, 200000), (2, 1), (12, 1)]
+    ```
+
+    One task gets six times the rows of the others. The `Window`
+    operator also buffers all rows of one key: beyond
+    `spark.sql.windowExec.buffer.in.memory.threshold` (an internal
+    setting, 4,096 rows) it moves them to a buffer that can spill to
+    disk. A million-node component means a million-row window group in
+    one task, every round until the end.
+
+    How to see it coming:
+
+    - **Degree distribution** each round:
+      `edges.groupBy("dst").count().orderBy(F.desc("count")).limit(10)`.
+      A component's size is visible as the degree of its minimum.
+    - **Component sizes** after a first run on a sample. In entity
+      resolution a component of thousands of "people" is never real; it
+      is a bridge of bad matches (see the listings below).
+
+    What to do about it:
+
+    - Fix the matches. Giant components in entity resolution are
+      almost always a data problem: a placeholder phone number, a shared
+      office e-mail, a template text. Drop edges built on values that
+      occur too often, before the graph.
+    - Use the `groupBy` + join form for rounds with known hubs. A
+      `min` aggregation is pre-aggregated on the map side, so the hub's
+      200,000 rows become one partial row per task before the shuffle;
+      the join then streams the hub's edges past one row. It reads its
+      input more than once, so checkpoint it every round.
+    - Adaptive skew-join splitting (`spark.sql.adaptive.skewJoin.enabled`)
+      applies only to sort-merge and shuffled hash joins whose skewed
+      partition is over `skewedPartitionFactor` (5) times the median
+      **and** `skewedPartitionThresholdInBytes` (256MB). On this plan it
+      did not split the hub's partition even with both lowered to small
+      values, so do not count on it; check the final plan
+      (`explain()` after the action) for `skew=true` before you do.
+    - GraphFrames (below) has a `broadcastThreshold` for exactly this
+      case.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Testing Against a Union-Find
+
+    A distributed graph algorithm needs a reference answer on the
+    driver. A union-find (disjoint set forest) computes connected
+    components in nearly linear time in plain Python, and with "the
+    smaller root wins" it produces the same labels:
+
+    ```python
+    def union_find(nodes, edges):
+        parent = {n: n for n in nodes}
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]      # path halving
+                x = parent[x]
+            return x
+        for a, b in edges:
+            if a is None or b is None:
+                continue
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[max(ra, rb)] = min(ra, rb)
+        return {n: find(n) for n in nodes}
+    ```
+
+    Then choose graphs that break implementations, not random ones only:
+
+    | Graph | What it catches |
+    |---|---|
+    | a path with ids in order | too many rounds; a round bound of `2 log2 n` |
+    | a path with shuffled ids | logic that assumes ids follow structure |
+    | a star whose hub has the **largest** id | small-star mistakes |
+    | isolated vertices | forgetting the vertex table |
+    | reversed and repeated edges, self-loops, NULLs | missing cleanup |
+    | a random sparse graph | many small components at once |
+
+    The exercise runs all of them as one graph in separate id ranges:
+    14,243 vertices, 14,232 raw edges, 816 components, 12 rounds.
+
+    Ids do not have to be numbers: `min`, `least` and `<` work on
+    strings, so `"L0007"` labels its component as well as `7` would
+    (the exercise clusters listings by their string ids). If you map
+    strings to longs to save space, do it with a dense numbering, not
+    `xxhash64`: two records whose hashes collide would become one node,
+    merging two entities with no edge between them.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Clusters of Listings, and the Trouble With Transitivity
+
+    Run on the marketplace listings of "Building LSH and an IVF Vector
+    Index", with an edge for every pair whose Jaccard similarity on raw
+    lower-case 5-shingles is at least a threshold:
+
+    ```text
+    J>=0.5: 1131 pairs, 72 clusters, rounds 3
+      size 24 sellers ['user001', 'user008', 'user042', 'user097'] 8 titles ['bunk bed'] 1
+      size 24 sellers ['user016', 'user019', 'user037', 'user046'] 10 titles ['dresser'] 1
+      size 23 sellers ['user032', 'user058', 'user076', 'user090'] 6 titles ['vinyl records'] 1
+      size 20 sellers ['user018', 'user052', 'user068', 'user089'] 5 titles ['air fryer'] 1
+      size 20 sellers ['deals_by_marc'] 1 titles ['acoustic guitar', 'aquarium', 'baby stroller', 'bread maker'] 15
+    J>=0.7: 351 pairs, 212 clusters, rounds 2
+      size 8 sellers ['user003', 'user144'] 2 titles ['kayak'] 1
+      size 8 sellers ['user010', 'user023'] 2 titles ['camera lens'] 1
+      size 6 sellers ['user012'] 1 titles ['baby stroller'] 1
+      size 6 sellers ['user011', 'user101'] 2 titles ['piano keyboard'] 1
+      size 6 sellers ['user043'] 1 titles ['acoustic guitar'] 1
+    ```
+
+    (Sellers and titles show the first four names and the count.) At
+    0.5 the largest "item" is 24 bunk-bed ads from 8 different sellers:
+    their descriptions share the same product phrase, each ad matches a
+    few others, and transitivity chains them all into one. The template
+    seller becomes one item with 15 different titles. At 0.7 the
+    clusters are reposts by one seller, or two sellers with the same ad
+    text.
+
+    This is "Clustering Changes the Score" from "Deduplication and
+    Entity Resolution" at a larger scale: there, one wrong edge turned
+    into nine false pairs. Connected components never weakens a match;
+    it only adds. One edge between two clusters merges them, so the
+    precision of the pairs decides the quality of the entities. Raise the threshold, add rules
+    that forbid an edge (different seller **and** different price, for
+    example), or cut clusters that are too large or too loosely
+    connected. The algorithm here only makes the closure cheap.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## GraphFrames and GraphX
+
+    You rarely need to write this yourself in production:
+
+    - **GraphFrames** is a separate project with a connected components
+      implementation on DataFrames. Its Spark 4 artifact is
+      `io.graphframes:graphframes-spark4_2.13`; the latest release on
+      Maven Central when this lesson was written is 0.12.3, whose pom
+      builds against `spark-sql_2.13` **4.1.2** (provided), with the
+      Python package `graphframes-py` 0.12.3 on PyPI. It was not tested
+      against 4.2.0 for this lesson; try it on your version before you
+      depend on it. Its Python `connectedComponents` takes
+      `algorithm` (`"two_phase"`, `"randomized_contraction"`, `"graphx"`;
+      `"graphframes"` is a deprecated alias of `"two_phase"`),
+      `checkpointInterval=2`, `use_local_checkpoints`, and
+      `broadcastThreshold`, which broadcasts the labels of high-degree
+      nodes (its docstring recommends `-1` to let adaptive execution
+      handle skewed joins instead). It needs a checkpoint directory
+      unless you use local checkpoints, for the reasons above.
+    - **GraphX** ships with Spark (`spark-graphx_2.13-4.2.0.jar` is in
+      PySpark's `jars/` folder) but has no Python API, and its
+      connected components is the Pregel label propagation from the
+      start of this lesson.
+
+    Knowing the algorithm still matters when you use a library: it tells
+    you why a checkpoint directory is required, why a giant component
+    makes the last rounds slow, and why the answer depends entirely on
+    the quality of your edges.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Large-Star / Small-Star
+
+    Complete:
+
+    1. `clean_edges(raw)`: no NULL ends, no self-loops, `src < dst`,
+       distinct.
+    2. `large_star(edges)` and `small_star(edges)`, each reading its
+       input **once** (window plus explode, no union, no self-join).
+    3. `is_converged(edges)`: the local test.
+    4. `connected_components(vertices, raw_edges, checkpoint_every,
+       max_rounds, on_round)`: the loop, checkpointing every
+       `checkpoint_every` rounds, caching and unpersisting in between,
+       calling `on_round(edges)` after every round, and returning
+       `(labels, rounds)` with a label for every vertex.
+
+    The checks: the small examples above, exactly one leaf in each star
+    operation's analyzed plan, both non-converged cases of the local
+    test, labels equal to a union-find on a graph combining a path of
+    4,096 nodes in order and shuffled, a star with the largest id as
+    hub, a random sparse graph, isolated vertices, reversed and repeated
+    edges, self-loops and NULLs; at most `2 log2 4096 = 24` rounds; an
+    optimized plan of at most 200 lines after every round (checked as
+    the rounds run, before the driver runs out of memory); and the
+    listing clusters equal to union-find.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "large_star: explode(array(struct(src as u, dst as v), struct(dst as u, src as v))), m = least(min(v) over Window.partitionBy('u'), u), keep v > u, select v as src and m as dst, distinct. small_star: u = greatest, v = least, m = min(v) over the window, explode(array(struct(v, m), struct(u, m))), drop src == dst, distinct. Loop: localCheckpoint() when rounds % checkpoint_every == 0, else cache() and count(); then unpersist the old edges."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - Entities are the connected components of the match graph: the
+      transitive closure of the pairs. Clean the edges first (NULLs,
+      self-loops, both directions, repeats) and bring isolated records
+      back from the vertex table.
+    - Label propagation needs about as many rounds as the diameter (100
+      for a path of 100). Large-star / small-star needs about `log2 n`
+      on paths (11 for 2,000 nodes, 15 for 20,000).
+    - Large-star links larger neighbours to `m(u)`; small-star collapses
+      smaller neighbours onto their minimum. The fixed point is stars
+      around each component's minimum, recognised locally: every `src`
+      has one `dst`, and no node is on both sides.
+    - A step that reads its input `k` times multiplies the plan by `k`
+      every round (12 for the join form: 1,728 leaves after three
+      rounds, then an `OutOfMemoryError`). Write steps that read their
+      input once: a window instead of `groupBy` plus join, an `explode`
+      instead of `union`. Check with `collectLeaves().length()`.
+    - `cache()` does not cut lineage, and cached plans print their
+      history: under AQE each round doubles the plan string, and every
+      action renders it for the SQL UI event
+      (`SQLExecution.withNewExecutionId0`). `spark.sql.maxPlanStringLength`
+      only hides it.
+    - `checkpoint()` (reliable, needs a directory) and
+      `localCheckpoint()` (fast, lost with an executor) replace the plan
+      with a `LogicalRDD`. Materialize the new round before unpersisting
+      the old one.
+    - Giant components put a component's every edge in one window
+      partition; watch degrees, and fix the matches that build them.
+    - Test against a union-find on graphs designed to break the code.
+    - Transitivity turns a few bad pairs into one big wrong entity; the
+      precision of the edges decides the quality of the clusters.
+
+    Next: **Sketches: HLL, Theta and KLL from the Inside**, another kind
+    of distributed algorithm: summaries small enough to store, that
+    merge without going back to the raw data.

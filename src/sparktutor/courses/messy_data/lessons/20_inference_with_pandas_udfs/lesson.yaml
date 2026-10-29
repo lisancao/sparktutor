@@ -1,0 +1,1063 @@
+- Class: meta
+  Lesson: "Running a Model over Your Data with pandas UDFs"
+  EstimatedMinutes: 50
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    "Documents to Rows" turned e-mails and documents into rows with
+    Python UDFs, "Images and Audio" ran NumPy over pixels with an Arrow
+    UDF, and "Text Analytics Without an LLM" built a search index with
+    Spark MLlib. This lesson closes the loop that most real projects
+    need: you have a model written in Python (yours, or one from
+    scikit-learn, PyTorch or a vendor SDK) and you want to run it over
+    every row of a large table.
+
+    The model here is deliberately tiny, a naive Bayes text classifier
+    in plain Python and NumPy, so that you can see every moving part.
+    The Spark side is exactly what you would write for a big model.
+
+    By the end of this lesson you will be able to:
+
+    - Train a small model on the driver and score data with it on the
+      executors
+    - Write a `pandas_udf` that takes and returns a pandas Series, and
+      explain how it differs from a plain `@udf`
+    - Control how many rows each call sees with
+      `spark.sql.execution.arrow.maxRecordsPerBatch`
+    - Load a model **once per task** with the iterator form of
+      `pandas_udf`, and prove it with evidence instead of hoping
+    - Ship a model to executors in a closure, a broadcast variable or a
+      file, and know what each costs
+    - Score whole batches with `mapInPandas`
+    - Explain why Spark may run your model more than once for the same
+      row, and what to do about it
+    - Sketch how an LLM call fits the same pattern
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Think of a model as a recipe and your table as a mountain of
+    ingredients. Training happens once, in one kitchen (the driver). To
+    cook the whole mountain you hand copies of the recipe to many cooks
+    (the executors). Each cook gets a crate of ingredients (a partition)
+    and works through it a tray at a time (a batch).
+
+    The expensive part is often reading the recipe, not cooking: loading
+    a real model can take seconds and hundreds of megabytes. So the
+    question this lesson keeps asking is: how often does each cook read
+    the recipe? Once per tray is wasteful. Once per crate is what you
+    want.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Data: Support Tickets
+
+    `data/messy/support_tickets/` holds three things:
+
+    - `train.csv`: 160 labelled tickets (`ticket_id, text, label`), 40
+      for each of four labels that match the policy documents in
+      `data/messy/docs/`: `shipping`, `returns`, `warranty`, `privacy`.
+    - `inbox/part-0000N.jsonl`: 240 unlabelled tickets in four JSON
+      Lines files (`ticket_id, channel, text`). They are messy on
+      purpose: shouting, HTML tags, emoji, runs of spaces, a few tickets
+      that mention two topics, and a few with no usable text at all
+      (empty, punctuation only, or `null`).
+    - `inbox_labels.csv`: the answer key for the inbox, so you can
+      measure accuracy. Tickets with no usable text are labelled
+      `unknown`.
+
+    ```python
+    inbox = (spark.read.schema("ticket_id string, channel string, text string")
+             .json("data/messy/support_tickets/inbox"))
+    inbox.show(5, truncate=60)
+    ```
+
+    ```text
+    +---------+--------+------------------------------------------------------------+
+    |ticket_id| channel|                                                        text|
+    +---------+--------+------------------------------------------------------------+
+    |    I0181|   email|Hello, unsubscribe me from marketing emails. update my pr...|
+    |    I0182|web_form|Hello, please refund the original payment? can I send it ...|
+    |    I0183|    chat|  Hello   team,   do   you   offer   express   shipping  ...|
+    |    I0184|   email|     Hello, do you offer express shipping to Vietnam? Cheers|
+    |    I0185|web_form|HI, HOW MANY DAYS DO I HAVE TO RETURN ITEMS? PLEASE REFUN...|
+    +---------+--------+------------------------------------------------------------+
+    only showing top 5 rows
+    ```
+
+    The rows start at `I0181` because Spark packs the largest file
+    (`part-00003.jsonl`) into a partition first. File order is not row
+    order; sort when order matters.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Train on the Driver
+
+    A **multinomial naive Bayes** classifier is a good first model
+    because you can read it. Training counts how often each word appears
+    in each label's tickets. To classify a new ticket, it adds up, for
+    each label, the log probability of the label and of every known
+    word in the ticket under that label, and picks the largest total.
+    Words it never saw in training are ignored, and a ticket with no
+    known words gets the label `unknown`.
+
+    The exercise file gives you the whole model as plain Python
+    functions: `tokenize(text)`, `train_naive_bayes(rows)`,
+    `predict_one(model, text)` for one text, and
+    `predict_batch(model, texts)` which does the same for a list of texts
+    with one NumPy matrix product. None of them touches Spark, so you
+    can test them on their own.
+
+    The training data is small, so read it with Spark, bring it to the
+    driver with `collect()`, and train there:
+
+    ```python
+    train = spark.read.option("header", True).csv("data/messy/support_tickets/train.csv")
+    rows = train.select("text", "label").collect()
+    model = train_naive_bayes([(r.text, r.label) for r in rows])
+
+    print(len(model["vocab"]), "words;", len(json.dumps(model)), "bytes as JSON")
+    print(predict_one(model, "My parcel never arrived"))
+    print(predict_one(model, "The screen is cracked, can you repair it?"))
+    print(predict_one(model, "?!"))
+    ```
+
+    ```text
+    133 words; 12168 bytes as JSON
+    ('shipping', 0.8858863779906665)
+    ('warranty', 0.9763135735565716)
+    ('unknown', 0.0)
+    ```
+
+    The second number is the model's confidence: the probability it
+    gives the winning label, between 0 and 1.
+
+    `collect()` is safe here because the training set is 160 rows. That
+    is the shape of most real projects: a training set that fits in one
+    machine's memory and a table to score that does not. When the
+    training data is large too, train with Spark MLlib (see "MLlib or
+    Your Own Model?" below) or sample first.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Row at a Time: a Plain Python UDF
+
+    You already know one way to run Python over every row, from
+    "Documents to Rows": a UDF.
+
+    ```python
+    @F.udf("string")
+    def label_row(text):
+        return predict_one(model, text)[0]
+
+    inbox.select("ticket_id", label_row("text").alias("label")).show(3)
+    ```
+
+    ```text
+    +---------+--------+
+    |ticket_id|   label|
+    +---------+--------+
+    |    I0181| privacy|
+    |    I0182| returns|
+    |    I0183|shipping|
+    +---------+--------+
+    only showing top 3 rows
+    ```
+
+    The function captures `model` from the enclosing scope. PySpark
+    pickles the function together with everything it refers to and sends
+    it to every task, so the executors get a copy of the model for free.
+
+    In 4.2 the plan shows `ArrowEvalPython`, because Arrow-optimized
+    UDFs are the default (`spark.sql.execution.pythonUDF.arrow.enabled`
+    is `true`, SPARK-54555). With `useArrow=False` you get the older
+    pickled path, `BatchEvalPython`:
+
+    ```text
+    +- ArrowEvalPython [label_row(text#40)#67], [pythonUDF0#69], 101
+    +- BatchEvalPython [label_row_pickled(text#40)#70], [pythonUDF0#72]
+    ```
+
+    Either way, Spark sends rows to the Python worker in batches, but
+    **your function is still called once per row**. For a model, that
+    means one prediction call per row, and no chance to use the
+    vectorized math (matrix products, GPU batches) that models are built
+    for.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## A Batch at a Time: pandas_udf
+
+    A **pandas UDF** (`pandas_udf`, Spark 2.3; the type-hint style since
+    3.0) is called once per **batch**. It receives each input column as
+    a `pandas.Series` holding many rows and must return a Series of the
+    same length:
+
+    ```python
+    import pandas as pd
+
+    @F.pandas_udf("string")
+    def label_batch(text: pd.Series) -> pd.Series:
+        labels, _ = predict_batch(model, text.tolist())
+        return pd.Series(labels)
+
+    inbox.groupBy(label_batch("text").alias("label")).count().orderBy("label").show()
+    ```
+
+    ```text
+    +--------+-----+
+    |   label|count|
+    +--------+-----+
+    | privacy|   54|
+    | returns|   63|
+    |shipping|   58|
+    | unknown|   12|
+    |warranty|   53|
+    +--------+-----+
+    ```
+
+    The **type hints are not decoration**: they tell Spark which kind of
+    pandas UDF this is. `pd.Series -> pd.Series` is the scalar kind; you
+    will meet the iterator kind below. The plan shows the same
+    `ArrowEvalPython` node with a different eval type number at the end
+    (`200` for a scalar pandas UDF, `101` for an Arrow-optimized plain
+    UDF):
+
+    ```text
+    +- ArrowEvalPython [label_batch(text#40)#85], [pythonUDF0#87], 200
+    ```
+
+    Two rules the result must follow, with the errors you get when it
+    does not (both arrive as `PYTHON_EXCEPTION` from the task, with the
+    real reason at the bottom of the traceback):
+
+    - **Same length as the input.** Dropping the NULL texts before
+      predicting returns one value too few:
+      `[SCHEMA_MISMATCH_FOR_PANDAS_UDF] Result vector from pandas_udf was
+      not the required length: expected 120, got 119.`
+    - **Values that fit the declared type.** Returning `text.str.len() /
+      2` (floats) from a UDF declared `"long"` fails with `Failed to
+      convert the value of the column '_0' with type 'float64' to Arrow
+      type 'int64'. ... Arrow safe type check can be disabled by using
+      SQL config spark.sql.execution.pandas.convertToArrowArraySafely.`
+      Do not disable the check; declare `"double"`, or convert
+      explicitly with `.round().astype("Int64")` (the capital-I pandas
+      type keeps NULLs as NULL).
+
+    `None` inside a returned Series of strings becomes NULL, which is how
+    the model's `unknown` rows could have been NULL instead if you
+    preferred.
+
+- Class: mult_question
+  Depth: all
+  Output: "A `pandas_udf` declared as `def f(text: pd.Series) -> pd.Series` is called how often?"
+  AnswerChoices: "Once per Arrow batch of rows;Once per row;Once per partition;Once per query"
+  CorrectAnswer: "Once per Arrow batch of rows"
+  Hint: "The function receives a pandas Series that holds many rows."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## How Big Is a Batch?
+
+    Spark cuts each partition into Arrow batches of at most
+    `spark.sql.execution.arrow.maxRecordsPerBatch` rows (default
+    `10000`). A batch never spans two partitions. You can watch it with
+    a UDF that reports the size of the Series it received:
+
+    ```python
+    @F.pandas_udf("long")
+    def batch_size(text: pd.Series) -> pd.Series:
+        return pd.Series([len(text)] * len(text))
+
+    print(inbox.rdd.getNumPartitions())
+    inbox.select(batch_size("text").alias("rows_in_batch")) \
+        .groupBy("rows_in_batch").count().show()
+    ```
+
+    ```text
+    2
+    +-------------+-----+
+    |rows_in_batch|count|
+    +-------------+-----+
+    |          120|  240|
+    +-------------+-----+
+    ```
+
+    On `local[2]` the four small files become two partitions of 120
+    rows, far below 10000, so each partition is one batch. The setting
+    is a runtime SQL conf, so you can change it between queries:
+
+    ```python
+    spark.conf.set("spark.sql.execution.arrow.maxRecordsPerBatch", "25")
+    inbox.select(batch_size("text").alias("rows_in_batch")) \
+        .groupBy("rows_in_batch").count().orderBy("rows_in_batch").show()
+    ```
+
+    ```text
+    +-------------+-----+
+    |rows_in_batch|count|
+    +-------------+-----+
+    |           20|   40|
+    |           25|  200|
+    +-------------+-----+
+    ```
+
+    Each partition of 120 rows is now four batches of 25 and one of 20.
+
+    Choosing the size is a memory trade. Every batch lives in the Python
+    worker as Arrow data and pandas objects at the same time, plus
+    whatever your model allocates for it. 10000 short strings are
+    nothing; 10000 images are gigabytes. Lower the value for wide rows
+    (documents, images, embeddings) and for models whose memory grows
+    with the batch. There is also an internal byte limit,
+    `spark.sql.execution.arrow.maxBytesPerBatch` (4.0, default 64 MiB),
+    and a batch is cut when either limit is reached.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Your pandas UDF runs a model that needs about 2 MB of memory per
+    row. Set the Arrow batch size for the current session to 500 rows.
+  CorrectAnswer: |
+    spark.conf.set("spark.sql.execution.arrow.maxRecordsPerBatch", "500")
+  Hint: "It is a SQL conf you can set at runtime with spark.conf.set; the key ends in maxRecordsPerBatch."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Is Batching Faster?
+
+    Usually, but measure instead of assuming. Scoring the inbox repeated
+    1000 times (240000 rows, cached) on `local[2]`, best of three runs on
+    one laptop, with a per-row function that is as tight as the batch
+    one (the vocabulary lookup built once, not per row):
+
+    | Style | Time |
+    |---|---|
+    | `@udf` (Arrow, the 4.2 default) | 0.92 s |
+    | `@udf(useArrow=False)` | 0.84 s |
+    | `pandas_udf` with `predict_batch` | 0.55 s |
+
+    The batch version wins, but by less than you might expect, and the
+    Arrow-optimized plain UDF is not faster than the pickled one for this
+    function. The reason is the model: tokenizing is a Python loop over
+    words in both versions, and only the scoring is a matrix product. The
+    more of a model's work is vectorized (NumPy, a neural network
+    framework, a GPU), the larger the gap. Numbers on your machine will
+    differ; the ranking is what to take away. "Tuning Python on Spark"
+    in the intermediate level goes into profiling Python on executors.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## The Nullable Integer Trap
+
+    pandas has no NULL for a plain `int64` column. When a batch of a
+    nullable integer column contains a NULL, PySpark 4.2.0 hands your
+    pandas UDF a `float64` Series with `NaN`, and a float64 cannot hold
+    every integer above 2^53 exactly:
+
+    ```python
+    @F.pandas_udf("string")
+    def dtype_of(s: pd.Series) -> pd.Series:
+        return pd.Series([str(s.dtype)] * len(s))
+
+    @F.pandas_udf("long")
+    def same(s: pd.Series) -> pd.Series:
+        return s
+
+    ids = spark.createDataFrame([(9007199254740993,), (None,)], "order_id bigint").coalesce(1)
+    ids.select("order_id", dtype_of("order_id").alias("dtype"), same("order_id").alias("back")).show()
+    ```
+
+    ```text
+    +----------------+-------+----------------+
+    |        order_id|  dtype|            back|
+    +----------------+-------+----------------+
+    |9007199254740993|float64|9007199254740992|
+    |            NULL|float64|            NULL|
+    +----------------+-------+----------------+
+    ```
+
+    The identity function changed the ID, silently. The dtype also
+    depends on the **batch**: a batch with no NULLs arrives as `int64`,
+    so the same UDF sees different types in different tasks.
+
+    4.2 adds `spark.sql.execution.pythonUDF.pandas.preferIntExtensionDtype`
+    (default `false`). With it set to `true`, integer columns always
+    arrive as pandas' nullable extension types (`Int64`, `Int32`, ...)
+    and the value survives:
+
+    ```text
+    +----------------+-----+----------------+
+    |        order_id|dtype|            back|
+    +----------------+-----+----------------+
+    |9007199254740993|Int64|9007199254740993|
+    |            NULL|Int64|            NULL|
+    +----------------+-----+----------------+
+    ```
+
+    Careful: the 4.2.0 PySpark migration guide says nullable integers
+    now arrive as extension dtypes, but on a stock 4.2.0 install the
+    config is off and you get `float64` as shown. Turn it on, or pass
+    IDs to pandas UDFs as strings.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Load the Model Once per Task: the Iterator Form
+
+    Real models live in files: weights on disk or in object storage. In
+    a scalar pandas UDF, the only place to load one is inside the
+    function, which runs once per batch. The exercise gives you
+    `load_model_for_task(model_path, marker_dir)`, which loads the model
+    from a JSON file and leaves an empty marker file behind each time,
+    so you can count loads. With 4 partitions of 60 tickets and batches
+    of 25:
+
+    ```python
+    spark.conf.set("spark.sql.execution.arrow.maxRecordsPerBatch", "25")
+    tickets = inbox.repartition(4)
+
+    @F.pandas_udf("string")
+    def label_loading_each_batch(text: pd.Series) -> pd.Series:
+        m = load_model_for_task(model_path, markers)
+        return pd.Series(predict_batch(m, text.tolist())[0])
+
+    tickets.select(label_loading_each_batch("text")).collect()
+    ```
+
+    ```text
+    12 loads
+    ```
+
+    Three batches per task, four tasks, twelve loads. The **iterator
+    form** (Spark 3.0, SPARK-26412) fixes this. The function receives an
+    *iterator* of batches for the whole task and yields one result per
+    batch, so code before the loop runs once per task:
+
+    ```python
+    from typing import Iterator
+
+    @F.pandas_udf("string")
+    def label_per_task(batches: Iterator[pd.Series]) -> Iterator[pd.Series]:
+        m = load_model_for_task(model_path, markers)   # runs once per task
+        for text in batches:
+            yield pd.Series(predict_batch(m, text.tolist())[0])
+
+    tickets.select(label_per_task("text")).collect()
+    ```
+
+    ```text
+    ['load-p0-a0-pid3435988-feaa41e0', 'load-p1-a0-pid3435993-c431b157',
+     'load-p2-a0-pid3435993-a696c4bc', 'load-p3-a0-pid3435988-5f3f3128']
+    ```
+
+    Four loads, one per partition (`p0` to `p3`), each by the first
+    attempt of its task (`a0`). The marker names also show the process
+    ID of the Python worker: two workers (two cores) shared the four
+    tasks.
+
+    Rules for the iterator form:
+
+    - The type hints are required to select it. Without them Spark
+      treats the function as scalar and fails with `[UDF_RETURN_TYPE]
+      Return type of the user-defined function should be pandas.Series,
+      but is generator.`
+    - Yield one result per input batch, of the same length. Across the
+      task the counts must match, or you get `[RESULT_ROWS_MISMATCH] The
+      number of output rows (1) must match the number of input rows
+      (3).`
+    - For several input columns, the hint is
+      `Iterator[Tuple[pd.Series, pd.Series]]` and each batch unpacks
+      into one Series per column:
+
+    ```python
+    from typing import Tuple
+
+    @F.pandas_udf("string")
+    def label_with_channel(batches: Iterator[Tuple[pd.Series, pd.Series]]) -> Iterator[pd.Series]:
+        m = load_model_for_task(model_path, markers)
+        for text, channel in batches:
+            labels, _ = predict_batch(m, text.tolist())
+            yield pd.Series([f"{c}:{l}" for c, l in zip(channel, labels)])
+
+    tickets.select(label_with_channel("text", "channel").alias("routed")).show(3)
+    ```
+
+    ```text
+    +----------------+
+    |          routed|
+    +----------------+
+    |   chat:shipping|
+    |web_form:privacy|
+    |   email:returns|
+    +----------------+
+    only showing top 3 rows
+    ```
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Returning Several Values: a Struct
+
+    A label alone hides how sure the model was. Declare a struct return
+    type and yield a pandas **DataFrame** whose column names match the
+    struct's fields:
+
+    ```python
+    @F.pandas_udf("struct<label:string, confidence:double>")
+    def label_and_confidence(batches: Iterator[pd.Series]) -> Iterator[pd.DataFrame]:
+        m = load_model_for_task(model_path, markers)
+        for text in batches:
+            labels, conf = predict_batch(m, text.tolist())
+            yield pd.DataFrame({"label": labels, "confidence": conf})
+
+    (tickets.select("ticket_id", label_and_confidence("text").alias("p"))
+        .select("ticket_id", "p.label", F.round("p.confidence", 3).alias("confidence"))
+        .filter("label != 'unknown'")
+        .orderBy("confidence").show(5))
+    ```
+
+    ```text
+    +---------+--------+----------+
+    |ticket_id|   label|confidence|
+    +---------+--------+----------+
+    |    I0162| returns|       0.3|
+    |    I0018| returns|     0.383|
+    |    I0045| returns|     0.398|
+    |    I0160| returns|     0.418|
+    |    I0195|shipping|     0.476|
+    +---------+--------+----------+
+    only showing top 5 rows
+    ```
+
+    The least confident predictions are worth a look: the first four are
+    shipping tickets ("when will my order be delivered", "delivery is
+    late") that the model got wrong, and the fifth is right but barely. Selecting `p.label` and `p.confidence` from the
+    struct does not run the UDF twice; Spark evaluates `p` once and reads
+    both fields from it. A DataFrame with the wrong column names fails
+    with a `KeyError` naming the missing columns.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Write the decorator and signature (first two lines) of a pandas UDF
+    `embed` that returns `array<float>`, takes one string column and
+    uses the iterator form so it can load a model once per task.
+  CorrectAnswer: |
+    @F.pandas_udf("array<float>")
+    def embed(batches: Iterator[pd.Series]) -> Iterator[pd.Series]:
+  Hint: "The return type goes in the decorator; the iterator form is chosen by the type hints Iterator[pd.Series] -> Iterator[pd.Series]."
+
+- Class: mult_question
+  Depth: all
+  Output: "Your iterator pandas UDF calls `load_model()` inside the `for batch in batches:` loop. A task has 30 batches. How many times is the model loaded in that task?"
+  AnswerChoices: "30;1;Once per executor;0, Spark caches it"
+  CorrectAnswer: "30"
+  Hint: "Only the code before the loop runs once per task."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Getting the Model to the Executors
+
+    There are three ways to give executors the model, and you have
+    already used two:
+
+    **In the closure.** The UDFs above capture `model`, so it travels
+    pickled inside the UDF. For this model the whole pickled UDF is
+    6987 bytes:
+
+    ```python
+    from pyspark.serializers import CloudPickleSerializer
+    print(len(CloudPickleSerializer().dumps(label_batch.func)), "bytes pickled")
+    ```
+
+    That is fine for kilobytes. In classic PySpark, a pickled UDF bigger
+    than `spark.broadcast.UDFCompressionThreshold` (default 1 MiB) is
+    turned into a broadcast automatically. Either way, everything in the
+    closure has to be pickleable, and a big closure is memory every task
+    holds whether it uses the model or not.
+
+    **As a broadcast variable** (classic mode only). The driver sends the
+    value to each executor once, where it is cached and read through
+    `.value`:
+
+    ```python
+    bc = spark.sparkContext.broadcast(model)
+
+    @F.pandas_udf("string")
+    def label_bc(text: pd.Series) -> pd.Series:
+        return pd.Series(predict_batch(bc.value, text.tolist())[0])
+    ```
+
+    On a Spark Connect session there is no `sparkContext`; touching it
+    fails with:
+
+    ```text
+    [JVM_ATTRIBUTE_NOT_SUPPORTED] Attribute `sparkContext` is not supported
+    in Spark Connect as it depends on the JVM.
+    ```
+
+    Closures and files work in both modes.
+
+    **As a file the executors load.** Save the model where every
+    executor can read it and load it in the UDF, once per task, as the
+    iterator form above does. This is the only option that scales to
+    large models, and the only one that works for models that cannot be
+    pickled (many deep learning models hold native resources). On a
+    cluster the path must be on shared storage (object storage, a
+    distributed file system, or a file shipped with
+    `spark.sparkContext.addFile` and found with `SparkFiles.get`); a
+    path on the driver's local disk does not exist on the executors. In
+    local mode every executor is your laptop, so a temporary directory
+    works.
+
+- Class: mult_question
+  Depth: all
+  Output: "You run on Spark Connect and your model is a 2 GB file in object storage. How should the UDF get it?"
+  AnswerChoices: "Load it from storage at the start of an iterator pandas UDF;spark.sparkContext.broadcast(model);Capture it in the UDF's closure;collect() it to the driver first"
+  CorrectAnswer: "Load it from storage at the start of an iterator pandas UDF"
+  Hint: "Connect has no sparkContext, and 2 GB does not belong in a pickled closure."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Once per Task Is Not Once per Worker
+
+    Python workers are reused across tasks by default
+    (`spark.python.worker.reuse` is `true`), so it is tempting to cache
+    the model in a global variable and load it once per worker process:
+
+    ```python
+    _MODEL = None
+
+    @F.pandas_udf("string")
+    def label_global(text: pd.Series) -> pd.Series:
+        global _MODEL
+        if _MODEL is None:
+            _MODEL = load_model_for_task(model_path, markers)
+        return pd.Series(predict_batch(_MODEL, text.tolist())[0])
+    ```
+
+    It does not work when the UDF is defined in your script (the
+    `__main__` module): four tasks gave four loads, even though only two
+    worker processes ran them:
+
+    ```text
+    ['load-p0-a0-pid3435993-...', 'load-p1-a0-pid3436560-...',
+     'load-p2-a0-pid3435993-...', 'load-p3-a0-pid3435993-...']
+    ```
+
+    The UDF is pickled **by value** together with its globals, and each
+    task unpickles a fresh copy, so `_MODEL` starts as `None` every time.
+    A cache survives between tasks only when it lives in a module the
+    workers *import* (a package installed on the executors, or a file
+    shipped with `spark.sparkContext.addPyFile`), because Python keeps
+    imported modules in the worker process.
+
+    Spark ML has a helper built on exactly that: `predict_batch_udf`
+    (3.4) in `pyspark.ml.functions`. You give it a function that loads
+    the model and returns a `predict` function over NumPy arrays; it
+    keeps the result in `pyspark.ml.model_cache.ModelCache` inside the
+    worker process:
+
+    ```python
+    import numpy as np
+    from pyspark.ml.functions import predict_batch_udf
+    from pyspark.sql.types import StringType
+
+    def make_predict_fn():
+        m = load_model_for_task(model_path, markers)
+        def predict(text: np.ndarray) -> np.ndarray:
+            return np.asarray(predict_batch(m, text.tolist())[0], dtype=object)
+        return predict
+
+    classify = predict_batch_udf(make_predict_fn, return_type=StringType(), batch_size=50)
+    tickets.select(classify("text")).collect()
+    tickets.select(classify("text")).collect()
+    ```
+
+    ```text
+    first query:  ['load-p0-a0-pid3436560-...', 'load-p1-a0-pid3435993-...']
+    second query: []
+    ```
+
+    Two loads for four tasks (one per worker process), and none for the
+    second query. The fine print, from the `ModelCache` source: it holds
+    at most three models per worker, it needs worker reuse on, and an
+    idle worker is killed after one minute, which empties its cache.
+    `batch_size` re-slices Spark's Arrow batches into model-sized pieces.
+    Caching across tasks and queries is a production concern; "Model
+    Inference in Production" in the intermediate level builds on it.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Batch Scoring With mapInPandas
+
+    A pandas UDF adds one column. Sometimes you want to work on whole
+    rows instead: read several columns, drop rows, emit more than one row
+    per input, or return a table with its own schema. `mapInPandas`
+    (Spark 3.0, SPARK-28198) hands your function an iterator of pandas
+    DataFrames for each partition (the same batches as above) and expects
+    an iterator of DataFrames back:
+
+    ```python
+    def score(batches):
+        m = load_model_for_task(model_path, markers)     # once per partition
+        for pdf in batches:
+            labels, conf = predict_batch(m, pdf["text"].tolist())
+            yield pd.DataFrame({"ticket_id": pdf["ticket_id"],
+                                "label": labels, "confidence": conf})
+
+    scored = tickets.mapInPandas(score, "ticket_id string, label string, confidence double")
+    scored.show(3)
+    ```
+
+    ```text
+    +---------+--------+------------------+
+    |ticket_id|   label|        confidence|
+    +---------+--------+------------------+
+    |    I0006|warranty| 0.848571880452549|
+    |    I0208|warranty|0.9996754525940297|
+    |    I0192|warranty|0.6060703527200753|
+    +---------+--------+------------------+
+    only showing top 3 rows
+    ```
+
+    The function is called once per partition, so the model loads once
+    per partition with no special type hints. Things to know:
+
+    - **Columns are matched by name**, not position. A missing or
+      misspelled column fails with `[RESULT_COLUMN_NAMES_MISMATCH] Column
+      names of the returned data do not match specified schema. Missing:
+      label. Unexpected: lbl.` Extra columns are dropped silently.
+    - **Any number of rows** per batch is fine, including zero. That is
+      the difference from a UDF, which must return exactly one value per
+      row.
+    - The input is the **whole row**: select only the columns the
+      function needs first, so Spark does not ship the rest to Python.
+
+    "Images and Audio" used `mapInArrow`, the same idea with PyArrow
+    record batches instead of pandas DataFrames.
+
+    Which one to use:
+
+    | Job | Tool |
+    |---|---|
+    | One value per row, cheap Python | `@udf` |
+    | One value per row, vectorized model, cheap to load | `pandas_udf`, Series to Series |
+    | One value per row, expensive model load | `pandas_udf`, iterator form |
+    | Model cached across tasks and queries | `predict_batch_udf` |
+    | Whole rows in, any rows out | `mapInPandas` (or `mapInArrow`) |
+
+- Class: mult_question
+  Depth: all
+  Output: "Your mapInPandas function yields DataFrames with columns `id, lbl`, and the declared schema is `id string, label string`. What happens?"
+  AnswerChoices: "The task fails with RESULT_COLUMN_NAMES_MISMATCH;lbl is renamed to label by position;label is NULL for every row;The extra lbl column is dropped and label is filled from it"
+  CorrectAnswer: "The task fails with RESULT_COLUMN_NAMES_MISMATCH"
+  Hint: "mapInPandas matches the columns you return to the schema by name."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Why Your Model May Run More Than Once
+
+    You write `withColumn("label", model_udf("text"))` once, but that is
+    a description, not an instruction to run the model once. Spark
+    decides how often to evaluate it. To see what actually happens, wrap
+    the model in a pandas UDF that appends the size of each batch to a
+    file, and count rows after each query:
+
+    | Query on `labeled = inbox.withColumn("label", udf("text"))` | Rows the model saw |
+    |---|---|
+    | `labeled.collect()` | 240 |
+    | `labeled.collect()` again | 240 more |
+    | `labeled.count()` | **0** |
+    | `labeled.show(3)` | 4 |
+    | `labeled.filter("label = 'warranty'").collect()` (53 rows) | **293** |
+    | same filter, UDF marked `.asNondeterministic()` | 240 |
+    | `labeled.cache().count()`, then two more queries on it | 240, then 0 |
+
+    Each line has a reason:
+
+    - **Every action starts from the plan.** Without a cache, the second
+      `collect()` scores everything again.
+    - **Unused columns are pruned.** `count()` does not need `label`, so
+      Spark never calls the model. Do not time a UDF with `count()`.
+    - **`show(3)` fetches one extra row** (to know whether to print
+      "only showing top 3 rows") and only from the first partition.
+    - **A filter on the output can duplicate the call.** Spark treats
+      your UDF as deterministic, so it pushes the filter below the
+      projection by substituting the UDF into the condition. The plan
+      then has two Python evaluations: one for the filter over all 240
+      rows, one for the 53 rows that survive:
+
+    ```text
+    *(2) Project [ticket_id#23, channel#24, text#25, pythonUDF0#49 AS label#37]
+    +- ArrowEvalPython [counted(text#25)#36], [pythonUDF0#49], 200
+       +- *(1) Project [ticket_id#23, channel#24, text#25]
+          +- *(1) Filter (pythonUDF0#48 = warranty)
+             +- ArrowEvalPython [counted(text#25)#36], [pythonUDF0#48], 200
+                +- FileScan json [ticket_id#23,channel#24,text#25] ...
+    ```
+
+    - **`asNondeterministic()`** tells Spark the result may differ
+      between calls, so it may not duplicate or move the call. That stops
+      the double scoring, at the price of blocking optimizations around
+      it. Use it when calls are expensive or have side effects, or when
+      the model really is random (sampling, dropout at inference).
+    - **Caching** ("Plans, Partitions and Caching") scores once and
+      serves later queries from memory. For an expensive model, writing
+      the scores to a table is even better: they survive the session.
+
+    Beyond these, a failed task is retried from the start of its
+    partition, a slow one may be duplicated by speculative execution, and
+    a lost executor means recomputing its partitions. So: **never rely on
+    a model call happening exactly once**. Keep calls free of side
+    effects, or make them idempotent. "Determinism, Retries and Fault
+    Injection" in the advanced level forces each of these on purpose.
+
+- Class: mult_question
+  Depth: all
+  Output: "You run `df.withColumn('label', model_udf('text')).filter(\"label = 'spam'\").collect()` over 1000 rows and 100 are spam. How many rows does the model score, with Spark's default treatment of the UDF?"
+  AnswerChoices: "1100;1000;100;2000"
+  CorrectAnswer: "1100"
+  Hint: "The filter is pushed below the projection with the UDF substituted in, so the UDF is evaluated for the filter and again for the surviving rows."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Using the Model From SQL
+
+    A pandas UDF can be registered for SQL like any UDF, so analysts can
+    call your model without Python:
+
+    ```python
+    spark.udf.register("classify", label_batch)
+    inbox.createOrReplaceTempView("inbox")
+    spark.sql("""
+        SELECT classify(text) AS label, count(*) AS n
+        FROM inbox GROUP BY 1 ORDER BY n DESC
+    """).show()
+    ```
+
+    ```text
+    +--------+---+
+    |   label|  n|
+    +--------+---+
+    | returns| 63|
+    |shipping| 58|
+    | privacy| 54|
+    |warranty| 53|
+    | unknown| 12|
+    +--------+---+
+    ```
+
+    The registration lives in the session that made it; a new session
+    (or a scheduled job) has to register it again.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## How Good Is It?
+
+    Scoring is only half the job; you also want to know how often the
+    model is right. Join the predictions to the answer key and average a
+    boolean:
+
+    ```python
+    answers = (spark.read.option("header", True).csv("data/messy/support_tickets/inbox_labels.csv")
+               .select(F.col("ticket_id").alias("id"), F.col("label").alias("expected")))
+    (answers.join(scored.withColumnRenamed("ticket_id", "id"), "id")
+        .agg(F.avg((F.col("label") == F.col("expected")).cast("double")).alias("accuracy"))
+        .show())
+    ```
+
+    ```text
+    +------------------+
+    |          accuracy|
+    +------------------+
+    |0.9666666666666667|
+    +------------------+
+    ```
+
+    232 of 240. The eight mistakes are honest ones: a ticket that
+    mentions a warranty claim *and* a privacy setting, polite openers
+    ("To whom it may concern") that appear more often in one label's
+    training tickets, and "when will my order be delivered" losing to
+    `returns`. The inbox was generated from the same phrases as the
+    training set, so 97% is flattering; real tickets would score lower.
+    The point is the method: hold out labelled data, score it with the
+    same code path as production, and look at the mistakes.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## A Note on LLMs (Ungraded)
+
+    Calling a large language model is the same pattern with a network in
+    the middle: one client per task, batched requests, and a structured
+    answer you validate in Spark. The sketch below runs anywhere because
+    `FakeClient` stands in for a real SDK; no key, no network:
+
+    ```python
+    class FakeClient:
+        """Stands in for an LLM SDK client: one call takes a list of prompts."""
+        def complete(self, prompts):
+            out = []
+            for p in prompts:
+                t = p.rsplit("Ticket: ", 1)[1].lower()
+                if "broken" in t:
+                    out.append('{"label": "warranty", "order_id": null}')
+                elif "order" in t:
+                    out.append('Sure! {"label": "shipping"}')          # not valid JSON
+                else:
+                    out.append('{"label": "returns", "order_id": 1234}')
+            return out
+
+    PROMPT = ("Classify the support ticket as shipping, returns, warranty or privacy. "
+              'Answer with JSON only: {{"label": "...", "order_id": <number or null>}}.'
+              "\n\nTicket: {text}")
+
+    def ask_model(batches):
+        client = FakeClient()          # one client per task: connections, auth, rate limits
+        for pdf in batches:
+            prompts = [PROMPT.format(text=t or "") for t in pdf["text"]]
+            answers = []
+            for start in range(0, len(prompts), 20):     # 20 prompts per request
+                answers += client.complete(prompts[start:start + 20])
+            yield pd.DataFrame({"ticket_id": pdf["ticket_id"], "answer": answers})
+
+    ANSWER = "struct<label:string, order_id:bigint>"
+    answers = inbox.mapInPandas(ask_model, "ticket_id string, answer string")
+    parsed = answers.withColumn("parsed", F.from_json("answer", ANSWER))
+    parsed.select("ticket_id", "answer", "parsed.label").show(4, truncate=45)
+    ```
+
+    ```text
+    +---------+--------------------------------------+-------+
+    |ticket_id|                                answer|  label|
+    +---------+--------------------------------------+-------+
+    |    I0181|{"label": "returns", "order_id": 1234}|returns|
+    |    I0182|           Sure! {"label": "shipping"}|   NULL|
+    |    I0183|           Sure! {"label": "shipping"}|   NULL|
+    |    I0184|{"label": "returns", "order_id": 1234}|returns|
+    +---------+--------------------------------------+-------+
+    ```
+
+    The fake model, like real ones, sometimes wraps its JSON in chatter.
+    `from_json` in its default PERMISSIVE mode turns that into a struct
+    of NULLs instead of failing the job, so you can count and quarantine
+    bad answers as in "JSON Drift and Quarantine". What this sketch
+    leaves out, and "Model Inference in Production" adds: timeouts,
+    retries with backoff, rate limits per executor, a dead-letter table
+    for failed calls, and caching answers by a hash of the input so a
+    rerun never pays twice. Remember the previous section, too: Spark
+    may call `ask_model` more than once for the same rows, and every
+    call costs money.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## MLlib or Your Own Model?
+
+    Spark MLlib has a naive Bayes classifier too
+    (`pyspark.ml.classification.NaiveBayes`, default
+    `modelType="multinomial"`, `smoothing=1.0`), and with the
+    `RegexTokenizer`, `StopWordsRemover` and `HashingTF` stages from
+    "Text Analytics Without an LLM" you could train and apply it without
+    any Python on the executors. Prefer MLlib when the algorithm you
+    need is there: training is distributed, scoring runs in the JVM, and
+    the fitted pipeline saves and loads as one object.
+
+    Use the pattern in this lesson when the model comes from somewhere
+    else: a scikit-learn pipeline, a PyTorch or ONNX network, a
+    tokenizer from a model hub, a vendor SDK. That is most models people
+    actually deploy, and the Spark side stays the same: train or download
+    on the driver, ship by file, load once per task, score in batches.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Classify Every Document, E-mail and Ticket
+
+    The model functions (`tokenize`, `train_naive_bayes`, `predict_one`,
+    `predict_batch`, `save_model`, `load_model`, `load_model_for_task`)
+    are written for you. Implement:
+
+    1. `load_texts(spark)`: one DataFrame `id, source, text` with the four
+       policy documents (source `doc`, id = file name, the whole file),
+       the four e-mails (source `mail`, id = file name, text = the
+       Subject header, a space, then the body) and the 240 inbox tickets
+       (source `inbox`, id = `ticket_id`).
+    2. `train_on_driver(spark)`: read `train.csv` with Spark, collect it,
+       and return `train_naive_bayes(...)`.
+    3. `label_column(texts, model)`: add `label` with a Series to Series
+       `pandas_udf` that captures `model`.
+    4. `label_once_per_task(texts, model_path, marker_dir)`: add `label`
+       and `confidence` with an iterator `pandas_udf` returning
+       `RESULT_TYPE`, calling `load_model_for_task` once per task.
+    5. `score_partitions(texts, model_path, marker_dir)`: the same with
+       `mapInPandas` and `SCORE_SCHEMA`.
+    6. `inbox_accuracy(scored, spark)`: the fraction of inbox tickets
+       whose label matches `inbox_labels.csv`.
+
+    The harness compares every prediction with `predict_one` run in plain
+    Python, sets the batch size to 25, repartitions the texts into 4
+    partitions, and counts the marker files: the iterator UDF and
+    `mapInPandas` must each load the model exactly 4 times, once in each
+    partition.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Mail text: F.concat_ws(' ', F.regexp_extract('value', r'(?m)^Subject: (.*)$', 1), F.trim(F.regexp_extract('value', r'\\r?\\n\\r?\\n(.*)', 1))). Iterator UDF: @F.pandas_udf(RESULT_TYPE) on def f(batches: Iterator[pd.Series]) -> Iterator[pd.DataFrame], load the model on the first line, then yield pd.DataFrame({'label': ..., 'confidence': ...}) inside the loop. mapInPandas: yield pd.DataFrame({'id': pdf['id'], 'label': ..., 'confidence': ...})."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    In this lesson you learned:
+
+    - **Train on the driver, score on the executors**: collect a small
+      training set, fit a plain Python model, apply it with a UDF
+    - **`@udf`** calls your function once per row (Arrow-optimized by
+      default in 4.2, `ArrowEvalPython ... 101`); **`pandas_udf`**
+      (Series to Series) once per batch (`ArrowEvalPython ... 200`), and
+      must return the same number of values with types that fit
+    - **Batch size** is `spark.sql.execution.arrow.maxRecordsPerBatch`
+      (default 10000), a runtime conf; lower it for wide rows and big
+      models
+    - **Nullable integers** reach pandas UDFs as `float64` when a batch
+      has a NULL, losing precision above 2^53, unless you set
+      `spark.sql.execution.pythonUDF.pandas.preferIntExtensionDtype`
+      (4.2, default `false`)
+    - **The iterator form** (`Iterator[pd.Series] -> Iterator[pd.Series]`)
+      runs setup once per task: load the model before the loop. Count
+      loads with evidence, such as a marker file per load
+    - **Shipping the model**: a closure for small models, a broadcast in
+      classic mode, a file on shared storage for anything large or on
+      Spark Connect; a global in your script is reset for every task, and
+      `predict_batch_udf` (3.4) caches per worker process
+    - **`mapInPandas`** for whole-row batch scoring; columns are matched
+      by name
+    - **Spark may run your model more than once**: repeated actions,
+      filters on the output, retries and speculation; `count()` may not
+      run it at all. Cache or write results, use `asNondeterministic()`
+      for expensive or side-effecting calls, keep calls idempotent
+    - An **LLM call** is the same pattern: a client per task, batched
+      requests, validated JSON
+
+    Next: **What Spark 4.x Adds for Messy Data**, the last lesson of the
+    basics level: geospatial types, collations, the TIME type and the
+    other 4.x features that help with messy data.

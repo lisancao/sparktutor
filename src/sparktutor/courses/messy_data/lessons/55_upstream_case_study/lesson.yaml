@@ -1,0 +1,1095 @@
+- Class: meta
+  Lesson: "From Wrong Results to a Fix: An Upstream Case Study"
+  EstimatedMinutes: 100
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    In "Filter Pushdown" (intermediate level) you met a trap: on Spark
+    4.2.0, with pushdown on, a DataFrame that has run a filtered query
+    keeps returning the filtered rows. That lesson gave you a
+    workaround (load afresh per query and per reference) and moved
+    on. This lesson does the opposite: it stays with the bug until it is understood, tested,
+    fixed and written up, the way a Spark contributor works.
+
+    It assumes "How Catalyst Plans Python" (where `PythonScanBuilder`,
+    `PythonScan` and the planning workers were introduced) and "The
+    Python Worker Protocol" (how a planning worker talks to the JVM).
+
+    By the end of this lesson you will be able to:
+
+    - Turn a symptom into a ten-line repro that anyone can run, and
+      map where the bug starts and stops (classic and Connect, views,
+      joins, caching)
+    - Read `PythonDataSourceV2`, `PythonScanBuilder` and `PythonScan`
+      in the 4.2.0 source and say which object owns which state
+    - Confirm a hypothesis with evidence you produce yourself: a count
+      of planned reads, and the reader object pulled out of the JVM's
+      cache through Py4J
+    - Write a regression test that fails on 4.2.0 for the right reason,
+      in PySpark's `unittest` style and in Scala
+    - Read master's fix, write the narrow version for the maintenance
+      branches, and test it against the 4.2.0 jars without building
+      Spark, using the Scala compiler that ships in `pyspark/jars`
+    - Search JIRA for duplicates, choose priority and versions, and
+      write the report
+
+    One thing up front: at the time of writing, this bug has no JIRA
+    issue. It is open on 4.2.0 and on the 4.3 branch. Writing that
+    issue well is part of the work.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Method in One Page
+
+    Every correctness bug in a large system is investigated with the
+    same loop. The steps are cheap at the start and expensive at the
+    end, so do them in order:
+
+    ```text
+    notice      a number that should not change, changes
+    minimize    the smallest program that still shows it
+    boundary    where it happens and where it does not
+    hypothesis  a precise claim about the code, with predictions
+    experiment  evidence that confirms or kills each prediction
+    test        an automated check that fails today
+    fix         the smallest change that makes the test pass
+    triage      duplicates, versions, priority, target branches
+    report      a JIRA a committer can act on without asking you
+    ```
+
+    Skipping ahead is the classic mistake. A fix written before the
+    boundary is known tends to cover the case you saw and miss the one
+    you did not; you will see exactly that happen below, in master's
+    own regression test.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Notice: A Count That Changes
+
+    The bug surfaced while testing "Filter Pushdown". The `files`
+    source lists `data/messy`, and pushes `kind = 'image'` into the
+    file listing:
+
+    ```python
+    df = spark.read.format("files").option("path", root).load()
+    df.count()                                    # 26
+    df.filter(sf.col("kind") == "image").count()  # 5
+    df.count()                                    # 5, not 26
+    ```
+
+    Nothing failed. No error, no warning, and `df.explain()` for the
+    last query shows a plain scan with no filter. The only signal was
+    a number that had no reason to change.
+
+    That is what makes correctness bugs expensive: they are found by
+    someone who compares numbers, usually much later. Two habits catch
+    them early. Check invariants you know (a count without a filter
+    does not depend on what ran before it), and when a number surprises
+    you, stop and write it down before you "fix" your own code around
+    it.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Minimize the Repro
+
+    A repro is minimal when every line is needed to show the bug. For a
+    data source bug that means:
+
+    - **No files, no network.** Rows come from `range()`. Anyone can run
+      it, on any machine, and nothing outside the program can change.
+    - **One partition, deterministic rows.** Ten rows, three with
+      `k = 'a'`; the right answers are obvious.
+    - **The least API.** One pushed filter type (`EqualTo`), no options.
+    - **Expected values in the output**, so a reader sees the bug
+      without running it.
+
+    ```python
+    from pyspark.sql import SparkSession
+    from pyspark.sql.datasource import DataSource, DataSourceReader, EqualTo
+
+    class Src(DataSource):
+        @classmethod
+        def name(cls): return "kv"
+        def schema(self): return "k string, v int"
+        def reader(self, schema): return R()
+
+    class R(DataSourceReader):
+        def __init__(self): self.k = None
+        def pushFilters(self, filters):
+            for f in filters:
+                if isinstance(f, EqualTo) and f.attribute == ("k",): self.k = f.value
+                else: yield f
+        def read(self, partition):
+            for i in range(10):
+                k = "a" if i < 3 else "b"
+                if self.k is None or k == self.k: yield (k, i)
+
+    spark = (SparkSession.builder.master("local[2]")
+             .config("spark.sql.python.filterPushdown.enabled", "true").getOrCreate())
+    spark.dataSource.register(Src)
+    df = spark.read.format("kv").load()
+    print("count before any filter:", df.count())
+    print("filter k='a':", df.filter("k = 'a'").count())
+    print("count after filtered query (expect 10):", df.count())
+    ```
+
+    On the pip `pyspark==4.2.0` package:
+
+    ```text
+    count before any filter: 10
+    filter k='a': 3
+    count after filtered query (expect 10): 3
+    ```
+
+    Notice what is not in it: the reader does not implement
+    `partitions()` (the default plans one partition) and does not
+    read the schema. Each removed line is one less thing a reviewer
+    has to rule out.
+
+- Class: mult_question
+  Depth: all
+  Output: "Which change makes a data source repro LESS useful for a JIRA?"
+  AnswerChoices: "Reading the rows from a CSV file in your home folder;Generating the rows with range();Printing the expected value next to each result;Removing the partitions() method so the default is used"
+  CorrectAnswer: "Reading the rows from a CSV file in your home folder"
+  Hint: "A committer must be able to run it without anything from your machine."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Find the Boundary
+
+    Now vary one thing at a time and record what happens. The table
+    below comes from one script on stock 4.2.0, classic mode, with an
+    audit folder that counts **planned reads** (each call of the
+    reader's `partitions()`, which runs once per planned read; how that
+    counter works comes later). Correct results are in parentheses.
+
+    | Query, in order, on one `df` | Result | Planned reads |
+    |---|---|---|
+    | `df.count()` | 10 | 1 |
+    | `df.filter("k = 'a'").count()` | 3 | 1 |
+    | `df.count()` | **3** (10) | 0 |
+    | `df.filter("v > 5").count()` | 4 | 1 |
+    | `df.filter("k = 'b'").count()` | 7 | 1 |
+    | `df.count()` | **7** (10) | 0 |
+    | `df.filter("k = 'a' OR v > 8").count()` | **1** (4) | 0 |
+
+    And on fresh DataFrames, each line its own `load()`:
+
+    | Query | Result | Planned reads |
+    |---|---|---|
+    | `f.union(f.filter("k = 'a'"))` | **6** (13) | 1 |
+    | `g.filter("k = 'a'").union(g.filter("k = 'b'"))` | **14** (10) | 2 |
+    | `h1.union(h2.filter("k = 'a'"))`, two loads | 13 | 2 |
+    | self-join on `v`, then `x.k = 'a'` | **10** (3) | 2 |
+    | `c.filter("k = 'a'")` first, then `c.cache().count()` | **3** (10) | 1 |
+
+    What the boundary says:
+
+    - **Zero planned reads is the tell.** Every wrong sequential answer
+      comes from a query that planned nothing and reused something.
+    - **A query whose filters reach `pushFilters` heals the DataFrame.**
+      `v > 5` arrives as `IsNotNull(v)` and `GreaterThan(v, 5)`; the
+      reader declines both, but the call still plans a new, unfiltered
+      read, and the next count is right again. An `OR` never reaches
+      `pushFilters` (lesson "Filter Pushdown"), so it does not heal.
+    - **It is not only about reuse across queries.** A single query
+      that mentions the same DataFrame twice is wrong on its very first
+      run. In `a UNION b` the last pushed filter wins for both sides
+      (7 + 7 = 14).
+    - **It can drop a filter, not only add one.** In the self-join,
+      Spark infers `IsNotNull(v)` for the right side (from the join
+      condition), that side's pushdown runs last, and the left side
+      reads every row although its `k = 'a'` was taken over by the
+      reader. The plan even says so:
+
+    ```text
+    (1) BatchScan kv
+    Output [2]: [k#42, v#43]
+    PushedFilters: [EqualTo(k,a)]
+    ReadSchema: struct<k:string,v:int>
+    (2) Filter
+    Input [2]: [k#42, v#43]
+    Condition : (isnotnull(k#42) AND isnotnull(v#43))
+    ```
+
+    - **Two `load()` calls never interfere**, and `cache()` freezes
+      whatever the first action computed, right or wrong.
+
+    The self-join result changes the severity: "do not reuse a
+    DataFrame" is a habit users can learn; "a self-join is wrong the
+    first time" is not.
+
+- Class: mult_question
+  Depth: all
+  Output: "On 4.2.0 with pushdown on, d is a fresh DataFrame. You run d.union(d.filter(\"k = 'a'\")).count() once. What do you get?"
+  AnswerChoices: "6, both sides read the filtered rows;13, the first query on a fresh DataFrame is always right;10, the filter is ignored;An error about a duplicate scan"
+  CorrectAnswer: "6, both sides read the filtered rows"
+  Hint: "Both sides of the union scan the same relation, and only one of them pushes a filter."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Classic and Connect: Same Bug, Different Path
+
+    The same script with `.remote("local[2]")` gives the same wrong
+    numbers. That is less obvious than it looks. On Spark Connect the
+    client does not hold a JVM DataFrame; every action sends a protobuf
+    plan and the server analyzes it again, so each `df.count()` could
+    have built a fresh relation.
+
+    It does not, because of a server-side cache. `SessionHolder`
+    (`sql/connect/server/src/main/scala/org/apache/spark/sql/connect/service/SessionHolder.scala`,
+    `usePlanCache`, around line 602) keeps resolved logical plans keyed
+    by the protobuf `Relation`, which includes its plan id. Since 4.1
+    it **always** caches the translation of a `Read.DataSource` node,
+    under the internal setting
+    `spark.connect.session.planCache.alwaysCacheDataSourceReadsEnabled`
+    (default `true`, declared in `Connect.scala`). Reusing a client
+    DataFrame reuses its plan id, so the server hands back the same
+    `DataSourceV2Relation`, with the same provider inside.
+
+    Turning the cache off is a clean experiment, because it changes
+    nothing but the sharing:
+
+    ```python
+    spark.conf.set("spark.connect.session.planCache.alwaysCacheDataSourceReadsEnabled", "false")
+    df = spark.read.format("kv").load()
+    print(df.count(), df.filter("k = 'a'").count(), df.count())
+    ```
+
+    ```text
+    default: 10 3 3
+    cache of data source reads off: 10 3 10
+    ```
+
+    With `spark.connect.session.planCache.enabled` set to `false`
+    instead, every DataFrame case in the boundary tables came out right
+    on Connect, including the self-union and the self-join: without the
+    cache, the server translates each reference to the DataFrame into
+    its own relation. A self-join through a temporary view stayed wrong
+    (10 instead of 3), because a view stores one analyzed plan, with
+    one relation, for all its references. In classic mode there is no
+    such switch, because `df` *is* the plan object.
+
+    So the defect is not "Connect caches plans" (that cache is correct
+    and valuable). The defect is state that is unsafe to share, living
+    on an object that both modes share for good reasons. Do not ship
+    the cache setting as a workaround: it is internal, it costs a full
+    analysis per reference, and it does nothing for classic users.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "Why does reusing a DataFrame reproduce the bug on Spark Connect, where the server re-analyzes each plan?"
+  AnswerChoices: "The server caches the resolved Read.DataSource by its protobuf relation and plan id, so it returns the same relation and provider;The Python client caches the provider;Spark Connect sends the read function to the client;It does not reproduce on Connect"
+  CorrectAnswer: "The server caches the resolved Read.DataSource by its protobuf relation and plan id, so it returns the same relation and provider"
+  Hint: "Look at usePlanCache in SessionHolder and the alwaysCacheDataSourceReadsEnabled setting."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Read the Source: Who Owns the State?
+
+    The fastest way into unfamiliar code is to ask, for each object:
+    how many of these exist, and how long does each live? Paths are
+    under `sql/core/src/main/scala/org/apache/spark/sql/` in the 4.2.0
+    source tree.
+
+    | Object | How many | Created in |
+    |---|---|---|
+    | `PythonDataSourceV2` (the provider) | one per `load()` | `DataSource.lookupDataSourceV2`, `execution/datasources/DataSource.scala` line 763, called from `catalyst/analysis/ResolveDataSource.scala` |
+    | `PythonTable` | one per provider | `PythonDataSourceV2.getTable` |
+    | `DataSourceV2Relation` | one per `load()`, shared by every query built on that DataFrame | the analyzer |
+    | `PythonScanBuilder` | one per scan, per planning | `PythonTable.newScanBuilder`, called by `V2ScanRelationPushDown` |
+    | `PythonScan`, `PythonBatch` | one per scan | `PythonScanBuilder.build`, `PythonScan.toBatch` |
+
+    The provider outlives every query; scans live for one plan. Now the
+    state, in `execution/datasources/v2/python/PythonDataSourceV2.scala`:
+
+    ```scala
+    private var readInfo: PythonDataSourceReadInfo = _      // line 55
+
+    def getOrCreateReadInfo(shortName: String, options: CaseInsensitiveStringMap,
+        outputSchema: StructType, isStreaming: Boolean): PythonDataSourceReadInfo = {
+      if (readInfo == null) {
+        val creationResult = getOrCreateDataSourceInPython(shortName, options, Some(outputSchema))
+        readInfo = source.createReadInfoInPython(creationResult, outputSchema, isStreaming)
+      }
+      readInfo
+    }
+
+    def setReadInfo(readInfo: PythonDataSourceReadInfo): Unit = {   // line 70
+      this.readInfo = readInfo
+    }
+    ```
+
+    `PythonDataSourceReadInfo` (in `UserDefinedPythonDataSource.scala`)
+    is a pickled read function plus the pickled partitions. Who writes
+    it? `PythonScanBuilder.pushFilters`, line 50:
+
+    ```scala
+    ds.source.pushdownFiltersInPython(dataSource, outputSchema, filters) match {
+      case None => filters // No filters are supported.
+      case Some(result) =>
+        // Filter pushdown also returns partitions and the read function.
+        // This helps reduce the number of Python worker calls.
+        ds.setReadInfo(result.readInfo)
+    ```
+
+    And who reads it? `PythonBatch` in `PythonScan.scala`, line 87,
+    lazily, during physical planning:
+
+    ```scala
+    private lazy val infoInPython: PythonDataSourceReadInfo = {
+      ds.getOrCreateReadInfo(shortName, options, outputSchema, isStreaming = false)
+    }
+    ```
+
+    The Python side explains why the read info is filter-specific. The
+    pushdown worker, `python/pyspark/sql/worker/data_source_pushdown_filters.py`,
+    calls your `pushFilters` on a fresh reader and then, "in the same
+    worker as filter pushdown", calls `write_read_func_and_partitions`
+    (from `plan_data_source_read.py`) on **that** reader. The pickled
+    read function closes over the reader, with `self.k = 'a'` inside.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Form the Hypothesis
+
+    Put it as a claim precise enough to be wrong:
+
+    > Filter pushdown plans a read with a reader that has seen the
+    > pushed filters, and stores it on the provider, which every scan of
+    > the relation shares. A scan that pushes nothing calls
+    > `getOrCreateReadInfo`, finds that read, and uses it. Spark has
+    > dropped no filter from that scan's plan, so nothing corrects the
+    > rows.
+
+    A good hypothesis makes predictions you have not checked yet:
+
+    1. A query after a pushed query plans **no** read (it reuses one).
+    2. The provider's `readInfo` holds a reader whose `k` is `'a'`
+       after `filter("k = 'a'")`, and `None` before.
+    3. In one query, the scan whose `pushFilters` runs last decides
+       what every scan of that relation reads (hence 14, and the
+       dropped filter in the self-join).
+    4. Two `load()` calls have two providers and cannot interfere.
+    5. Keeping the pushed read on the scan instead of the provider
+       makes every case right.
+
+    Prediction 4 is already confirmed by the boundary table. The rest
+    need evidence.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Experiment 1: Count Planned Reads
+
+    `partitions()` runs exactly once per planned read, in a planning
+    worker on the driver, whether the read was planned by the pushdown
+    worker or by `plan_data_source_read.py`. A marker file per call
+    turns that into a number the driver can read:
+
+    ```python
+    def partitions(self):
+        if self.audit:
+            import uuid
+            with open(os.path.join(self.audit, f"plan-{uuid.uuid4().hex}"), "w") as f:
+                f.write(repr(self.k))
+        return [InputPartition(0)]
+    ```
+
+    The planning worker is a separate Python process, so a counter on
+    `self` or a global would be lost with it; the file system is the
+    simplest channel back. For `count`, `filter count`, `count` the
+    planned reads were `[1, 1, 0]`: prediction 1 holds.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Experiment 2: Open the Provider
+
+    In classic mode the JVM objects are one Py4J call away. The fields
+    are private Scala vars, so read them with Java reflection:
+
+    ```python
+    import inspect
+    from pyspark import cloudpickle
+
+    def private(obj, field):
+        f = obj.getClass().getDeclaredField(field)
+        f.setAccessible(True)
+        return f.get(obj)
+
+    rel = df._jdf.queryExecution().analyzed()       # DataSourceV2Relation
+    table = rel.table()                             # PythonTable
+    print([f.getName() for f in table.getClass().getDeclaredFields()])
+    ds = private(table, "ds")                       # PythonDataSourceV2
+    print([f.getName() for f in ds.getClass().getDeclaredFields()])
+    ```
+
+    ```text
+    ['ds', 'shortName', 'outputSchema']
+    ['source', 'name', 'dataSourceInPython', 'readInfo', 'bitmap$0']
+    ```
+
+    Then fingerprint the cached read after each query:
+
+    ```python
+    import hashlib
+
+    def read_info():
+        info = private(ds, "readInfo")
+        if info is None:
+            return None
+        func = bytes(info.func())
+        return (info.getClass().getSimpleName(), hashlib.sha256(func).hexdigest()[:12],
+                len(func), info.partitions().size())
+
+    print("after load():", read_info())
+    print("count", df.count(), read_info())
+    print("filter count", df.filter("k = 'a'").count(), read_info())
+    print("count", df.count(), read_info())
+    other = spark.read.format("kv").load()
+    ods = private(other._jdf.queryExecution().analyzed().table(), "ds")
+    child = df.filter("k = 'a'")._jdf.queryExecution().analyzed().child()
+    print("same provider object for a second load()?", ods.equals(ds),
+          "| same for a filtered child?", private(child.table(), "ds").equals(ds))
+    ```
+
+    ```text
+    after load(): None
+    count 10 ('PythonDataSourceReadInfo', '18981234c728', 6068, 1)
+    filter count 3 ('PythonDataSourceReadInfo', '0cc9ad7eb106', 6071, 1)
+    count 3 ('PythonDataSourceReadInfo', '0cc9ad7eb106', 6071, 1)
+    same provider object for a second load()? False | same for a filtered child? True
+    ```
+
+    The pushed query replaced the cached function (three bytes longer:
+    the pickled `'a'`), and the next count used it. To see the reader
+    itself, unpickle the function. `write_read_func_and_partitions`
+    pickles the pair `(data_source_read_func, schema)`, and the reader
+    is one of the function's free variables:
+
+    ```python
+    func, schema = cloudpickle.loads(bytes(private(ds, "readInfo").func()))
+    print(sorted(inspect.getclosurevars(func).nonlocals))
+    print(vars(inspect.getclosurevars(func).nonlocals["reader"]))
+    ```
+
+    ```text
+    ['converter', 'data_source', 'max_arrow_batch_size', 'reader', 'return_type']
+    {'k': 'a'}
+    ```
+
+    Prediction 2 holds, and the evidence is the actual object, not an
+    inference from counts. This only works in classic mode (`_jdf` does
+    not exist on Connect) and on private fields, so keep it to
+    investigation and tests, never production code.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    `provider` is the `PythonDataSourceV2` JVM object of a DataFrame,
+    and `private(obj, field)` is the reflection helper above. Store the
+    provider's cached read info in a variable called `info`.
+  CorrectAnswer: |
+    info = private(provider, "readInfo")
+  Hint: "The field is named readInfo; private() takes the object and the field name."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Where the Bug Came From
+
+    Knowing when a bug was introduced tells committers how far back a
+    fix must go. The history (in a clone of `apache/spark`):
+
+    - **SPARK-51271** added the filter pushdown API for Python data
+      sources (4.1.0). In that first version, `pushFilters` already
+      replaced state on the provider: the pickled data source after
+      pushdown, through `setDataSourceInPython`.
+    - **SPARK-51575**, "Combine pushdown and partition planning
+      workers" (commit `46bd9ccecef`, in the `v4.1.0` tag), made the
+      pushdown worker plan the read too, to save one Python worker
+      round trip, and introduced `ds.setReadInfo(result.readInfo)`.
+      Its test plan was "Existing tests in `test_python_datasource.py`".
+      Even in 4.2.0, every pushdown test in that file queries a
+      DataFrame built as `load().filter(...)`; none queries the
+      unfiltered DataFrame afterwards, so none could see the leak.
+    - 4.0 is not affected: `PythonScanBuilder` in `v4.0.0` has no
+      `pushFilters` at all.
+    - The same `setReadInfo` line is in the `v4.1.0-rc1`, `v4.2.0-rc6`,
+      `v4.2.1-rc3` and `v4.3.0-rc2` tags.
+
+    ```bash
+    git log --oneline --all --grep=SPARK-51575
+    git show 46bd9ccecef -- sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/v2/python/PythonScanBuilder.scala
+    git tag --contains 46bd9ccecef | grep -E '^v4\.1\.0$'
+    git show v4.3.0-rc2:sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/v2/python/PythonScanBuilder.scala | grep -n setReadInfo
+    ```
+
+    ```text
+    46bd9ccecef [SPARK-51575][PYTHON] Combine Python Data Source pushdown & plan read workers
+    ...
+    v4.1.0
+    50:        ds.setReadInfo(result.readInfo)
+    ```
+
+    One gotcha: `git log -S setReadInfo` (the "pickaxe", which finds
+    commits that add or remove a string) pointed at an unrelated commit
+    in the clone used here, because it is a shallow clone and the
+    oldest commit it has looks like it added every file. Search by JIRA
+    key or deepen the clone before trusting `-S` or `git blame`.
+
+    There is a review lesson in this history. `getOrCreateReadInfo`
+    takes the options, the schema and `isStreaming` as arguments, but
+    its cache ignores all of them: after the first call, it returns
+    whatever was stored, by anyone. A method whose result depends on
+    its call history rather than its arguments is worth a question in
+    every review.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Write the Failing Test
+
+    A regression test has one job: fail today, for the reason in the
+    report, and pass once the bug is fixed. In PySpark's own suite the
+    data source tests live in
+    `python/pyspark/sql/tests/test_python_datasource.py`, in a mixin
+    (`BasePythonDataSourceTestsMixin`) that runs once on
+    `ReusedSQLTestCase` (classic) and once more through
+    `python/pyspark/sql/tests/connect/test_parity_python_datasource.py`
+    on `ReusedConnectTestCase`. A test added to the mixin covers both
+    paths you found in the boundary. In that style:
+
+    ```python
+    import unittest
+
+    from pyspark.sql.datasource import DataSource, DataSourceReader, EqualTo, InputPartition
+    from pyspark.testing.sqlutils import ReusedSQLTestCase
+
+
+    class FilterPushdownLeakTests(ReusedSQLTestCase):
+        def _register(self):
+            class LeakReader(DataSourceReader):
+                def __init__(self):
+                    self.k = None
+
+                def pushFilters(self, filters):
+                    for f in filters:
+                        if isinstance(f, EqualTo) and f.attribute == ("k",):
+                            self.k = f.value
+                        else:
+                            yield f
+
+                def partitions(self):
+                    return [InputPartition(0)]
+
+                def read(self, partition):
+                    for i in range(10):
+                        k = "a" if i < 3 else "b"
+                        if self.k is None or k == self.k:
+                            yield (k, i)
+
+            class LeakSource(DataSource):
+                @classmethod
+                def name(cls):
+                    return "leak_kv"
+
+                def schema(self):
+                    return "k string, v int"
+
+                def reader(self, schema):
+                    return LeakReader()
+
+            self.spark.dataSource.register(LeakSource)
+
+        def test_filter_pushdown_does_not_leak_into_reused_scan(self):
+            with self.sql_conf({"spark.sql.python.filterPushdown.enabled": True}):
+                self._register()
+                df = self.spark.read.format("leak_kv").load()
+                self.assertEqual(df.filter("k = 'a'").count(), 3)
+                self.assertEqual(df.count(), 10)
+
+        def test_filter_pushdown_does_not_leak_within_one_query(self):
+            with self.sql_conf({"spark.sql.python.filterPushdown.enabled": True}):
+                self._register()
+                df = self.spark.read.format("leak_kv").load()
+                self.assertEqual(df.union(df.filter("k = 'a'")).count(), 13)
+
+
+    if __name__ == "__main__":
+        unittest.main(verbosity=2)
+    ```
+
+    `pyspark.testing` ships in the pip package, so this runs against
+    stock 4.2.0 with plain `python test_leak.py` (output trimmed):
+
+    ```text
+    FAIL: test_filter_pushdown_does_not_leak_into_reused_scan
+        self.assertEqual(df.count(), 10)
+    AssertionError: 3 != 10
+
+    FAIL: test_filter_pushdown_does_not_leak_within_one_query
+        self.assertEqual(df.union(df.filter("k = 'a'")).count(), 13)
+    AssertionError: 6 != 13
+
+    Ran 4 tests in 12.134s
+    FAILED (failures=2)
+    ```
+
+    (The extra two tests are both `test_assert_classic_mode`: one
+    inherited by `FilterPushdownLeakTests`, and one from the imported
+    `ReusedSQLTestCase` itself, which `unittest.main` also collects
+    because it is a test case class in the module's namespace.) They are **failures**, not errors: the code
+    ran and gave the wrong answer. A test that errors on the broken
+    build (an import error, a typo) "fails" too, but proves nothing
+    about the bug.
+
+    Master's fix added this Scala test to
+    `sql/core/src/test/scala/org/apache/spark/sql/execution/python/PythonDataSourceSuite.scala`
+    (from `git -C <spark> show b51665875a3`):
+
+    ```scala
+    test("filter pushdown does not leak into a reused base scan") {
+      assume(shouldTestPandasUDFs)
+      // Same as above for filter pushdown: the read function bound to the pushed filters must not
+      // leak into the base scan, which would make the base DataFrame return only filtered rows.
+      val dataSourceScript =
+        s"""
+           |from pyspark.sql.datasource import DataSource, DataSourceReader, InputPartition
+           |
+           |class SimpleDataSourceReader(DataSourceReader):
+           |    def pushFilters(self, filters):
+           |        self._filtered = True
+           |        return []
+           |
+           |    def partitions(self):
+           |        return [InputPartition(0)]
+           |
+           |    def read(self, partition):
+           |        if getattr(self, "_filtered", False):
+           |            yield (1,)
+           |        else:
+           |            for i in range(10):
+           |                yield (i,)
+           |
+           |class SimpleDataSource(DataSource):
+           |    def schema(self):
+           |        return "id int"
+           |
+           |    def reader(self, schema):
+           |        return SimpleDataSourceReader()
+           |""".stripMargin
+      val schema = StructType.fromDDL("id INT")
+      val dataSource =
+        createUserDefinedPythonDataSource(name = dataSourceName, pythonScript = dataSourceScript)
+      withSQLConf(SQLConf.PYTHON_FILTER_PUSHDOWN_ENABLED.key -> "true") {
+        spark.dataSource.registerPython(dataSourceName, dataSource)
+        val df = spark.read.format(dataSourceName).schema(schema).load()
+        checkAnswer(df.filter("id = 1"), Seq(Row(1)))
+        checkAnswer(df, (0 until 10).map(Row(_)))
+      }
+    }
+    ```
+
+    It covers the sequential case only. The fix also makes the union
+    and the self-join right (you will check that below), but no test
+    pins it. A backport is a good moment to add the in-query cases, so
+    a later refactor cannot bring them back alone.
+
+- Class: mult_question
+  Depth: all
+  Output: "Your new regression test errors on the 4.2.0 build with NameError before any query runs. What does that tell you about the bug?"
+  AnswerChoices: "Nothing: the test must fail on an assertion about the wrong rows to prove it detects the bug;That the bug is confirmed;That the bug is fixed;That the bug only affects classic mode"
+  CorrectAnswer: "Nothing: the test must fail on an assertion about the wrong rows to prove it detects the bug"
+  Hint: "A test detects a bug when the code under test runs and returns the wrong answer."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Read the Fix on Master
+
+    Master fixed this inside SPARK-58551 ("Python Data Sources Limit
+    Pushdown API", commit `b51665875a3`, fix version 4.4.0), because
+    limit pushdown hit the same leak: `df.limit(2)` made `df` read two
+    rows. The relevant part of the diff, condensed (comments
+    shortened, limit pushdown left out):
+
+    ```scala
+    // PythonScanBuilder: the read info planned during pushdown stays on this scan
+    private var readInfo: Option[PythonDataSourceReadInfo] = None
+    ...
+    readInfo = result.readInfo            // was: ds.setReadInfo(result.readInfo)
+    ...
+    new PythonScan(ds, shortName, outputSchema, options, supportedFilters, pushedLimit, readInfo)
+
+    // PythonScan / PythonBatch: use the scan's own read info if it has one
+    private lazy val infoInPython: PythonDataSourceReadInfo = {
+      readInfo.getOrElse(
+        ds.getOrCreateReadInfo(shortName, options, outputSchema, isStreaming = false))
+    }
+
+    // PythonDataSourceV2: setReadInfo is gone; the cache keeps only pushdown-free reads
+    ```
+
+    Why it works: state now lives exactly as long as the plan it
+    describes. A read planned for one scan's filters is reachable only
+    from that scan. The provider still caches a read, but only the
+    one planned **without** pushdown, which is the same for every scan
+    that pushes nothing, so sharing it is safe. (Master also records
+    which pushdown flags were on when that cache was filled and
+    recomputes when they change, so the `DATA_SOURCE_PUSHDOWN_DISABLED`
+    check still runs after a flag flip.)
+
+    Notice what the fix did not do: remove the cache, or plan every
+    read twice. "Make it slower until it is right" fixes bugs too, but
+    reviewers rightly push back on it when a scoping fix exists.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## A Narrow Fix for the Maintenance Branches
+
+    SPARK-58551 adds a public API (`DataSourceReader.pushLimit`) and a
+    new config, and Spark's versioning policy says maintenance
+    releases "contain bug fixes and security patches only; they do not
+    introduce new features". So it will not be backported, and
+    branch-4.2 and branch-4.3 need their own small patch: only the
+    scoping part, against the 4.2.0 code.
+
+    ```diff
+    --- a/.../v2/python/PythonDataSourceV2.scala
+    +++ b/.../v2/python/PythonDataSourceV2.scala
+    +  // Caches the read info of scans that push nothing down. Every such scan plans the same
+    +  // read, so it is safe to share across the scans of this provider. Read info planned during
+    +  // filter pushdown is specific to one scan and is carried by that PythonScan instead.
+       private var readInfo: PythonDataSourceReadInfo = _
+    ...
+    -  def setReadInfo(readInfo: PythonDataSourceReadInfo): Unit = {
+    -    this.readInfo = readInfo
+    -  }
+    -
+    --- a/.../v2/python/PythonScanBuilder.scala
+    +++ b/.../v2/python/PythonScanBuilder.scala
+       private var supportedFilters: Array[Filter] = Array.empty
+    +  // Read info planned by filter pushdown. It belongs to this scan only: the provider `ds` is
+    +  // shared by every scan of the relation, so storing it there would leak the pushed filters
+    +  // into other scans.
+    +  private var readInfo: Option[PythonDataSourceReadInfo] = None
+
+       override def build(): Scan =
+    -    new PythonScan(ds, shortName, outputSchema, options, supportedFilters)
+    +    new PythonScan(ds, shortName, outputSchema, options, supportedFilters, readInfo)
+    ...
+    -        ds.setReadInfo(result.readInfo)
+    +        readInfo = Some(result.readInfo)
+    --- a/.../v2/python/PythonScan.scala
+    +++ b/.../v2/python/PythonScan.scala
+    -    supportedFilters: Array[Filter]
+    +    supportedFilters: Array[Filter],
+    +    readInfo: Option[PythonDataSourceReadInfo] = None
+     ) extends Scan with SupportsMetadata {
+    -  override def toBatch: Batch = new PythonBatch(ds, shortName, outputSchema, options)
+    +  override def toBatch: Batch = new PythonBatch(ds, shortName, outputSchema, options, readInfo)
+    ...
+    -    options: CaseInsensitiveStringMap) extends Batch {
+    +    options: CaseInsensitiveStringMap,
+    +    readInfo: Option[PythonDataSourceReadInfo] = None) extends Batch {
+    ...
+       private lazy val infoInPython: PythonDataSourceReadInfo = {
+    -    ds.getOrCreateReadInfo(shortName, options, outputSchema, isStreaming = false)
+    +    readInfo.getOrElse(
+    +      ds.getOrCreateReadInfo(shortName, options, outputSchema, isStreaming = false))
+       }
+    ```
+
+    That is the whole patch. The streaming path (`PythonMicroBatchStream`) only calls
+    `getOrCreateReadInfo` and never pushes filters, so it is untouched.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Testing the Fix Without Building Spark
+
+    A full build takes a long time, and you can get strong evidence
+    much sooner. The pip package ships the Scala compiler
+    (`pyspark/jars/scala-compiler-2.13.18.jar` for 4.2.0, next to
+    `scala-library` and `scala-reflect` of the same version), and the
+    three changed classes only depend on classes in those jars. So
+    compile the patched files against the release you have:
+
+    ```bash
+    J=$(python -c "import pyspark, os; print(os.path.dirname(pyspark.__file__))")/jars
+    mkdir classes
+    java -cp "$J/*" scala.tools.nsc.Main -usejavacp -nowarn -d classes \
+      PythonDataSourceV2.scala PythonScanBuilder.scala PythonScan.scala
+    ```
+
+    It took about 3.5 seconds and produced the classes of
+    `org/apache/spark/sql/execution/datasources/v2/python/` that those
+    files define. Then put them in front of Spark's own jars:
+
+    ```python
+    spark = (SparkSession.builder.master("local[2]")
+             .config("spark.driver.extraClassPath", "/path/to/classes")
+             .config("spark.sql.python.filterPushdown.enabled", "true")
+             .getOrCreate())
+    ```
+
+    In local mode the executors run in the driver JVM, so the driver
+    classpath is enough. With the patched classes, the boundary script
+    gave the right answer in every row of both tables, the PySpark
+    tests above passed, and the same was true over Spark Connect
+    (`.remote("local[2]")` with the same setting, plan cache on),
+    including the self-join through a temporary view:
+
+    ```text
+    df.count() again (expect 10)                                 10     planning calls: 0
+    df.filter(k = 'a' OR v > 8).count() (expect 4)               4      planning calls: 0
+    fresh: union(filter a) count (expect 13)                     13     planning calls: 2
+    fresh: filter a union filter b (expect 10)                   10     planning calls: 2
+    ```
+
+    Look at the planned reads: the third count still plans nothing.
+    The unfiltered read is cached on the provider, as intended; only
+    the filtered one moved.
+
+    Know the limits of this trick before you rely on it. It works when
+    every class that calls a changed signature is patched too. A new
+    constructor parameter, even one with a default value, changes the
+    constructor's signature in bytecode (Scala keeps the default in a
+    separate method), so any class compiled against the old constructor
+    would fail at run time with `NoSuchMethodError`. Here the only
+    callers, `new PythonScan(` in `PythonScanBuilder` and
+    `new PythonBatch(` in `PythonScan`, are in the patched files. It is
+    evidence for you and a strong line in the
+    JIRA; the PR still needs the real test suites.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Building Spark to Test for Real
+
+    For the PR you run Spark's own tests on a build of the branch. From
+    the root of a clone (commands from `python/docs/source/development/testing.rst`
+    and the Spark developer tools page):
+
+    ```bash
+    # Build Spark once (SBT shown; Maven works too: build/mvn -DskipTests clean package)
+    build/sbt -Phive clean package
+
+    # The Scala suite, one test by name (-z matches a substring of the test name)
+    build/sbt "sql/testOnly *PythonDataSourceSuite -- -z \"does not leak\""
+
+    # PySpark tests: a whole module, a class, or one test
+    python/run-tests --testnames pyspark.sql.tests.test_python_datasource
+    python/run-tests --testnames 'pyspark.sql.tests.test_python_datasource PythonDataSourceTests.test_filter_pushdown'
+    python/run-tests --testnames pyspark.sql.tests.connect.test_parity_python_datasource
+    ```
+
+    `python/run-tests` uses the jars of your build, not the pip
+    package, so rebuild (`build/sbt package` is enough after the first
+    full build) whenever you change Scala. Keep the SBT console open
+    (`build/sbt`, then `testOnly ...` at its prompt) while you iterate;
+    it saves the startup on every run.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Triage: Duplicates, Versions, Priority
+
+    **Duplicates.** Search before you write. JIRA's REST API makes the
+    search repeatable:
+
+    ```bash
+    curl -s -G "https://issues.apache.org/jira/rest/api/2/search" \
+      --data-urlencode 'jql=project = SPARK AND text ~ "python data source" AND text ~ "pushdown" ORDER BY created DESC' \
+      --data-urlencode "fields=summary,status" --data-urlencode "maxResults=15"
+    ```
+
+    On 2026-10-28 that returned SPARK-58551 (the limit pushdown work),
+    SPARK-55087 (the `DATA_SOURCE_PUSHDOWN_DISABLED` default, open),
+    SPARK-59909 (the broken error message from "Filter Pushdown"),
+    SPARK-51575, SPARK-51271, SPARK-51883 (docs) and unrelated issues;
+    searches for `setReadInfo`, and for `labels = correctness` on
+    Python data sources, returned nothing. SPARK-58551 fixes the bug on
+    master but does not describe it as a bug of released versions, so
+    it is related, not a duplicate. Link it.
+
+    **Affects versions.** Only list what you have shown: 4.2.0
+    (reproduced on the pip package). 4.1.0 and the 4.3.0 release
+    candidates have the identical `setReadInfo` code (the tags above);
+    either reproduce there too or say "code identical" rather than
+    "reproduced".
+
+    **Priority.** Spark's contributing guide says priority should be
+    Major or below for most reports, with one exception: "correctness or
+    data-loss issues, which can be flagged as Blockers", and
+    "Correctness and data loss issues should be considered Blockers for
+    their target versions." Add the `correctness` label either way. The
+    counter-argument is that pushdown sits behind an internal setting
+    that is off by default. The self-join result (wrong on the first
+    query of a fresh DataFrame) is the strongest fact for the higher
+    priority; put it in the description and let committers decide.
+
+    **Target branches.** Master is fixed. The maintenance branches
+    (branch-4.2, inside its maintenance window, and branch-4.3, whose
+    release candidates carry the bug) need the narrow patch. The policy
+    page leaves "critical bug fixes (e.g., correctness issues) that may
+    introduce behavior changes" to case-by-case evaluation; this fix
+    changes no API and only makes wrong results right, which is the
+    easy case. The usual flow is one PR against the oldest branch that
+    should get it, or against branch-4.3 with backports requested.
+
+- Class: mult_question
+  Depth: all
+  Output: "SPARK-58551 already fixes the leak on master. Why not just ask for it to be backported to branch-4.2?"
+  AnswerChoices: "It adds a new public API and config, and maintenance releases take bug fixes only;Backports are never allowed in Spark;It does not fix the leak;branch-4.2 is no longer maintained"
+  CorrectAnswer: "It adds a new public API and config, and maintenance releases take bug fixes only"
+  Hint: "Read the MAINTENANCE paragraph of the versioning policy."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Write the JIRA
+
+    A report a committer can act on without a round trip has these
+    parts, in this order:
+
+    ```text
+    Summary      Python data source filter pushdown leaks into other scans of the
+                 same relation and returns wrong results
+    Type         Bug
+    Component    PySpark, SQL
+    Affects      4.2.0 (reproduced); 4.1.0 and 4.3.0 RCs: code identical
+    Labels       correctness
+    Description
+      1. One sentence of symptom, with the setting that enables it
+         (spark.sql.python.filterPushdown.enabled=true).
+      2. The minimal repro, with actual and expected output.
+      3. The boundary: classic and Connect; temp views; a self-union
+         and a self-join wrong on the first query; a declined filter
+         heals; separate load() calls are fine.
+      4. Cause, with file and line: PythonScanBuilder.pushFilters stores
+         the pushdown read info on the shared PythonDataSourceV2
+         (setReadInfo); PythonBatch reads it via getOrCreateReadInfo.
+         Introduced by SPARK-51575 (4.1.0).
+      5. Master: fixed as part of SPARK-58551 (link), which cannot be
+         backported (new API and config).
+      6. Proposed fix: the scoping part only (three files), with the
+         master test plus in-query tests; tested against the 4.2.0 jars
+         with patched classes.
+    Leave empty  Fix Version/s, Target Version/s (committers set them)
+    ```
+
+    Write it in JIRA's wiki markup (`{code:python}...{code}`,
+    `{{monospace}}`), keep the repro copy-pasteable, and keep opinions
+    out of the description: what you ran, what you saw, what you
+    expected, what the code does.
+
+    Whether and when to file is a judgment for whoever owns the work.
+    For this bug, at the time of writing, no issue exists; if you
+    reproduce it on a later 4.2.x or 4.3.x, search again before writing
+    one, since someone may have filed it in the meantime.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Workarounds Until a Fix Ships
+
+    For users of the 4.1 and 4.2 releases (and the 4.3 release
+    candidates) with pushdown on:
+
+    - **One `load()` per reference**, not per query: a self-join needs
+      two loads, not one DataFrame used twice. A temporary view is one
+      relation for every reference to it, so a self-join through a view
+      is affected too (it returned 10 instead of 3 on a fresh view).
+    - **Materialize once** when the same data is queried many times:
+      `localCheckpoint()` (or a table) of a fresh load. Later queries
+      scan Spark's copy, never the source, so pushdown no longer saves
+      I/O; take the snapshot before any filtered query on that load.
+    - **Turning the flag off is not a workaround** for a reader that
+      implements `pushFilters`: every query then fails with
+      `DATA_SOURCE_PUSHDOWN_DISABLED` ("Filter Pushdown"). A connector
+      can avoid this by offering a reader class without `pushFilters`
+      as its default; you will build exactly that in the final project.
+    - `cache()` does not help: it stores whatever the first action
+      read.
+
+    In the exercise you wrap the first two in a small class.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Reproduce, Prove, Test, Fix
+
+    This exercise runs as plain `python` (its first line is
+    `# spark-run: python`) because the last step starts a second Python
+    process with a different JVM classpath. Complete, in order:
+
+    1. `LeakKVReader`: `pushFilters` (take over `EqualTo` on `k`),
+       `read` (ten rows, three with `k = 'a'`, honouring the pushed
+       value), and an audit marker per `partitions()` call.
+    2. `minimal_repro(spark)`: the three counts on ONE DataFrame.
+    3. `planning_calls(spark, audit_dir)`: planned reads per query.
+    4. `provider_reader_state(df)`: `vars()` of the reader inside the
+       provider's cached read function, through Py4J and cloudpickle.
+    5. `LeakRegressionTests`: three tests (reused DataFrame, self-union,
+       self-join). The harness runs them with a shared DataFrame (each
+       must FAIL on an assertion) and with fresh loads (each must pass).
+    6. `SafeSource`: `table()` loads afresh on every call; `snapshot()`
+       keeps a checkpoint of a fresh load.
+    7. `PATCHED_SCALA`: the three 4.2.0 Scala files. Make the narrow
+       fix. The harness compiles them with `pyspark/jars`' Scala
+       compiler, starts a fresh JVM with your classes first on the
+       classpath, checks that they were loaded, and reruns your tests
+       with a shared DataFrame: now they must pass, and after a pushed
+       query the provider must not hold the pushed reader.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "Reflection: private(rel.table(), 'ds') then private(ds, 'readInfo'). cloudpickle.loads(bytes(info.func())) gives (func, schema); inspect.getclosurevars(func).nonlocals['reader']. Scala: add readInfo: Option[PythonDataSourceReadInfo] to PythonScanBuilder, set it in pushFilters instead of ds.setReadInfo, pass it through PythonScan to PythonBatch (default None), and use readInfo.getOrElse(ds.getOrCreateReadInfo(...))."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - The method: notice, minimize, find the boundary, state a
+      hypothesis with predictions, confirm with your own evidence, write
+      a test that fails for the right reason, fix narrowly, triage,
+      report.
+    - The bug: in 4.2.0 (and the identical code of 4.1.0 and the 4.3.0
+      release candidates), `PythonScanBuilder.pushFilters`
+      stores the read planned for one scan's filters on the shared
+      `PythonDataSourceV2` (`setReadInfo`, from SPARK-51575), and
+      `PythonBatch` of every other scan reads it through
+      `getOrCreateReadInfo`. Results are wrong across queries on one
+      DataFrame or view, and within a single self-union or self-join,
+      where a pushed filter can even vanish.
+    - Connect reproduces it through the server's cache of resolved
+      `Read.DataSource` plans (`alwaysCacheDataSourceReadsEnabled`,
+      4.1); the cache is fine, the shared state is not.
+    - Evidence: zero planned reads on the wrong queries, and the
+      reader with `k = 'a'` unpickled from the provider's `readInfo`
+      through Py4J reflection.
+    - Master fixed it inside SPARK-58551 by keeping pushdown read info
+      on `PythonScan`; that change adds an API, so the maintenance
+      branches need the three-file scoping patch, which you can compile
+      with the Scala compiler in `pyspark/jars` and test against 4.2.0.
+    - Workarounds: one `load()` per reference, or a checkpointed
+      snapshot; turning the flag off does not work for a reader with
+      `pushFilters`.
+
+    Next: **Final Project: Your Own Connector**, where you build a
+    connector for a new messy format that is safe from this bug by
+    design.

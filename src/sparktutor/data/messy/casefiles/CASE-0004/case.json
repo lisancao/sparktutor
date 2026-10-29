@@ -1,0 +1,29 @@
+{
+  "schema": 2,
+  "case_id": "CASE-0004",
+  "opened": "2026-03-09T10:00:00Z",
+  "status": "waiting",
+  "priority": "P2",
+  "tags": [
+    "damaged"
+  ],
+  "meta": {
+    "customer": {
+      "id": "C021",
+      "tier": "silver"
+    },
+    "order": 1044
+  },
+  "attachments": [
+    {
+      "name": "photo.png",
+      "sha256": "0966c7731232973390626bb72caf50e77887346128f2d5201b821db9d0b3bf59",
+      "bytes": 79
+    },
+    {
+      "name": "scan.png",
+      "sha256": "43c1b79b26009d2798246be983aa5ffa1a5757f916e10cdcad7cbc5fab3f40a0",
+      "bytes": 69
+    }
+  ]
+}

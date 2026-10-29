@@ -1,0 +1,753 @@
+- Class: meta
+  Lesson: "Determinism, Retries and Fault Injection"
+  EstimatedMinutes: 90
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    "Streaming Internals: Checkpoints, State and Real-Time Mode" showed
+    a micro-batch being replayed after a crash and a sink surviving it.
+    Batch jobs replay too, in more ways and with less ceremony: a task
+    is retried, a stage is recomputed because its shuffle files
+    vanished, a slow task gets a speculative twin, a DataFrame without
+    a cache is computed once per action. Each time, your Python runs
+    again. If it is deterministic and its effects are idempotent, you
+    never notice. If not, you get duplicates, drifting ids and, in the
+    worst case, a job that Spark itself refuses to finish.
+
+    This lesson assumes "Writers" and "Streaming Readers and Writers"
+    (commit protocols and batch ids) and "How Catalyst Plans Python"
+    (Python UDFs in plans). By the end you will be able to:
+
+    - List every way Spark 4.2 can execute the same code twice, and
+      reproduce most of them on a laptop
+    - Tell retry-stable nondeterminism (`rand(seed)`, `uuid()`) from
+      the kind that breaks retries (Python `random`, wall clocks)
+    - Predict what Catalyst does with a nondeterministic expression,
+      and prove it with a plan and a call count
+    - Read `RDD.outputDeterministicLevel` and explain how
+      `DAGScheduler` handles a lost shuffle from an indeterminate stage,
+      including the 4.2 checksum-based retry and the error you get when
+      Spark gives up
+    - Show why Spark Connect re-runs analysis per action, and what that
+      does to `rand()` and `current_timestamp()`
+    - Inject failures deliberately (`local[N,F]`, `attemptNumber()`,
+      deleted shuffle files, a crash flag) and prove a pipeline gives
+      byte-identical results under them
+
+    Paths below are relative to the Spark 4.2.0 source tree; the
+    scheduler is in `core/src/main/scala/org/apache/spark/scheduler/`.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## When Spark Runs Your Code Again
+
+    | Cause | What runs again | Where it lives in 4.2.0 |
+    |---|---|---|
+    | task failure (exception, lost executor) | that task, up to `spark.task.maxFailures` (default 4) attempts | `TaskSetManager.handleFailedTask` |
+    | fetch failure (shuffle files lost) | the lost map tasks of the parent stage, then the failed stage; up to `spark.stage.maxConsecutiveAttempts` (default 4) | `DAGScheduler.handleTaskCompletion`, case `FetchFailed` |
+    | indeterminate rollback | *all* tasks of the affected stages | `DAGScheduler.rollbackSucceedingStages` |
+    | speculation (`spark.speculation`, default `false`) | a second copy of a slow task, racing the first | `TaskSetManager.checkSpeculatableTasks` |
+    | several actions on one uncached DataFrame | the whole plan, once per action | every action builds a job |
+    | evicted cache blocks | the partitions needed to rebuild them | `RDD.getOrCompute` |
+    | Spark Connect | analysis (and so seeds and timestamps) per action | the server re-plans each request |
+    | streaming replay | a whole micro-batch, same batch id | `MicroBatchExecution` (previous lesson) |
+
+    Two things in the list are easy to forget. A retried task re-runs
+    everything in its stage, including Python UDFs and side effects
+    from earlier in the stage, not just the line that failed. And
+    accumulators, the classic way to count things from tasks, behave
+    differently for each row of the table, as you will measure below.
+
+    Adaptive query execution is not on the list on purpose: it
+    re-plans the part of a query that has not run yet between stages,
+    and reuses the shuffle output of stages that finished. Re-running
+    finished work comes from the causes above, not from AQE.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Local Mode Hides Retries
+
+    Run the same failing task under two masters. The UDF fails on the
+    first attempt of partition 1 and records every call with its
+    attempt number:
+
+    ```python
+    import glob, os, random, tempfile
+    from pyspark import TaskContext
+    from pyspark.sql import SparkSession, functions as F
+    from pyspark.sql.types import DoubleType
+
+    def fresh(master, **conf):
+        """Stop the active session and start one with this master.
+        builder.getOrCreate() would silently reuse the old one."""
+        active = SparkSession.getActiveSession()
+        if active is not None:
+            active.stop()
+        builder = SparkSession.builder.master(master)
+        for k, v in conf.items():
+            builder = builder.config(k, v)
+        s = builder.getOrCreate()
+        s.sparkContext.setLogLevel("OFF")
+        return s
+
+    def attempt_demo(master):
+        spark = fresh(master)
+        log = tempfile.mkdtemp()
+
+        def flaky(x, r):
+            ctx = TaskContext.get()
+            v = random.random()
+            with open(f"{log}/p{ctx.partitionId()}_a{ctx.attemptNumber()}.txt", "a") as f:
+                f.write(f"{x} {v} {r}\n")
+            if ctx.partitionId() == 1 and ctx.attemptNumber() == 0 and x == 150:
+                raise RuntimeError("injected failure on the first attempt")
+            return v
+
+        df = (spark.range(0, 400, numPartitions=4).select("id", F.rand(7).alias("r"))
+              .withColumn("py", F.udf(flaky, DoubleType())("id", "r")))
+        try:
+            print(master, "rows:", df.count() and len(df.collect()))
+        except Exception as e:
+            print(master, "failed:", type(e).__name__)
+        print("  attempt files:", sorted(os.path.basename(p) for p in glob.glob(f"{log}/*")))
+        return log
+
+    attempt_demo("local[4]")
+    log = attempt_demo("local[4,2]")
+    for a in (0, 1):
+        line = [l for l in open(f"{log}/p1_a{a}.txt") if l.startswith("120 ")][0]
+        print(f"  id 120, attempt {a}: random.random()={line.split()[1]}  rand(7)={line.split()[2]}")
+    ```
+
+    ```text
+    local[4] failed: PythonException
+      attempt files: ['p0_a0.txt', 'p1_a0.txt', 'p2_a0.txt', 'p3_a0.txt']
+    local[4,2] rows: 400
+      attempt files: ['p0_a0.txt', 'p1_a0.txt', 'p1_a1.txt', 'p2_a0.txt', 'p3_a0.txt']
+      id 120, attempt 0: random.random()=0.17458449299896028  rand(7)=0.6118994604433453
+      id 120, attempt 1: random.random()=0.8618682996681739  rand(7)=0.6118994604433453
+    ```
+
+    (`df.count()` does not call the UDF, because the `py` column is
+    pruned; `collect()` does. The files are written by the `collect()`.)
+
+    `SparkContext.createTaskScheduler` (`core/src/main/scala/org/apache/spark/SparkContext.scala`)
+    builds the local scheduler with `MAX_LOCAL_TASK_FAILURES = 1` for
+    `local` and `local[N]`: **one failure fails the job**, and
+    `spark.task.maxFailures` is not consulted. The master
+    `local[N,F]` (regex `LOCAL_N_FAILURES_REGEX`) allows F attempts per
+    task. Tests that never use it never see a retry.
+
+    Speculation cannot be tried locally at all: `TaskSchedulerImpl.start`
+    schedules the speculation check only when `!isLocal`. Even
+    `local-cluster[2,1,1024]` (real executor JVMs on one machine) never
+    launched a copy in my runs, because a speculative copy must run on
+    a different host from the original. To study speculation you need
+    two machines; to defend against it, apply everything below: a
+    speculative copy is just a second attempt that runs at the same
+    time as the first.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Nondeterminism That Survives a Retry, and the Kind That Does Not
+
+    The output above holds the most useful fact in this lesson.
+    `rand(7)` gave the same value to row 120 in both attempts;
+    Python's `random.random()` did not.
+
+    Spark's own random expressions implement the `Nondeterministic`
+    trait (`sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/Expression.scala`):
+    `initialize(partitionIndex)` seeds the generator with the
+    expression's seed plus the partition index. `rand`, `randn`,
+    `uuid`, `shuffle`, `random` all work this way. Given the same seed,
+    the same partition and the same input order, a retried task
+    produces the same values. A seed you do not give is chosen at
+    analysis time by the analyzer rule `ResolveRandomSeed` (in
+    `Analyzer.scala`) and then fixed in the plan.
+
+    So `rand()` is repeatable *within a query* and for the same
+    partitioning; it is not repeatable across queries, or when the rows
+    arrive in another order. Python code has none of these guarantees:
+    `random`, `uuid.uuid4()`, `time.time()`, `datetime.now()` and a
+    call to a service all give a retry different answers. (One
+    classic source is defused for you: `SparkContext` sets
+    `PYTHONHASHSEED` to `0` for Python workers unless you set it, in
+    `pyspark/core/context.py`, so iterating a `set` of strings gives the
+    same order in every worker.)
+
+    `monotonically_increasing_id()` is the other trap: it encodes the
+    partition index and the row's position, so a retried task repeats
+    it only if it sees its rows in the same order (not after a
+    shuffle), and it changes whenever the partitioning does (more
+    files, a different `maxPartitionBytes`, AQE coalescing). For ids
+    that must survive reruns, derive them from content:
+    `F.sha2(F.concat_ws("|", key columns), 256)` or `F.xxhash64(...)`.
+
+- Class: mult_question
+  Depth: all
+  Output: "A task computing F.rand(42) and a Python UDF that calls random.random() fails and is retried. Which values are the same in the second attempt?"
+  AnswerChoices: "Only the F.rand(42) values;Only the Python UDF values;Both, because Spark replays the first attempt's values;Neither, because a retry reseeds everything"
+  CorrectAnswer: "Only the F.rand(42) values"
+  Hint: "Spark's random expressions are seeded per partition; Python's random module knows nothing about Spark."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## How Catalyst Treats a Nondeterministic Expression
+
+    Every Catalyst expression has `deterministic`; a Python UDF is
+    deterministic unless you call `asNondeterministic()` on it. The
+    optimizer uses the flag to decide which rewrites are safe. A filter
+    can be pushed below a projection only if the projection is
+    deterministic (`PushPredicateThroughNonJoin` in
+    `sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/Optimizer.scala`),
+    because evaluating a nondeterministic expression on fewer rows
+    changes its results. That changes how often your UDF runs:
+
+    ```python
+    spark = fresh("local[4]")
+    calls = spark.sparkContext.accumulator(0)
+
+    def plus_one(x):
+        calls.add(1)
+        return x + 1
+
+    det = F.udf(plus_one, "long")
+    nondet = F.udf(plus_one, "long").asNondeterministic()
+    base = spark.range(0, 1000, numPartitions=4)
+    for name, u in [("deterministic", det), ("asNondeterministic", nondet)]:
+        calls.value = 0
+        q = base.withColumn("y", u("id")).where("id < 10")
+        q.collect()
+        print(f"{name}: {calls.value} UDF calls for 10 rows")
+        print(q._jdf.queryExecution().optimizedPlan().toString())
+    ```
+
+    ```text
+    deterministic: 10 UDF calls for 10 rows
+    Project [id#24L, pythonUDF0#27L AS y#26L]
+    +- ArrowEvalPython [plus_one(id#24L)#25L], [pythonUDF0#27L], 101
+       +- Filter (id#24L < 10)
+          +- Range (0, 1000, step=1, splits=Some(4))
+
+    asNondeterministic: 1000 UDF calls for 10 rows
+    Project [id#24L, pythonUDF0#30L AS y#29L]
+    +- Filter (id#24L < 10)
+       +- ArrowEvalPython [plus_one(id#24L)#28L], [pythonUDF0#30L], 101
+          +- Range (0, 1000, step=1, splits=Some(4))
+    ```
+
+    Marking a UDF nondeterministic is honest and expensive: the filter
+    stays above it, so it runs on every row. (`ArrowEvalPython`, not
+    `BatchEvalPython`, because `spark.sql.execution.pythonUDF.arrow.enabled`
+    defaults to `true`; "How Catalyst Plans Python" covers both.) Mark
+    a UDF nondeterministic when its result really varies (it reads a
+    clock, samples, calls a service), and do not mark it to "be safe":
+    the optimizer stops collapsing projections over it, pushing filters
+    through it and using it in some places at all. A nondeterministic
+    expression in a join condition is rejected at analysis:
+
+    ```python
+    a = spark.range(5)
+    b = spark.range(5).withColumnRenamed("id", "j")
+    try:
+        a.join(b, (a.id == b.j) & (F.rand(1) > 0.5)).collect()
+    except Exception as e:
+        print(e.getCondition(), str(e).splitlines()[0][:160])
+    ```
+
+    ```text
+    INVALID_NON_DETERMINISTIC_EXPRESSIONS [INVALID_NON_DETERMINISTIC_EXPRESSIONS] The operator
+    expects a deterministic expression, but the actual expression is "((id = j) AND (rand(1) > 0.5))".
+    ```
+
+    Note the flag is a *promise to the optimizer*, nothing more. A UDF
+    that calls `random.random()` but is left deterministic gets
+    optimized as if it were pure, and Spark has no way to know that a
+    retry changed its output, until the 4.2 checksums later in this
+    lesson notice.
+
+- Class: mult_question
+  Depth: intermediate
+  Output: "You add asNondeterministic() to a Python UDF used in a projection, followed by a filter on another column. What happens to the plan?"
+  AnswerChoices: "The filter stays above the UDF, so the UDF runs on every input row;The filter is pushed below the UDF as before;The UDF is evaluated twice, once before and once after the filter;Spark refuses to run the query"
+  CorrectAnswer: "The filter stays above the UDF, so the UDF runs on every input row"
+  Hint: "Pushing a filter below a nondeterministic expression changes which rows it is evaluated on."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Determinism Levels in the DAG
+
+    The scheduler knows nothing about expressions. It works with RDDs,
+    and each RDD reports `outputDeterministicLevel`
+    (`core/src/main/scala/org/apache/spark/rdd/RDD.scala`), one of:
+
+    - `DETERMINATE`: same data in the same order on every computation
+    - `UNORDERED`: same data, order may differ. Every shuffle read is
+      at least this, because fetched blocks arrive in random order
+    - `INDETERMINATE`: the data itself may differ
+
+    `getOutputDeterministicLevel` derives it from the parents. The
+    case that matters is an **order-sensitive** function on `UNORDERED`
+    input, which gives `INDETERMINATE` (`MapPartitionsRDD`,
+    `PartitionwiseSampledRDD`). The classic order-sensitive function is
+    a round-robin repartition: row k goes to partition k mod n, so a
+    different order sends rows to different partitions. You can read the
+    level of a plan's final RDD in Classic mode:
+
+    ```python
+    spark = fresh("local[4]", **{"spark.sql.adaptive.enabled": "false"})
+
+    def level(df):
+        return df._jdf.queryExecution().toRdd().outputDeterministicLevel().toString()
+
+    base = spark.range(0, 1000, numPartitions=4)
+    shuffled = base.groupBy((F.col("id") % 10).alias("k")).count()
+    for name, df in {
+        "range": base,
+        "groupBy": shuffled,
+        "hash repartition after groupBy": shuffled.repartition(4, "k"),
+        "round-robin repartition after groupBy": shuffled.repartition(3),
+        "sample after groupBy": shuffled.sample(0.5, seed=1),
+    }.items():
+        print(f"{name:40} {level(df)}")
+    spark.conf.set("spark.sql.execution.sortBeforeRepartition", "false")
+    print(f"{'round-robin, sortBeforeRepartition=false':40} {level(shuffled.repartition(3))}")
+    ```
+
+    ```text
+    range                                    DETERMINATE
+    groupBy                                  UNORDERED
+    hash repartition after groupBy           UNORDERED
+    round-robin repartition after groupBy    UNORDERED
+    sample after groupBy                     UNORDERED
+    round-robin, sortBeforeRepartition=false INDETERMINATE
+    ```
+
+    Round-robin `repartition(n)` is safe by default because
+    `ShuffleExchangeExec` sorts each input partition before assigning
+    rows (`spark.sql.execution.sortBeforeRepartition`, internal,
+    default `true`, added for SPARK-23207, "Shuffle+Repartition on an
+    DataFrame could lead to incorrect answers"); it marks the RDD
+    order-sensitive only when that sort is off. The level also says
+    nothing about Python: a UDF that calls `random.random()` before a
+    shuffle leaves the map stage "DETERMINATE" as far as the scheduler
+    knows.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## A Lost Shuffle, Three Ways
+
+    When a reducer cannot read a map output (the executor that wrote it
+    died, or its disk was wiped), the task fails with a
+    `FetchFailedException`. That does not count as a task failure;
+    `DAGScheduler` marks the map output lost and resubmits the map
+    stage (only the missing map tasks) and then the failed stage.
+
+    You can cause one on a laptop: run a job, delete one map task's
+    shuffle files from `spark.local.dir`, and run the same DataFrame
+    again. The second `collect()` reuses the shuffle (the map stage is
+    skipped), and the reducers find a file missing:
+
+    ```python
+    import shutil
+
+    def lost_shuffle(udf_kind, full_retry):
+        local = tempfile.mkdtemp()
+        spark = fresh("local[4]", **{
+            "spark.local.dir": local,
+            "spark.sql.adaptive.enabled": "false",
+            "spark.sql.shuffle.orderIndependentChecksum.enableFullRetryOnMismatch": full_retry})
+
+        def bucket(x):
+            return random.randint(0, 3) if udf_kind == "random" else x % 4
+
+        df = (spark.range(0, 4000, numPartitions=4)
+              .withColumn("b", F.udf(bucket, "int")("id"))
+              .repartition(4, "b")
+              .groupBy("b").agg(F.count("*").alias("n")))
+        first = sorted((r.b, r.n) for r in df.collect())
+        victim = sorted(glob.glob(f"{local}/**/shuffle_*_0_0.data", recursive=True))[0]
+        for f in glob.glob(victim.replace(".data", ".*")):
+            os.remove(f)                                     # map task 0's output is gone
+        try:
+            second = sorted((r.b, r.n) for r in df.collect())
+            print(f"{udf_kind:7} fullRetry={full_retry:5}  same result: {first == second}  "
+                  f"rows: {sum(n for _, n in second)}")
+        except Exception as e:
+            msg = [l for l in str(e).splitlines() if "Job aborted" in l][0]
+            print(f"{udf_kind:7} fullRetry={full_retry:5}  FAILED: {msg[msg.index('Job aborted'):][:200]}")
+        shutil.rmtree(local, ignore_errors=True)
+
+    lost_shuffle("modulo", "true")
+    lost_shuffle("random", "false")
+    lost_shuffle("random", "true")
+    ```
+
+    ```text
+    modulo  fullRetry=true   same result: True  rows: 4000
+    random  fullRetry=false  same result: False  rows: 4000
+    random  fullRetry=true   FAILED: Job aborted due to stage failure: A shuffle map stage
+      with indeterminate output was failed and retried. However, Spark cannot rollback the
+      ResultStage 3 to re-process the input data, and has to fail this job. Please eliminate
+      the indeterminacy by checkpointing the RDD before repartition and try again.
+    ```
+
+    (The `fresh()` helper turns logging off. At level `ERROR` the log
+    shows `ShuffleBlockFetcherIterator: Error occurred while fetching
+    local blocks` with a `java.nio.file.NoSuchFileException` for
+    `shuffle_0_0_0.index`; that is the fetch failure. The stage retry
+    itself is silent unless you read the log or the stage attempts in
+    the Spark UI.)
+
+    - With a deterministic UDF, the recomputed map task wrote the same
+      data, and the result is identical: the retry was invisible.
+    - With a random UDF and the 4.2 check turned off, the job
+      "succeeded" with different counts. The second answer is not
+      wrong in itself (the bucketing is random), but nothing told you
+      that a recomputation happened and that the data under the result
+      changed. When reducers that already finished read the *old* map
+      output and the others read the *new* one, rows are lost or
+      duplicated; that is the failure mode behind SPARK-23207 and
+      SPARK-51756 ("Non-deterministic stage could lead to incorrect
+      results with partial retry").
+    - With the default settings, Spark noticed and refused.
+
+    What noticed it is new. Spark 4.1 (SPARK-51756) taught SQL shuffle
+    map tasks to compute an **order-independent checksum** of what they
+    write to each reduce partition and report it with their map status
+    (`spark.sql.shuffle.orderIndependentChecksum.enabled`). When a
+    recomputed map task reports a different checksum,
+    `MapOutputTracker.registerMapOutput` flags a mismatch, the stage
+    becomes `isRuntimeIndeterminate` (`ShuffleMapStage.scala`), and
+    `DAGScheduler` rolls back every stage that consumed it so that all
+    of their tasks run again
+    (`spark.sql.shuffle.orderIndependentChecksum.enableFullRetryOnMismatch`).
+    Both settings were `false` in 4.1 and are `true` by default in 4.2
+    (SPARK-54830), which is why this protection is new to most
+    readers. A `ShuffleMapStage` can be rolled back (unless the legacy
+    `spark.shuffle.useOldFetchProtocol` is on). A `ResultStage` that
+    already finished some partitions cannot, because those results may
+    already be in your driver or written out (SPARK-25342, "Support
+    rolling back a result stage", is still open), so
+    `filterAndAbortUnrollbackableStages` aborts the job with the message
+    above. In 4.2.0 SQL shuffles use this runtime detection instead of
+    the older static rule (`isStaticallyIndeterminate`, from the RDD
+    level) whenever full retry is enabled.
+
+    The advice in the error message, checkpoint before the shuffle, is
+    the general fix: a reliably checkpointed RDD is `DETERMINATE` by
+    definition (`isReliablyCheckpointed` in `RDD.outputDeterministicLevel`).
+    The better fix is not to feed a shuffle with values that change on
+    recomputation.
+
+- Class: mult_question
+  Depth: advanced
+  Output: "In Spark 4.2 a shuffle map task is recomputed after a fetch failure and writes different data than its first attempt, while the result stage has already finished some partitions. What happens with default settings?"
+  AnswerChoices: "The job is aborted because a partially finished result stage cannot be rolled back;The result stage silently mixes old and new map output;Only the missing map task reruns and the job succeeds;Spark retries the whole application"
+  CorrectAnswer: "The job is aborted because a partially finished result stage cannot be rolled back"
+  Hint: "The order-independent checksum detects the change. What can Spark roll back, and what not?"
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Accumulators, Actions and observe()
+
+    Accumulators look like the natural way to count things from tasks.
+    Measure them against the causes of re-execution:
+
+    ```python
+    spark = fresh("local[4,3]")
+    calls = spark.sparkContext.accumulator(0)
+
+    def counted(x):
+        calls.add(1)
+        if TaskContext.get().attemptNumber() == 0 and x % 100 == 50:
+            raise RuntimeError("injected")               # every task fails once, midway
+        return x
+
+    u = F.udf(counted, "long")
+    df = spark.range(0, 400, numPartitions=4).select(u("id").alias("v"))
+    out = tempfile.mkdtemp()
+
+    df.agg(F.sum("v")).first()
+    print("one action, every task retried once:", calls.value)
+    df.write.mode("overwrite").parquet(out)
+    print("after a second action:", calls.value)
+
+    calls.value = 0
+    obs = Observation("m")
+    observed = df.observe(obs, F.count(F.lit(1)).alias("rows"), F.sum("v").alias("total"))
+    observed.write.mode("overwrite").parquet(out)
+    print("observe() on the write:", obs.get, " accumulator:", calls.value)
+    print("part files:", len(glob.glob(f"{out}/part-*")),
+          " rows read back:", spark.read.parquet(out).count())
+    ```
+
+    ```text
+    one action, every task retried once: 400
+    after a second action: 800
+    observe() on the write: {'rows': 400, 'total': 79800}  accumulator: 400
+    part files: 4  rows read back: 400
+    ```
+
+    The failed attempts called the UDF 51 times each, but their
+    accumulator updates were dropped: the driver merges a task's
+    accumulator updates only when the task succeeds (failed tasks
+    report only internal metrics that ask for it, `countFailedValues`).
+    So a retry does not double count; a **second action** does, because
+    it is a second, successful computation. Recomputed stages after a
+    fetch failure double count the same way.
+
+    `DataFrame.observe` (3.3, `Observation` in Python) computes named
+    aggregates as a side output of the query that actually writes the
+    data (`CollectMetricsExec` in the plan), from successful tasks
+    only, and hands them to you when the action finishes. It counts the
+    rows that were written, once, whatever happened on the way. Use it
+    for row counts and sums that you report or check thresholds on.
+
+    `cache()` is the other answer to "two actions", with a caveat: an
+    evicted or lost cache block is recomputed from the plan, so a
+    cache makes repeated actions cheaper, not deterministic.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Spark Connect Analyses Every Action Again
+
+    In Classic mode a DataFrame holds a `QueryExecution`: it is
+    analyzed once, and its optimized plan (where `current_timestamp()`
+    becomes a literal and random seeds are fixed) is computed once and
+    kept. A Spark Connect DataFrame is an unresolved plan on the
+    client; every action sends it to the server, which analyzes and
+    optimizes it from scratch. The same script in both modes:
+
+    ```python
+    import time
+    from pyspark.sql import SparkSession, functions as F
+
+    def compare(spark, mode):
+        sql_df = spark.sql("SELECT rand() AS r, uuid() AS u, current_timestamp() AS t")
+        api_df = spark.range(1).select(F.rand().alias("r"), F.uuid().alias("u"),
+                                       F.current_timestamp().alias("t"))
+        for name, df in [("spark.sql", sql_df), ("DataFrame API", api_df)]:
+            a = df.collect()[0]; time.sleep(1.1); b = df.collect()[0]
+            print(f"{mode:8} {name:14} same rand: {a.r == b.r}  same uuid: {a.u == b.u}  "
+                  f"same timestamp: {a.t == b.t}")
+    ```
+
+    ```text
+    classic  spark.sql      same rand: True  same uuid: True  same timestamp: True
+    classic  DataFrame API  same rand: True  same uuid: True  same timestamp: True
+    connect  spark.sql      same rand: False  same uuid: False  same timestamp: False
+    connect  DataFrame API  same rand: True  same uuid: True  same timestamp: False
+    ```
+
+    (For Connect, run it with `SparkSession.builder.remote("local[2]")`
+    instead of `master`.)
+
+    Two surprises:
+
+    - In Classic, `current_timestamp()` stayed the same across two
+      actions on the same DataFrame, more than a second apart, because
+      the optimized plan with the timestamp folded in is reused. A new
+      DataFrame gets a new time.
+    - In Connect, the Python client generates a seed itself when you
+      call `F.rand()` or `F.uuid()` without one (`pyspark/sql/connect/functions/builtin.py`
+      passes `lit(py_random.randint(0, sys.maxsize))`), so DataFrame API
+      randomness is stable across actions. SQL text is re-analyzed on
+      the server and `ResolveRandomSeed` picks a new seed each time.
+
+    For pipelines this means: in Connect, a DataFrame built with
+    `spark.sql("... rand() ...")` gives a different sample to each
+    action that uses it. Write the seed into the SQL (`rand(42)`), or
+    materialize the result before using it twice.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    Start a local SparkSession named `spark` with four worker threads
+    in which every task may be attempted up to three times.
+  CorrectAnswer: |
+    spark = SparkSession.builder.master("local[4,3]").getOrCreate()
+  Hint: "The local master takes a second number after the thread count: local[N,F]."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Writes That Survive Retries and Reruns
+
+    A retried task is safe for Spark's file writers because of the
+    commit protocol (`spark.sql.sources.commitProtocolClass`, default
+    `SQLHadoopMapReduceCommitProtocol`, over Hadoop's
+    `FileOutputCommitter` with algorithm version 1, which
+    `SparkHadoopUtil` sets unless you set
+    `spark.hadoop.mapreduce.fileoutputcommitter.algorithm.version`). Each task attempt writes under its own
+    directory, and only the job commit moves files into place. Looking
+    from inside a running task (a UDF that lists the output folder,
+    during a two-task write where one task fails once):
+
+    ```text
+    _temporary/0/_temporary/attempt_20261028141622117626066273813706_0000_m_000000_0/
+        part-00000-7ef571dc-21d8-47e1-9a16-58e86f27f31f-c000.snappy.parquet
+    ```
+
+    and after the job: `_SUCCESS`, `part-00000-...` and `part-00001-...`,
+    one file per partition, no matter how many attempts ran. "Writers"
+    built the same idea by hand for a Python data source (staging
+    folder, job id, manifest).
+
+    What the commit protocol does not cover is the **rerun**: the job
+    succeeded, something after it failed, and the scheduler runs the
+    whole job again. Then the save mode decides:
+
+    - `append` adds a second copy of everything.
+    - `overwrite` replaces the table, which is idempotent for a job
+      that rebuilds all of it.
+    - For partitioned outputs where a run produces some partitions
+      (one day, one source), `partitionBy(...)` with
+      `spark.sql.sources.partitionOverwriteMode=dynamic` replaces only
+      the partitions present in the new data. The default is `static`,
+      where `overwrite` deletes every partition first.
+    - Table formats make this explicit: Delta's `replaceWhere` or a
+      `MERGE` keyed by a content id ("Landing Messy Data in Delta Lake").
+
+    And side effects that are not files: an email, a payment, a row
+    posted to another system. Inside a task they repeat with every
+    retry, every recomputed stage, every speculative copy and every
+    extra action. The rule is the same as for a streaming sink: give
+    each effect a stable key (the content id, the batch id), and either
+    perform it once on the driver after the data is committed, or make
+    the receiver ignore a repeated key.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## A Fault Injection Toolkit
+
+    Every technique in this lesson, collected:
+
+    | To provoke | Do | Observe |
+    |---|---|---|
+    | task retries | master `local[N,F]`, and fail when `TaskContext.get().attemptNumber() == 0` | attempt numbers in a log written by the task |
+    | a fetch failure and stage resubmission | set `spark.local.dir` to a temp folder, run an action, delete `shuffle_<shuffle>_<map>_0.*`, run an action on the same DataFrame | the stage's attempts in the UI; `NoSuchFileException` in the log |
+    | an indeterminate map stage | a Python UDF with `random` before a shuffle, then the step above | the abort message, or a changed result with full retry off |
+    | a rerun | call the job function twice | duplicates with `append` |
+    | different partitioning | `spark.sql.files.maxPartitionBytes`, `openCostInBytes`, `spark.sql.shuffle.partitions`, AQE on or off | `df.rdd.getNumPartitions()`, changing `monotonically_increasing_id()` and `sample()` results |
+    | a streaming replay | raise in `foreachBatch` after writing, restart | `offsets/N` without `commits/N` (previous lesson) |
+    | a crash flag executors can see | a file at an absolute path created and removed by the driver | Python workers inherit no variables you set in the driver after the JVM started, but they share the local disk in local mode |
+
+    A test harness that uses them compares a clean run with a chaos run
+    and requires identical results. That is the exercise.
+
+- Class: mult_question
+  Depth: all
+  Output: "A job writes with mode('append') and succeeds. A later step fails, and the scheduler reruns the whole job. What protects the output from duplicates?"
+  AnswerChoices: "Nothing: append adds a second copy, so use overwrite (or dynamic partition overwrite, or a MERGE by key);The commit protocol, which removes files from earlier jobs;Task attempt directories, which keep only the newest attempt;The _SUCCESS file, which makes Spark skip completed jobs"
+  CorrectAnswer: "Nothing: append adds a second copy, so use overwrite (or dynamic partition overwrite, or a MERGE by key)"
+  Hint: "The commit protocol makes one job atomic. A second job is a second job."
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Two Small Gotchas from Writing This Lesson
+
+    - `F.udf(f, "double")` at module level, before any session exists,
+      fails in 4.2.0 with `[SESSION_OR_CONTEXT_NOT_EXISTS] SparkContext
+      or SparkSession should be created first.`: creating the UDF
+      parses the DDL return type, and the parser needs a session. Pass
+      a `DataType` (`DoubleType()`) for UDFs defined at import time.
+    - A UDF object pickles its function, with the globals it uses,
+      **once**: the first time you call it to build a column (the
+      Java-side UDF is created and cached then). Everything later
+      reuses that pickle. With `CFG = {"x": 1}` and
+      `u = F.udf(lambda v: CFG["x"], LongType())`, building `df1` with
+      `u`, setting `CFG["x"] = 2` and building `df2` with `u` gives
+      `1` for both; a new `F.udf(...)` object picks up the new value.
+      In the exercise's starter, an accumulator stored in a global dict
+      after the DataFrame was built reached the tasks as `None`.
+      Create such objects first, pass values as columns or literals, or
+      build the UDF inside the function that uses it.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: Make a Fragile Job Correct
+
+    A batch job turns the checkout service's events
+    (`data/messy/checkout_events/`) into a charges table: one row per
+    `pay` event with a `charge_id`, the amount converted to USD by a
+    payment service (`call_service`, given), an audit sample, a
+    ledger with one posting per charge, and metrics (number of charges,
+    total revenue in USD).
+
+    The starter works, once, on a good day. Every piece of it breaks
+    under re-execution:
+
+    1. `with_charge_id`: uses `uuid()`, so the same charge gets another
+       id in every query. Derive the id from the event's content.
+    2. `audit_sample`: uses `sample(0.5, seed=42)`, which depends on
+       partitioning and row order. Choose rows by a hash of `charge_id`.
+    3. `_to_usd`: posts to the ledger from inside the UDF, so retries
+       and extra actions post again. Make it only convert, and complete
+       `post_ledger` to post from the driver after the write, keyed by
+       `charge_id`, replacing the ledger file in one step.
+    4. `run_job`: counts with an accumulator, runs a second action for
+       the revenue, and appends. Use `observe()` on the write and
+       `mode("overwrite")`.
+
+    The harness runs a clean job (`local[2]`), stops the session, then
+    runs a chaos job in a new session: `local[4,4]`, tiny input splits,
+    7 shuffle partitions, AQE off, the payment service failing the
+    first attempt of every task, and the job run twice in a row. The
+    charges, the audit sample, the ledger and the metrics must be
+    identical between the two.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "charge_id: F.sha2(F.concat_ws('|', 'event_id', 'user'), 256).substr(1, 16). Sample: F.pmod(F.xxhash64('charge_id'), F.lit(2)) == 0. In run_job: obs = Observation('charges'); charges = charges.observe(obs, F.count(F.lit(1)).alias('charges'), F.round(F.sum('amount_usd'), 2).alias('revenue_usd')), write with mode('overwrite'), then read obs.get. post_ledger: read the committed parquet, build a dict by charge_id, write a temp file and os.replace it."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    - Spark re-executes code on task failures, fetch failures (map
+      stage resubmission), indeterminate rollbacks, speculation, every
+      action on an uncached DataFrame, cache rebuilds, streaming
+      replays, and (for analysis) every Spark Connect action.
+    - `local[N]` never retries a task; `local[N,F]` allows F attempts.
+      Speculation is off in local mode by construction.
+    - `rand(seed)`, `uuid()` and friends are seeded per partition and
+      repeat on retry; Python randomness, clocks and services do not.
+      `monotonically_increasing_id()` and `sample()` depend on
+      partitioning. Ids that must survive reruns come from content.
+    - The deterministic flag is a promise to the optimizer:
+      `asNondeterministic()` keeps filters above the UDF, and
+      nondeterministic expressions are rejected where they would be
+      unsafe (`INVALID_NON_DETERMINISTIC_EXPRESSIONS`).
+    - RDDs report `DETERMINATE`, `UNORDERED` or `INDETERMINATE`;
+      `sortBeforeRepartition` keeps round-robin repartitions safe. In
+      4.2, SQL shuffles checksum their output, and a recomputed map task
+      with different output rolls back all consumers, or aborts the job
+      if a result stage already finished partitions.
+    - Accumulator updates from failed tasks are dropped, but second
+      actions and recomputed stages count again. `observe()` counts what
+      was written, once.
+    - Classic DataFrames keep their optimized plan (same timestamp
+      across actions); Connect re-analyzes per action, so SQL `rand()`
+      changes between actions.
+    - Commit protocols make a job atomic, not a rerun idempotent: choose
+      overwrite semantics, key every external effect, and post effects
+      after the commit.
+
+    Next: **Shipping Python Dependencies to a Cluster**, where the code
+    that all these retries re-run has to reach the executors in the
+    first place.

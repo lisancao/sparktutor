@@ -1,0 +1,572 @@
+- Class: meta
+  Lesson: "Your First Python Data Source"
+  EstimatedMinutes: 45
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    So far you have read messy data with Spark's built-in sources and
+    then parsed it with functions and UDFs. That works until the data
+    lives somewhere Spark cannot list or open by itself: a file format
+    with no reader, an internal API, a device, a queue. For those, Spark
+    4.0 added the **Python Data Source API** (SPARK-44076): you write a
+    few small Python classes, register them, and from then on
+    `spark.read.format("yourname").load()` works like any built-in
+    source, in parallel, from DataFrames and SQL.
+
+    This lesson builds the smallest useful data source, slowly, and
+    shows exactly what Spark does with each piece. The data source lessons
+    that follow build on the same shape, so the habits you form here (validate
+    options early, plan partitions as plain data, test without Spark)
+    pay off later.
+
+    By the end of this lesson you will be able to:
+
+    - Write a `DataSource`, a `DataSourceReader` and an `InputPartition`
+    - Register a source and read it with `format(...)` and from SQL
+    - Handle options (always strings, keys case-insensitive) and
+      validate them with clear messages
+    - Split the work into partitions that run as parallel tasks
+    - Explain which method runs where, and why everything must pickle
+    - Honour a schema the user passes with `.schema(...)`
+    - Test the reader as plain Python, without a Spark session
+    - Recognize the error conditions and when each one appears
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Think of Spark as a restaurant kitchen and your data source as a new
+    supplier. You tell the kitchen three things: the supplier's name (so
+    orders can say `format("counter")`), what the deliveries look like
+    (the schema), and how to split a big order into boxes (partitions)
+    that several cooks can unpack at the same time. Each cook opens one
+    box (one `read(partition)` call) and hands over rows.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Why Not Just Use Python?
+
+    You could read anything with plain Python on the driver and call
+    `spark.createDataFrame(rows)`. That is fine for a hundred rows. It
+    breaks down because:
+
+    - All the data passes through one process (the driver), so it does
+      not scale and can run out of memory.
+    - Nothing runs in parallel: one connection, one file at a time.
+    - It is not reusable: every notebook repeats the code, and SQL users
+      cannot use it at all.
+    - It cannot stream ("Streaming Readers and Writers") or be a write target ("Writers").
+
+    A data source moves the reading into Spark tasks on the executors,
+    and gives it a name everyone can use.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## The Smallest Data Source
+
+    ```python
+    from pyspark.sql.datasource import DataSource, DataSourceReader
+
+    class Hello(DataSource):
+        def schema(self):
+            return "greeting string"
+
+        def reader(self, schema):
+            return HelloReader()
+
+    class HelloReader(DataSourceReader):
+        def read(self, partition):
+            yield ("hello",)
+            yield ("world",)
+
+    spark.dataSource.register(Hello)
+    spark.read.format("Hello").load().show()
+    ```
+
+    ```
+    +--------+
+    |greeting|
+    +--------+
+    |   hello|
+    |   world|
+    +--------+
+    ```
+
+    Three things happened:
+
+    - `schema()` told Spark the columns. A DDL string like
+      `"id long, label string"` is the easy form; a `StructType` works
+      too.
+    - `reader(schema)` returned the object that produces rows.
+    - `read(partition)` yielded rows as tuples, in schema order. It may
+      also yield `Row(...)` objects (matched to columns by name) or
+      PyArrow `RecordBatch`es ("Types, Arrow and Performance"). A `dict` is not accepted: it
+      fails with `DATA_SOURCE_INVALID_RETURN_TYPE`.
+
+    The format name is `name()`, which defaults to the class name, and
+    Spark matches it case-insensitively: `format("hello")` and
+    `format("HELLO")` work too. Real sources override `name()` with a
+    short lowercase name.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Options Are Strings in a Case-Insensitive Dict
+
+    Everything after `format(...)` that you pass with `.option(key,
+    value)` arrives in `self.options`, a `CaseInsensitiveDict` whose
+    **keys are lowercased** and whose **values are strings**, whatever
+    type you passed:
+
+    ```python
+    from pyspark.sql.datasource import CaseInsensitiveDict
+
+    opts = CaseInsensitiveDict({"Rows": "5"})
+    print(opts["rows"], opts.get("ROWS"), "rows" in opts, opts.get("prefix", "row"))
+    ```
+
+    ```
+    5 5 True row
+    ```
+
+    `.option("rows", 10)` therefore gives you `"10"`, and
+    `.option("enabled", True)` gives you `"true"`. Convert and check
+    every option yourself, and raise `ValueError` with a message that
+    names the option and the value you got. The user sees that message
+    (inside Spark's error), so it is your source's user interface.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Partitions: Splitting the Work
+
+    `partitions()` returns a list of `InputPartition` objects. Spark
+    runs **one task per partition**, in parallel, and calls
+    `read(partition)` once in each task. A partition is a small, plain
+    description of a share of the work ("ids 0 to 3", "these four
+    files", "page 2 of the API"), not the data itself.
+
+    ```python
+    from pyspark.sql.datasource import InputPartition
+
+    class RangePartition(InputPartition):
+        def __init__(self, start, end):
+            self.start = start
+            self.end = end
+    ```
+
+    The planning logic is plain Python, so keep it in a function you
+    can test on its own:
+
+    ```python
+    def plan_ranges(rows, partitions):
+        n = min(partitions, rows)
+        if n <= 0:
+            return []
+        base, extra = divmod(rows, n)
+        ranges, start = [], 0
+        for i in range(n):
+            end = start + base + (1 if i < extra else 0)
+            ranges.append((start, end))
+            start = end
+        return ranges
+
+    print(plan_ranges(10, 3), plan_ranges(2, 5), plan_ranges(0, 2))
+    ```
+
+    ```
+    [(0, 4), (4, 7), (7, 10)] [(0, 1), (1, 2)] []
+    ```
+
+    Rules Spark enforces:
+
+    - `partitions()` must return a **list** (a generator fails with
+      `DATA_SOURCE_TYPE_MISMATCH`: "Expected 'partitions' to return a
+      list") of `InputPartition` instances.
+    - **An empty list does not mean "no tasks".** Spark replaces it with
+      `[InputPartition(None)]` and calls `read()` once with that. Your
+      `read()` must handle a partition that is not one of yours, usually
+      by yielding nothing.
+    - If you do not override `partitions()`, you get that same single
+      `InputPartition(None)`, so everything runs in one task.
+
+- Class: mult_question
+  Depth: all
+  Output: "Your reader's partitions() returns an empty list because there is nothing to read. What does Spark do?"
+  AnswerChoices: "It calls read() once with InputPartition(None);It runs no tasks and returns an empty DataFrame without calling read();It fails with DATA_SOURCE_TYPE_MISMATCH;It calls partitions() again until it is not empty"
+  CorrectAnswer: "It calls read() once with InputPartition(None)"
+  Hint: "An empty list is replaced by the default partition list."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Where Each Piece Runs
+
+    Your script defines the classes, but most of the methods do not run
+    in your script's Python process. Spark starts separate Python worker
+    processes and sends them your objects by pickling them:
+
+    | When | Where | What runs |
+    |------|-------|-----------|
+    | `register(...)` | your script | the class is pickled and handed to Spark |
+    | `.load()` | a Python worker started by Spark | `DataSource(options)` and `schema()` |
+    | first action (`count`, `show`, `collect`) | a Python worker | `reader(schema)`, `reader.__init__`, `partitions()`; then the reader and partitions are pickled |
+    | each task | a Python worker on an executor | `read(partition)` on an unpickled copy of the reader |
+
+    Printing `os.getpid()` from each method shows different process ids
+    from your script's. Three consequences:
+
+    - **Everything on `self` must pickle.** A reader that keeps a lock or
+      a socket fails at the first action with `PYTHON_DATA_SOURCE_ERROR`
+      ("Failed to initialize Python data source reader ... cannot pickle
+      'socket' object"). Keep only plain values (strings, numbers,
+      lists, dicts) on `self`, and open connections, files and clients
+      inside `read()`.
+    - **Imports for `read()` belong inside `read()`** (or at the top of
+      a module that every worker can import). The class is pickled by
+      value because it is defined in your `__main__` script, so the
+      workers do not need your file on disk.
+    - **Changing a global variable in `read()` changes nothing in your
+      script.** Each task works on its own copy. Results come back only
+      as rows.
+
+    In local mode, anything a method prints to `stderr` shows up in your
+    console, which is handy while learning. On a cluster it goes to the
+    executor logs; "Packaging, Registration, Testing and Debugging" shows how to collect worker logs properly.
+
+- Class: mult_question
+  Depth: all
+  Output: "Your reader opens a database connection in __init__ and keeps it on self. What happens at the first action?"
+  AnswerChoices: "It fails because the reader is pickled to send it to the tasks, and connections do not pickle;Each task reuses the same connection;Spark opens one connection per task automatically;Nothing: __init__ runs in each task"
+  CorrectAnswer: "It fails because the reader is pickled to send it to the tasks, and connections do not pickle"
+  Hint: "Look at the table: the reader is created once during planning, then copied to every task."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## A Complete Source: counter
+
+    Here is the source you will finish in the exercise. It produces
+    `rows` numbered rows, split into `partitions` ranges:
+
+    ```python
+    from pyspark.sql.datasource import DataSource, DataSourceReader
+
+    def whole_number(options, key, default, minimum):
+        raw = options.get(key, default)
+        if raw is None:
+            raise ValueError(f"option '{key}' is required")
+        try:
+            value = int(raw)
+        except ValueError:
+            raise ValueError(f"option '{key}' must be a whole number, got {raw!r}") from None
+        if value < minimum:
+            raise ValueError(f"option '{key}' must be >= {minimum}, got {value}")
+        return value
+
+    class CounterDataSource(DataSource):
+        @classmethod
+        def name(cls):
+            return "counter"
+
+        def schema(self):
+            return "id long, label string"
+
+        def reader(self, schema):
+            return CounterReader(self.options, schema)
+
+    class CounterReader(DataSourceReader):
+        def __init__(self, options, schema):
+            self.rows = whole_number(options, "rows", None, 0)
+            self.partition_count = whole_number(options, "partitions", "2", 1)
+            self.prefix = options.get("prefix", "row")
+            self.columns = [field.name for field in schema.fields]
+
+        def partitions(self):
+            return [RangePartition(s, e) for s, e in plan_ranges(self.rows, self.partition_count)]
+
+        def read(self, partition):
+            if not isinstance(partition, RangePartition):
+                return
+            for i in range(partition.start, partition.end):
+                values = {"id": i, "label": f"{self.prefix}-{i}"}
+                yield tuple(values[c] for c in self.columns)
+
+    spark.dataSource.register(CounterDataSource)
+
+    df = spark.read.format("counter").option("rows", 10).option("partitions", 3).load()
+    (df.groupBy(F.spark_partition_id().alias("partition"))
+       .agg(F.min("id").alias("first"), F.max("id").alias("last"), F.count("*").alias("rows"))
+       .orderBy("partition").show())
+    ```
+
+    ```
+    +---------+-----+----+----+
+    |partition|first|last|rows|
+    +---------+-----+----+----+
+    |        0|    0|   3|   4|
+    |        1|    4|   6|   3|
+    |        2|    7|   9|   3|
+    +---------+-----+----+----+
+    ```
+
+    `spark_partition_id()` shows which task produced each row: three
+    partitions, three tasks, with the sizes `plan_ranges` chose.
+
+    `name()` must be a `@classmethod` (Spark calls it on the class), and
+    `register` uses it as the format name.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    `CounterDataSource` is defined as above. Register it, then load it
+    with the option `rows` set to 5 into a DataFrame called `df`.
+  CorrectAnswer: |
+    spark.dataSource.register(CounterDataSource)
+    df = spark.read.format("counter").option("rows", 5).load()
+  Hint: "spark.dataSource.register(...), then spark.read.format(<the name() value>).option(...).load()."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Honouring the User's Schema
+
+    `reader(schema)` receives the schema Spark will use. Usually that is
+    what your `schema()` returned, but a user can pass their own:
+
+    ```python
+    (spark.read.format("counter")
+          .schema("label string, id long")
+          .option("rows", 2)
+          .load()
+          .show())
+    ```
+
+    ```
+    +-----+---+
+    |label| id|
+    +-----+---+
+    |row-0|  0|
+    |row-1|  1|
+    +-----+---+
+    ```
+
+    When the user supplies a schema, Spark does **not** call your
+    `schema()` at all; it passes the user's schema straight to
+    `reader()`. Spark does not reorder your values either. If `read()`
+    yielded `(id, label)` tuples here, Spark would put `"row-0"` into the
+    `id` column and the task would fail with `PYTHON_EXCEPTION` wrapping
+    `ArrowInvalid: Could not convert 'row-0' with type str: tried to
+    convert to int64`; with two columns of the same type you would get
+    swapped values and no error at all. That is why `CounterReader`
+    builds each row from `self.columns`, in the order the schema asks
+    for. Check the names
+    too, and fail with a clear message for a column you do not produce,
+    instead of quietly returning `None`.
+
+    A user schema is also how you skip work: a schema with fewer columns
+    lets `read()` compute less. "Reading a Custom File Format, in Parallel" uses this to avoid opening files
+    when only metadata is asked for.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## From SQL
+
+    A registered Python source is available to SQL in the same session:
+
+    ```python
+    spark.sql("""
+        CREATE OR REPLACE TEMPORARY VIEW five
+        USING counter OPTIONS (rows '5', prefix 'n')
+    """)
+    spark.sql("SELECT * FROM five WHERE id >= 3").show()
+    ```
+
+    ```
+    +---+-----+
+    | id|label|
+    +---+-----+
+    |  3|  n-3|
+    |  4|  n-4|
+    +---+-----+
+    ```
+
+    Registration lasts for the session. A new session (or a new
+    `spark-submit`) must register again; "Packaging, Registration, Testing and Debugging" packages a source so
+    Spark finds it automatically.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Testing Without Spark
+
+    Every piece except `register` is ordinary Python, so you can test it
+    in milliseconds with no session: build the options and schema
+    yourself, call `partitions()` and `read()` the way Spark would, and
+    check that the reader pickles.
+
+    ```python
+    import pickle
+    from pyspark.sql.datasource import CaseInsensitiveDict
+    from pyspark.sql.types import LongType, StringType, StructField, StructType
+
+    SCHEMA_STRUCT = StructType([StructField("id", LongType()), StructField("label", StringType())])
+
+    def read_without_spark(options):
+        reader = CounterReader(CaseInsensitiveDict(options), SCHEMA_STRUCT)
+        return [row for p in reader.partitions() for row in reader.read(p)]
+
+    print(read_without_spark({"rows": "3", "partitions": "2"}))
+    pickle.loads(pickle.dumps(CounterReader(CaseInsensitiveDict({"rows": "3"}), SCHEMA_STRUCT)))
+    ```
+
+    ```
+    [(0, 'row-0'), (1, 'row-1'), (2, 'row-2')]
+    ```
+
+    Two details:
+
+    - Pass a `CaseInsensitiveDict`, as Spark does, so the test sees the
+      same lowercase keys and string values.
+    - Build the `StructType` from type objects. Parsing a DDL string
+      (`StructType.fromDDL`, `udf("...")`) needs a running session and
+      fails with `SESSION_OR_CONTEXT_NOT_EXISTS` without one.
+
+    These tests do not prove that Spark accepts your rows (types are
+    checked when Spark converts them), so keep one small end-to-end read
+    as well. The exercise does both.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## When Things Go Wrong
+
+    Errors from a Python data source surface at three different moments,
+    with different conditions. Knowing which is which tells you where to
+    look:
+
+    | Where the bug is | When it fails | Condition |
+    |------------------|---------------|-----------|
+    | `DataSource.schema()` (or `__init__`) | at `.load()` (on Spark Connect, when something first needs the schema) | `PYTHON_DATA_SOURCE_ERROR`: "Failed to create Python data source instance" |
+    | `reader()`, `reader.__init__` (option checks), pickling the reader | at the first action | `PYTHON_DATA_SOURCE_ERROR`: "Failed to initialize Python data source reader" |
+    | `partitions()` | at the first action | `PYTHON_DATA_SOURCE_ERROR`: "Failed to generate Python data source read partitions" |
+    | `read()`, or rows that do not fit the schema | while the tasks run | `PYTHON_EXCEPTION`, with your traceback inside |
+
+    For example, a missing required option:
+
+    ```python
+    df = spark.read.format("counter").load()   # no error yet
+    df.collect()
+    ```
+
+    ```
+    AnalysisException: [PYTHON_DATA_SOURCE_ERROR] Failed to initialize
+    Python data source reader: Traceback (most recent call last):
+      ...
+    ValueError: option 'rows' is required
+    ```
+
+    `load()` succeeded because only `schema()` ran; the reader, which
+    checks the options, is created at the first action. Rows of the
+    wrong length fail inside the task: `PYTHON_EXCEPTION` wrapping
+    `DATA_SOURCE_RETURN_SCHEMA_MISMATCH` ("Expected: 2 columns, Found: 1
+    columns"). Always scroll to the last lines of the Python traceback:
+    that is your code's error.
+
+- Class: mult_question
+  Depth: all
+  Output: "Your reader's __init__ raises ValueError(\"option 'rows' is required\"). When does the user see the error?"
+  AnswerChoices: "At the first action, as PYTHON_DATA_SOURCE_ERROR;At spark.read.format(...).load(), as PYTHON_EXCEPTION;Only when a task runs read();Never: Spark uses a default value"
+  CorrectAnswer: "At the first action, as PYTHON_DATA_SOURCE_ERROR"
+  Hint: "load() only creates the DataSource and asks for its schema. The reader is created when the query is planned."
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Limits to Know Now
+
+    - **Declarative Pipelines**: on 4.2.0 a pipeline that reads a Python
+      data source finishes its flows and then `spark-pipelines` exits
+      with status 1 (SPARK-59135, fixed in 4.4.0). Use Python data
+      sources from scripts and jobs for now; this course does.
+    - **Built-in names are taken**: registering a Python source named
+      `json`, `parquet` or another built-in name fails with
+      `DATA_SOURCE_ALREADY_EXISTS`. "Packaging, Registration, Testing and Debugging" covers naming and
+      overriding.
+    - **Python speed**: every row passes through Python. For large reads,
+      yielding PyArrow batches instead of tuples is much faster
+      ("Types, Arrow and Performance"), and filter pushdown ("Filter Pushdown") avoids producing rows
+      that would be thrown away.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: The counter Source
+
+    Build the `counter` source from this lesson, piece by piece. The
+    harness first tests your code as plain Python, **before any Spark
+    session exists**, then reads it through Spark.
+
+    1. `plan_ranges(rows, partitions)`: split `range(rows)` into at most
+       `partitions` contiguous `(start, end)` pairs whose sizes differ by
+       at most one, earlier ranges larger, none empty.
+    2. `CounterDataSource`: `name()` (a classmethod) returns
+       `"counter"`, `schema()` returns `SCHEMA`, `reader(schema)` returns
+       a `CounterReader`.
+    3. `CounterReader.__init__(options, schema)`: read `rows` (required),
+       `partitions` (default `"2"`) and `prefix` (default `"row"`) with
+       the `_whole_number` helper, remember the schema's column names,
+       and raise `ValueError` for a column other than `id` and `label`.
+    4. `partitions()`: one `RangePartition` per range from
+       `plan_ranges`.
+    5. `read(partition)`: yield one tuple per id, in the schema's column
+       order; yield nothing for a partition that is not a
+       `RangePartition`.
+    6. `read_without_spark(options)`: create a reader with
+       `CaseInsensitiveDict(options)` and `SCHEMA_STRUCT`, and return all
+       rows from all its partitions.
+
+    The harness checks the ranges, plain-Python reads, option errors,
+    pickling, then through Spark: schema, rows, a 4/3/3 split across
+    three partitions, case-insensitive names, `prefix`, user schemas
+    (fewer and reordered columns), `rows` 0, the error for a missing
+    option, and a SQL view.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "plan_ranges: n = min(partitions, rows); base, extra = divmod(rows, n); the first `extra` ranges get one more row. read(): if not isinstance(partition, RangePartition): return; then values = {'id': i, 'label': f'{self.prefix}-{i}'} and yield tuple(values[c] for c in self.columns)."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    In this lesson you learned:
+
+    - **The Python Data Source API** (4.0, SPARK-44076): a `DataSource`
+      (name, schema, reader), a `DataSourceReader` (partitions, read) and
+      `InputPartition`s, registered with `spark.dataSource.register`
+    - **`name()`** is a classmethod, defaults to the class name, and is
+      matched case-insensitively; registered sources work in SQL with
+      `USING name OPTIONS (...)`
+    - **Options** are strings with lowercase keys: convert and validate
+      them in the reader with messages that name the option
+    - **Partitions** are small plain descriptions of work, one task each;
+      `partitions()` returns a list, and an empty list still means one
+      `read(InputPartition(None))` call
+    - **Where code runs**: `schema()` at `load()`, the reader and
+      `partitions()` at the first action, `read()` in the tasks, all in
+      Python workers; everything on `self` must pickle
+    - **User schemas** skip `schema()`; build rows in the order of the
+      schema you are given
+    - **Test without Spark** with `CaseInsensitiveDict` and a
+      `StructType` built from type objects
+    - **Errors**: `PYTHON_DATA_SOURCE_ERROR` from planning (at `load()`
+      or the first action), `PYTHON_EXCEPTION` from `read()`
+
+    Next: **Plans, Partitions and Caching**, where you learn to read
+    what Spark plans to do with all of these sources, and why.

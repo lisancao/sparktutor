@@ -1,0 +1,954 @@
+- Class: meta
+  Lesson: "Schemas for Data You Don't Control"
+  EstimatedMinutes: 60
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What You'll Learn
+
+    From "Why Spark for Messy Data, and How It Runs Your Code" you know
+    how Spark plans and runs a query, and from "Setup, a First Session
+    and a Tour of the Sample Data" you can open a session, read a folder
+    and look at `printSchema()`. This lesson is about that schema: what it
+    is made of, where it comes from, and what to do when the data you
+    receive keeps changing shape. It follows chapter 3 of *Learning
+    Spark* (the structured APIs), with data that doesn't follow the
+    rules.
+
+    By the end of this lesson you will be able to:
+
+    - Name Spark's data types and pick the right one for numbers, money,
+      text, bytes, dates and times, nested data and VARIANT
+    - Explain what nullability means in a schema, and why for files it is
+      only a hint
+    - Write a schema as a DDL string or a `StructType`, print it in
+      several forms, and store it in a file with `schema.json()`
+    - Explain what schema inference costs and why it is unstable on
+      messy data, with `samplingRatio` as the proof
+    - Read files through an enforced schema, and merge Parquet schemas
+      with `mergeSchema`
+    - Detect drift by comparing two schemas in code
+    - Combine DataFrames of different shapes with
+      `unionByName(allowMissingColumns=True)`, and reshape one to a target
+      schema with `try_cast` and `DataFrame.to`
+    - Handle column names with spaces, dots, duplicates and different
+      cases
+
+    The examples use `data/messy/events/`: three days of order events
+    whose shape changes every day.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## What a Schema Is
+
+    Every DataFrame has a **schema**: an ordered list of columns, each
+    with a **name**, a **data type** and a **nullable** flag (whether it
+    may hold NULL, Spark's "no value"). Spark needs it before it runs
+    anything: the planner uses the types to choose operations, and the
+    file readers use it to decode bytes.
+
+    A schema comes from one of three places:
+
+    1. **You.** You pass it to the reader: `spark.read.schema(...)`.
+    2. **The file.** Parquet, ORC, Avro and Delta tables store their
+       schema in the file or table metadata, so reading it is cheap.
+    3. **Inference.** For JSON, CSV and XML, which store text, Spark
+       reads the data and guesses.
+
+    Two philosophies follow from that. **Schema on write** (a database,
+    a Delta table) checks data against the schema when it is written,
+    so readers can trust it. **Schema on read** (a folder of JSON files)
+    stores whatever producers sent, and each reader decides what the data
+    means when it reads. Messy data is schema on read almost by
+    definition, which is why this lesson exists: you have to bring the
+    schema, check the data against it, and decide what to do with what
+    doesn't fit.
+
+- Class: text
+  Depth: beginner
+  Output: |
+    Think of a schema as the column headings of a paper form, with a rule
+    under each: "Date of birth (a date)", "Phone (digits only)". A clerk
+    who receives a pile of filled-in forms can trust the answers only as
+    far as someone checked them against those rules. Schema on write is
+    the clerk who rejects a form at the counter. Schema on read is the
+    clerk who files everything and checks only when someone asks a
+    question. This lesson teaches you to be the second clerk without
+    being fooled.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Spark's Data Types
+
+    `typeof()` is a SQL function that names the type of any value. The
+    literals below show the main types (`1Y` is a tinyint literal, `1L` a
+    bigint, `1.5D` a double, `X'00'` a binary):
+
+    ```python
+    spark.sql("""
+    SELECT typeof(true) AS a, typeof(1Y) AS b, typeof(1S) AS c, typeof(1) AS d, typeof(1L) AS e,
+           typeof(1.5F) AS f, typeof(1.5D) AS g, typeof(1.5) AS h, typeof('x') AS i,
+           typeof(X'00') AS j, typeof(DATE'2026-10-01') AS k
+    """).show()
+    ```
+
+    ```
+    +-------+-------+--------+---+------+-----+------+------------+------+------+----+
+    |      a|      b|       c|  d|     e|    f|     g|           h|     i|     j|   k|
+    +-------+-------+--------+---+------+-----+------+------------+------+------+----+
+    |boolean|tinyint|smallint|int|bigint|float|double|decimal(2,1)|string|binary|date|
+    +-------+-------+--------+---+------+-----+------+------------+------+------+----+
+    ```
+
+    | DDL name | Python class | Holds | Python value |
+    |----------|--------------|-------|--------------|
+    | `BOOLEAN` | `BooleanType` | true / false | `bool` |
+    | `TINYINT`, `SMALLINT` | `ByteType`, `ShortType` | 1- and 2-byte integers (-128 to 127, -32768 to 32767) | `int` |
+    | `INT` | `IntegerType` | 4-byte integers (about plus or minus 2.1 billion) | `int` |
+    | `BIGINT` | `LongType` | 8-byte integers | `int` |
+    | `FLOAT`, `DOUBLE` | `FloatType`, `DoubleType` | binary floating point | `float` |
+    | `DECIMAL(p,s)` | `DecimalType(p, s)` | exact decimals, p digits with s after the point | `decimal.Decimal` |
+    | `STRING` | `StringType` | text | `str` |
+    | `BINARY` | `BinaryType` | raw bytes | `bytes` / `bytearray` |
+    | `DATE` | `DateType` | a calendar day | `datetime.date` |
+    | `TIMESTAMP` | `TimestampType` | an instant in time | `datetime.datetime` |
+    | `TIMESTAMP_NTZ` | `TimestampNTZType` | a wall-clock date and time, no zone | `datetime.datetime` |
+    | `INTERVAL ...` | `DayTimeIntervalType`, `YearMonthIntervalType` | a length of time | `datetime.timedelta` (day-time only) |
+    | `ARRAY<T>` | `ArrayType(T)` | an ordered list | `list` |
+    | `MAP<K,V>` | `MapType(K, V)` | key to value pairs | `dict` |
+    | `STRUCT<...>` | `StructType([...])` | named fields, like a nested row | `Row` |
+    | `VARIANT` | `VariantType` | any JSON-like value (4.0) | `VariantVal` |
+
+    The complex and newer types, again with `typeof`:
+
+    ```
+    +---------+-------------+------------+----------------------+----------+---------------+--------------------------+-------+
+    |ts       |ntz          |dt          |ym                    |arr       |m              |st                        |v      |
+    +---------+-------------+------------+----------------------+----------+---------------+--------------------------+-------+
+    |timestamp|timestamp_ntz|interval day|interval year to month|array<int>|map<string,int>|struct<id:int,plan:string>|variant|
+    +---------+-------------+------------+----------------------+----------+---------------+--------------------------+-------+
+    ```
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Numbers: Overflow, Doubles and Decimals
+
+    Since Spark 4.0, ANSI SQL mode is on by default (SPARK-44444), so a
+    number that doesn't fit its type is an error, not a silent wrap:
+
+    ```python
+    spark.sql("SELECT CAST(300 AS TINYINT)").collect()
+    # [CAST_OVERFLOW] The value 300 of the type "INT" cannot be cast to "TINYINT"
+    #   due to an overflow. Use `try_cast` to tolerate overflow and return NULL instead.
+
+    spark.sql("SELECT 2147483647 + 1").collect()
+    # [ARITHMETIC_OVERFLOW] overflow. Use 'try_add' to tolerate overflow and return NULL instead.
+    ```
+
+    `FLOAT` and `DOUBLE` are binary fractions, so most decimal numbers
+    are stored approximately. That is fine for measurements and wrong for
+    money:
+
+    ```python
+    spark.sql("SELECT 0.1D + 0.2D AS as_double, 0.1BD + 0.2BD AS as_decimal").show()
+    ```
+
+    ```
+    +-------------------+----------+
+    |          as_double|as_decimal|
+    +-------------------+----------+
+    |0.30000000000000004|       0.3|
+    +-------------------+----------+
+    ```
+
+    `DECIMAL(p, s)` stores exactly `p` digits, `s` of them after the
+    point, up to 38 digits. `DecimalType()` with no arguments is
+    `DecimalType(10,0)`: no digits after the point, a common surprise.
+    A value too big for the declared precision fails under ANSI mode:
+
+    ```python
+    spark.sql("SELECT CAST(12345.678 AS DECIMAL(5,2))").collect()
+    # [NUMERIC_VALUE_OUT_OF_RANGE.WITH_SUGGESTION] 12345.678 cannot be represented as Decimal(5, 2).
+
+    spark.sql("SELECT TRY_CAST(12345.678 AS DECIMAL(5,2)) d, CAST(123.456 AS DECIMAL(5,2)) r").collect()
+    # [Row(d=None, r=Decimal('123.46'))]   (too big: NULL; too many decimals: rounded)
+    ```
+
+    For JSON, inference makes every whole number a `BIGINT` and every
+    number with a point a `DOUBLE`. The option `prefersDecimal` makes it
+    choose decimals instead: on the first events file, `amount` became
+    `decimal(4,2)` instead of `double`.
+
+- Class: mult_question
+  Depth: all
+  Output: "Which type should hold order totals such as 19.99 so that sums are exact?"
+  AnswerChoices: "DECIMAL(12,2);DOUBLE;FLOAT;DecimalType() with no arguments"
+  CorrectAnswer: "DECIMAL(12,2)"
+  Hint: "0.1 + 0.2 as doubles is 0.30000000000000004. And DecimalType() defaults to (10,0), with no digits after the point."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Dates, Times and Time Zones
+
+    Spark has two timestamp types, and mixing them up is the most common
+    source of "the times are off by a few hours":
+
+    - **`TIMESTAMP`** (also called `TIMESTAMP_LTZ`, local time zone) is an
+      **instant**: a point on the world's timeline, stored as
+      microseconds since 1970-01-01 00:00 UTC. Text is converted to and
+      from it using the session time zone,
+      `spark.sql.session.timeZone`.
+    - **`TIMESTAMP_NTZ`** (no time zone, Spark 3.4, SPARK-35662) is a
+      **wall-clock reading**, "10:00 on 1 October", with no zone at all.
+      It never shifts.
+
+    The same text under two session time zones:
+
+    ```python
+    q = "SELECT TIMESTAMP '2026-10-01 10:00:00' AS ts, TIMESTAMP_NTZ '2026-10-01 10:00:00' AS ntz"
+    for tz in ["UTC", "America/Vancouver"]:
+        spark.conf.set("spark.sql.session.timeZone", tz)
+        spark.sql(q).withColumn("epoch", F.unix_timestamp("ts")).show()
+    ```
+
+    ```
+    +-------------------+-------------------+----------+
+    |                 ts|                ntz|     epoch|
+    +-------------------+-------------------+----------+
+    |2026-10-01 10:00:00|2026-10-01 10:00:00|1790848800|
+    +-------------------+-------------------+----------+
+    +-------------------+-------------------+----------+
+    |                 ts|                ntz|     epoch|
+    +-------------------+-------------------+----------+
+    |2026-10-01 10:00:00|2026-10-01 10:00:00|1790874000|
+    +-------------------+-------------------+----------+
+    ```
+
+    The text looks identical, but `epoch` (seconds since 1970 UTC) shows
+    two different instants, 25200 seconds (7 hours) apart: "10:00 in UTC"
+    and "10:00 in Vancouver". A plain `TIMESTAMP` column in DDL means
+    `TIMESTAMP_LTZ` because `spark.sql.timestampType` defaults to
+    `TIMESTAMP_LTZ`.
+
+    **Gotcha: collecting to Python.** `collect()` turns a `TIMESTAMP` into
+    a naive `datetime` in the **Python process's** local time zone, not
+    the session's. With the session in UTC, the same row collected on
+    machines in different zones gave:
+
+    ```
+    TZ=UTC               datetime.datetime(2026, 10, 1, 10, 0)
+    TZ=Asia/Ho_Chi_Minh  datetime.datetime(2026, 10, 1, 17, 0)
+    ```
+
+    while `toPandas()` printed `2026-10-01 10:00:00` (the session zone)
+    on both. Set `spark.sql.session.timeZone` explicitly in every job (all
+    the exercises in this course set it to UTC), and compare instants
+    inside Spark rather than after collecting.
+
+    **Intervals** are lengths of time. Subtracting two timestamps gives
+    an `interval day to second`, which collects as a `timedelta`
+    (`TIMESTAMP '2026-10-03 12:00:00' - TIMESTAMP '2026-10-01 10:00:00'`
+    collected as `timedelta(days=2, seconds=7200)`). Year-month intervals
+    cannot be collected to Python in 4.2.0: `collect()` fails with
+    `[NOT_IMPLEMENTED] YearMonthIntervalType.fromInternal is not
+    implemented.` Cast them to string first if you need to look at them.
+
+- Class: mult_question
+  Depth: all
+  Output: "Two jobs read the text '2026-10-01 10:00:00' into a TIMESTAMP column, one with the session time zone UTC and one with America/Vancouver. What do they store?"
+  AnswerChoices: "Two different instants, 7 hours apart;The same instant, because the text is the same;The same value, because TIMESTAMP has no time zone;Nothing, a time zone must be in the text"
+  CorrectAnswer: "Two different instants, 7 hours apart"
+  Hint: "TIMESTAMP is an instant, and text is converted with the session time zone. TIMESTAMP_NTZ is the type that never shifts."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Nested Types, and a First Look at VARIANT
+
+    Messy data is usually nested. The inferred schema of the events has
+    all three complex types' worth of nesting:
+
+    - `items: array<struct<qty: bigint, sku: string>>`: a list of
+      structs, one per line item
+    - `user: struct<geo: struct<country: string>, id: bigint, plan: string>`:
+      a struct inside a struct
+
+    A **struct** has fixed, named fields (like a row inside a row). An
+    **array** holds any number of elements of one type. A **map** holds
+    key to value pairs where keys are not known in advance (a
+    `map<string,string>` of free-form tags, for example). You reach into
+    them by path: `F.col("user.geo.country")`, `F.col("items")[0]`,
+    `F.col("tags")["color"]`. "Complex Types and Higher-Order Functions"
+    teaches them in depth.
+
+    A schema object lets you navigate the same way:
+
+    ```python
+    events = spark.read.json("data/messy/events")
+    print(events.schema["user"].dataType["geo"])
+    print(events.schema.fieldNames())
+    print(events.dtypes[:3])
+    ```
+
+    ```
+    StructField('geo', StructType([StructField('country', StringType(), True)]), True)
+    ['_corrupt_record', 'amount', 'event', 'event_type', 'items', 'ts', 'user', 'user_id']
+    [('_corrupt_record', 'string'), ('amount', 'string'), ('event', 'string')]
+    ```
+
+    `schema["user"]` is a `StructField` (name, type, nullable); its
+    `dataType` is the nested `StructType`, which you can index again.
+
+    All of these types need you to know the shape. **VARIANT** (Spark
+    4.0, SPARK-45827) is for when you don't: one column that holds any
+    JSON-like value, object, array, number or string, in an efficient
+    binary form, with fields pulled out at query time. "VARIANT Basics:
+    Profiling and Nested Data" uses it on these same events.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Nullability: A Promise Spark Doesn't Always Keep
+
+    Each field has a `nullable` flag. `False` promises the column never
+    holds NULL, which lets the optimizer skip null checks. For data you
+    don't control, the important fact is this: **file sources ignore the
+    promise.** When you read files with a schema that says `NOT NULL`,
+    Spark makes every field nullable, because nothing guarantees the
+    files agree (in the 4.2.0 source, `DataSource.resolveRelation` calls
+    `dataSchema.asNullable` for file relations):
+
+    ```python
+    d = spark.read.schema("event STRING NOT NULL, user_id BIGINT NOT NULL").json("data/messy/events")
+    d.printSchema()
+    print(d.filter("user_id IS NULL").count())
+    ```
+
+    ```
+    root
+     |-- event: string (nullable = true)
+     |-- user_id: long (nullable = true)
+
+    41
+    ```
+
+    41 of the 61 events have no `user_id`, and nothing failed. So
+    `NOT NULL` in a reading schema is documentation, not a check. To
+    enforce it, count the NULLs yourself (later lessons build quality
+    rules for this) or write to a table format that enforces it.
+
+    Where Spark does check is when it builds data from Python objects:
+
+    ```python
+    from pyspark.sql.types import StructType, StructField, IntegerType
+    st = StructType([StructField("id", IntegerType(), False)])
+    spark.createDataFrame([(1,), (None,)], st)
+    # [FIELD_NOT_NULLABLE_WITH_NAME] field id: This field is not nullable, but got None.
+    ```
+
+    And a gotcha: `createDataFrame(..., verifySchema=False)` skips that
+    check, and the `None` did not become NULL. It came back as
+    `Row(id=0)`, a made-up zero. Don't turn off verification for data you
+    don't trust.
+
+- Class: mult_question
+  Depth: all
+  Output: "You read JSON files with the schema `id BIGINT NOT NULL`, and some records have no id. What happens?"
+  AnswerChoices: "The read succeeds, the column becomes nullable, and those rows have NULL ids;The read fails with FIELD_NOT_NULLABLE_WITH_NAME;Those records are dropped;The ids become 0"
+  CorrectAnswer: "The read succeeds, the column becomes nullable, and those rows have NULL ids"
+  Hint: "For file sources, Spark turns every field nullable. The check that raises FIELD_NOT_NULLABLE_WITH_NAME is in createDataFrame."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Writing Schemas: DDL Strings and StructType
+
+    You can write a schema in two equivalent ways. A **DDL string**
+    (DDL is "data definition language", the SQL used in `CREATE TABLE`)
+    is short:
+
+    ```python
+    ddl = "id BIGINT NOT NULL, name STRING, tags ARRAY<STRING>, address STRUCT<city: STRING, zip: STRING>"
+    ```
+
+    A **`StructType`** is the same thing as Python objects, which is
+    what you want when a program builds or inspects a schema:
+
+    ```python
+    from pyspark.sql.types import StructType, StructField, LongType, StringType, ArrayType
+
+    schema = StructType([
+        StructField("id", LongType(), False),
+        StructField("name", StringType()),                 # nullable defaults to True
+        StructField("tags", ArrayType(StringType())),
+        StructField("address", StructType([
+            StructField("city", StringType()),
+            StructField("zip", StringType()),
+        ])),
+    ])
+    ```
+
+    Every reader and `createDataFrame` accept either form. To turn one
+    into the other, `StructType.fromDDL(ddl)` (4.0) parses DDL, and
+    `schema.toDDL()` (4.0) prints it back. Both need a running session,
+    because the parsing is done by Spark's SQL parser in the JVM; without
+    one you get
+    `[SESSION_OR_CONTEXT_NOT_EXISTS] SparkContext or SparkSession should be created first.`
+
+    A schema prints several ways:
+
+    ```python
+    s = StructType.fromDDL(ddl)
+    print(s.simpleString())
+    print(s.toDDL())
+    print(s.treeString())     # what printSchema() prints (4.0)
+    ```
+
+    ```
+    struct<id:bigint,name:string,tags:array<string>,address:struct<city:string,zip:string>>
+    id BIGINT NOT NULL,name STRING,tags ARRAY<STRING>,address STRUCT<city: STRING, zip: STRING>
+    root
+     |-- id: long (nullable = false)
+     |-- name: string (nullable = true)
+     |-- tags: array (nullable = true)
+     |    |-- element: string (containsNull = true)
+     |-- address: struct (nullable = true)
+     |    |-- city: string (nullable = true)
+     |    |-- zip: string (nullable = true)
+    ```
+
+    `simpleString()` leaves out nullability, which makes it handy for
+    comparing types. Note `long` in the tree and `bigint` elsewhere: they
+    are two names for the same type.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Storing a Schema in a File
+
+    A schema that lives only in code is hard to share with the team that
+    produces the data. `schema.json()` gives a JSON document that
+    describes it completely, nullability and nested types included, and
+    `StructType.fromJson` reads it back. This needs no session:
+
+    ```python
+    import json
+
+    text = s.json()
+    print(text[:120])
+    restored = StructType.fromJson(json.loads(text))
+    print(restored == s)
+    ```
+
+    ```
+    {"fields":[{"metadata":{},"name":"id","nullable":false,"type":"long"},{"metadata":{},"name":"name","nullable":true,"type
+    True
+    ```
+
+    Write that text to a file next to your job, put it under version
+    control, and you have a **schema contract**: the agreed shape of the
+    data, which code can load, compare with what really arrives, and use
+    to read files. That is this lesson's exercise.
+
+    Equality of `StructType` objects compares everything: names, types,
+    nullability, the order of fields, and metadata. Two schemas that
+    differ only in nullability are not `==`, while their
+    `simpleString()` values are equal.
+
+- Class: cmd_question
+  Depth: all
+  Output: |
+    `schema` is a `StructType` and `json` is imported. Write one line
+    that assigns to `copy` a `StructType` rebuilt from `schema`'s JSON
+    text.
+  CorrectAnswer: |
+    copy = StructType.fromJson(json.loads(schema.json()))
+  Hint: "schema.json() gives a string; fromJson wants the parsed dict."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Inference: What It Costs and Why It Wobbles
+
+    Without a schema, the JSON reader reads every record once just to
+    decide the schema, before your query even starts ("Why Spark for
+    Messy Data, and How It Runs Your Code" showed that `spark.read.json`
+    runs a job straight away). Then it reads the data again for the
+    query. For a large folder that first pass can cost as much as the
+    query.
+
+    The result also depends on exactly which records it saw. Read the
+    event files one day at a time:
+
+    ```python
+    for day in ["01", "02", "03"]:
+        print(day, spark.read.json(f"data/messy/events/events_2026-10-{day}.json").schema.simpleString())
+    ```
+
+    ```
+    01 struct<amount:double,event:string,ts:string,user_id:bigint>
+    02 struct<amount:string,event:string,items:array<struct<qty:bigint,sku:string>>,ts:string,user:struct<id:bigint,plan:string>>
+    03 struct<_corrupt_record:string,amount:struct<currency:string,value:double>,event_type:string,items:array<struct<qty:bigint,sku:string>>,ts:string,user:struct<geo:struct<country:string>,id:bigint,plan:string>>
+    ```
+
+    Three days, three schemas; `amount` is a `double`, a `string` and a
+    `struct`. A job that infers will change its output schema whenever a
+    new kind of file lands. A few rules of JSON inference are visible
+    here: fields are sorted by name, whole numbers become `bigint`,
+    conflicting types widen to `string`, and timestamps stay strings
+    unless you set `option("inferTimestamp", True)` (off by default).
+    "JSON Drift and Quarantine" takes these rules apart in detail.
+
+    `samplingRatio` makes inference read only a fraction of the records.
+    Faster, and less stable still. On the whole folder with `local[4]`:
+
+    ```python
+    for r in [1.0, 0.1, 0.05, 0.01]:
+        print(r, spark.read.option("samplingRatio", r).json("data/messy/events").schema.simpleString())
+    ```
+
+    ```
+    1.0  struct<_corrupt_record:string,amount:string,event:string,event_type:string,items:...,ts:string,user:struct<geo:struct<country:string>,id:bigint,plan:string>,user_id:bigint>
+    0.1  struct<_corrupt_record:string,amount:string,event:string,event_type:string,items:...,ts:string,user:struct<geo:struct<country:string>,id:bigint,plan:string>>
+    0.05 struct<amount:double,event:string,items:array<struct<qty:bigint,sku:string>>,ts:string,user:struct<id:bigint,plan:string>>
+    0.01 struct<>
+    ```
+
+    At 0.1 `user_id` vanished; at 0.05 `amount` turned back into a
+    `double`, so string amounts would now fail to parse; at 0.01 the
+    sample was empty and the schema has **no columns at all**. That last
+    DataFrame still has 61 rows, and `columns` is `[]`. The sample uses
+    a fixed seed (1, in the 4.2.0 source), so the same files give the
+    same answer, but it is drawn per partition, so the answer changes
+    with the number of files and cores.
+
+- Class: mult_question
+  Depth: all
+  Output: "A job reads a folder of JSON with `samplingRatio` 0.05 to save time. What is the risk?"
+  AnswerChoices: "Rare fields or types are missed, so values that don't fit the guessed schema are lost or the schema changes from run to run;None, the sample is random so it is always representative;The job reads 20 times more data;samplingRatio only affects CSV"
+  CorrectAnswer: "Rare fields or types are missed, so values that don't fit the guessed schema are lost or the schema changes from run to run"
+  Hint: "At 0.05 the sample saw only numeric amounts, and at 0.01 it saw nothing."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Reading Through an Enforced Schema
+
+    The cure for unstable inference is to read with a schema you chose.
+    Reading is then faster (no inference pass) and the output shape is
+    always the same. Values that don't fit the declared type become
+    NULL, and fields the schema doesn't mention are ignored:
+
+    ```python
+    c = spark.read.schema("event STRING, amount DOUBLE").json("data/messy/events")
+    (c.groupBy(F.col("_metadata.file_name").alias("file"))
+      .agg(F.count("*").alias("rows"), F.count("amount").alias("amount_ok"))
+      .orderBy("file").show(truncate=False))
+    ```
+
+    ```
+    +----------------------+----+---------+
+    |file                  |rows|amount_ok|
+    +----------------------+----+---------+
+    |events_2026-10-01.json|20  |20       |
+    |events_2026-10-02.json|20  |15       |
+    |events_2026-10-03.json|21  |0        |
+    +----------------------+----+---------+
+    ```
+
+    (`F.count("amount")` counts non-NULL values; `_metadata.file_name`
+    is the hidden column with the source file name, covered in "Files as
+    Files: binaryFile, Globs and Metadata".)
+
+    The schema held, and the numbers tell you exactly how much data
+    didn't fit: day 2's five amounts written as strings and every one of
+    day 3's object amounts. Losing them silently would be bad; counting
+    them is the first step. "JSON Drift and Quarantine" shows how to
+    keep the raw record of each one (the corrupt record column and parse
+    modes) and how to read every shape of `amount`.
+
+    Formats that store their schema behave differently. Parquet records
+    each column's physical type, and reading a column with an
+    incompatible type fails instead of giving NULL. A folder of two
+    Parquet files, one with `amount` as a double and one as a string,
+    read without `mergeSchema` (so Spark took `double` from one file's
+    footer), failed at `collect()` with:
+
+    ```
+    [FAILED_READ_FILE.PARQUET_COLUMN_DATA_TYPE_MISMATCH] Encountered error while reading file
+    file:///.../b/part-00001-....snappy.parquet. Data type mismatches when reading Parquet
+    column [amount]. Expected Spark type double, actual Parquet type BINARY.
+    ```
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Parquet and mergeSchema
+
+    When Parquet files in one folder have different columns, Spark by
+    default takes the schema from one of them (`spark.sql.parquet.mergeSchema`
+    is `false`), so columns that exist only in other files disappear.
+    The `mergeSchema` option reads every file's footer and unions the
+    columns. Day 1 and day 2 of the events, written as Parquet under
+    `day=1` and `day=2` folders (with day 2's `amount` cast to double
+    first):
+
+    ```python
+    print(spark.read.parquet(p).schema.simpleString())
+    print(spark.read.option("mergeSchema", "true").parquet(p).schema.simpleString())
+    ```
+
+    ```
+    struct<amount:double,event:string,ts:string,user_id:bigint,day:int>
+    struct<amount:double,event:string,ts:string,user_id:bigint,items:array<struct<qty:bigint,sku:string>>,user:struct<id:bigint,plan:string>,day:int>
+    ```
+
+    (`day` is a partition column, made from the `day=1` folder names.)
+    Merging costs a read of every footer, which is why it is off by
+    default. It only unions columns; it does not reconcile types. Without
+    the cast, day 2's string `amount` against day 1's double failed at
+    read time with `[CANNOT_MERGE_SCHEMAS] Failed merging schemas`,
+    caused by `[CANNOT_MERGE_INCOMPATIBLE_DATA_TYPE] Failed to merge
+    incompatible data types "DOUBLE" and "STRING"` (in classic PySpark it
+    reaches Python as a `Py4JJavaError` with that text, not as an
+    exception with a condition).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Detecting Drift in Code
+
+    **Drift** is any difference between the schema you expect and the
+    one that arrives: a field added, a field missing, a type changed. To
+    catch it automatically, compare two schemas field by field.
+
+    - Compare **types** with `simpleString()`, so nullability (which
+      file sources reset anyway) doesn't count as drift.
+    - **Recurse into structs**, so a new field deep inside `user` is
+      reported as `user.geo`, not as "the whole user changed".
+    - Report three kinds: `added`, `missing`, `type_changed`.
+
+    The heart of it:
+
+    ```python
+    def schema_drift(expected, actual, prefix=""):
+        drift = []
+        actual_fields = {f.name: f for f in actual.fields}
+        for field in expected.fields:
+            path = prefix + field.name
+            if field.name not in actual_fields:
+                drift.append(("missing", path, field.dataType.simpleString()))
+            # ... recurse into structs, compare simpleString(), then find the added fields
+        return sorted(drift)
+    ```
+
+    Comparing the agreed contract (the exercise's `CONTRACT_DDL`) with
+    day 1's schema, inferred with `inferTimestamp` on, gives:
+
+    ```
+    [('added', 'user_id', 'bigint'),
+     ('missing', 'items', 'array<struct<qty:bigint,sku:string>>'),
+     ('missing', 'user', 'struct<id:bigint,plan:string>')]
+    ```
+
+    A report like this can fail a job, open a ticket, or just be logged
+    next to the data. You will finish the function in the exercise.
+
+    One trap: field **order** is part of a struct type, and JSON
+    inference sorts fields by name. A contract that says
+    `STRUCT<sku: STRING, qty: BIGINT>` has a different `simpleString()`
+    from the inferred `struct<qty:bigint,sku:string>`, so a naive
+    comparison reports a change that isn't one. Write nested fields of a
+    contract in alphabetical order, or compare struct fields by name, as
+    the recursive function does for structs (it still compares a struct
+    inside an array by its `simpleString()`).
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Combining DataFrames of Different Shapes
+
+    `union` stacks two DataFrames **by position**: column 1 with column
+    1, whatever the names. On drifted data it fails, or worse, succeeds
+    and mixes columns. `unionByName` matches columns by name. With day 1
+    (`d1`) and day 3 (`d3`) of the events read by inference:
+
+    ```python
+    d1.union(d3)
+    # [NUM_COLUMNS_MISMATCH] UNION can only be performed on inputs with the same number of
+    #   columns, but the first input has 4 columns and the second input has 6 columns.
+
+    d1.unionByName(d3)
+    # [UNRESOLVED_COLUMN_AMONG_FIELD_NAMES] Cannot resolve column name "event" among
+    #   (_corrupt_record, amount, event_type, items, ts, user).
+    ```
+
+    `allowMissingColumns=True` (Spark 3.1, SPARK-29358) fills a column
+    that one side lacks with NULL. Day 1 with day 2 then works:
+
+    ```python
+    d1.unionByName(d2, allowMissingColumns=True).schema.simpleString()
+    # struct<amount:double,event:string,ts:string,user_id:bigint,
+    #        items:array<struct<qty:bigint,sku:string>>,user:struct<id:bigint,plan:string>>
+    ```
+
+    Wait: day 2's `amount` is a string, yet the result says `double`.
+    The union found a common type and added a plain
+    `cast(amount as double)` to day 2's side (`explain()` shows it), so
+    `'32.83'` became `32.83`. That cast is strict under ANSI mode: one
+    amount such as `'n/a'` would fail the whole query with
+    `CAST_INVALID_INPUT` when it runs. And matching names does not fix
+    types that can't be combined at all. Day 1 with day 3:
+
+    ```python
+    d1.unionByName(d3, allowMissingColumns=True)
+    # [INCOMPATIBLE_COLUMN_TYPE] UNION can only be performed on tables with compatible column
+    #   types. The first column of the second table is "STRUCT<currency: STRING, value: DOUBLE>"
+    #   type which is not compatible with "DOUBLE" at the same column of the first table.
+    ```
+
+    So before combining sources, reshape each one to a common target.
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Reshaping to a Target Schema
+
+    Three tools, each with limits worth knowing.
+
+    **`cast` and `try_cast`.** `cast` converts a column to a type and,
+    under ANSI mode, fails on a bad value. `try_cast` (a `Column` method
+    since 4.0) returns NULL instead. Both work only between types that
+    can be converted at all. A struct can't become a double, and
+    `try_cast` doesn't change that; the query fails before it runs:
+
+    ```python
+    d3.select(F.col("amount").try_cast("double"))
+    # [DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION] Cannot resolve "TRY_CAST(amount AS DOUBLE)"
+    #   due to data type mismatch: cannot cast "STRUCT<currency: STRING, value: DOUBLE>" to "DOUBLE".
+    ```
+
+    `try_cast` protects you from bad **values**, not from incompatible
+    **types**. Check the types first (that is what the drift report is
+    for).
+
+    **`DataFrame.to(schema)`** (Spark 3.4, SPARK-39625) reorders columns
+    by name, drops columns the schema doesn't list, and casts where the
+    cast is safe. What it did on 4.2.0:
+
+    | Case | Result |
+    |------|--------|
+    | columns in another order | reordered |
+    | extra columns | dropped |
+    | `bigint` to `int`, `double` to `string` | cast |
+    | `string` to `double` | ``[INVALID_COLUMN_OR_FIELD_DATA_TYPE] Column or field `amount` is of type "STRING" while it's required to be "DOUBLE".`` |
+    | nullable column, target `NOT NULL` | ``[NULLABLE_COLUMN_OR_FIELD] Column or field `user_id` is nullable while it's required to be non-nullable.`` |
+    | missing nullable column | **filled with NULL** |
+    | missing `NOT NULL` column | `[UNRESOLVED_COLUMN.WITH_SUGGESTION]` |
+
+    The "missing nullable column" row contradicts the 4.2.0 docstring,
+    which says missing columns lead to failures; the 4.2.0 source
+    (`Project.reorderFields`) fills them with NULL. Test this behaviour
+    if you rely on it.
+
+    **Your own select.** For messy data the most predictable tool is a
+    `select` you build from the target schema: for each target column,
+    keep it if the type already matches, `try_cast` it if both types are
+    plain, rebuild a struct field by field if both are structs, and use
+    `F.lit(None).cast(type)` (a typed NULL) when the column is missing or
+    can't be converted. The exercise builds exactly this.
+
+- Class: mult_question
+  Depth: all
+  Output: "`amount` is a STRUCT in one file. What does `F.col('amount').try_cast('double')` do?"
+  AnswerChoices: "The query fails during analysis with DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION;It returns NULL for every row;It returns the struct's first field;It returns the struct as a JSON string"
+  CorrectAnswer: "The query fails during analysis with DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION"
+  Hint: "try_cast turns bad values into NULL. Is a struct-to-double conversion a bad value or an impossible type?"
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Column Names From the Wild
+
+    Producers name things however they like. What Spark 4.2.0 does with
+    awkward names:
+
+    **Spaces** work in the DataFrame API but must be quoted with
+    backticks inside SQL expressions:
+
+    ```python
+    weird = spark.createDataFrame([(1, 2, 3)], ["order id", "user.name", "Amount"])
+    weird.select("order id")                          # works
+    weird.selectExpr("order id")                      # [UNRESOLVED_COLUMN.WITH_SUGGESTION] ... `order`
+    weird.selectExpr("`order id` AS order_id")        # works
+    ```
+
+    **Dots** mean "field of a struct" to Spark, so a column literally
+    named `user.name` needs backticks even in the DataFrame API:
+
+    ```python
+    weird.select("user.name")      # [UNRESOLVED_COLUMN.WITH_SUGGESTION] `user`.`name` cannot be resolved.
+                                   #   Did you mean one of the following? [`user.name`, ...]
+    weird.select("`user.name`")    # works
+    weird.withColumnRenamed("user.name", "user_name")   # works: renaming takes the plain name
+    ```
+
+    **Case.** Spark resolves names case-insensitively by default
+    (`spark.sql.caseSensitive` is `false`): `weird.select("amount")` finds
+    `Amount`. That turns into an error when a source has two names that
+    differ only in case. A JSON line `{"amount": 1, "Amount": 2}` fails at
+    read time with ``[COLUMN_ALREADY_EXISTS] The column `amount` already
+    exists.``, and so does a JSON object with a repeated key such as
+    `{"a": 1, "a": 2}`. With `spark.sql.caseSensitive` set to `true`, the
+    first one reads as two columns, `Amount` and `amount`; prefer
+    renaming at the edge over flipping that setting for a whole job.
+    A DataFrame with columns `a` and `A` gives
+    ``[AMBIGUOUS_REFERENCE] Reference `a` is ambiguous`` when you select
+    `a`.
+
+    **Duplicates and blanks in CSV headers.** A header
+    `id,name,name,,total amount` read with `header=True` gave the columns
+    `['id', 'name1', 'name2', '_c3', 'total amount']`: Spark numbers
+    duplicate names and names an empty one by its position. "CSV and
+    Delimited Files" covers headers in depth.
+
+    The cure is the same in every case: rename to plain `snake_case`
+    names as the first step after reading, with `withColumnsRenamed`
+    (3.4) for a dict of renames or `toDF(*new_names)` to replace them
+    all, and keep the original names only in your documentation.
+
+- Class: text
+  Depth: intermediate
+  Output: |
+    ## Schemas in Production
+
+    A few habits that pay off as soon as more than one job reads a
+    source:
+
+    - **Keep the contract next to the code**, as a `.json` file from
+      `schema.json()` or as a DDL string, under version control. Change
+      it deliberately, in review, like code.
+    - **Read with the contract, profile with inference.** The job reads
+      through the contract (stable output), and a separate check infers
+      the schema of new files and compares it with the contract to
+      report drift. That is what the exercise's `load_with_contract`
+      does.
+    - **Decide per field what drift means.** A new field is usually
+      harmless (log it). A missing field may be a renamed one. A type
+      change is the one that silently loses data, so it is the one to
+      alert on.
+    - **Write the result to a table format that enforces the schema**
+      ("Landing Messy Data in Delta Lake" shows how Delta rejects
+      drifted writes, and what `mergeSchema` means there).
+    - **Plan for the shapes you can't predict**: keep the raw record
+      next to the parsed columns, or keep the whole record as VARIANT.
+
+- Class: text
+  Depth: advanced
+  Output: |
+    ## Schema Metadata
+
+    Each `StructField` carries a `metadata` dict that travels with the
+    schema through `json()`, `fromJson`, Parquet files and most
+    transformations. It is a place for comments or lineage notes, and
+    SQL's `COMMENT` clause uses it:
+
+    ```python
+    s = StructType.fromDDL("amount DOUBLE COMMENT 'order total in CAD'")
+    print(s["amount"].metadata)       # {'comment': 'order total in CAD'}
+    ```
+
+    Remember that `StructType` equality includes metadata, so two
+    schemas that differ only in a comment are not `==`. Another reason
+    to compare `simpleString()` (or your own normalized form) when
+    checking for drift.
+
+- Class: script
+  Depth: all
+  Output: |
+    ## Exercise: A Schema Contract for the Events
+
+    The team has agreed on a contract for order events (`CONTRACT_DDL` in
+    the starter):
+
+    ```
+    event STRING, user STRUCT<id: BIGINT, plan: STRING>, amount DOUBLE,
+    items ARRAY<STRUCT<qty: BIGINT, sku: STRING>>, ts TIMESTAMP
+    ```
+
+    Implement:
+
+    1. `save_contract(schema, path)` and `load_contract(path)`: store the
+       schema as JSON text and read it back with `StructType.fromJson`.
+    2. `schema_drift(expected, actual)`: a sorted list of
+       `(kind, path, detail)` tuples, `kind` being `missing`, `added` or
+       `type_changed`, comparing types with `simpleString()` and going
+       inside structs that both sides have (nested paths use dots).
+    3. `load_with_contract(spark, path, contract_path)`: return
+       `(df, drift)`. `df` is the files read with the contract as their
+       schema, plus a `_file` column from `_metadata.file_name`. `drift`
+       compares the contract with the schema Spark infers for the same
+       files (with `inferTimestamp` on).
+    4. `align_column` and `align_to(df, contract)`: reshape a DataFrame
+       read by inference to exactly the contract's schema. The struct
+       case is written for you; add the plain-type case (`try_cast`) and
+       the fallback (a typed NULL), then build the `select`.
+
+    The checks: the contract survives a round trip through a file; the
+    drift for day 1 and day 3 matches exactly; the folder read through
+    the contract has the contract's columns plus `_file`, 61 rows and
+    20, 15 and 0 usable amounts per day; day 3 aligned to the contract
+    keeps every `user.id`, turns its object amounts into NULL and gains a
+    NULL `event`; and aligned day 1 and day 3 combine with `unionByName`
+    into 41 rows.
+  StarterFile: starter.py
+  SolutionFile: solution.py
+  Hint: "save: open(path, 'w').write(schema.json()). load: StructType.fromJson(json.load(open(path))). In schema_drift, e = field.dataType and a = actual_fields[field.name].dataType; when both are StructType, extend with schema_drift(e, a, path + '.'); otherwise compare e.simpleString() with a.simpleString(). In align_to: df.select(*[align_column(F.col(f.name), have[f.name], f.dataType).alias(f.name) if f.name in have else F.lit(None).cast(f.dataType).alias(f.name) for f in contract.fields])."
+
+- Class: text
+  Depth: all
+  Output: |
+    ## Summary
+
+    In this lesson you learned:
+
+    - **Types**: integers by size, `DOUBLE` for measurements and
+      `DECIMAL(p,s)` for money (`DecimalType()` is `(10,0)`); ANSI mode
+      (4.0) turns overflow into `CAST_OVERFLOW`, `ARITHMETIC_OVERFLOW` or
+      `NUMERIC_VALUE_OUT_OF_RANGE` errors, and `try_cast` into NULL.
+    - **Time**: `TIMESTAMP` is an instant converted with
+      `spark.sql.session.timeZone`; `TIMESTAMP_NTZ` (3.4) is a wall-clock
+      value. `collect()` gives datetimes in the Python process's zone.
+      Year-month intervals can't be collected in 4.2.0.
+    - **Nested types**: struct, array, map, and VARIANT (4.0) when the
+      shape is unknown.
+    - **Nullability** is a hint for file sources (every field becomes
+      nullable); `createDataFrame` checks it, and `verifySchema=False`
+      turned a `None` into `0`.
+    - **Writing schemas**: DDL strings or `StructType`;
+      `fromDDL`/`toDDL` (4.0) need a session; `simpleString()`,
+      `treeString()`, and `json()`/`fromJson` for storing contracts.
+    - **Inference** costs a pass over the data and changes with the
+      data; `samplingRatio` can drop fields or produce an empty schema.
+    - **Enforced schemas** give a stable shape; values that don't fit
+      become NULL for JSON, and fail for Parquet. `mergeSchema` unions
+      Parquet columns but not types.
+    - **Drift** is found by comparing schemas field by field with
+      `simpleString()`, recursing into structs.
+    - **Combining shapes**: `unionByName(allowMissingColumns=True)`
+      (3.1) fills missing columns but fails on incompatible types;
+      `try_cast` fixes bad values, not impossible types; `DataFrame.to`
+      (3.4) reorders, drops and fills missing nullable columns.
+    - **Names**: backticks for spaces in SQL and for dots everywhere,
+      case-insensitive resolution by default, `COLUMN_ALREADY_EXISTS` for
+      JSON keys that differ only in case, and renaming right after
+      reading.
+
+    Next: **Columns and Expressions: Cleaning Values**, where the schema
+    holds and the job becomes fixing the values inside it: strings,
+    numbers, dates and nulls.
